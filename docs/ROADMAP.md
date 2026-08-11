@@ -100,6 +100,20 @@ hex-decoding table for URL decoding (`%XX` → byte) is a comptime
 
 ### M7 — Comptime route resolution and dispatch
 
+**Status: DONE** (2026-08-11). Part A: byte-level radix trie in
+`dsl/router.zig` (O(path length) lookup; exact beats prefix; prefix nodes
+carry their longest-prefix chain; comptime-built into .rodata for
+struct-literal configs via `buildTrie`, startup-built for JSON via
+`buildTrieRuntime`; duplicate (path, match) routes are a compile error for
+struct configs, `error.AmbiguousRoutes` at runtime; `matchRoutes` unchanged
+and still used as the no-trie fallback). Part B: `dispatchForRoute` +
+`assignDispatch` in `dsl/pipeline.zig` generate a comptime-specialised
+`*const fn (ctx) anyerror!Outcome` per route (stored on `Route.dispatch`,
+called directly from the pipeline walk). `Server.comptimeInit` builds both at
+compile time; `Server.initWithTrie` builds the trie at startup for JSON.
+Gates met: 14 new router/pipeline/server tests, `zig build test` 117/117,
+100-route A/B in `bench/BENCH.md` (+1.9% @c100, +7.8% @c500 — no regression).
+
 *Depends on*: M4 (`dsl/router.zig`, `dsl/pipeline.zig`).
 
 Two comptime-driven improvements to the per-request hot path.

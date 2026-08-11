@@ -291,3 +291,32 @@ work — shows +0.8%. The M6 additions are O(path) scans and one compare on
 the hot path; recorded as within the <5% gate. `zig build test` green
 throughout (83 M5 tests + 20 new M6 tests = 103). `bench/http-check.py`
 15/15 (extended) against the M6 server, 11/11 against both A/B builds.
+
+## Milestone 7: comptime route trie + per-route dispatch specialisation
+
+Date: 2026-08-11, same box. The M6 tree plus: a byte-level radix trie over
+the route table (O(path length) lookup instead of O(routes); built at compile
+time for struct-literal configs, in .rodata) and comptime-specialised
+per-route dispatch functions (each route directly calls its bound modules —
+no phase loop, no moduleFor scans, no Registry.resolve at runtime). JSON
+configs get the same-shape trie built at startup; their routes keep the
+loop-walk dispatch. The default server now runs the comptime path.
+
+**Method**: same-day A/B against the pre-M7 tree (`f08d6a2`, the M6 commit),
+both `ReleaseFast`, both running the synthetic **100-route JSON config**
+(`bench/config-100r.json`) with `--threads 4`, both verified with
+`bench/http-check.py` 15/15. Co-resident interleaved runs (6 reps at c=100,
+5 at c=500, 10 s each, ports swapped only by position; the target was
+`/r42/` — a mid-table route, so the linear matcher scans ~42 routes per
+request while the trie walks 4 bytes).
+
+| conns | M7 (trie+dispatch) req/s | M6 (linear+walk) req/s | delta |
+|---|---:|---:|---:|
+| 100 | 251,167 | 246,536 | **+1.9%** |
+| 500 | 252,889 | 234,630 | **+7.8%** |
+
+**Conclusion**: no regression at any route count; the trie + dispatch
+specialisation is faster at both measured points (+1.9% / +7.8%; the gap
+widens with concurrency, where per-request matching cost matters). `zig build
+test` green throughout (103 M6 tests + 14 new M7 tests = 117). All existing
+router/pipeline tests pass unchanged.

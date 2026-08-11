@@ -43,9 +43,10 @@ pub fn main() !void {
     }
 
     // HTTP mode runs through the config-driven pipeline (Milestone 4). The
-    // default config (echo on every path) is a comptime struct literal; an
-    // explicit JSON config is parsed at startup with std.json and lives for
-    // the process duration.
+    // default config (echo on every path) is a comptime struct literal: its
+    // route trie and per-route dispatch functions are built at compile time
+    // (Milestone 7). An explicit JSON config is parsed at startup with
+    // std.json; its trie is built at startup and freed with the server.
     var json_buf: ?[]u8 = null;
     var loaded_cfg: ?tcp_server.runtime.config.Config = null;
     if (config_path) |p| {
@@ -57,7 +58,12 @@ pub fn main() !void {
     defer if (loaded_cfg) |*cfg| cfg.deinit(allocator);
 
     var http_srv: tcp_server.runtime.server.Server = tcp_server.runtime.server.Server.default();
-    if (loaded_cfg) |cfg| http_srv = tcp_server.runtime.server.Server.init(cfg);
+    var http_srv_owns_trie = false;
+    if (loaded_cfg) |cfg| {
+        http_srv = try tcp_server.runtime.server.Server.initWithTrie(allocator, cfg);
+        http_srv_owns_trie = true;
+    }
+    defer if (http_srv_owns_trie) http_srv.deinit(allocator);
 
     const n = threads orelse (std.Thread.getCpuCount() catch 1);
     var s = try tcp_server.multireactor.Server.initWithThreadsAndHandlerTimeout(allocator, port, n, mode, &http_srv, idle_timeout);

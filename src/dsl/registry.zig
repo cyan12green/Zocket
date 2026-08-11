@@ -11,6 +11,24 @@ pub const Request = http_parser.Request;
 pub const Response = http_response.Response;
 pub const Status = http_response.Status;
 
+/// Result of a full pipeline walk for one request. Defined here (not in the
+/// pipeline) so the router's `DispatchFn` can reference it without an import
+/// cycle; the pipeline re-exports it as `pipeline.Outcome`.
+pub const Outcome = enum {
+    /// A module produced a response (`ctx.resp` is valid).
+    handled,
+    /// The chain ended without a module claiming the request (no route
+    /// matched, a short-circuit, or no module attached). The caller sends the
+    /// default response.
+    not_handled,
+};
+
+/// A comptime-specialised per-route dispatch function (Milestone 7): directly
+/// calls the modules bound to a route's phases — no phase loop, no moduleFor
+/// scans, no Registry.resolve at runtime. Stored on `Route.dispatch` for
+/// struct-literal configs; null for JSON-loaded routes (loop-walk fallback).
+pub const DispatchFn = *const fn (ctx: *Context) anyerror!Outcome;
+
 /// The standard module interface. A module is a comptime value of this type,
 /// exported by its source file; the registry below enumerates them. `run` is
 /// the per-request handler: it may mutate the context and returns an `Action`
