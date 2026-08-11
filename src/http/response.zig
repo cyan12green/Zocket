@@ -89,6 +89,23 @@ pub const Response = struct {
     pub fn writeToBuffer(self: *const Response, buf: *buffer_mod.Buffer) !void {
         try self.write(BufferSink{ .buf = buf });
     }
+
+    /// Serialize only the head (status line + headers + blank line) into a
+    /// connection send buffer. `Content-Length` still reflects the body
+    /// length, but the body bytes are not written — the HEAD method response
+    /// (RFC 9110 §9.3.2). Same framing and sizes as `write`, minus the body.
+    pub fn writeHeadToBuffer(self: *const Response, buf: *buffer_mod.Buffer) !void {
+        var scratch: [96]u8 = undefined;
+        const sink = BufferSink{ .buf = buf };
+        try sink.writeAll(try std.fmt.bufPrint(&scratch, "HTTP/1.1 {d} {s}\r\n", .{
+            @intFromEnum(self.status),
+            self.status.reasonPhrase(),
+        }));
+        for (self.headers[0..self.header_count]) |h| {
+            try sink.writeAll(try std.fmt.bufPrint(&scratch, "{s}: {s}\r\n", .{ h.name, h.value }));
+        }
+        try sink.writeAll(try std.fmt.bufPrint(&scratch, "Content-Length: {d}\r\n\r\n", .{self.body.len}));
+    }
 };
 
 /// Adapter writing into a net buffer. Errors instead of silently truncating
@@ -205,6 +222,23 @@ test "writeToBuffer fails cleanly when the buffer is too small" {
     // Nothing was written.
     try testing.expectEqual(@as(usize, 0), buf.availableRead());
     try testing.expectEqual(@as(usize, 0), buf.write_pos);
+}
+
+test "writeHeadToBuffer writes head only with full Content-Length" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.ok);
+    resp.setHeader("Connection", "keep-alive");
+    resp.setBody("the body that must not be sent");
+
+    const buf = try buffer_mod.Buffer.init(allocator);
+    defer buf.deinit(allocator);
+    try resp.writeHeadToBuffer(buf);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 30\r\n\r\n",
+        buf.peek(),
+    );
+    // Head-only serialization is exactly the full wire size minus the body.
+    try testing.expectEqual(resp.wireSize() - resp.body.len, buf.availableRead());
 }
 
 test "wireSize matches written bytes across configurations" {

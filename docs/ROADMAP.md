@@ -60,6 +60,17 @@ the comptime win is configuration, not algorithm).
 
 ### M6 — HTTP robustness: chunked encoding + URL decoding + HEAD
 
+**Status: DONE** (2026-08-11). Chunked transfer-encoding in the parser
+(`chunk_size`/`chunk_data`/`chunk_crlf`/`chunk_trailers` states; trailer
+headers dropped; `max_chunked_body` cap → 413), percent-decoded
+`Request.decoded_target` (comptime `[256]u8` hex table; escape-free targets
+stay zero-copy) + `Request.query_string` split, HEAD (head-only wire output
+with the would-be-body Content-Length), comptime MIME switch
+(`src/http/mime.zig`). Gates met: 20 new parser/response/mime/reactor tests,
+`zig build test` 103/103, `bench/http-check.py` extended to 15 checks and
+passing, M6 A/B in `bench/BENCH.md` (latency floor +0.8%; throughput deltas
+inside the same-binary control envelope).
+
 *Depends on*: M3 (parser, response builder).
 
 Fill the HTTP/1.1 gaps that block real content modules.

@@ -10,6 +10,9 @@ Verifies, over real TCP connections:
 - pipelined requests in a single write
 - error paths: 400 (malformed), 501 (unknown method), 413 (oversized body)
 - Connection: close terminates the connection
+- chunked request bodies are assembled and echoed (M6)
+- HEAD responses carry head only, with the would-be body Content-Length (M6)
+- query strings and percent-encoded targets are accepted (M6)
 Exits non-zero on any mismatch.
 """
 import http.client
@@ -117,6 +120,38 @@ def main() -> int:
         f"POST / HTTP/1.1\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
     )
     check("431 body overflow", b"431 Request Header Fields Too Large" in got)
+
+    # 9. Chunked request body (two chunks + trailer) is assembled and echoed.
+    got = raw_request(
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        b"5\r\nhello\r\n6\r\n world\r\n0\r\nX-T: dropped\r\n\r\n"
+    )
+    check("chunked body echoed", b"hello world" in got and b"200 OK" in got)
+
+    # 10. HEAD: head only, no body bytes, Content-Length of the would-be body.
+    s = socket.create_connection((HOST, PORT), timeout=5)
+    s.settimeout(5)
+    s.sendall(b"HEAD / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    ok_head = head.startswith(b"HTTP/1.1 200 OK") and b"Content-Length: 5\r\n" in head
+    rest = b""
+    try:
+        rest = s.recv(4096)
+    except socket.timeout:
+        pass
+    s.close()
+    check("HEAD head-only with body-length Content-Length", ok_head and rest == b"")
+
+    # 11. Query strings and percent-encoded targets parse (catch-all route).
+    got = raw_request(b"GET /some/path?x=1&y=2 HTTP/1.1\r\n\r\n")
+    check("query string accepted", b"200 OK" in got)
+    got = raw_request(b"GET /a%20b%2Fc HTTP/1.1\r\n\r\n")
+    check("percent-encoded target accepted", b"200 OK" in got)
 
     print(f"\nhttp-check: {len(failures)} failures")
     for f in failures[:10]:

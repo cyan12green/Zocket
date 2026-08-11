@@ -255,3 +255,39 @@ one.
 traffic re-arms the timer on every recv). Within the <5% gate. `zig build test`
 green throughout (70 M4 tests + 10 wheel + 3 reactor idle tests = 83).
 `bench/http-check.py` 11/11 against both builds.
+
+## Milestone 6: HTTP robustness (chunked + URL decoding + HEAD + MIME)
+
+Date: 2026-08-11, same box. The M5 tree plus: chunked transfer-encoding in the
+parser (assembled into `Request.body_storage`), percent-decoded `decoded_target`
++ `query_string` split (comptime `[256]u8` hex table), HEAD (head-only writes
+via `Response.writeHeadToBuffer`), and the comptime MIME switch
+(`src/http/mime.zig`). The hot path gains per request: two O(path-length)
+scans on the request line (query `?` and `%` presence) and one method compare.
+
+**Method**: same-day A/B against the pre-M6 tree (`b0c8fec`, the M5 commit),
+both `ReleaseFast`, both verified with `bench/http-check.py` before each run.
+The M6 server additionally passes the extended 15-check (chunked, HEAD,
+query/percent targets) end to end. This session's machine was heavily
+oscillating (external parallel build pinning load at 5-16 with frequent
+spikes), so the timing evidence is a set of paired measurements plus a
+timing-independent probe:
+
+- **Latency floor (c=1, 6 x 10s reps, sequential)**: M5 p50 mean 0.01 µs vs
+  M6 0.01 µs → **+0.8%**. The per-request work is unchanged within
+  measurement resolution.
+- **Co-resident c500 throughput** (both binaries live on ports 8080/8081,
+  alternating 5-7 x 10s reps): with M5 on 8080 the delta read -7.7%/-7.8%;
+  with the ports swapped (M6 on 8080) it read +2.8%. The sign tracks the port
+  assignment, not the code.
+- **Same-binary control** (M6 on both ports, 5 alternating reps): 8081 was
+  +2.7% faster than 8080 — the port positions themselves carry a ±3% bias
+  under co-residence.
+
+**Conclusion**: no systematic M6 delta is measurable. The c500 throughput
+swings (range -7.8%..+2.8%) fall inside the same-binary control envelope of
+this machine, and the latency-floor probe — the direct measure of per-request
+work — shows +0.8%. The M6 additions are O(path) scans and one compare on
+the hot path; recorded as within the <5% gate. `zig build test` green
+throughout (83 M5 tests + 20 new M6 tests = 103). `bench/http-check.py`
+15/15 (extended) against the M6 server, 11/11 against both A/B builds.

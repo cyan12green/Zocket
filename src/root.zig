@@ -11,6 +11,7 @@ pub const timer_wheel = @import("net/timer_wheel.zig");
 pub const epoll = @import("net/epoll.zig");
 
 pub const http = struct {
+    pub const mime = @import("http/mime.zig");
     pub const parser = @import("http/parser.zig");
     pub const response = @import("http/response.zig");
 };
@@ -47,6 +48,7 @@ comptime {
     _ = @import("net/multireactor.zig");
     _ = @import("http/parser.zig");
     _ = @import("http/response.zig");
+    _ = @import("http/mime.zig");
     _ = @import("dsl/phase.zig");
     _ = @import("dsl/router.zig");
     _ = @import("dsl/registry.zig");

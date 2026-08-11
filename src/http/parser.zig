@@ -8,6 +8,10 @@ pub const max_headers = 32;
 /// Cap on the size of a single request-line or header line (RFC 7230 has no
 /// hard limit; this bounds parser memory and maps to HTTP 431).
 pub const max_line_bytes = 8192;
+/// Cap on the assembled body of a chunked request. Chunked bodies are copied
+/// out of the connection buffer (unlike Content-Length bodies, which are
+/// zero-copy), so this bounds the memory a single request can claim.
+pub const max_chunked_body = 64 * 1024;
 
 pub const Method = enum {
     get,
@@ -28,14 +32,16 @@ pub const Version = struct {
 /// Outcome of one parse() call. `.incomplete` means "need more bytes, call
 /// again after recv". On `.complete` the parser has consumed the request from
 /// the buffer and is ready for the next pipelined request; `req.body` is a
-/// zero-copy slice into the buffer and is only valid until the connection's
-/// next recv/compact.
+/// zero-copy slice into the buffer (Content-Length bodies) or into
+/// `req.body_storage` (chunked bodies) and is only valid until the connection's
+/// next recv/compact or the next request.
 pub const Outcome = union(enum) {
     incomplete,
     complete,
     bad_request, // 400
     header_too_large, // 431
-    unsupported, // 501 (bad version, unknown method, chunked, ...)
+    payload_too_large, // 413 (chunked body over max_chunked_body)
+    unsupported, // 501 (bad version, unknown method, ...)
     out_of_memory,
 };
 
@@ -48,10 +54,17 @@ const Slot = struct {
 
 /// A parsed HTTP/1.x request. Header names/values are copied into private
 /// storage owned by this struct (safe against buffer compaction); the body is
-/// a zero-copy view into the connection buffer.
+/// a zero-copy view into the connection buffer (Content-Length) or into
+/// `body_storage` (chunked).
 pub const Request = struct {
     method: Method,
     target: []const u8,
+    /// Percent-decoded target (query string stripped, `+` not converted).
+    /// Targets without escapes alias the `target` bytes (zero-copy).
+    decoded_target: []const u8,
+    /// Slice of the request line from `?` onwards (including the `?`), or
+    /// empty when the target has no query string.
+    query_string: []const u8,
     version: Version,
     keep_alive: bool,
     content_length: usize,
@@ -59,6 +72,9 @@ pub const Request = struct {
 
     allocator: std.mem.Allocator,
     storage: std.ArrayList(u8),
+    /// Assembly buffer for chunked request bodies (Content-Length bodies are
+    /// zero-copy views into the connection buffer instead).
+    body_storage: std.ArrayList(u8),
     slots: [max_headers]Slot = undefined,
     header_count: usize = 0,
     transfer_chunked: bool = false,
@@ -67,28 +83,35 @@ pub const Request = struct {
         return .{
             .method = .unknown,
             .target = "",
+            .decoded_target = "",
+            .query_string = "",
             .version = .{ .major = 1, .minor = 1 },
             .keep_alive = true,
             .content_length = 0,
             .body = &.{},
             .allocator = allocator,
             .storage = .empty,
+            .body_storage = .empty,
         };
     }
 
     pub fn deinit(self: *Request) void {
         self.storage.deinit(self.allocator);
+        self.body_storage.deinit(self.allocator);
     }
 
     /// Prepare the struct for the next request on the same connection.
     pub fn reset(self: *Request) void {
         self.method = .unknown;
         self.target = "";
+        self.decoded_target = "";
+        self.query_string = "";
         self.version = .{ .major = 1, .minor = 1 };
         self.keep_alive = true;
         self.content_length = 0;
         self.body = &.{};
         self.storage.clearRetainingCapacity();
+        self.body_storage.clearRetainingCapacity();
         self.header_count = 0;
         self.transfer_chunked = false;
     }
@@ -176,6 +199,68 @@ fn parseVersion(tok: []const u8) ?Version {
     return .{ .major = major, .minor = minor };
 }
 
+/// Comptime `%XX` hex decode table: hex value of a byte, or 0xff when the
+/// byte is not a hex digit.
+const hex_value: [256]u8 = blk: {
+    var table = [_]u8{0xff} ** 256;
+    for ("0123456789abcdefABCDEF") |c| {
+        const v = if (c >= '0' and c <= '9')
+            c - '0'
+        else if (c >= 'a' and c <= 'f')
+            c - 'a' + 10
+        else
+            c - 'A' + 10;
+        table[c] = v;
+    }
+    break :blk table;
+};
+
+/// Percent-decode `src` into `dst` (which must hold `src.len` bytes).
+/// Returns null on a malformed escape (`%` not followed by two hex digits).
+/// `+` is left as-is (it only means space in form encodings, not in targets).
+fn percentDecode(src: []const u8, dst: []u8) ?[]const u8 {
+    var i: usize = 0;
+    var o: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '%') {
+            if (i + 2 >= src.len) return null;
+            const hi = hex_value[src[i + 1]];
+            const lo = hex_value[src[i + 2]];
+            if (hi == 0xff or lo == 0xff) return null;
+            dst[o] = hi * 16 + lo;
+            i += 3;
+        } else {
+            dst[o] = c;
+            i += 1;
+        }
+        o += 1;
+    }
+    return dst[0..o];
+}
+
+/// Parse a chunk-size line: an optional hex size (RFC 9112 allows leading
+/// `+`; extensions after `;` are tolerated and dropped).
+fn parseChunkSize(line: []const u8) error{BadChunkSize}!usize {
+    var size: usize = 0;
+    var saw_digit = false;
+    for (line) |c| {
+        if (c == ';') break;
+        const v = hex_value[c];
+        if (v == 0xff) {
+            // Extension or whitespace terminates the size.
+            if (c == ' ' or c == '\t') break;
+            return error.BadChunkSize;
+        }
+        // v <= 15, so this is exactly the size*16+v > maxInt(usize) test.
+        if (size > (std.math.maxInt(usize) - 15) / 16) return error.BadChunkSize;
+        size = size * 16 + v;
+        saw_digit = true;
+    }
+    if (!saw_digit) return error.BadChunkSize;
+    return size;
+}
+
 /// Incremental HTTP/1.x request parser. State lives here across recv calls;
 /// the connection buffer is used as the accumulation buffer (partial lines
 /// stay in the buffer; this parser never blocks).
@@ -192,7 +277,15 @@ pub const Parser = struct {
     line: std.ArrayList(u8),
     body_remaining: usize = 0,
 
-    const State = enum { request_line, headers, body };
+    const State = enum {
+        request_line,
+        headers,
+        body,
+        chunk_size,
+        chunk_data,
+        chunk_crlf,
+        chunk_trailers,
+    };
 
     const LineError = error{ TooLong, OutOfMemory };
 
@@ -242,9 +335,16 @@ pub const Parser = struct {
                 switch (line) {
                     .line_data => |l| {
                         if (l.len == 0) {
-                            // End of headers.
-                            if (req.transfer_chunked) return .unsupported;
+                            // End of headers. The accumulated line (possibly a
+                            // split CRLF remnant) is dead; clear it so the
+                            // chunked states never see stale bytes.
+                            self.line.clearRetainingCapacity();
                             finalizeKeepAlive(req);
+                            if (req.transfer_chunked) {
+                                self.state = .chunk_size;
+                                self.body_remaining = 0;
+                                continue;
+                            }
                             if (req.content_length > 0) {
                                 self.body_remaining = req.content_length;
                                 self.state = .body;
@@ -280,6 +380,66 @@ pub const Parser = struct {
                 }
                 return .incomplete;
             },
+            .chunk_size => {
+                const line = (self.readLine(buf) catch |e| return lineErrorToOutcome(e)) orelse return .incomplete;
+                switch (line) {
+                    .line_data => |l| {
+                        const size = parseChunkSize(l) catch return .bad_request;
+                        self.line.clearRetainingCapacity();
+                        if (size == 0) {
+                            self.state = .chunk_trailers;
+                            continue;
+                        }
+                        if (size > max_chunked_body or req.body_storage.items.len + size > max_chunked_body) {
+                            return .payload_too_large;
+                        }
+                        self.body_remaining = size;
+                        self.state = .chunk_data;
+                        continue;
+                    },
+                }
+            },
+            .chunk_data => {
+                // Copy the chunk payload out of the connection buffer: the
+                // next chunk's size line and CRLFs interrupt it, so the body
+                // cannot stay zero-copy.
+                const have = buf.availableRead();
+                const take = @min(have, self.body_remaining);
+                if (take > 0) {
+                    req.body_storage.appendSlice(req.allocator, buf.peek()[0..take]) catch return .out_of_memory;
+                    buf.consume(take);
+                    self.body_remaining -= take;
+                }
+                if (self.body_remaining > 0) return .incomplete;
+                self.body_remaining = 2; // the CRLF terminating the chunk
+                self.state = .chunk_crlf;
+                continue;
+            },
+            .chunk_crlf => {
+                if (buf.availableRead() < self.body_remaining) return .incomplete;
+                // Lenient about the exact line ending (consistent with
+                // readLine); the two bytes are discarded either way.
+                buf.consume(self.body_remaining);
+                self.state = .chunk_size;
+                continue;
+            },
+            .chunk_trailers => {
+                const line = (self.readLine(buf) catch |e| return lineErrorToOutcome(e)) orelse return .incomplete;
+                switch (line) {
+                    .line_data => |l| {
+                        if (l.len == 0) {
+                            // Trailer headers are dropped: the request is
+                            // complete once the empty trailer line is read.
+                            req.body = req.body_storage.items;
+                            self.line.clearRetainingCapacity();
+                            self.reset();
+                            return .complete;
+                        }
+                        self.line.clearRetainingCapacity();
+                        continue;
+                    },
+                }
+            },
         };
     }
 
@@ -298,7 +458,37 @@ pub const Parser = struct {
 
         const target_off = req.storage.items.len;
         req.storage.appendSlice(self.allocator, target_tok) catch return .out_of_memory;
-        req.target = req.storage.items[target_off..];
+
+        // Query string split: everything from `?` onwards (including it).
+        var query_off: ?usize = null;
+        var path_len = target_tok.len;
+        if (mem.indexOfScalar(u8, target_tok, '?')) |qi| {
+            query_off = target_off + qi;
+            path_len = qi;
+        }
+
+        // Percent-decoded target. Targets without escapes are zero-copy slices
+        // into `storage`; escaped ones are decoded into a stack scratch buffer
+        // first (appending reallocates `storage`, invalidating earlier
+        // slices), then copied into `storage`. All slices are taken only
+        // after every append, once the backing storage is stable.
+        var decoded_off: ?usize = null;
+        if (mem.indexOfScalar(u8, target_tok[0..path_len], '%') != null) {
+            var decoded_buf: [max_line_bytes]u8 = undefined;
+            const decoded = percentDecode(target_tok[0..path_len], &decoded_buf) orelse return .bad_request;
+            decoded_off = req.storage.items.len;
+            req.storage.appendSlice(self.allocator, decoded) catch return .out_of_memory;
+        }
+
+        req.target = req.storage.items[target_off .. target_off + target_tok.len];
+        req.decoded_target = if (decoded_off) |off|
+            req.storage.items[off..]
+        else
+            req.storage.items[target_off .. target_off + path_len];
+        req.query_string = if (query_off) |off|
+            req.storage.items[off .. target_off + target_tok.len]
+        else
+            "";
         return null;
     }
 
@@ -529,13 +719,11 @@ test "malformed request line and headers yield 400" {
     }
 }
 
-test "unsupported protocol, method, and chunked encoding yield 501" {
+test "unsupported protocol and method yield 501" {
     const allocator = testing.allocator;
     const bad_wires = [_][]const u8{
         "GET / HTTP/2.0\r\n\r\n",
         "BREW / HTTP/1.1\r\n\r\n",
-        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
-        "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
     };
     for (bad_wires) |wire| {
         const buf = try fill(allocator, wire);
@@ -546,6 +734,243 @@ test "unsupported protocol, method, and chunked encoding yield 501" {
         defer parser.deinit();
         try testing.expectEqual(Outcome.unsupported, parser.parse(buf, &req));
     }
+}
+
+test "chunked request: single chunk" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(req.transfer_chunked);
+    try testing.expectEqualStrings("hello", req.body);
+    try testing.expectEqual(@as(usize, 0), buf.availableRead());
+}
+
+test "chunked request: multiple chunks with interleaved trailers dropped" {
+    const allocator = testing.allocator;
+    const wire =
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n" ++
+        "6\r\n world\r\n" ++
+        "4\r\n!?!?\r\n" ++
+        "0\r\n" ++
+        "X-Trailer: dropped\r\n" ++
+        "\r\n";
+    const buf = try fill(allocator, wire);
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("hello world!?!?", req.body);
+    try testing.expectEqual(@as(usize, 0), buf.availableRead());
+}
+
+test "chunked request: empty body" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqual(@as(usize, 0), req.body.len);
+}
+
+test "chunked request: size extensions and uppercase hex tolerated" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator,
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "A;foo=bar;baz\r\nabcdefghij\r\n" ++
+            "3\r\nxyz\r\n" ++
+            "0\r\n\r\n");
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("abcdefghijxyz", req.body);
+}
+
+test "chunked request: malformed size line yields 400" {
+    const allocator = testing.allocator;
+    const bad_wires = [_][]const u8{
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nnope\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n-5\r\nhello\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\r\n",
+    };
+    for (bad_wires) |wire| {
+        const buf = try fill(allocator, wire);
+        defer buf.deinit(allocator);
+        var req = Request.init(allocator);
+        defer req.deinit();
+        var parser = Parser.init(allocator);
+        defer parser.deinit();
+        try testing.expectEqual(Outcome.bad_request, parser.parse(buf, &req));
+    }
+}
+
+test "chunked request: body over the cap yields 413" {
+    const allocator = testing.allocator;
+    var wire_buf: [max_chunked_body + 128]u8 = undefined;
+    const chunk_size = max_chunked_body + 1;
+    const head = std.fmt.bufPrint(&wire_buf, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{X}\r\n", .{chunk_size}) catch unreachable;
+    const buf = try fill(allocator, head);
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    // The size line announces more than the cap before any payload arrives.
+    try testing.expectEqual(Outcome.payload_too_large, parser.parse(buf, &req));
+}
+
+test "chunked request: incremental feeding at every byte boundary" {
+    const allocator = testing.allocator;
+    const wire =
+        "POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "3\r\nabc\r\n4\r\ndefg\r\n0\r\n\r\n";
+
+    var split: usize = 0;
+    while (split < wire.len) : (split += 1) {
+        const buf = try fill(allocator, wire[0..split]);
+        defer buf.deinit(allocator);
+
+        var req = Request.init(allocator);
+        defer req.deinit();
+        var parser = Parser.init(allocator);
+        defer parser.deinit();
+
+        try testing.expectEqual(Outcome.incomplete, parser.parse(buf, &req));
+        _ = buf.writeSlice(wire[split..]);
+        try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+        try testing.expectEqualStrings("abcdefg", req.body);
+    }
+}
+
+test "chunked request pipelined with a content-length request" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator,
+        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n" ++
+            "POST /b HTTP/1.1\r\nContent-Length: 2\r\n\r\ncd");
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("ab", req.body);
+
+    req.reset();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("cd", req.body);
+}
+
+test "chunked body spanning recv boundaries" {
+    const allocator = testing.allocator;
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    // Headers + first chunk size + half a chunk arrive first.
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe");
+    defer buf.deinit(allocator);
+    try testing.expectEqual(Outcome.incomplete, parser.parse(buf, &req));
+
+    _ = buf.writeSlice("llo\r\n0\r\n\r\n");
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("hello", req.body);
+}
+
+test "URL decoding: escapes are decoded, plain targets are zero-copy" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET /a%20b%2Fc%41 HTTP/1.1\r\n\r\n");
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("/a%20b%2Fc%41", req.target);
+    try testing.expectEqualStrings("/a b/cA", req.decoded_target);
+    try testing.expectEqualStrings("", req.query_string);
+
+    const plain = try fill(allocator, "GET /plain/path HTTP/1.1\r\n\r\n");
+    defer plain.deinit(allocator);
+    var req2 = Request.init(allocator);
+    defer req2.deinit();
+    var parser2 = Parser.init(allocator);
+    defer parser2.deinit();
+    try testing.expectEqual(Outcome.complete, parser2.parse(plain, &req2));
+    // Zero-copy: the decoded target aliases the raw target bytes.
+    try testing.expectEqualStrings("/plain/path", req2.decoded_target);
+    try testing.expectEqual(@as(usize, 0), req2.decoded_target.ptr - req2.target.ptr);
+}
+
+test "URL decoding: malformed escapes yield 400" {
+    const allocator = testing.allocator;
+    const bad_wires = [_][]const u8{
+        "GET /a% HTTP/1.1\r\n\r\n",
+        "GET /a%2 HTTP/1.1\r\n\r\n",
+        "GET /a%zz HTTP/1.1\r\n\r\n",
+    };
+    for (bad_wires) |wire| {
+        const buf = try fill(allocator, wire);
+        defer buf.deinit(allocator);
+        var req = Request.init(allocator);
+        defer req.deinit();
+        var parser = Parser.init(allocator);
+        defer parser.deinit();
+        try testing.expectEqual(Outcome.bad_request, parser.parse(buf, &req));
+    }
+}
+
+test "query string split" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET /search?q=zig+lang&page=2 HTTP/1.1\r\n\r\n");
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("/search", req.decoded_target);
+    try testing.expectEqualStrings("?q=zig+lang&page=2", req.query_string);
+
+    // Escapes before the '?' are decoded; the query string stays raw.
+    const buf2 = try fill(allocator, "GET /files%20x?raw=1 HTTP/1.1\r\n\r\n");
+    defer buf2.deinit(allocator);
+    var req2 = Request.init(allocator);
+    defer req2.deinit();
+    var parser2 = Parser.init(allocator);
+    defer parser2.deinit();
+    try testing.expectEqual(Outcome.complete, parser2.parse(buf2, &req2));
+    try testing.expectEqualStrings("/files x", req2.decoded_target);
+    try testing.expectEqualStrings("?raw=1", req2.query_string);
 }
 
 test "oversized header line yields 431" {

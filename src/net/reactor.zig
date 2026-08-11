@@ -359,6 +359,10 @@ pub const Reactor = struct {
                     self.respondAndClose(fd, .not_implemented);
                     return;
                 },
+                .payload_too_large => {
+                    self.respondAndClose(fd, .payload_too_large);
+                    return;
+                },
                 .out_of_memory => {
                     self.respondAndClose(fd, .internal_error);
                     return;
@@ -380,10 +384,19 @@ pub const Reactor = struct {
                     const close = ctx.close_after_write or !session.req.keep_alive;
                     resp.setHeader("Connection", if (close) "close" else "keep-alive");
                     conn.send_buf.compact();
-                    resp.writeToBuffer(conn.send_buf) catch {
-                        self.removeConnection(fd);
-                        return;
-                    };
+                    if (session.req.method == .head) {
+                        // HEAD: status line + headers only (Content-Length
+                        // reflects the would-be body).
+                        resp.writeHeadToBuffer(conn.send_buf) catch {
+                            self.removeConnection(fd);
+                            return;
+                        };
+                    } else {
+                        resp.writeToBuffer(conn.send_buf) catch {
+                            self.removeConnection(fd);
+                            return;
+                        };
+                    }
                     session.close_after_write = close;
                     session.writing = true;
                     self.flushHttp(fd);
@@ -940,6 +953,70 @@ test "reactor runs a JSON-config pipeline with default 404 fallback" {
     r.join();
 }
 
+
+test "reactor HEAD responds with head only and correct Content-Length" {
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // HEAD on a path the echo module answers with an empty body.
+    try writeAll(pair[0], "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    var buf: [512]u8 = undefined;
+    const n = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n]);
+
+    // HEAD on a POST-shaped path: Content-Length must reflect the would-be
+    // body, but no body bytes may follow the head.
+    try writeAll(pair[0], "HEAD /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    const want2 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\n";
+    const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
+    try testing.expectEqualStrings(want2, buf[0..n2]);
+    // The echoed body must NOT be sent: a short read window yields nothing.
+    try testing.expectError(error.Timeout, readUntil(pair[0], &buf, 1, 500));
+
+    r.stop();
+    r.join();
+}
+
+test "reactor serves a chunked request end to end" {
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0],
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 11\r\n\r\nhello world";
+    const n = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n]);
+
+    r.stop();
+    r.join();
+}
 
 // M5: idle timeout. A 1 s timeout is used so the tests finish quickly; the
 // wheel's tick granularity is 100 ms, so deadlines land within ~100 ms of the
