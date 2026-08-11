@@ -31,6 +31,9 @@ pub const Server = struct {
     /// Config-driven HTTP request processor shared by the reactors (HTTP mode
     /// only; null falls back to each reactor's default handler).
     http_handler: ?*const runtime_server.Server,
+    /// Connection idle timeout in seconds, forwarded to every reactor (zero
+    /// disables idle reaping).
+    idle_timeout_seconds: u32,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !Server {
         const n = try std.Thread.getCpuCount();
@@ -47,6 +50,19 @@ pub const Server = struct {
         n_threads: usize,
         mode: reactor.Mode,
         http_handler: ?*const runtime_server.Server,
+    ) !Server {
+        return initWithThreadsAndHandlerTimeout(allocator, port, n_threads, mode, http_handler, reactor.default_idle_timeout_seconds);
+    }
+
+    /// Full constructor: reactor count, HTTP handler, and the idle timeout in
+    /// seconds (zero disables idle reaping).
+    pub fn initWithThreadsAndHandlerTimeout(
+        allocator: std.mem.Allocator,
+        port: u16,
+        n_threads: usize,
+        mode: reactor.Mode,
+        http_handler: ?*const runtime_server.Server,
+        idle_timeout_seconds: u32,
     ) !Server {
         const n = @max(n_threads, 1);
 
@@ -70,7 +86,7 @@ pub const Server = struct {
             try reactors_list.ensureTotalCapacity(allocator, n);
             for (0..n) |i| {
                 const r = try allocator.create(reactor.Reactor);
-                const init_res = reactor.Reactor.initWithHandler(allocator, i, mode, http_handler) catch |e| {
+                const init_res = reactor.Reactor.initWithHandlerTimeout(allocator, i, mode, http_handler, idle_timeout_seconds) catch |e| {
                     allocator.destroy(r);
                     return e;
                 };
@@ -91,6 +107,7 @@ pub const Server = struct {
             .total_accepted = std.atomic.Value(usize).init(0),
             .mode = mode,
             .http_handler = http_handler,
+            .idle_timeout_seconds = idle_timeout_seconds,
         };
 
         self.main_ep.add(self.listener, epoll.Events.In | epoll.Events.EdgeTriggered, self.listener) catch |e| {

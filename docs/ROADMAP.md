@@ -29,6 +29,14 @@ module plugs into one of the 10 phases and is wired from config.
 
 ### M5 — Connection lifecycle: idle timeout + timer wheel
 
+**Status: DONE** (2026-08-11). `src/net/timer_wheel.zig` ring-buffer wheel
+(1024 slots, 100 ms ticks — both comptime constants), `Connection.timer`
+entry, reactor advances the wheel each loop iteration and closes expired
+connections; `--idle-timeout N` CLI flag (default 60, 0 disables) wired via
+`multireactor.Server`. Gates met: 10 wheel unit tests + 3 reactor idle
+integration tests, `zig build test` 83/83, `bench/http-check.py` 11/11, M5 A/B
+in `bench/BENCH.md` (-2.5% at c500, interleaved).
+
 *Depends on*: M4 (reactor, connection struct).
 
 A ring-buffer timer wheel (`src/net/timer_wheel.zig`, O(1) insert/remove/rearm).

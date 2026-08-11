@@ -9,6 +9,7 @@ pub fn main() !void {
     var single = false;
     var mode: tcp_server.reactor.Mode = .http;
     var config_path: ?[]const u8 = null;
+    var idle_timeout: u32 = tcp_server.reactor.default_idle_timeout_seconds;
 
     var args = std.process.args();
     while (args.next()) |arg| {
@@ -18,6 +19,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--threads")) {
             const v = args.next() orelse return error.MissingThreadsArgument;
             threads = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, arg, "--idle-timeout")) {
+            const v = args.next() orelse return error.MissingIdleTimeoutArgument;
+            idle_timeout = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, arg, "--single")) {
             single = true;
         } else if (std.mem.eql(u8, arg, "--echo")) {
@@ -56,11 +60,16 @@ pub fn main() !void {
     if (loaded_cfg) |cfg| http_srv = tcp_server.runtime.server.Server.init(cfg);
 
     const n = threads orelse (std.Thread.getCpuCount() catch 1);
-    var s = try tcp_server.multireactor.Server.initWithThreadsAndHandler(allocator, port, n, mode, &http_srv);
+    var s = try tcp_server.multireactor.Server.initWithThreadsAndHandlerTimeout(allocator, port, n, mode, &http_srv, idle_timeout);
     defer s.deinit();
     switch (mode) {
         .echo => std.debug.print("Starting multi-reactor TCP echo server on port {} with {} threads\n", .{ port, n }),
         .http => std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads\n", .{ port, n }),
+    }
+    if (idle_timeout > 0) {
+        std.debug.print("Idle timeout: {}s\n", .{idle_timeout});
+    } else {
+        std.debug.print("Idle timeout: disabled\n", .{});
     }
     try s.run();
 }

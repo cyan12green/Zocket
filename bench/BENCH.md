@@ -205,3 +205,53 @@ exact, `bad=0` everywhere; 2 reps, medians):
 (actually within ±4.1%; the raw-echo modes, which bypass the pipeline, are
 within ±0.5%). `zig build test` green throughout (36 M3 tests + 33 new M4
 tests = 69).
+
+## Milestone 5: connection lifecycle (idle timeout + timer wheel)
+
+Date: 2026-08-11, same box as above. The M4 tree plus the timer wheel: every
+connection carries a `TimerEntry` in a 1024-slot/100 ms ring-buffer wheel the
+reactor advances each loop iteration; idle connections (default 60 s, `--idle-timeout`
+to change, 0 to disable) expire and close. The wheel is O(1) per insert/remove/
+rearm; the per-iteration cost is one clock read + (usually) one empty slot walk.
+`--echo`/`--single` paths are untouched (the wheel only runs in the
+multi-reactor server).
+
+**Method**: same-day A/B against the pre-M5 tree (`ffa43dc`), both `ReleaseFast`,
+both verified with `bench/http-check.py` (11/11) before every sweep. The
+workstation was oscillating badly during this session (an external parallel C
+build pinned load average at 5-16 for stretches, and c10/c100 single-connection
+latency is spike-dominated), so the primary measurement is an **interleaved
+A/B**: both binaries running simultaneously on ports 8080/8081, 5 alternating
+10 s bombardier reps at 500 connections (any load spike hits both sides
+equally). A full quiet-window sweep (c10/c100/c500, 3 reps) was also recorded
+but its c100/c500 deltas fall inside the run-to-run noise band (see rep
+spreads below).
+
+Interleaved c500 (medians of 5 alternating reps, co-resident servers):
+
+| config | req/s (median) | latency p50 | latency p95 |
+|---|---:|---:|---:|
+| M4 baseline | 263,289 | 1.13 ms | 5.78 ms |
+| M5 | 256,783 | 1.16 ms | 5.91 ms |
+| delta | **-2.5%** | | |
+
+Quiet-window full sweep (3 reps, medians; both builds measured minutes apart
+while load was ~1.5; the M5 c500 number was partially hit by the build
+starting up):
+
+| conns | M5 req/s | M4 req/s | delta |
+|---|---:|---:|---:|
+| 10 | 209,104 | 211,041 | -0.9% |
+| 100 | 225,966 | 211,947 | +6.6% |
+| 500 | 236,376 | 250,738 | -5.7% |
+
+Rep spread (quiet-window sweep): c10 ±30% (both builds swing 169k-241k),
+c100 M4 188k-240k vs M5 220k-226k (M5 tighter), c500 ±5%. The c10/c100
+numbers are noise-dominated; the interleaved c500 measurement is the reliable
+one.
+
+**Conclusion**: the idle-timeout machinery adds -2.5% at 500 connections
+(co-resident interleaved measurement, the worst case exercised; keep-alive
+traffic re-arms the timer on every recv). Within the <5% gate. `zig build test`
+green throughout (70 M4 tests + 10 wheel + 3 reactor idle tests = 83).
+`bench/http-check.py` 11/11 against both builds.

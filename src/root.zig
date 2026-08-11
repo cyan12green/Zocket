@@ -7,6 +7,7 @@ pub const eventfd = @import("net/eventfd.zig");
 pub const sockets = @import("net/sockets.zig");
 pub const buffer = @import("net/buffer.zig");
 pub const connection = @import("net/connection.zig");
+pub const timer_wheel = @import("net/timer_wheel.zig");
 pub const epoll = @import("net/epoll.zig");
 
 pub const http = struct {
@@ -36,6 +37,7 @@ pub const runtime = struct {
 comptime {
     _ = @import("net/buffer.zig");
     _ = @import("net/connection.zig");
+    _ = @import("net/timer_wheel.zig");
     _ = @import("net/epoll.zig");
     _ = @import("net/eventfd.zig");
     _ = @import("net/sockets.zig");

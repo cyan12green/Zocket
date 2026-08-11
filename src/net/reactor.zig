@@ -5,12 +5,17 @@ const epoll = @import("epoll.zig");
 const eventfd = @import("eventfd.zig");
 const connection = @import("connection.zig");
 const sockets = @import("sockets.zig");
+const timer_wheel = @import("timer_wheel.zig");
 const http_parser = @import("../http/parser.zig");
 const http_response = @import("../http/response.zig");
 const dsl_pipeline = @import("../dsl/pipeline.zig");
 const runtime_server = @import("../runtime/server.zig");
 
 const max_events = 1024;
+
+/// Default connection idle timeout in seconds (Milestone 5). Zero disables
+/// idle reaping.
+pub const default_idle_timeout_seconds: u32 = 60;
 
 /// Fallback HTTP request processor used when a reactor is created without an
 /// explicit handler (e.g. in tests): the default echo-on-everything config.
@@ -63,9 +68,25 @@ pub const Reactor = struct {
     /// monotonic, so tests can assert dispatch happened without racing
     /// connection reaping.
     registered: std.atomic.Value(usize),
+    /// Idle timeout in wheel ticks (1 s each); zero disables idle reaping.
+    idle_timeout_ticks: u64,
+    /// Wall-clock epoch the timer ticks are measured from.
+    epoch: std.time.Instant,
+    /// Timer wheel advancing on every loop iteration; idle connections expire
+    /// and close.
+    wheel: timer_wheel.default_wheel,
+    /// Connections the wheel expired in the current advance pass; drained
+    /// after `advanceTo` returns (the wheel callback must not tear down
+    /// objects whose entries are still linked).
+    expired_fds: std.ArrayList(posix.fd_t),
 
     pub fn init(allocator: std.mem.Allocator, id: usize, mode: Mode) !Reactor {
-        return initWithHandler(allocator, id, mode, null);
+        return initWithTimeout(allocator, id, mode, default_idle_timeout_seconds);
+    }
+
+    /// Like `init`, with an explicit idle timeout in seconds (zero disables).
+    pub fn initWithTimeout(allocator: std.mem.Allocator, id: usize, mode: Mode, idle_timeout_seconds: u32) !Reactor {
+        return initWithHandlerTimeout(allocator, id, mode, null, idle_timeout_seconds);
     }
 
     /// Like `init`, but with an explicit HTTP request processor (used in HTTP
@@ -75,6 +96,18 @@ pub const Reactor = struct {
         id: usize,
         mode: Mode,
         http_handler: ?*const runtime_server.Server,
+    ) !Reactor {
+        return initWithHandlerTimeout(allocator, id, mode, http_handler, default_idle_timeout_seconds);
+    }
+
+    /// Full constructor: HTTP handler + idle timeout in seconds (zero
+    /// disables idle reaping).
+    pub fn initWithHandlerTimeout(
+        allocator: std.mem.Allocator,
+        id: usize,
+        mode: Mode,
+        http_handler: ?*const runtime_server.Server,
+        idle_timeout_seconds: u32,
     ) !Reactor {
         var self = Reactor{
             .allocator = allocator,
@@ -90,6 +123,10 @@ pub const Reactor = struct {
             .pending = .empty,
             .pending_lock = .{},
             .registered = std.atomic.Value(usize).init(0),
+            .idle_timeout_ticks = timer_wheel.default_wheel.tickForNs(@as(u64, idle_timeout_seconds) * std.time.ns_per_s),
+            .epoch = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
+            .wheel = .{},
+            .expired_fds = .empty,
         };
         errdefer self.ep.close();
         self.ep.add(self.wakeup.fd, epoll.Events.In, self.wakeup.fd) catch {
@@ -112,6 +149,7 @@ pub const Reactor = struct {
         self.connections.deinit();
         self.http_sessions.deinit();
         self.pending.deinit(self.allocator);
+        self.expired_fds.deinit(self.allocator);
     }
 
     pub fn start(self: *Reactor) !void {
@@ -153,6 +191,7 @@ pub const Reactor = struct {
         sockets.pinToCpu(self.id);
         var events: [max_events]linux.epoll_event = undefined;
         while (self.running.load(.acquire)) {
+            self.advanceTimers();
             const n = self.ep.wait(&events, 100) catch continue;
             for (events[0..n]) |ev| {
                 self.handleEvent(ev.events, @intCast(ev.data.ptr));
@@ -162,6 +201,38 @@ pub const Reactor = struct {
         // even if a connection arrived between the last wakeup and stop.
         self.wakeup.read();
         self.drainPending();
+    }
+
+    /// Advance the timer wheel to the current wall tick and close every
+    /// connection that expired. One clock read and (usually) one empty slot
+    /// walk per loop iteration.
+    fn advanceTimers(self: *Reactor) void {
+        if (self.idle_timeout_ticks == 0) return;
+        const tick = self.nowTick();
+        self.wheel.advanceTo(tick, self, onExpired);
+        for (self.expired_fds.items) |fd| self.removeConnection(fd);
+        self.expired_fds.clearRetainingCapacity();
+    }
+
+    /// Wall-clock time in wheel ticks (1 s granularity), relative to `epoch`.
+    fn nowTick(self: *const Reactor) u64 {
+        const now = std.time.Instant.now() catch return 0;
+        return timer_wheel.default_wheel.tickForNs(now.since(self.epoch));
+    }
+
+    /// Timer wheel fired an entry: record its connection for teardown. Runs
+    /// on the reactor thread inside `advanceTo`; only appends (the wheel may
+    /// hold pointers to connections whose destruction must be deferred).
+    fn onExpired(self: *Reactor, entry: *timer_wheel.TimerEntry) void {
+        const conn: *connection.Connection = @fieldParentPtr("timer", entry);
+        self.expired_fds.append(self.allocator, conn.fd) catch {};
+    }
+
+    /// (Re)arm the idle timer for `conn` at the current tick. Any recv is
+    /// activity, so the timer is pushed back on every read.
+    fn rearmTimer(self: *Reactor, conn: *connection.Connection) void {
+        if (self.idle_timeout_ticks == 0) return;
+        self.wheel.rearm(&conn.timer, self.nowTick(), self.idle_timeout_ticks);
     }
 
     fn handleEvent(self: *Reactor, events: u32, fd: posix.fd_t) void {
@@ -194,6 +265,7 @@ pub const Reactor = struct {
                 self.removeConnection(fd);
                 return;
             }
+            self.rearmTimer(conn);
             self.onMessage(conn) catch {
                 self.removeConnection(fd);
             };
@@ -224,6 +296,7 @@ pub const Reactor = struct {
 
         if (events & epoll.Events.In != 0) {
             const conn = self.connections.get(fd) orelse return;
+            var got_data = false;
             while (true) {
                 const n = conn.recv() catch |e| switch (e) {
                     error.WouldBlock => break,
@@ -239,7 +312,9 @@ pub const Reactor = struct {
                     self.removeConnection(fd);
                     return;
                 }
+                got_data = true;
             }
+            if (got_data) self.rearmTimer(conn);
             const session = self.http_sessions.getPtr(fd) orelse return;
             if (!session.writing) self.processHttp(fd);
         }
@@ -443,6 +518,9 @@ pub const Reactor = struct {
                 conn.destroy();
                 continue;
             }
+            if (self.idle_timeout_ticks > 0) {
+                self.wheel.insert(&conn.timer, self.nowTick(), self.idle_timeout_ticks);
+            }
             if (self.mode == .http) {
                 var session = HttpSession{
                     .parser = http_parser.Parser.init(self.allocator),
@@ -452,6 +530,7 @@ pub const Reactor = struct {
                 } else |_| {
                     session.parser.deinit();
                     session.req.deinit();
+                    self.wheel.remove(&conn.timer);
                     self.ep.remove(conn.fd) catch {};
                     conn.close();
                     conn.destroy();
@@ -463,6 +542,8 @@ pub const Reactor = struct {
     fn removeConnection(self: *Reactor, fd: posix.fd_t) void {
         if (self.connections.fetchRemove(fd)) |kv| {
             const conn = kv.value;
+            // Unlink the idle timer so the wheel never points at freed memory.
+            self.wheel.remove(&conn.timer);
             self.ep.remove(fd) catch {};
             conn.close();
             conn.destroy();
@@ -479,6 +560,7 @@ pub const Reactor = struct {
         var it = self.connections.valueIterator();
         while (it.next()) |c| {
             const conn = c.*;
+            self.wheel.remove(&conn.timer);
             self.ep.remove(conn.fd) catch {};
             conn.close();
             conn.destroy();
@@ -856,4 +938,111 @@ test "reactor runs a JSON-config pipeline with default 404 fallback" {
 
     r.stop();
     r.join();
+}
+
+
+// M5: idle timeout. A 1 s timeout is used so the tests finish quickly; the
+// wheel's tick granularity is 100 ms, so deadlines land within ~100 ms of the
+// nominal second (the loop re-advances the wheel before every epoll_wait,
+// timeout 100 ms). Sleeps below leave generous margins on both sides of every
+// deadline.
+test "reactor closes a connection that goes idle" {
+    const allocator = testing.allocator;
+    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // No traffic at all: the reactor expires the connection ~1 s after it was
+    // registered. EOF (error.Eof) proves the close; Timeout would mean the
+    // timer never fired.
+    std.posix.nanosleep(2, 0);
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 1000));
+
+    r.stop();
+    r.join();
+    try testing.expectEqual(@as(usize, 0), r.countConnections());
+}
+
+test "reactor resets the idle timer on active traffic" {
+    const allocator = testing.allocator;
+    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Request 1: arms the timer with a ~1 s deadline.
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const n1 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty, buf[0..n1]);
+
+    // Request 2 just before the deadline: pushes the deadline to ~1.5 s.
+    std.posix.nanosleep(0, 500 * std.time.ns_per_ms);
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const n2 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty, buf[0..n2]);
+
+    // Request 3 *after* the original ~1 s deadline: answered, which proves the
+    // timer was re-armed (without rearming the connection would already be
+    // closed and this write would fail).
+    std.posix.nanosleep(0, 600 * std.time.ns_per_ms);
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const n3 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty, buf[0..n3]);
+
+    // Idle again past the re-armed deadline (~2.5 s): now it does expire.
+    std.posix.nanosleep(2, 0);
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 1000));
+
+    r.stop();
+    r.join();
+    try testing.expectEqual(@as(usize, 0), r.countConnections());
+}
+
+test "idle timeout of zero disables reaping" {
+    const allocator = testing.allocator;
+    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 0);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Well past any plausible 1 s window: the connection must still be alive.
+    std.posix.nanosleep(2, 0);
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const n1 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty, buf[0..n1]);
+
+    r.stop();
+    r.join();
+    try testing.expectEqual(@as(usize, 1), r.countConnections());
 }
