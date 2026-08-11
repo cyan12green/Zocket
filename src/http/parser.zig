@@ -24,6 +24,66 @@ pub const Method = enum {
     unknown,
 };
 
+/// FNV-1a (32-bit) over lower-cased bytes (Milestone 8). Header names and
+/// values hash case-insensitively, so a comptime-known name's hash is a
+/// compile-time constant and slot matching reduces to an integer compare.
+/// `known` is the header-name set whose hashes must be collision-free; the
+/// comptime assertion below makes a collision a compile error.
+pub const header_hasher = struct {
+    pub fn hash(name: []const u8) u32 {
+        var h: u32 = 2166136261;
+        for (name) |c| {
+            h ^= ascii.toLower(c);
+            h *%= 16777619;
+        }
+        return h;
+    }
+
+    /// The known header-name set: lookups for these are hash-matched.
+    pub const known = [_][]const u8{
+        "host",
+        "content-type",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "accept-encoding",
+        "if-none-match",
+        "if-modified-since",
+        "range",
+        "accept",
+        "user-agent",
+        "cookie",
+        "authorization",
+        "referer",
+        "upgrade",
+        "expect",
+    };
+
+    /// True if `h` is the hash of one of the known names.
+    pub fn isKnownHash(h: u32) bool {
+        inline for (known) |n| {
+            if (hash(n) == h) return true;
+        }
+        return false;
+    }
+
+    comptime {
+        // A collision among the known names would make hash-matched lookup
+        // ambiguous: a compile error, not a runtime bug. The hashes are
+        // computed once (comptime branch budget) and compared pairwise.
+        const known_hashes: [known.len]u32 = blk: {
+            var out: [known.len]u32 = undefined;
+            for (known, 0..) |n, i| out[i] = hash(n);
+            break :blk out;
+        };
+        for (known_hashes, 0..) |a, i| {
+            for (known_hashes[i + 1 ..]) |b| {
+                if (a == b) @compileError("header name hash collision in known set");
+            }
+        }
+    }
+};
+
 pub const Version = struct {
     major: u8,
     minor: u8,
@@ -50,6 +110,9 @@ const Slot = struct {
     name_len: u32,
     value_off: u32,
     value_len: u32,
+    /// FNV-1a hash of the (lower-cased) name (Milestone 8): lookups compare
+    /// integers, with the string verified only on a hash hit.
+    name_hash: u32,
 };
 
 /// A parsed HTTP/1.x request. Header names/values are copied into private
@@ -121,11 +184,17 @@ pub const Request = struct {
     }
 
     /// Case-insensitive lookup of a header value (first occurrence wins).
-    pub fn header(self: *const Request, name: []const u8) ?[]const u8 {
+    /// `name` is a comptime literal (Milestone 8): its hash is a
+    /// compile-time constant, so the scan compares one integer per slot and
+    /// verifies the string only on a hash hit.
+    pub fn header(self: *const Request, comptime name: []const u8) ?[]const u8 {
+        const target_hash = comptime header_hasher.hash(name);
         for (self.slots[0..self.header_count]) |s| {
-            const n = self.storage.items[s.name_off..][0..s.name_len];
-            if (ascii.eqlIgnoreCase(n, name)) {
-                return self.storage.items[s.value_off..][0..s.value_len];
+            if (s.name_hash == target_hash) {
+                const n = self.storage.items[s.name_off..][0..s.name_len];
+                if (ascii.eqlIgnoreCase(n, name)) {
+                    return self.storage.items[s.value_off..][0..s.value_len];
+                }
             }
         }
         return null;
@@ -147,10 +216,13 @@ pub const Request = struct {
         const v = mem.trim(u8, value, " \t");
         if (n.len == 0) return error.Malformed;
 
-        if (ascii.eqlIgnoreCase(n, "content-length")) {
+        // Known-name detection is a hash compare (Milestone 8): the wire name
+        // is hashed once and matched against comptime constants.
+        const name_hash = header_hasher.hash(n);
+        if (name_hash == comptime header_hasher.hash("content-length")) {
             self.content_length = std.fmt.parseInt(usize, v, 10) catch return error.Malformed;
-        } else if (ascii.eqlIgnoreCase(n, "transfer-encoding")) {
-            if (containsIgnoreCase(v, "chunked")) self.transfer_chunked = true;
+        } else if (name_hash == comptime header_hasher.hash("transfer-encoding")) {
+            if (valueHasChunked(v)) self.transfer_chunked = true;
         }
 
         const name_off = self.storage.items.len;
@@ -163,16 +235,23 @@ pub const Request = struct {
             .name_len = @intCast(n.len),
             .value_off = @intCast(value_off),
             .value_len = @intCast(v.len),
+            .name_hash = name_hash,
         };
         self.header_count += 1;
     }
 };
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+/// True if a Transfer-Encoding value lists `chunked` (comma-separated;
+/// `;`-parameters on a token are tolerated). Token matching is a hash
+/// compare against the comptime `chunked` hash (Milestone 8).
+fn valueHasChunked(value: []const u8) bool {
+    var tokens = mem.tokenizeAny(u8, value, ",");
+    while (tokens.next()) |t| {
+        var tok = mem.trim(u8, t, " \t");
+        if (mem.indexOfScalar(u8, tok, ';')) |semi| tok = tok[0..semi];
+        if (tok.len > 0 and header_hasher.hash(tok) == comptime header_hasher.hash("chunked")) {
+            return true;
+        }
     }
     return false;
 }
@@ -528,12 +607,14 @@ fn finalizeKeepAlive(req: *Request) void {
     var keep = false;
     for (0..req.headerCount()) |i| {
         const h = req.headerAt(i);
-        if (!ascii.eqlIgnoreCase(h.name, "connection")) continue;
+        // Hash compare for the name, then for each comma token (Milestone 8).
+        if (header_hasher.hash(h.name) != comptime header_hasher.hash("connection")) continue;
         var tokens = mem.tokenizeAny(u8, h.value, ",");
         while (tokens.next()) |t| {
             const tok = mem.trim(u8, t, " \t");
-            if (ascii.eqlIgnoreCase(tok, "close")) close = true;
-            if (ascii.eqlIgnoreCase(tok, "keep-alive")) keep = true;
+            const tok_hash = header_hasher.hash(tok);
+            if (tok_hash == comptime header_hasher.hash("close")) close = true;
+            if (tok_hash == comptime header_hasher.hash("keep-alive")) keep = true;
         }
     }
     const default_keep = req.version.major == 1 and req.version.minor >= 1;
@@ -900,6 +981,93 @@ test "chunked body spanning recv boundaries" {
     _ = buf.writeSlice("llo\r\n0\r\n\r\n");
     try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
     try testing.expectEqualStrings("hello", req.body);
+}
+
+// ---- Milestone 8: comptime header-name hashing ----
+
+test "header hasher is case-insensitive and distinguishes names" {
+    try testing.expectEqual(
+        header_hasher.hash("content-type"),
+        header_hasher.hash("Content-Type"),
+    );
+    try testing.expectEqual(
+        header_hasher.hash("HOST"),
+        header_hasher.hash("host"),
+    );
+    try testing.expect(header_hasher.hash("host") != header_hasher.hash("content-type"));
+    // Comptime-known argument folds to a constant.
+    try testing.expectEqual(@as(u32, comptime header_hasher.hash("range")), header_hasher.hash("RANGE"));
+}
+
+test "known header-name set is collision-free" {
+    const hashes: [header_hasher.known.len]u32 = blk: {
+        var out: [header_hasher.known.len]u32 = undefined;
+        for (header_hasher.known, 0..) |n, i| out[i] = header_hasher.hash(n);
+        break :blk out;
+    };
+    for (hashes, 0..) |a, i| {
+        for (hashes[i + 1 ..]) |b| {
+            try testing.expect(a != b);
+        }
+        try testing.expect(header_hasher.isKnownHash(a));
+    }
+    try testing.expect(!header_hasher.isKnownHash(header_hasher.hash("x-custom")));
+}
+
+test "hash-matched lookup finds known and unknown headers with any case" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator,
+        "GET / HTTP/1.1\r\n" ++
+            "HoSt: example.com\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "ACCEPT-ENCODING: gzip, deflate\r\n" ++
+            "X-Custom-Header: custom-value\r\n\r\n");
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("example.com", req.header("host").?);
+    try testing.expectEqualStrings("text/plain", req.header("content-type").?);
+    try testing.expectEqualStrings("gzip, deflate", req.header("accept-encoding").?);
+    try testing.expectEqualStrings("custom-value", req.header("X-CUSTOM-HEADER").?);
+    try testing.expectEqual(@as(?[]const u8, null), req.header("missing-header"));
+
+    // The stored slot hash matches the recomputed name hash.
+    const h = req.headerAt(3);
+    try testing.expectEqual(header_hasher.hash(h.name), header_hasher.hash("x-custom-header"));
+}
+
+test "hashed value matching: keep-alive tokens and chunked detection" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { wire: []const u8, keep: bool }{
+        .{ .wire = "GET / HTTP/1.1\r\nConnection: CLOSE\r\n\r\n", .keep = false },
+        .{ .wire = "GET / HTTP/1.1\r\nConnection: keep-alive, upgrade\r\n\r\n", .keep = true },
+        .{ .wire = "GET / HTTP/1.0\r\nConnection: KEEP-ALIVE\r\n\r\n", .keep = true },
+    };
+    for (cases) |c| {
+        const buf = try fill(allocator, c.wire);
+        defer buf.deinit(allocator);
+        var req = Request.init(allocator);
+        defer req.deinit();
+        var parser = Parser.init(allocator);
+        defer parser.deinit();
+        try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+        try testing.expectEqual(c.keep, req.keep_alive);
+    }
+
+    // Chunked detection via hashed tokens, tolerating parameters.
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, ChUnKeD;foo=1\r\n\r\n0\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(req.transfer_chunked);
 }
 
 test "URL decoding: escapes are decoded, plain targets are zero-copy" {

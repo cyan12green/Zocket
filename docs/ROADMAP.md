@@ -173,6 +173,18 @@ resolution run at compile time.
 
 ### M8 — Comptime header-name hashing
 
+**Status: DONE** (2026-08-11). FNV-1a (32-bit, lower-cased) hashing in
+`http/parser.zig`: the known header-name set (`header_hasher.known`) is
+collision-checked at compile time (a collision is a compile error);
+`Slot.name_hash` stores the wire name's hash; `Request.header(comptime name)`
+scans with one integer compare per slot and verifies the string only on a
+hash hit; `addHeader` detects content-length/transfer-encoding by hash; the
+Connection/Transfer-Encoding value tokens are hash-matched against comptime
+constants. `header_hasher` is exported for the response builder's dedup.
+Gates met: 4 new parser tests, `zig build test` 121/121 (wire output
+byte-identical), micro-benchmark recorded, M8 A/B in `bench/BENCH.md`
+(-2.0% / -2.6%, within gate).
+
 *Depends on*: M3 (`http/parser.zig`, `http/response.zig`).
 
 Replace case-insensitive string comparison in header lookups with integer

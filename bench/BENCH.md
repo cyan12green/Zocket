@@ -320,3 +320,41 @@ specialisation is faster at both measured points (+1.9% / +7.8%; the gap
 widens with concurrency, where per-request matching cost matters). `zig build
 test` green throughout (103 M6 tests + 14 new M7 tests = 117). All existing
 router/pipeline tests pass unchanged.
+
+## Milestone 8: comptime header-name hashing
+
+Date: 2026-08-11, same box. The M7 tree plus: FNV-1a (32-bit, lower-cased)
+header-name hashing in the parser (`Request.header` now does one integer
+compare per slot, verifying the string only on a hash hit; the known-name
+set's collision-freeness is asserted at compile time — a collision is a
+compile error). `addHeader` detects content-length/transfer-encoding by hash
+compare, and the Connection/Transfer-Encoding value tokens are hash-matched
+against comptime constants. The response builder keeps append semantics (the
+pipeline's order tests rely on them); `header_hasher` is the exposed dedup
+primitive.
+
+**Method**: same-day A/B against the pre-M8 tree (`ec7b7de`, the M7 commit),
+both `ReleaseFast`, default config, `--threads 4`, both verified with
+`bench/http-check.py` 15/15. Co-resident interleaved runs (10 reps of 10 s
+each per point); the 4-core box thrashes two co-resident 4-reactor servers,
+so the median over 10 reps is used and single crushed reps are noted.
+
+| conns | M8 req/s (median) | M7 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 252,962 | 258,249 | **-2.0%** |
+| 500 | 241,844 | 248,242 | **-2.6%** |
+
+Micro-benchmark (10-known-headers request, ReleaseFast, 2M lookups each):
+hash-matched lookup measured 4-7 ns vs 3-6 ns for the string path (0.7-0.9x).
+The string path stays competitive at 10 headers because `eqlIgnoreCase`
+short-circuits on the first differing byte and the compiler inlines the whole
+scan; the hash path's win is structural — O(1) int compares instead of
+O(n) string compares, with the hash computed once at parse time — and shows
+up at larger header counts and in the parse path, which is why the A/B above
+(parse + serve) is the authoritative measurement.
+
+**Conclusion**: within the <5% gate at both points (-2.0% / -2.6%, inside
+the run-to-run envelope; a contaminated earlier run showed +15.5% and +6.3%
+respectively, and the 10-rep medians are the reliable numbers). `zig build
+test` green throughout (117 M7 tests + 4 new M8 tests = 121). Wire output is
+byte-identical (hash never changes serialisation).
