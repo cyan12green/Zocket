@@ -9,6 +9,11 @@ pub const buffer = @import("net/buffer.zig");
 pub const connection = @import("net/connection.zig");
 pub const epoll = @import("net/epoll.zig");
 
+pub const http = struct {
+    pub const parser = @import("http/parser.zig");
+    pub const response = @import("http/response.zig");
+};
+
 // This Zig snapshot only collects `test` blocks that are reachable through
 // comptime imports from the test root file; plain `pub const` imports of
 // submodules are analyzed lazily and their tests are skipped. Pull every
@@ -23,4 +28,6 @@ comptime {
     _ = @import("net/dispatcher.zig");
     _ = @import("net/reactor.zig");
     _ = @import("net/multireactor.zig");
+    _ = @import("http/parser.zig");
+    _ = @import("http/response.zig");
 }

@@ -26,13 +26,14 @@ pub const Server = struct {
     dispatch: dispatcher.Dispatcher,
     running: std.atomic.Value(bool),
     total_accepted: std.atomic.Value(usize),
+    mode: reactor.Mode,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !Server {
         const n = try std.Thread.getCpuCount();
-        return initWithThreads(allocator, port, n);
+        return initWithThreads(allocator, port, n, .http);
     }
 
-    pub fn initWithThreads(allocator: std.mem.Allocator, port: u16, n_threads: usize) !Server {
+    pub fn initWithThreads(allocator: std.mem.Allocator, port: u16, n_threads: usize, mode: reactor.Mode) !Server {
         const n = @max(n_threads, 1);
 
         const listener = try sockets.createListeningSocket(port, 4096);
@@ -55,7 +56,7 @@ pub const Server = struct {
             try reactors_list.ensureTotalCapacity(allocator, n);
             for (0..n) |i| {
                 const r = try allocator.create(reactor.Reactor);
-                const init_res = reactor.Reactor.init(allocator, i) catch |e| {
+                const init_res = reactor.Reactor.init(allocator, i, mode) catch |e| {
                     allocator.destroy(r);
                     return e;
                 };
@@ -74,6 +75,7 @@ pub const Server = struct {
             .dispatch = dispatcher.Dispatcher.init(reactors_list.items),
             .running = std.atomic.Value(bool).init(false),
             .total_accepted = std.atomic.Value(usize).init(0),
+            .mode = mode,
         };
 
         self.main_ep.add(self.listener, epoll.Events.In | epoll.Events.EdgeTriggered, self.listener) catch |e| {
@@ -252,7 +254,7 @@ const Client = struct {
 
 test "multi-reactor accepts under concurrent connections and echoes correctly" {
     const allocator = std.heap.page_allocator;
-    var server = try Server.initWithThreads(allocator, 0, 4);
+    var server = try Server.initWithThreads(allocator, 0, 4, .echo);
     defer server.deinit();
     const port = try server.boundPort();
 

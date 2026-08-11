@@ -45,7 +45,7 @@ fn makeReactors(allocator: std.mem.Allocator, n: usize) ![]*reactor.Reactor {
     const raws = try allocator.alloc(*reactor.Reactor, n);
     for (raws, 0..) |_, i| {
         const r = try allocator.create(reactor.Reactor);
-        r.* = try reactor.Reactor.init(allocator, i);
+        r.* = try reactor.Reactor.init(allocator, i, .echo);
         raws[i] = r;
     }
     return raws;

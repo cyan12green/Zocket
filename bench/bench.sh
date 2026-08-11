@@ -5,20 +5,21 @@
 #   binary   path to the server executable to benchmark
 #   tag      label used in result file names (e.g. "single_threaded", "multi_threaded_8")
 #
-# Requires bombardier >= v1.2 (https://github.com/codesenberg/bombardier), plus
-# python3 for result summarization.
-#
-# Protocol note: the server under test is a raw byte-echo server. It returns
-# the request bytes unchanged, so bombardier (an HTTP client) reports every
-# request as an HTTP response-parse error. The reported Reqs/sec, latency and
-# throughput nevertheless measure real request/response round trips; the
-# relative comparison between builds is what matters. bench/echo-check.py
-# independently verifies byte-level echo correctness under the same load.
+# Protocol note: for raw-echo servers (default) the server returns the request
+# bytes unchanged, so bombardier (an HTTP client) reports every request as an
+# HTTP response-parse error. The reported Reqs/sec, latency and throughput
+# nevertheless measure real request/response round trips; the relative
+# comparison between builds is what matters. bench/echo-check.py independently
+# verifies byte-level echo correctness under the same load. For the HTTP
+# server (Milestone 3+) set CHECK=http-check.py and bombardier metrics are
+# fully valid.
 set -euo pipefail
 
 BIN=${1:?usage: bench.sh <binary> <tag>}
 TAG=${2:?usage: bench.sh <binary> <tag>}
 shift 2
+
+CHECK=${CHECK:-echo-check.py}
 
 BOMB=${BOMB:-$HOME/go/bin/bombardier}
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,7 +37,7 @@ SRVPID=$!
 trap 'kill $SRVPID 2>/dev/null || true' EXIT
 sleep 0.5
 
-python3 "$ROOT/bench/echo-check.py" "$PORT" || { echo "echo-check FAILED; aborting"; exit 1; }
+python3 "$ROOT/bench/$CHECK" "$PORT" || { echo "$CHECK FAILED; aborting"; exit 1; }
 
 for c in $CONNECTIONS; do
     for r in $(seq 1 "$REPS"); do

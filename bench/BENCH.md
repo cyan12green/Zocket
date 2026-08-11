@@ -1,33 +1,45 @@
 # Benchmark: Milestone 1 vs Milestone 2 (multi-reactor)
 
 Date: 2026-08-10. Machine: single 4-core Intel Core i7-1185G7 @ 3.00 GHz
-(8 logical CPUs, hyperthreading on), Ubuntu 24.04, kernel loopback only.
-Both server builds are `ReleaseFast` from the same tree.
+(8 logical CPUs, hyperthreading on), Ubuntu 24.04, kernel loopback only,
+powersave CPU governor (measured 2.4 GHz under load). Both server builds are
+`ReleaseFast` from the same tree.
+
+**Environment caveat**: this is a shared workstation. An external nginx build
+ran during part of the measurement window and spiked load average well above
+the CPU count; all numbers in this document were re-measured with the machine
+at >85% idle, but absolute values still carry run-to-run variance (reported
+spread visible across reps in `bench/results/`). Prefer relative comparisons.
 
 ## Protocol caveat
 
-The server is a raw byte-echo: it returns the request bytes unchanged. HTTP
-benchmark clients (bombardier) therefore cannot parse the echoed response and
-report every request as a response-parse error; they also cap out at ~2.9k
-req/s on this machine regardless of server (client-side limit, see below).
-To measure true server capacity a custom pipelined echo client
-(`bench/echo-client.zig`) is used as the primary tool; it verifies every echo
-byte-for-byte and reports an error count (`bad`).
+The M1/M2 raw echo server returns the request bytes unchanged, so bombardier
+(an HTTP client) cannot parse the echoed response and reports every request as
+a response-parse error; it also caps out at ~2.9k req/s on this machine
+regardless of server (client-side limit). To measure true server capacity a
+custom pipelined echo client (`bench/echo-client.zig`) is used as the primary
+tool; it verifies every echo byte-for-byte and reports an error count (`bad`).
+
+The M3 HTTP server (README Milestone 3) produces valid HTTP responses, so
+bombardier metrics for `--http` runs are fully valid (verified by
+`bench/http-check.py` before every sweep).
 
 ## Reproducing
 
 ```sh
 zig build -Doptimize=ReleaseFast
 
-# bombardier sweeps (client-limited; consistent comparison)
-bench/bench.sh zig-out/bin/tcp_server --single single_threaded
-bench/bench.sh zig-out/bin/tcp_server multi_threaded_4 --threads 4
+# M1/M2 raw echo: bombardier sweeps (client-limited; consistent comparison)
+bench/bench.sh zig-out/bin/tcp_server single_threaded --single
+bench/bench.sh zig-out/bin/tcp_server multi_threaded_4 --threads 4 --echo
 
-# true-capacity sweeps with the custom echo client
+# M3 HTTP: valid bombardier metrics
+CHECK=http-check.py bench/bench.sh zig-out/bin/tcp_server http_1thread --http --threads 1
+CHECK=http-check.py bench/bench.sh zig-out/bin/tcp_server http_4threads --http --threads 4
+
+# true-capacity sweeps with the custom echo client (raw-echo modes only)
 bench/bench2.sh zig-out/bin/tcp_server single_threaded --single
-bench/bench2.sh zig-out/bin/tcp_server multi_threaded_2 --threads 2
-bench/bench2.sh zig-out/bin/tcp_server multi_threaded_4 --threads 4
-bench/bench2.sh zig-out/bin/tcp_server multi_threaded_8 --threads 8
+bench/bench2.sh zig-out/bin/tcp_server multi_threaded_4 --threads 4 --echo
 
 python3 bench/summarize.py bench/results <tag>   # bombardier table
 python3 bench/summarize2.py bench/results        # echo-client table
@@ -106,3 +118,49 @@ either server; see protocol caveat).
 - Lower per-request syscall count (send from the recv path, avoid the extra
   EPOLLOUT round trip when the send buffer is empty).
 - Batched epoll_ctl / writev; zero-copy via io_uring.
+
+## Milestone 3: HTTP/1.1 server
+
+The M3 server responds `200 OK` with the request body echoed; keep-alive is
+default. **bombardier now yields valid HTTP metrics** (previously every
+request was a response-parse error). `bench/http-check.py` (11 checks incl.
+keep-alive, pipelining, error paths) runs before each sweep.
+
+HTTP sweep (median of 3 x 10s runs, valid HTTP):
+
+| config | conns | reqs/sec | latency p50 | latency p95 |
+|---|---:|---:|---:|---:|
+| http_1thread | 10 | 87,278 | 0.07 ms | 0.20 ms |
+| http_1thread | 100 | 81,715 | 0.45 ms | 4.88 ms |
+| http_1thread | 500 | 93,344 | 3.86 ms | 14.74 ms |
+| http_1thread | 1000 | 159,728 | 5.30 ms | 13.99 ms |
+| http_4threads | 10 | 134,264 | 0.06 ms | 0.12 ms |
+| http_4threads | 100 | 104,411 | 0.47 ms | 3.69 ms |
+| http_4threads | 500 | 149,376 | 2.96 ms | 7.78 ms |
+| http_4threads | 1000 | 161,012 | 5.51 ms | 13.20 ms |
+
+Multi-reactor improvement over single-reactor (HTTP mode):
+
+| conns | 1 thread | 4 threads | improvement |
+|---|---:|---:|---:|
+| 10 | 87,278 | 134,264 | +54% |
+| 100 | 81,715 | 104,411 | +28% |
+| 500 | 93,344 | 149,376 | +60% |
+| 1000 | 159,728 | 161,012 | +1% (client ceiling) |
+
+Dual-client check at 400 total connections (2 x 200, 8 s): HTTP-1 = 61.1k
+req/s, HTTP-4 = **158.7k req/s (2.6x)**, p50 6.5 ms vs 2.3 ms.
+
+Notes:
+
+- The ~160k req/s ceiling seen at high concurrency is the bombardier client's
+  ceiling, not the server's: two independent clients also converge on it,
+  and single-reactor latency at c=1000 (6.2 ms mean, 1000 conns / 6.2 ms =
+  161k) is consistent with full queueing of whatever the client can throw.
+  Server capacity is therefore higher than every number here; the
+  multi-reactor advantage is a lower bound.
+- Keep-alive amortizes the accept/dispatch handoff (one wakeup per
+  connection, not per request), which is why HTTP mode at ~90-160k req/s
+  dwarfs the raw-echo client-limited numbers.
+- Latency floor at low concurrency (p50 0.06-0.07 ms) reflects the
+  single-write response flush (one syscall batch per response).

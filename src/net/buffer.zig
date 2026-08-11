@@ -57,6 +57,14 @@ pub const Buffer = struct {
         return to_read;
     }
 
+    /// Advance the read position by `n` bytes without copying. Used by
+    /// zero-copy consumers (e.g. the HTTP parser) that have already taken a
+    /// slice from `peek()`.
+    pub fn consume(self: *Buffer, n: usize) void {
+        std.debug.assert(n <= self.availableRead());
+        self.read_pos += n;
+    }
+
     pub fn compact(self: *Buffer) void {
         if (self.read_pos == 0) return;
         const available = self.availableRead();
@@ -117,4 +125,26 @@ test "buffer compact" {
     buf.compact();
     try testing.expectEqual(0, buf.read_pos);
     try testing.expectEqual(0, buf.write_pos);
+}
+
+test "buffer consume advances read position without copying" {
+    const allocator = testing.allocator;
+    const buf = try Buffer.init(allocator);
+    defer buf.deinit(allocator);
+
+    _ = buf.writeSlice("hello world");
+
+    // Zero-copy: take a slice, then consume exactly that many bytes.
+    const part = buf.peek()[0..5];
+    try testing.expectEqualStrings("hello", part);
+    buf.consume(5);
+
+    try testing.expectEqual(5, buf.read_pos);
+    try testing.expectEqual(6, buf.availableRead());
+    try testing.expectEqualStrings(" world", buf.peek());
+
+    // consume(0) and full-drain are fine.
+    buf.consume(0);
+    buf.consume(6);
+    try testing.expectEqual(0, buf.availableRead());
 }
