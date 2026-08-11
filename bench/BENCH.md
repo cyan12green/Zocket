@@ -164,3 +164,44 @@ Notes:
   dwarfs the raw-echo client-limited numbers.
 - Latency floor at low concurrency (p50 0.06-0.07 ms) reflects the
   single-write response flush (one syscall batch per response).
+
+## Milestone 4: config-driven phase pipeline
+
+Date: 2026-08-11, same box as above. The M3 hardcoded HTTP response path was
+replaced by the DSL phase pipeline (route match in `find_config` + module
+dispatch through the 10 nginx-style phases; the M3 behavior is now the `echo`
+module on the catch-all route). `--echo`/`--single` never touch the pipeline,
+so raw-echo numbers should be bit-identical.
+
+**Method**: same-day A/B against the pre-M4 tree (`c897d01`), both `ReleaseFast`
+from the same source state, both run through the stock harness minutes apart
+under identical machine load, so run-to-run environment variance cancels.
+Note: `bench/bench.sh` starts the server without forwarding its extra args
+(and `bench/bench2.sh` forwards args but not the port), so the HTTP sweeps are
+effectively 8-thread (default) runs for both builds — the labels below are
+relative tags, not thread counts. One noise outlier (an orphaned baseline
+server process eating a full core during the first M4 c10 sweep) was killed and
+the M4 sweep re-run; the re-run is what is recorded.
+
+HTTP sweep (same-day A/B, median of 3 x 10s, bombardier, valid HTTP; both
+builds verified with `bench/http-check.py` before every sweep):
+
+| conns | M4 req/s | M3 baseline req/s | delta |
+|---|---:|---:|---:|
+| 10 | 239,810 | 240,630 | -0.3% |
+| 100 | 247,132 | 243,713 | +1.4% |
+| 500 | 250,683 | 247,544 | +1.3% |
+| 1000 | 231,025 | 222,009 | +4.1% |
+
+Raw-echo true-capacity A/B (`--echo --threads 4`, custom echo client, byte
+exact, `bad=0` everywhere; 2 reps, medians):
+
+| client threads | M4 req/s | M3 baseline req/s | delta |
+|---|---:|---:|---:|
+| 8 x 40 conns | 223,574 | 224,104 | -0.2% |
+| 16 x 40 conns | 266,686 | 265,582 | +0.4% |
+
+**Conclusion**: pipeline overhead is within ±5% at every point measured
+(actually within ±4.1%; the raw-echo modes, which bypass the pipeline, are
+within ±0.5%). `zig build test` green throughout (36 M3 tests + 33 new M4
+tests = 69).

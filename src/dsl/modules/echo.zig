@@ -1,0 +1,71 @@
+const std = @import("std");
+const registry = @import("../registry.zig");
+const http_response = @import("../../http/response.zig");
+
+/// Largest request body the echo response can hold: the response (head + body)
+/// must fit into the 16 KiB send buffer alongside the status line and headers.
+pub const max_echo_body = 16 * 1024 - 1024;
+
+/// The echo content module: responds 200 OK with the request body echoed,
+/// byte-identical to the Milestone 3 hardcoded HTTP handler. Bodies larger
+/// than the echo cap get a 413 and ask the connection to close, exactly like
+/// the pre-pipeline reactor path.
+pub const echo: registry.Module = .{
+    .name = "echo",
+    .phase = .content,
+    .run = run,
+};
+
+fn run(ctx: *registry.Context) !registry.Action {
+    if (ctx.req.body.len > max_echo_body) {
+        ctx.resp.* = http_response.Response.init(.payload_too_large);
+        ctx.resp.setBody(http_response.Status.payload_too_large.reasonPhrase());
+        ctx.close_after_write = true;
+        return .handled;
+    }
+    ctx.resp.* = http_response.Response.init(.ok);
+    if (ctx.req.body.len > 0) ctx.resp.setBody(ctx.req.body);
+    return .handled;
+}
+
+const testing = std.testing;
+
+test "echo module responds with the request body" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.body = "the payload";
+
+    var resp = http_response.Response.init(.ok);
+    var ctx = registry.Context{ .req = &req, .resp = &resp };
+
+    try testing.expectEqual(registry.Action.handled, try run(&ctx));
+    try testing.expectEqual(http_response.Status.ok, resp.status);
+    try testing.expectEqualStrings("the payload", resp.body);
+    try testing.expect(!ctx.close_after_write);
+}
+
+test "echo module rejects oversized bodies with 413 and close" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var body = [_]u8{'x'} ** (max_echo_body + 1);
+    req.body = &body;
+
+    var resp = http_response.Response.init(.ok);
+    var ctx = registry.Context{ .req = &req, .resp = &resp };
+
+    try testing.expectEqual(registry.Action.handled, try run(&ctx));
+    try testing.expectEqual(http_response.Status.payload_too_large, resp.status);
+    try testing.expect(ctx.close_after_write);
+}
+
+test "empty body produces an empty 200" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+
+    var resp = http_response.Response.init(.ok);
+    var ctx = registry.Context{ .req = &req, .resp = &resp };
+
+    try testing.expectEqual(registry.Action.handled, try run(&ctx));
+    try testing.expectEqual(http_response.Status.ok, resp.status);
+    try testing.expectEqual(@as(usize, 0), resp.body.len);
+}

@@ -1,6 +1,6 @@
 ## Project
 
-High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Milestone 2 (multi-reactor) reached: multi-threaded epoll echo server, one epoll loop per core. Milestone 3 (HTTP/1.1) in progress: request parser + response builder + keep-alive reactor mode (`--http`). Future base for a hot-reloadable, nginx-style config-driven HTTP server.
+High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Milestone 2 (multi-reactor) reached: multi-threaded epoll echo server, one epoll loop per core. Milestone 3 (HTTP/1.1) done: request parser + response builder + keep-alive reactor mode (`--http`). Milestone 4 done: config-driven phase pipeline (`src/dsl/`, `src/runtime/`) — a comptime module registry, nginx-style phase dispatch, prefix/exact routing, and a single `echo` content module; config from a JSON file or a comptime struct literal. Future base for a hot-reloadable, nginx-style config-driven HTTP server.
 
 ## Commands
 
@@ -9,6 +9,7 @@ High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Miles
 - `zig build run -- --single` — run the Milestone 1 single-threaded echo server (A/B comparison).
 - `zig build run -- --echo` — raw byte-echo protocol (Milestone 1/2 semantics) in the multi-reactor framework.
 - `zig build run -- --http` — HTTP/1.1 mode (default): `200 OK` echoing the request body, keep-alive, pipelining.
+- `zig build run -- --config <file>` — HTTP mode with a JSON config (routes + per-phase module bindings); see `config.example.json`.
 - `zig build run -- --threads N` — N reactor threads (default: CPU count; use physical-core count, e.g. 4, for best throughput).
 - `zig build run -- --port P` — change port.
 - `zig build -Doptimize=ReleaseFast` — for benchmarking.
@@ -19,13 +20,15 @@ High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Miles
 
 - `src/root.zig` is the library module root; every new submodule MUST be re-exported there (consumer imports `@import("tcp_server")`).
 - `src/root.zig` also comptime-imports every submodule: this Zig snapshot only collects `test` blocks reachable via comptime imports from the test root, so new submodules must be added to that block or their tests silently never run.
-- `src/main.zig` is the exe entrypoint (CLI flags only; all server logic lives in `src/net/` and `src/http/`).
-- Planned modules (see `README.md` milestones): `net/` (exists), `http/` (exists, M3), `runtime/`, `dsl/` (router + config DSL). Organization in submodules is a hard requirement — never dump code into main.zig.
+- `src/main.zig` is the exe entrypoint (CLI flags only; all server logic lives in `src/net/`, `src/http/`, `src/dsl/`, `src/runtime/`).
+- Module map: `net/` (M1/M2 transport), `http/` (M3 parser/response), `dsl/` (M4 phase pipeline: `phase.zig`, `router.zig`, `registry.zig`, `pipeline.zig`, `modules/`), `runtime/` (M4 config + server wiring: `config.zig`, `server.zig`). Organization in submodules is a hard requirement — never dump code into main.zig.
 - `net/` currently: `server.zig` (Milestone 1 single-threaded epoll loop, kept for A/B), `multireactor.zig` (accept loop + dispatcher + reactor lifecycle), `reactor.zig` (per-core epoll thread; connection queue handed over via mutex + eventfd; echo or HTTP modes), `dispatcher.zig` (lock-free round-robin), `eventfd.zig`, `epoll.zig`, `connection.zig`, `buffer.zig`, `sockets.zig` (raw syscall helpers).
 - `http/` currently: `parser.zig` (incremental HTTP/1.x request parser: request line, headers, Content-Length body, keep-alive logic, 400/431/501 outcomes), `response.zig` (status + headers + body builder, Content-Length always set, `writeToBuffer` for the send path).
-- Reactor HTTP flow: read (edge-triggered drain) → parse → build response into the send buffer (body echo) → flush on EPOLLOUT; keep-alive resets parser+request and continues with pipelined data; errors respond and close (receive side drained so close() sends FIN, not RST).
-- Tests are inline `test` blocks in source files; any new functionality needs tests. Concurrency tests live in `reactor.zig`, `dispatcher.zig`, `multireactor.zig` (integration); parser/response tests in `http/parser.zig`, `http/response.zig`.
-- Performance matters (epoll, multi-reactor per physical core; best throughput at `--threads <physical cores>`); no full RFC compliance needed for HTTP initially.
+- M4 phase pipeline (see `docs/M4.md`): `dsl/phase.zig` defines the 10 nginx-style phases (post_read … log); `dsl/router.zig` does prefix/exact matching (exact beats prefix, longest prefix wins); `dsl/registry.zig` is the comptime module registry — a module is a `Module` value (`name`, `phase`, `run(ctx) -> Action`), `pass`/`handled`/`short_circuit`; `dsl/pipeline.zig` walks `Phase.all`, running the route matcher in `find_config` and each matched route's phase binding; `dsl/modules/echo.zig` is the echo content module. `runtime/config.zig` loads `Config` from a comptime struct literal (`Config.default()`) or JSON via `std.json` (`fromJson`); `runtime/server.zig` is the shared `Server` the reactor calls. New modules: export a `Module` in `dsl/modules/`, add it to `default_registry` in `dsl/registry.zig`, re-export in root.zig.
+- std.json is runtime-only in this snapshot: `std.json.parseFromSlice` at comptime fails (`@intFromPtr` in `std.mem`), so JSON configs are parsed at startup; comptime configs are struct literals.
+- Reactor HTTP flow: read (edge-triggered drain) → parse → build response via the shared M4 pipeline (Context{req, resp} → runtime.Server.handleRequest → phase pipeline) into the send buffer → flush on EPOLLOUT; keep-alive resets parser+request and continues with pipelined data; errors respond and close (receive side drained so close() sends FIN, not RST). `.not_handled` (no route / short-circuit / no module) → default 404.
+- Tests are inline `test` blocks in source files; any new functionality needs tests. Concurrency tests live in `reactor.zig`, `dispatcher.zig`, `multireactor.zig` (integration); parser/response tests in `http/parser.zig`, `http/response.zig`; pipeline/registry/router/config tests in `dsl/`, `runtime/`.
+- Performance matters (epoll, multi-reactor per physical core; best throughput at `--threads <physical cores>`; the M4 pipeline must stay under ~5% overhead — verify with same-day A/B against the pre-M4 tree); no full RFC compliance needed for HTTP initially.
 - Refer to `/home/sid/Personal/zig` for stdlib reference details.
 
 ## Known stdlib quirks (pinned 0.16.0-dev snapshot)

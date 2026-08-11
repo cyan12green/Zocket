@@ -14,6 +14,21 @@ pub const http = struct {
     pub const response = @import("http/response.zig");
 };
 
+pub const dsl = struct {
+    pub const phase = @import("dsl/phase.zig");
+    pub const router = @import("dsl/router.zig");
+    pub const registry = @import("dsl/registry.zig");
+    pub const pipeline = @import("dsl/pipeline.zig");
+    pub const modules = struct {
+        pub const echo = @import("dsl/modules/echo.zig");
+    };
+};
+
+pub const runtime = struct {
+    pub const config = @import("runtime/config.zig");
+    pub const server = @import("runtime/server.zig");
+};
+
 // This Zig snapshot only collects `test` blocks that are reachable through
 // comptime imports from the test root file; plain `pub const` imports of
 // submodules are analyzed lazily and their tests are skipped. Pull every
@@ -30,4 +45,11 @@ comptime {
     _ = @import("net/multireactor.zig");
     _ = @import("http/parser.zig");
     _ = @import("http/response.zig");
+    _ = @import("dsl/phase.zig");
+    _ = @import("dsl/router.zig");
+    _ = @import("dsl/registry.zig");
+    _ = @import("dsl/pipeline.zig");
+    _ = @import("dsl/modules/echo.zig");
+    _ = @import("runtime/config.zig");
+    _ = @import("runtime/server.zig");
 }

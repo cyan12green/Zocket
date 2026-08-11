@@ -7,6 +7,7 @@ const connection = @import("connection.zig");
 const reactor = @import("reactor.zig");
 const dispatcher = @import("dispatcher.zig");
 const sockets = @import("sockets.zig");
+const runtime_server = @import("../runtime/server.zig");
 
 const max_events = 1024;
 
@@ -27,6 +28,9 @@ pub const Server = struct {
     running: std.atomic.Value(bool),
     total_accepted: std.atomic.Value(usize),
     mode: reactor.Mode,
+    /// Config-driven HTTP request processor shared by the reactors (HTTP mode
+    /// only; null falls back to each reactor's default handler).
+    http_handler: ?*const runtime_server.Server,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !Server {
         const n = try std.Thread.getCpuCount();
@@ -34,6 +38,16 @@ pub const Server = struct {
     }
 
     pub fn initWithThreads(allocator: std.mem.Allocator, port: u16, n_threads: usize, mode: reactor.Mode) !Server {
+        return initWithThreadsAndHandler(allocator, port, n_threads, mode, null);
+    }
+
+    pub fn initWithThreadsAndHandler(
+        allocator: std.mem.Allocator,
+        port: u16,
+        n_threads: usize,
+        mode: reactor.Mode,
+        http_handler: ?*const runtime_server.Server,
+    ) !Server {
         const n = @max(n_threads, 1);
 
         const listener = try sockets.createListeningSocket(port, 4096);
@@ -56,7 +70,7 @@ pub const Server = struct {
             try reactors_list.ensureTotalCapacity(allocator, n);
             for (0..n) |i| {
                 const r = try allocator.create(reactor.Reactor);
-                const init_res = reactor.Reactor.init(allocator, i, mode) catch |e| {
+                const init_res = reactor.Reactor.initWithHandler(allocator, i, mode, http_handler) catch |e| {
                     allocator.destroy(r);
                     return e;
                 };
@@ -76,6 +90,7 @@ pub const Server = struct {
             .running = std.atomic.Value(bool).init(false),
             .total_accepted = std.atomic.Value(usize).init(0),
             .mode = mode,
+            .http_handler = http_handler,
         };
 
         self.main_ep.add(self.listener, epoll.Events.In | epoll.Events.EdgeTriggered, self.listener) catch |e| {
@@ -285,4 +300,99 @@ test "multi-reactor accepts under concurrent connections and echoes correctly" {
     server.stop();
     run_thread.join();
     try testing.expectEqual(@as(usize, 4), server.threadCount());
+}
+
+fn tcpConnect(port: u16) !posix.fd_t {
+    const stream = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(stream);
+    var addr: posix.sockaddr = .{
+        .family = posix.AF.INET,
+        .data = [_]u8{0} ** 14,
+    };
+    std.mem.writeInt(u16, addr.data[0..2], port, .big);
+    std.mem.writeInt(u32, addr.data[2..6], 0x7f000001, .big);
+    try posix.connect(stream, &addr, 16);
+    return stream;
+}
+
+fn httpWriteAll(sock: posix.fd_t, bytes: []const u8) !void {
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const n = posix.write(sock, remaining) catch {
+            std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+            continue;
+        };
+        remaining = remaining[n..];
+    }
+}
+
+fn httpReadUntil(sock: posix.fd_t, buf: []u8, expected_len: usize, timeout_ms: u64) !usize {
+    var total: usize = 0;
+    const start = std.time.Instant.now() catch return error.Timeout;
+    while (total < expected_len) {
+        if ((std.time.Instant.now() catch return error.Timeout).since(start) > timeout_ms * std.time.ns_per_ms) {
+            return error.Timeout;
+        }
+        const n = posix.read(sock, buf[total..expected_len]) catch {
+            std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+            continue;
+        };
+        if (n == 0) return error.Eof;
+        total += n;
+    }
+    return total;
+}
+
+// End-to-end integration: a JSON config (parsed at runtime with std.json)
+// drives a real HTTP request through the echo module over a real TCP
+// connection to the multi-reactor server.
+test "multi-reactor HTTP with JSON config echoes via the pipeline" {
+    const allocator = std.heap.page_allocator;
+    const json =
+        \\{ "routes": [
+        \\    { "path": "/echo", "match": "prefix", "modules": { "content": "echo" } }
+        \\  ] }
+    ;
+    var cfg = try runtime_server.Config.fromJson(allocator, json);
+    defer cfg.deinit(allocator);
+    try cfg.validate(runtime_server.default_registry);
+    const srv = runtime_server.Server.init(cfg);
+
+    var server = try Server.initWithThreadsAndHandler(allocator, 0, 2, .http, &srv);
+    defer server.deinit();
+    const port = try server.boundPort();
+
+    var run_thread = try std.Thread.spawn(.{}, struct {
+        fn f(s: *Server) !void {
+            s.run() catch {};
+        }
+    }.f, .{&server});
+
+    // Let reactors reach epoll_wait before the first connection.
+    std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+
+    const sock = try tcpConnect(port);
+    defer posix.close(sock);
+
+    // POST with a body: the echo module answers with the body echoed.
+    try httpWriteAll(sock, "POST /echo HTTP/1.1\r\nContent-Length: 12\r\n\r\nhello-e2e-ok");
+    var buf: [512]u8 = undefined;
+    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 12\r\n\r\nhello-e2e-ok";
+    const n1 = try httpReadUntil(sock, &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n1]);
+
+    // A second request on the same keep-alive connection.
+    try httpWriteAll(sock, "GET /echo HTTP/1.1\r\n\r\n");
+    const want2 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    const n2 = try httpReadUntil(sock, &buf, want2.len, 3000);
+    try testing.expectEqualStrings(want2, buf[0..n2]);
+
+    // No matching route: default 404, connection stays alive.
+    try httpWriteAll(sock, "GET /nope HTTP/1.1\r\n\r\n");
+    const want_404 = "HTTP/1.1 404 Not Found\r\nConnection: keep-alive\r\nContent-Length: 9\r\n\r\nNot Found";
+    const n3 = try httpReadUntil(sock, &buf, want_404.len, 3000);
+    try testing.expectEqualStrings(want_404, buf[0..n3]);
+
+    server.stop();
+    run_thread.join();
 }

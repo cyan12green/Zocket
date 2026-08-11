@@ -1,0 +1,14 @@
+{
+  "routes": [
+    {
+      "path": "/echo",
+      "match": "exact",
+      "modules": { "content": "echo" }
+    },
+    {
+      "path": "/",
+      "match": "prefix",
+      "modules": { "content": "echo" }
+    }
+  ]
+}

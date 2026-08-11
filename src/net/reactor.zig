@@ -7,11 +7,14 @@ const connection = @import("connection.zig");
 const sockets = @import("sockets.zig");
 const http_parser = @import("../http/parser.zig");
 const http_response = @import("../http/response.zig");
+const dsl_pipeline = @import("../dsl/pipeline.zig");
+const runtime_server = @import("../runtime/server.zig");
 
 const max_events = 1024;
-/// Largest request body the echo response can hold: the response (head + body)
-/// must fit into the 16 KiB send buffer alongside the status line and headers.
-const max_echo_body = 16 * 1024 - 1024;
+
+/// Fallback HTTP request processor used when a reactor is created without an
+/// explicit handler (e.g. in tests): the default echo-on-everything config.
+const default_http_handler = runtime_server.Server.default();
 
 /// Connection protocol handled by a reactor.
 pub const Mode = enum {
@@ -47,6 +50,10 @@ pub const Reactor = struct {
     wakeup: eventfd.EventFd,
     connections: std.AutoHashMap(posix.fd_t, *connection.Connection),
     http_sessions: std.AutoHashMap(posix.fd_t, HttpSession),
+    /// Config-driven HTTP request processor (Milestone 4). Only used in `.http`
+    /// mode; when null, `default_http_handler` is used. Shared read-only across
+    /// reactors, so it is safe to call from the reactor thread.
+    http_handler: ?*const runtime_server.Server,
     running: std.atomic.Value(bool),
     thread: ?std.Thread,
     pending: std.ArrayList(*connection.Connection),
@@ -58,6 +65,17 @@ pub const Reactor = struct {
     registered: std.atomic.Value(usize),
 
     pub fn init(allocator: std.mem.Allocator, id: usize, mode: Mode) !Reactor {
+        return initWithHandler(allocator, id, mode, null);
+    }
+
+    /// Like `init`, but with an explicit HTTP request processor (used in HTTP
+    /// mode; ignored in echo mode).
+    pub fn initWithHandler(
+        allocator: std.mem.Allocator,
+        id: usize,
+        mode: Mode,
+        http_handler: ?*const runtime_server.Server,
+    ) !Reactor {
         var self = Reactor{
             .allocator = allocator,
             .id = id,
@@ -66,6 +84,7 @@ pub const Reactor = struct {
             .wakeup = try eventfd.EventFd.create(),
             .connections = std.AutoHashMap(posix.fd_t, *connection.Connection).init(allocator),
             .http_sessions = std.AutoHashMap(posix.fd_t, HttpSession).init(allocator),
+            .http_handler = http_handler,
             .running = std.atomic.Value(bool).init(false),
             .thread = null,
             .pending = .empty,
@@ -270,22 +289,27 @@ pub const Reactor = struct {
                     return;
                 },
                 .complete => {
-                    if (session.req.body.len > max_echo_body) {
-                        self.respondAndClose(fd, .payload_too_large);
-                        return;
-                    }
                     var resp = http_response.Response.init(.ok);
-                    if (session.req.body.len > 0) resp.setBody(session.req.body);
-                    resp.setHeader(
-                        "Connection",
-                        if (session.req.keep_alive) "keep-alive" else "close",
-                    );
+                    var ctx = dsl_pipeline.Context{ .req = &session.req, .resp = &resp };
+                    const handler = self.http_handler orelse &default_http_handler;
+                    const request_outcome = handler.handleRequest(&ctx) catch {
+                        self.respondAndClose(fd, .internal_error);
+                        return;
+                    };
+                    if (request_outcome == .not_handled) {
+                        // No module claimed the request (no route matched, a
+                        // short-circuit, or no module attached): default 404.
+                        resp = http_response.Response.init(.not_found);
+                        resp.setBody(http_response.Status.not_found.reasonPhrase());
+                    }
+                    const close = ctx.close_after_write or !session.req.keep_alive;
+                    resp.setHeader("Connection", if (close) "close" else "keep-alive");
                     conn.send_buf.compact();
                     resp.writeToBuffer(conn.send_buf) catch {
                         self.removeConnection(fd);
                         return;
                     };
-                    session.close_after_write = !session.req.keep_alive;
+                    session.close_after_write = close;
                     session.writing = true;
                     self.flushHttp(fd);
                     if (!self.connections.contains(fd)) return;
@@ -772,8 +796,9 @@ test "reactor HTTP oversized body yields 413 and closes" {
     const conn = try connection.Connection.create(allocator, pair[1]);
     r.attach(conn);
 
-    var body = [_]u8{'x'} ** (max_echo_body + 1);
-    var wire_buf: [max_echo_body + 256]u8 = undefined;
+    const echo_mod = @import("../dsl/modules/echo.zig");
+    var body = [_]u8{'x'} ** (echo_mod.max_echo_body + 1);
+    var wire_buf: [echo_mod.max_echo_body + 256]u8 = undefined;
     const wire = std.fmt.bufPrint(&wire_buf, "POST / HTTP/1.1\r\nContent-Length: {d}\r\n\r\n", .{body.len}) catch unreachable;
     try writeAll(pair[0], wire);
     // Body arrives in a second chunk to exercise the partial-body path.
@@ -785,4 +810,50 @@ test "reactor HTTP oversized body yields 413 and closes" {
     const n = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n]);
     try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+}
+
+// A JSON config loaded at runtime, driving requests through the pipeline in a
+// reactor: unmatched requests fall back to the default 404 (no module
+// attached), matched ones go through the echo module.
+test "reactor runs a JSON-config pipeline with default 404 fallback" {
+    const allocator = testing.allocator;
+    const json =
+        \\{ "routes": [
+        \\    { "path": "/only", "match": "exact", "modules": { "content": "echo" } }
+        \\  ] }
+    ;
+    var cfg = try runtime_server.Config.fromJson(allocator, json);
+    defer cfg.deinit(allocator);
+    try cfg.validate(runtime_server.default_registry);
+    const srv = runtime_server.Server.init(cfg);
+
+    var r = try Reactor.initWithHandler(allocator, 0, .http, &srv);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Matched route: echo module answers with the request body.
+    try writeAll(pair[0], "POST /only HTTP/1.1\r\nContent-Length: 4\r\n\r\necho");
+    var buf: [512]u8 = undefined;
+    const want_echo = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 4\r\n\r\necho";
+    const n1 = try readUntil(pair[0], &buf, want_echo.len, 3000);
+    try testing.expectEqualStrings(want_echo, buf[0..n1]);
+
+    // No route matches: default 404, connection stays alive.
+    try writeAll(pair[0], "GET /elsewhere HTTP/1.1\r\n\r\n");
+    const want_404 = "HTTP/1.1 404 Not Found\r\nConnection: keep-alive\r\nContent-Length: 9\r\n\r\nNot Found";
+    const n2 = try readUntil(pair[0], &buf, want_404.len, 3000);
+    try testing.expectEqualStrings(want_404, buf[0..n2]);
+
+    r.stop();
+    r.join();
 }
