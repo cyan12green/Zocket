@@ -82,6 +82,15 @@ pub fn acceptNonBlock(listener: posix.fd_t) AcceptError!posix.fd_t {
     };
 }
 
+/// Resolve the actual bound port of a listening socket (useful when binding
+/// with port 0 for tests).
+pub fn boundPort(fd: posix.fd_t) !u16 {
+    var addr: sockaddr_in = undefined;
+    var len: posix.socklen_t = @sizeOf(sockaddr_in);
+    try posix.getsockname(fd, @as(*posix.sockaddr, @ptrCast(&addr)), &len);
+    return std.mem.bigToNative(u16, addr.sin_port);
+}
+
 /// Pin the calling thread to a single CPU from the allowed set.
 /// Best-effort: failure (e.g. sandboxed environment) is ignored.
 pub fn pinToCpu(cpu: usize) void {

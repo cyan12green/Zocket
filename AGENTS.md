@@ -1,23 +1,36 @@
 ## Project
 
-High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Future base for a hot-reloadable, nginx-style config-driven HTTP server.
+High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Milestone 2 (multi-reactor) reached: multi-threaded epoll echo server, one epoll loop per core. Future base for a hot-reloadable, nginx-style config-driven HTTP server.
 
 ## Commands
 
 - `zig build test` — run all tests (two parallel execs: library module + exe tests). Always run before finishing work.
-- `zig build run` — run echo server (`src/main.zig`, port 8080).
+- `zig build run` — run echo server (`src/main.zig`, default multi-reactor, port 8080).
+- `zig build run -- --single` — run the Milestone 1 single-threaded server (A/B comparison).
+- `zig build run -- --threads N` — multi-reactor with N reactor threads (default: CPU count; use physical-core count, e.g. 4, for best throughput).
+- `zig build run -- --port P` — change port.
 - `zig build -Doptimize=ReleaseFast` — for benchmarking.
+- Benchmark: `bash bench/bench.sh <binary> <tag> [--extra server args]` (bombardier sweeps + echo-check) and `bash bench/bench2.sh <binary> <tag> [--extra server args]` (true-capacity echo-client sweeps); summarize with `bench/summarize.py` / `bench/summarize2.py`; see `bench/BENCH.md`.
 - Verify compilation with `zig build` or `zig build-exe` after any change.
 
 ## Layout & conventions
 
 - `src/root.zig` is the library module root; every new submodule MUST be re-exported there (consumer imports `@import("tcp_server")`).
-- `src/main.zig` is the exe entrypoint.
+- `src/root.zig` also comptime-imports every submodule: this Zig snapshot only collects `test` blocks reachable via comptime imports from the test root, so new submodules must be added to that block or their tests silently never run.
+- `src/main.zig` is the exe entrypoint (CLI flags only; all server logic lives in `src/net/`).
 - Planned modules (see `README.md` milestones): `net/` (exists), `http/`, `runtime/`, `dsl/` (router + config DSL). Organization in submodules is a hard requirement — never dump code into main.zig.
-- `net/` currently: `server.zig` (epoll event loop), `epoll.zig`, `connection.zig`, `buffer.zig`.
-- Tests are inline `test` blocks in source files (`src/net/buffer.zig`, `src/net/epoll.zig`); any new functionality needs tests.
-- Performance matters (epoll, single-threaded first, then multi-reactor per core); no full RFC compliance needed for HTTP initially.
+- `net/` currently: `server.zig` (Milestone 1 single-threaded epoll loop, kept for A/B), `multireactor.zig` (accept loop + dispatcher + reactor lifecycle), `reactor.zig` (per-core epoll thread; connection queue handed over via mutex + eventfd), `dispatcher.zig` (lock-free round-robin), `eventfd.zig`, `epoll.zig`, `connection.zig`, `buffer.zig`, `sockets.zig` (raw syscall helpers).
+- Tests are inline `test` blocks in source files; any new functionality needs tests. Concurrency tests live in `reactor.zig`, `dispatcher.zig`, `multireactor.zig` (integration).
+- Performance matters (epoll, multi-reactor per physical core; best throughput at `--threads <physical cores>`); no full RFC compliance needed for HTTP initially.
 - Refer to `/home/sid/Personal/zig` for stdlib reference details.
+
+## Known stdlib quirks (pinned 0.16.0-dev snapshot)
+
+- `std.posix.accept` is unusable (its `AcceptError` omits `error.SocketNotListening` which its own body returns). Use `sockets.acceptNonBlock` (raw `accept4`).
+- `std.posix.epoll_ctl` panics (`unreachable`) on EBADF — never call `epoll_ctl(DEL)` after closing the epoll fd (close connections before closing the epoll fd).
+- `std.ArrayList` is the unmanaged `array_list.Aligned`: use `.empty`, `append(gpa, item)`, `deinit(gpa)`.
+- `std.time.sleep` / `std.time.milliTimestamp` do not exist; use `std.posix.nanosleep` (nsec must be < 1e9) and `std.time.Instant`.
+- Network sockaddr: `posix.sockaddr` = `{ family: u16, data: [14]u8 }`; `sockaddr_in` layout has NO BSD `sin_len`. Ports/addresses must be written as raw big-endian bytes (`writeInt(..., .big)`, NOT `nativeToBig` + `writeInt` — that double-swaps).
 
 ---
 name: caveman

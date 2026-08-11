@@ -107,7 +107,8 @@ test "buffer compact" {
     defer buf.deinit(allocator);
 
     _ = buf.writeSlice("hello");
-    _ = buf.readSlice(&[5]u8{0}**5);
+    var zeroes = [_]u8{0} ** 5;
+    _ = buf.readSlice(&zeroes);
 
     try testing.expectEqual(0, buf.availableRead());
     try testing.expectEqual(5, buf.read_pos);
