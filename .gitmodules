@@ -1,0 +1,9 @@
+[submodule "third_party/httpx.zig"]
+	path = third_party/httpx.zig
+	url = https://github.com/muhammad-fiaz/httpx.zig.git
+[submodule "third_party/actix-web"]
+	path = third_party/actix-web
+	url = https://github.com/actix/actix-web.git
+[submodule "third_party/bun"]
+	path = third_party/bun
+	url = https://github.com/oven-sh/bun.git
