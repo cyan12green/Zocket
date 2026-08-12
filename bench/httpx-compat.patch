@@ -1,0 +1,151 @@
+diff --git a/bench/main.zig b/bench/main.zig
+index 797e39c..e0daf7c 100644
+--- a/bench/main.zig
++++ b/bench/main.zig
+@@ -11,9 +11,12 @@ const BenchConfig = struct {
+     rounds: usize,
+ };
+ 
++var bench_global_io = std.Io.Threaded.init_single_threaded;
++
+ fn nowNanos() i96 {
+-    const io = std.Io.Threaded.global_single_threaded.io();
+-    return std.Io.Timestamp.now(io, .awake).toNanoseconds();
++    const io = bench_global_io.io();
++    const ts = (std.Io.Clock.now(.real, io) catch return 0);
++    return ts.toNanoseconds();
+ }
+ 
+ fn runBenchmark(name: []const u8, cfg: BenchConfig, func: *const fn () void) void {
+diff --git a/build.zig b/build.zig
+index 67ba029..3a7f56e 100644
+--- a/build.zig
++++ b/build.zig
+@@ -37,6 +37,8 @@ pub fn build(b: *std.Build) void {
+     httpx_module.addImport("brotli", brotli_dep.module("brotli"));
+ 
+     const examples = [_]struct { name: []const u8, path: []const u8, skip_run_all: bool = false }{
++        .{ .name = "bench_server", .path = "examples/bench_server.zig" },
++        .{ .name = "reqresp_bench", .path = "bench/reqresp_bench.zig", .skip_run_all = true },
+         .{ .name = "simple_get", .path = "examples/simple_get.zig" },
+         .{ .name = "simple_get_deserialize", .path = "examples/simple_get_deserialize.zig" },
+         .{ .name = "http_auth_helpers", .path = "examples/http_auth_helpers.zig" },
+diff --git a/src/concurrency/executor.zig b/src/concurrency/executor.zig
+index 46f66a7..9075a79 100644
+--- a/src/concurrency/executor.zig
++++ b/src/concurrency/executor.zig
+@@ -48,7 +48,7 @@ pub const Executor = struct {
+     running: bool = false,
+     threads: []Thread = &.{},
+     mutex: std.Io.Mutex = .init,
+-    cond: std.Io.Condition = .init,
++    cond: std.Io.Condition = .{},
+ 
+     const Self = @This();
+ 
+diff --git a/src/net/unix.zig b/src/net/unix.zig
+index 133322b..c37aae4 100644
+--- a/src/net/unix.zig
++++ b/src/net/unix.zig
+@@ -230,9 +230,7 @@ pub const UnixListener = struct {
+ 
+         // Remove stale socket file
+         {
+-            const io = defaultIo();
+-            const cwd = std.Io.Dir.cwd();
+-            cwd.deleteFile(io, path) catch {};
++            std.fs.cwd().deleteFile(path) catch {};
+         }
+ 
+         const fd = try createSocket();
+diff --git a/src/protocol/quic.zig b/src/protocol/quic.zig
+index 7451b6f..4acd0c4 100644
+--- a/src/protocol/quic.zig
++++ b/src/protocol/quic.zig
+@@ -130,7 +130,7 @@ pub const ConnectionId = struct {
+ 
+     pub fn random() ConnectionId {
+         var cid = ConnectionId{ .len = 8 };
+-        defaultIo().random(cid.data[0..8]);
++        std.crypto.random.bytes(cid.data[0..8]);
+         return cid;
+     }
+ };
+diff --git a/src/tls/crypto_utils.zig b/src/tls/crypto_utils.zig
+index 6a8037e..11413eb 100644
+--- a/src/tls/crypto_utils.zig
++++ b/src/tls/crypto_utils.zig
+@@ -8,7 +8,7 @@ const std = @import("std");
+ /// Fill `buf` with cryptographically-secure random bytes using the
+ /// thread-local IO subsystem (Zig 0.16.0 API).
+ pub fn tlsRandom(buf: []u8) void {
+-    std.Io.Threaded.global_single_threaded.io().random(buf);
++    std.crypto.random.bytes(buf);
+ }
+ 
+ test "tlsRandom fills buffer with random bytes" {
+diff --git a/src/tls/tls.zig b/src/tls/tls.zig
+index 08159b9..4977ea6 100644
+--- a/src/tls/tls.zig
++++ b/src/tls/tls.zig
+@@ -105,9 +105,8 @@ fn pemDecode(allocator: Allocator, pem: []const u8) ![]const u8 {
+ 
+ /// Load a PEM certificate chain file. Returns a list of DER-encoded certificates.
+ pub fn loadCertChain(allocator: Allocator, path: []const u8) ![]const []const u8 {
+-    const io = std.Io.Threaded.global_single_threaded.io();
+-    const dir = std.Io.Dir.cwd();
+-    const pem = try dir.readFileAlloc(io, path, allocator, .unlimited);
++    const dir = std.fs.cwd();
++    const pem = try dir.readFileAlloc(path, allocator, .unlimited);
+     defer allocator.free(pem);
+ 
+     // Count certificates in the chain
+@@ -147,9 +146,8 @@ pub fn loadCertChain(allocator: Allocator, path: []const u8) ![]const []const u8
+ 
+ /// Load a PEM private key file. Returns DER-encoded PKCS#1 or PKCS#8 key bytes.
+ pub fn loadPrivateKey(allocator: Allocator, path: []const u8) ![]const u8 {
+-    const io = std.Io.Threaded.global_single_threaded.io();
+-    const dir = std.Io.Dir.cwd();
+-    const pem = try dir.readFileAlloc(io, path, allocator, .unlimited);
++    const dir = std.fs.cwd();
++    const pem = try dir.readFileAlloc(path, allocator, .unlimited);
+     defer allocator.free(pem);
+ 
+     // Find the private key section
+diff --git a/src/util/any_io.zig b/src/util/any_io.zig
+index dc593cf..a8370f9 100644
+--- a/src/util/any_io.zig
++++ b/src/util/any_io.zig
+@@ -12,26 +12,28 @@ const builtin = @import("builtin");
+ /// Returns the appropriate `std.Io` for the current execution context.
+ ///
+ /// - In tests: `std.testing.io` (single-threaded, deterministic)
+-/// - Otherwise: `std.Io.Threaded.global_single_threaded.io()`
++/// - Otherwise: `std.Io.Threaded.init_single_threaded.io()`
+ ///
+ /// Use this for single-threaded test code. For code that spawns real OS
+ /// threads (executors, thread pools), use `threadIo()` instead.
++var global_single_threaded = std.Io.Threaded.init_single_threaded;
++
+ pub inline fn defaultIo() std.Io {
+     return if (builtin.is_test)
+         std.testing.io
+     else
+-        std.Io.Threaded.global_single_threaded.io();
++        global_single_threaded.io();
+ }
+ 
+ /// Returns a real thread-safe `std.Io` suitable for multi-threaded code.
+ ///
+ /// - In tests: `std.testing.io` (a real `Io.Threaded`, safe from any thread)
+-/// - Otherwise: `std.Io.Threaded.global_single_threaded.io()`
++/// - Otherwise: `std.Io.Threaded.init_single_threaded.io()`
+ pub inline fn threadIo() std.Io {
+     if (comptime builtin.is_test) {
+         return std.testing.io;
+     }
+-    return std.Io.Threaded.global_single_threaded.io();
++    return global_single_threaded.io();
+ }
+ 
+ /// Sleeps for `ms` milliseconds using the canonical IO.

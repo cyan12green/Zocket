@@ -3,3 +3,7 @@ zig-out/
 main
 bench/results/*.server.log
 bench/echo_client
+
+# benchmark artifacts
+bench/.cache/
+bench/foreign/actix/target/

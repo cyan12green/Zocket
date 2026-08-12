@@ -1,0 +1,13 @@
+[package]
+name = "actix_bench"
+version = "0.1.0"
+edition = "2021"
+
+# The framework is pinned by the third_party/actix-web submodule
+# (tag web-v4.14.1); transitive crates come from crates.io.
+[dependencies]
+actix-web = { path = "../../../third_party/actix-web/actix-web" }
+
+[profile.release]
+lto = true
+codegen-units = 1
