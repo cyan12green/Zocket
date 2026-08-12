@@ -1,50 +1,80 @@
+# zig-tcp-server
+
+High-performance TCP/HTTP server in Zig (0.16.0-dev, pinned in
+`build.zig.zon`): multi-reactor epoll transport, HTTP/1.1, an nginx-style
+config-driven phase pipeline, static file serving, reverse proxying, and
+kernel-level optimizations (SO_REUSEPORT, sendfile, writev).
+
+## Status
+
+| Milestone | Status | Description |
+|---|---:|---|
+| M1 | DONE | Single-threaded epoll echo server (`src/net/server.zig`, kept for A/B). Baseline in `bench/BENCH.md`. |
+| M2 | DONE | Multi-reactor: one epoll loop per core, connection handoff via mutex + eventfd. Best at `--threads <physical cores>`. |
+| M3 | DONE | HTTP/1.1: incremental request parser, response builder, HTTP reactor mode. Docs: `docs/M3.md`. |
+| M4 | DONE | Config-driven phase pipeline: comptime module registry, 10 nginx-style phases, prefix/exact routing, echo module, JSON or comptime config. Docs: `docs/M4.md`. |
+| M5 | DONE | Connection lifecycle: ring-buffer timer wheel, idle timeout (`--idle-timeout`, default 60 s). |
+| M6 | DONE | HTTP robustness: chunked transfer-encoding, URL decoding, HEAD, comptime MIME table. |
+| M7 | DONE | Comptime route trie (O(path) lookup) + per-route dispatch specialisation. |
+| M8 | DONE | Comptime header-name hashing (integer-compare lookups). |
+| M9 | DONE | Response transforms: gzip, cache headers, conditional GETs (304). |
+| M10 | DONE | Static files: disk (root/index/autoindex, ranges 206/416, 304) + comptime embedded assets (zero disk I/O). |
+| M11 | DONE | Comptime response templates: module-less template routes pre-serialised and served from `.rodata`. |
+| M12 | DONE | Reverse proxy: per-backend keep-alive pools, load balancing (round-robin / least-connections / ip_hash), passive health checks, X-Forwarded-For / X-Real-IP. |
+| M13 | DONE | Observability: access log, error log, stub_status page, SIGHUP graceful reload. |
+| M14 | DONE | Kernel-level: SO_REUSEPORT per-reactor accept, sendfile for static bodies, writev for head+body; io_uring explored and deferred. |
+
+Roadmap: `docs/ROADMAP.md`.
+
+## Source layout
+
+```
 src/
-    main.zig
-    root.zig             (library root; re-exports + comptime test imports)
-    net/
-        server.zig        (M1 single-threaded, kept for A/B)
-        multireactor.zig  (M2: accept loop + dispatcher + reactor lifecycle)
-        reactor.zig       (M2/M3/M4: per-core epoll thread, echo or HTTP mode)
-        dispatcher.zig
-        eventfd.zig
-        epoll.zig
-        connection.zig
-        buffer.zig
-        sockets.zig
-    http/
-        parser.zig        (M3: incremental HTTP/1.x request parser)
-        response.zig      (M3: response builder)
-    dsl/
-        phase.zig         (M4: nginx-style phase enum, execution order)
-        router.zig        (M4: prefix/exact route matching)
-        registry.zig      (M4: comptime module registry + Context)
-        pipeline.zig      (M4: phase dispatch loop)
-        modules/
-            echo.zig      (M4: echo content module)
-    runtime/
-        config.zig        (M4: route table, JSON + struct-literal loading)
-        server.zig        (M4: shared request processor wiring)
+  main.zig            CLI entry (flags only; all logic lives below)
+  root.zig            library root; re-exports + comptime test imports
+  embeds.zig          comptime embedded assets (@embedFile)
+  net/                transport + lifecycle (M1/M2/M5/M13/M14)
+    server.zig        M1 single-threaded echo (A/B)
+    multireactor.zig  reactor orchestration
+    reactor.zig       per-core epoll thread (echo or HTTP mode)
+    dispatcher.zig    lock-free round-robin (M2; removed by SO_REUSEPORT)
+    timer_wheel.zig   idle-timeout timer wheel (M5)
+    connection.zig    per-connection recv/send buffers
+    buffer.zig        growable byte buffer (memmove-safe)
+    epoll.zig         epoll wrapper (raw syscalls)
+    eventfd.zig       wakeup primitive
+    sockets.zig       raw socket syscall helpers
+  http/               HTTP/1.1 layer (M3/M6/M8)
+    parser.zig        incremental request parser
+    response.zig      response builder (Content-Length always set)
+    mime.zig          comptime MIME table (M6)
+  dsl/                config pipeline (M4/M7/M9-M12)
+    phase.zig         nginx-style phase enum
+    router.zig        prefix/exact routing + comptime trie (M7)
+    registry.zig      comptime module registry + Context
+    pipeline.zig      phase dispatch loop
+    modules/          echo, gzip, cache, access_log, error_log,
+                      proxy, static, stub_status
+  runtime/            config loading + server wiring (M4)
+```
 
+## Run modes
 
-Status
-Milestone 1  DONE   Single-threaded epoll echo server (src/net/server.zig).
-                     Baseline recorded in bench/BENCH.md.
-Milestone 2  DONE   Multi-threaded reactors, one epoll loop per core
-                     (src/net/multireactor.zig, reactor.zig). Best
-                     throughput at --threads <physical cores>.
-Milestone 3  DONE   HTTP/1.1 parsing (request line, headers, Content-Length
-                     body, keep-alive), response builder, HTTP reactor mode
-                     (--http). Docs/plan: docs/M3.md.
-Milestone 4  DONE   Config-driven phase pipeline: comptime module registry,
-                     nginx-style phase dispatch, prefix/exact routing, echo
-                     module, JSON or struct-literal config. Docs: docs/M4.md.
+```
+zig build run                          HTTP mode (default), port 8080
+zig build run -- --threads N           N reactor threads (default: CPU count)
+zig build run -- --port P              change port
+zig build run -- --config <file>       HTTP with a JSON config (routes + module bindings)
+zig build run -- --echo                raw byte-echo protocol (M1/M2 semantics)
+zig build run -- --single              M1 single-threaded echo server (A/B)
+zig build run -- --idle-timeout S      idle connection timeout in seconds (0 disables)
+```
 
-Run modes
+## Tests and benchmarks
 
-  zig build run                       HTTP mode (default), port 8080
-  zig build run -- --http --threads 4 HTTP, 4 reactors (best on this box)
-  zig build run -- --config <file>    HTTP, config-driven pipeline (JSON)
-  zig build run -- --echo             raw byte-echo, multi-reactor
-  zig build run -- --single           Milestone 1 single-threaded echo
-
-Benchmarks and correctness checks: see bench/BENCH.md and docs/M3.md, docs/M4.md.
+- `zig build test` — unit + concurrency tests (152 passing).
+- `bench/bench.sh`, `bench/bench2.sh`, `bench/summarize.py` — reproducible
+  benchmark harness; results and methodology in `bench/BENCH.md`.
+- `bench/compare-servers.sh` — cross-language comparison against actix-web,
+  Bun.serve and httpx.zig (pinned third-party submodules).
+- `bench/http-check.py`, `bench/echo-check.py` — end-to-end correctness checks.
