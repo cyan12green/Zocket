@@ -529,3 +529,46 @@ throughout (143 M11 tests + 2 new M12 tests = 145). Note: the in-process
 network integration tests were dropped because this sandbox's test-runner
 refuses TCP (`zig run` accepts it, `zig test` does not); the equivalent
 checks run end-to-end against the real server binary instead.
+
+## Milestone 13: observability + graceful reload
+
+Date: 2026-08-12, same box. The M12 tree plus: the `access_log` module (log
+phase; the combined format string is parsed at compile time into a token
+sequence — per-request formatting walks a constant token list with zero
+string scanning — with per-reactor buffered stderr writes flushed at 4 KB);
+the `error_log` module (log phase; severity derived from the status — error
+>= 500, warn 400-499, info below — filtered against a comptime threshold;
+the reactor also logs parse errors directly, since they never reach the
+pipeline); the `stub_status` module (content phase; nginx_status-style page
+rendered from shared atomic server counters — accepted/active/requests/
+reading/writing/waiting, updated by the reactors and the accept loop); and
+SIGHUP graceful reload: the main loop re-parses the config, builds a fresh
+reactor set with the new route table, swaps the dispatcher (new connections
+get the new config) and drains the old reactors (they stop accepting, serve
+existing connections to completion, then exit and are joined).
+
+**Correctness**: unit tests cover the comptime format-token parsing (all
+combined fields present), the log date format, error severity derivation and
+the stub page rendering. End-to-end: combined-format access log lines
+observed on stderr (`127.0.0.1 - - [12/Aug/2026:07:06:09 +0000] "POST /echo
+HTTP/1.1" 200 5 "-" "-"`), `[warn] ... -> 400 Bad Request` for parse errors,
+stub counters incrementing under load (active/requests/accepted), and the
+SIGHUP dance: config A (echo) -> swap file to config B (response template)
+-> SIGHUP -> new connections serve the template while a pre-existing
+keep-alive connection keeps the old config until it finishes. `zig build
+test` 149/149, `bench/http-check.py` 15/15.
+
+**Method**: same-day A/B against the pre-M13 tree (`ca45e28`, the M12
+commit), both `ReleaseFast`, default config, `--threads 4`, both verified
+15/15. Co-resident interleaved runs (10 reps of 10 s each). This A/B
+measures the always-on hot-path additions: the shared-counter atomics
+(~6-8 relaxed atomics per request).
+
+| conns | M13 req/s (median) | M12 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 237,514 | 236,138 | **+0.6%** |
+| 500 | 257,463 | 259,300 | **-0.7%** |
+
+**Conclusion**: within the <5% gate (+0.6% / -0.7% — the counter atomics are
+not measurably costly). `zig build test` green throughout (145 M12 tests +
+4 new M13 tests = 149).

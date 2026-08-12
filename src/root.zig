@@ -27,6 +27,9 @@ pub const dsl = struct {
         pub const cache = @import("dsl/modules/cache.zig");
         pub const static = @import("dsl/modules/static.zig");
         pub const proxy = @import("dsl/modules/proxy.zig");
+        pub const access_log = @import("dsl/modules/access_log.zig");
+        pub const error_log = @import("dsl/modules/error_log.zig");
+        pub const stub_status = @import("dsl/modules/stub_status.zig");
     };
 };
 
@@ -62,6 +65,9 @@ comptime {
     _ = @import("dsl/modules/cache.zig");
     _ = @import("dsl/modules/static.zig");
     _ = @import("dsl/modules/proxy.zig");
+    _ = @import("dsl/modules/access_log.zig");
+    _ = @import("dsl/modules/error_log.zig");
+    _ = @import("dsl/modules/stub_status.zig");
     _ = @import("runtime/config.zig");
     _ = @import("runtime/server.zig");
 }

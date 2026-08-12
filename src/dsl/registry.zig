@@ -74,6 +74,26 @@ pub const Context = struct {
     /// IPv4 address of the client (network byte order), for proxy headers
     /// (Milestone 12). Zeroes when unknown (socketpair tests).
     client_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    /// Shared server counters for the stub status page (Milestone 13),
+    /// updated atomically by the reactors.
+    stats: ?*const ServerStats = null,
+};
+
+/// Shared connection/request counters (Milestone 13): updated atomically by
+/// the reactors, rendered by the stub_status module. Defined here so the
+/// Context can reference it without an import cycle; the runtime Server
+/// re-exports it.
+pub const ServerStats = struct {
+    accepted: std.atomic.Value(u64) = .init(0),
+    active: std.atomic.Value(u64) = .init(0),
+    requests: std.atomic.Value(u64) = .init(0),
+    reading: std.atomic.Value(u64) = .init(0),
+    writing: std.atomic.Value(u64) = .init(0),
+    waiting: std.atomic.Value(u64) = .init(0),
+
+    pub fn init() ServerStats {
+        return .{};
+    }
 };
 
 pub const ModuleInfo = struct {
@@ -132,13 +152,16 @@ pub const default_registry = Registry(.{
     @import("modules/cache.zig").cache_headers,
     @import("modules/static.zig").static,
     @import("modules/proxy.zig").proxy,
+    @import("modules/access_log.zig").access_log,
+    @import("modules/error_log.zig").error_log,
+    @import("modules/stub_status.zig").stub_status,
 });
 
 const testing = std.testing;
 
 test "modules register themselves with a name and a phase" {
     const infos = default_registry.infos();
-    try testing.expectEqual(@as(usize, 6), infos.len);
+    try testing.expectEqual(@as(usize, 9), infos.len);
     try testing.expectEqualStrings("echo", infos[0].name);
     try testing.expectEqual(Phase.content, infos[0].phase);
 }

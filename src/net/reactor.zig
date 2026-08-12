@@ -38,6 +38,9 @@ const HttpSession = struct {
     /// Close the connection once the current response has been flushed
     /// (errors, and requests that asked for Connection: close).
     close_after_write: bool = false,
+    /// Stub-status accounting state (Milestone 13): which shared counter the
+    /// connection currently contributes to.
+    stat_state: enum { waiting, reading, writing } = .waiting,
 };
 
 /// A single-reactor worker: its own thread, its own epoll instance and its own
@@ -79,6 +82,13 @@ pub const Reactor = struct {
     /// after `advanceTo` returns (the wheel callback must not tear down
     /// objects whose entries are still linked).
     expired_fds: std.ArrayList(posix.fd_t),
+    /// Shared connection/request counters (Milestone 13); null in echo mode.
+    stats: ?*runtime_server.ServerStats = null,
+    /// Graceful-drain mode (Milestone 13): stop accepting new connections
+    /// and exit the loop once the connection map empties (or a timeout).
+    draining: std.atomic.Value(bool) = .init(false),
+    drained: std.atomic.Value(bool) = .init(false),
+    drain_started: std.time.Instant = undefined,
 
     pub fn init(allocator: std.mem.Allocator, id: usize, mode: Mode) !Reactor {
         return initWithTimeout(allocator, id, mode, default_idle_timeout_seconds);
@@ -127,6 +137,11 @@ pub const Reactor = struct {
             .epoch = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
             .wheel = .{},
             .expired_fds = .empty,
+            .stats = if (mode == .http)
+                @constCast((http_handler orelse &default_http_handler).stats)
+            else
+                null,
+            .drain_started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
         };
         errdefer self.ep.close();
         self.ep.add(self.wakeup.fd, epoll.Events.In, self.wakeup.fd) catch {
@@ -171,8 +186,29 @@ pub const Reactor = struct {
         }
     }
 
+    /// Graceful drain (Milestone 13): stop accepting new connections; the
+    /// loop exits once every existing connection has finished (or after
+    /// `drain_timeout_ns`). The reactor thread must be joined afterwards.
+    pub fn drain(self: *Reactor) void {
+        self.draining.store(true, .release);
+        self.drain_started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+        self.wakeup.write();
+    }
+
+    /// True once the reactor loop has exited after a drain (polled by the
+    /// server to join and free drained reactors).
+    pub fn isDrained(self: *const Reactor) bool {
+        return self.drained.load(.acquire);
+    }
+
     /// Hand a new connection to this reactor. Safe to call from any thread.
+    /// Rejected (and closed) while the reactor is draining.
     pub fn attach(self: *Reactor, conn: *connection.Connection) void {
+        if (self.draining.load(.acquire)) {
+            conn.close();
+            conn.destroy();
+            return;
+        }
         self.pending_lock.lock();
         defer self.pending_lock.unlock();
         self.pending.append(self.allocator, conn) catch {
@@ -187,10 +223,17 @@ pub const Reactor = struct {
         return self.connections.count();
     }
 
+    const drain_timeout_ns = 30 * std.time.ns_per_s;
+
     fn reactorLoop(self: *Reactor) void {
         sockets.pinToCpu(self.id);
         var events: [max_events]linux.epoll_event = undefined;
         while (self.running.load(.acquire)) {
+            if (self.draining.load(.acquire)) {
+                if (self.connections.count() == 0) break;
+                const now = std.time.Instant.now() catch break;
+                if (now.since(self.drain_started) > drain_timeout_ns) break;
+            }
             self.advanceTimers();
             const n = self.ep.wait(&events, 100) catch continue;
             for (events[0..n]) |ev| {
@@ -201,6 +244,7 @@ pub const Reactor = struct {
         // even if a connection arrived between the last wakeup and stop.
         self.wakeup.read();
         self.drainPending();
+        self.drained.store(true, .release);
     }
 
     /// Advance the timer wheel to the current wall tick and close every
@@ -226,6 +270,18 @@ pub const Reactor = struct {
     fn onExpired(self: *Reactor, entry: *timer_wheel.TimerEntry) void {
         const conn: *connection.Connection = @fieldParentPtr("timer", entry);
         self.expired_fds.append(self.allocator, conn.fd) catch {};
+    }
+
+    /// Stub-status accounting: the session moved from reading to writing
+    /// (a response has been queued).
+    fn markWriting(self: *Reactor, fd: posix.fd_t) void {
+        const stats = self.stats orelse return;
+        const session = self.http_sessions.getPtr(fd) orelse return;
+        if (session.stat_state == .reading) {
+            session.stat_state = .writing;
+            _ = stats.reading.fetchSub(1, .monotonic);
+            _ = stats.writing.fetchAdd(1, .monotonic);
+        }
     }
 
     /// (Re)arm the idle timer for `conn` at the current tick. Any recv is
@@ -314,7 +370,17 @@ pub const Reactor = struct {
                 }
                 got_data = true;
             }
-            if (got_data) self.rearmTimer(conn);
+            if (got_data) {
+                self.rearmTimer(conn);
+                if (self.stats) |s| {
+                    const session = self.http_sessions.getPtr(fd) orelse return;
+                    if (session.stat_state == .waiting) {
+                        session.stat_state = .reading;
+                        _ = s.waiting.fetchSub(1, .monotonic);
+                        _ = s.reading.fetchAdd(1, .monotonic);
+                    }
+                }
+            }
             const session = self.http_sessions.getPtr(fd) orelse return;
             if (!session.writing) self.processHttp(fd);
         }
@@ -374,6 +440,7 @@ pub const Reactor = struct {
                         .resp = &resp,
                         .allocator = self.allocator,
                         .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0 },
+                        .stats = self.stats,
                     };
                     const handler = self.http_handler orelse &default_http_handler;
 
@@ -396,6 +463,8 @@ pub const Reactor = struct {
                             _ = conn.send_buf.writeSlice(fb.body);
                         }
                         session.close_after_write = close;
+                        if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+                        self.markWriting(fd);
                         session.writing = true;
                         self.flushHttp(fd);
                         if (!self.connections.contains(fd)) return;
@@ -435,6 +504,8 @@ pub const Reactor = struct {
                     }
                     if (resp.body_owned) self.allocator.free(resp.body);
                     session.close_after_write = close;
+                    if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+                    self.markWriting(fd);
                     session.writing = true;
                     self.flushHttp(fd);
                     if (!self.connections.contains(fd)) return;
@@ -480,6 +551,13 @@ pub const Reactor = struct {
         }
 
         session.writing = false;
+        if (self.stats) |s| {
+            if (session.stat_state == .writing) {
+                session.stat_state = .waiting;
+                _ = s.writing.fetchSub(1, .monotonic);
+                _ = s.waiting.fetchAdd(1, .monotonic);
+            }
+        }
         session.parser.reset();
         session.req.reset();
         // Nothing to send: wait for the next request without spurious
@@ -503,6 +581,22 @@ pub const Reactor = struct {
     fn respondAndClose(self: *Reactor, fd: posix.fd_t, status: http_response.Status) void {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
+        // Milestone 13: error-log line for errors the pipeline never sees
+        // (parse failures). Pipeline-visible errors are logged by the
+        // error_log module when bound.
+        {
+            const code = @intFromEnum(status);
+            var ip_buf: [16]u8 = undefined;
+            const ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ conn.peer_ip[0], conn.peer_ip[1], conn.peer_ip[2], conn.peer_ip[3] }) catch "-";
+            var line_buf: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "[{s}] {s} - -> {d} {s}\n", .{
+                if (code >= 500) "error" else "warn",
+                ip,
+                code,
+                status.reasonPhrase(),
+            }) catch return;
+            _ = std.posix.write(2, line) catch {};
+        }
 
         var resp = http_response.Response.init(status);
         resp.setBody(status.reasonPhrase());
@@ -513,6 +607,8 @@ pub const Reactor = struct {
             return;
         };
         session.close_after_write = true;
+        if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+        self.markWriting(fd);
         session.writing = true;
         self.flushHttp(fd);
     }
@@ -571,6 +667,10 @@ pub const Reactor = struct {
             if (self.idle_timeout_ticks > 0) {
                 self.wheel.insert(&conn.timer, self.nowTick(), self.idle_timeout_ticks);
             }
+            if (self.stats) |s| {
+                _ = s.active.fetchAdd(1, .monotonic);
+                _ = s.waiting.fetchAdd(1, .monotonic);
+            }
             if (self.mode == .http) {
                 var session = HttpSession{
                     .parser = http_parser.Parser.init(self.allocator),
@@ -600,6 +700,14 @@ pub const Reactor = struct {
         }
         if (self.http_sessions.fetchRemove(fd)) |kv| {
             var sess = kv.value;
+            if (self.stats) |s| {
+                switch (sess.stat_state) {
+                    .waiting => _ = s.waiting.fetchSub(1, .monotonic),
+                    .reading => _ = s.reading.fetchSub(1, .monotonic),
+                    .writing => _ = s.writing.fetchSub(1, .monotonic),
+                }
+                _ = s.active.fetchSub(1, .monotonic);
+            }
             sess.parser.deinit();
             sess.req.deinit();
         }

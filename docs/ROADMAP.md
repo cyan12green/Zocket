@@ -450,6 +450,23 @@ rewriting rules can be validated at comptime for struct-literal configs.
 
 ### M13 — Observability + graceful reload
 
+**Status: DONE** (2026-08-12). `access_log` module (log phase): the combined
+format string is parsed at comptime into a token sequence (zero per-request
+string scanning), buffered per-reactor stderr writes. `error_log` module:
+severity derived from the status, filtered against a comptime threshold; the
+reactor also logs parse errors directly (they never reach the pipeline).
+`stub_status` module: nginx_status-style page from shared atomic server
+counters (`ServerStats`; accepted/active/requests/reading/writing/waiting,
+updated by the reactors and accept loop). SIGHUP graceful reload:
+`installSignalHandlers` + `multireactor.Server.reload_fn` — the main loop
+re-parses the config, swaps in a fresh reactor set with the new handler and
+dispatcher (new connections get the new config), and drains the old reactors
+(no new accepts; existing connections finish; join when empty or after 30 s).
+Gates met: 4 new unit tests + e2e verification (combined-format lines on
+stderr, parse-error warn lines, stub counters under load, the full SIGHUP
+config-A→B dance with old-connection drain), `zig build test` 149/149,
+M13 A/B in `bench/BENCH.md` (+0.6% / -0.7%, within gate).
+
 *Depends on*: M10 (static files for log content) + M12 (proxy metrics).
 
 - **Access log module** (`dsl/modules/access_log.zig`, `log` phase):

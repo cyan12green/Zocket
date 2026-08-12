@@ -6,6 +6,10 @@ const router_mod = @import("../dsl/router.zig");
 
 pub const Config = config_mod.Config;
 pub const default_registry = registry.default_registry;
+pub const ServerStats = registry.ServerStats;
+
+/// Shared counters for the default (comptime) server instance.
+var default_stats: ServerStats = .{};
 
 /// The config-driven HTTP request processor. A single immutable instance is
 /// shared by every reactor; it holds the route table and dispatches each fully
@@ -20,6 +24,10 @@ pub const default_registry = registry.default_registry;
 pub const Server = struct {
     cfg: Config,
     router: router_mod.Router = .{},
+    /// Shared connection/request counters (Milestone 13). Points at the
+    /// process-global `default_stats` for comptime/default servers and at an
+    /// allocator-owned struct for JSON-config servers (freed by `deinit`).
+    stats: *ServerStats = &default_stats,
 
     /// Plain constructor: no trie, linear route matching. Kept for tests and
     /// embedders that construct routes at runtime.
@@ -51,9 +59,12 @@ pub const Server = struct {
     /// call `deinit` to free them.
     pub fn initWithTrie(allocator: std.mem.Allocator, cfg: Config) !Server {
         const trie = try router_mod.buildTrieRuntime(allocator, cfg.routes);
+        const stats = try allocator.create(ServerStats);
+        errdefer allocator.destroy(stats);
         return .{
             .cfg = cfg,
             .router = .{ .routes = cfg.routes, .trie = trie, .owned = true },
+            .stats = stats,
         };
     }
 
@@ -61,6 +72,7 @@ pub const Server = struct {
     /// comptime and plain-init servers).
     pub fn deinit(self: *Server, allocator: std.mem.Allocator) void {
         self.router.deinit(allocator);
+        if (self.stats != &default_stats) allocator.destroy(self.stats);
     }
 
     /// The default server: echo module on the catch-all route, the pre-pipeline

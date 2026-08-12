@@ -68,6 +68,50 @@ pub fn main() !void {
     const n = threads orelse (std.Thread.getCpuCount() catch 1);
     var s = try tcp_server.multireactor.Server.initWithThreadsAndHandlerTimeout(allocator, port, n, mode, &http_srv, idle_timeout);
     defer s.deinit();
+
+    // Graceful reload (Milestone 13): SIGHUP re-parses the config and swaps
+    // in a fresh reactor set; old connections drain on the old set. Only
+    // meaningful with --config; old handlers stay alive until process exit.
+    tcp_server.multireactor.installSignalHandlers();
+    var reload_handlers = std.ArrayList(*tcp_server.runtime.server.Server).empty;
+    defer reload_handlers.deinit(allocator);
+    if (config_path) |path| {
+        const ReloadState = struct {
+            allocator: std.mem.Allocator,
+            config_path: []const u8,
+            handlers: *std.ArrayList(*tcp_server.runtime.server.Server),
+
+            fn reload(userdata: *anyopaque) ?*const tcp_server.runtime.server.Server {
+                const st: *@This() = @ptrCast(@alignCast(userdata));
+                const json = std.fs.cwd().readFileAlloc(st.config_path, st.allocator, .limited(1 << 20)) catch return null;
+                defer st.allocator.free(json);
+                var cfg = tcp_server.runtime.config.Config.fromJson(st.allocator, json) catch return null;
+                cfg.validate(tcp_server.dsl.registry.default_registry) catch return null;
+                // The config memory must outlive the handler (the server's
+                // route table points into it); it is freed at process exit
+                // along with the handler itself (one leak per reload).
+                const srv = st.allocator.create(tcp_server.runtime.server.Server) catch return null;
+                srv.* = tcp_server.runtime.server.Server.initWithTrie(st.allocator, cfg) catch {
+                    st.allocator.destroy(srv);
+                    return null;
+                };
+                st.handlers.append(st.allocator, srv) catch {
+                    st.allocator.destroy(srv);
+                    return null;
+                };
+                std.debug.print("reload: config re-parsed\n", .{});
+                return srv;
+            }
+        };
+        var reload_state = ReloadState{
+            .allocator = allocator,
+            .config_path = path,
+            .handlers = &reload_handlers,
+        };
+        s.reload_fn = ReloadState.reload;
+        s.reload_userdata = &reload_state;
+    }
+
     switch (mode) {
         .echo => std.debug.print("Starting multi-reactor TCP echo server on port {} with {} threads\n", .{ port, n }),
         .http => std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads\n", .{ port, n }),

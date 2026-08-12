@@ -34,6 +34,13 @@ pub const Server = struct {
     /// Connection idle timeout in seconds, forwarded to every reactor (zero
     /// disables idle reaping).
     idle_timeout_seconds: u32,
+    /// Graceful reload (Milestone 13): set by the embedder along with
+    /// `reload_userdata`; on SIGHUP the loop calls it to get a new HTTP
+    /// handler, swaps in a fresh reactor set and drains the old one.
+    reload_fn: ?*const fn (*anyopaque) ?*const runtime_server.Server = null,
+    reload_userdata: ?*anyopaque = null,
+    /// Old reactor sets waiting for their connections to finish.
+    draining: std.ArrayList(*reactor.Reactor) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !Server {
         const n = try std.Thread.getCpuCount();
@@ -108,6 +115,9 @@ pub const Server = struct {
             .mode = mode,
             .http_handler = http_handler,
             .idle_timeout_seconds = idle_timeout_seconds,
+            .reload_fn = null,
+            .reload_userdata = null,
+            .draining = .empty,
         };
 
         self.main_ep.add(self.listener, epoll.Events.In | epoll.Events.EdgeTriggered, self.listener) catch |e| {
@@ -127,6 +137,7 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         for (self.reactors.items) |r| r.deinit();
         self.reactors.deinit(self.allocator);
+        self.draining.deinit(self.allocator);
         self.main_ep.close();
         self.stop_ev.close();
         posix.close(self.listener);
@@ -159,7 +170,9 @@ pub const Server = struct {
 
     /// Blocking event loop. Starts the reactor threads, accepts connections and
     /// dispatches them round-robin; returns when `stop` is called (or an error
-    /// is fatal), then stops and joins all reactor threads.
+    /// is fatal), then stops and joins all reactor threads. On SIGHUP
+    /// (`reload_requested`), swaps in a fresh reactor set with the reload
+    /// callback's handler and drains the old set.
     pub fn run(self: *Server) !void {
         for (self.reactors.items) |r| try r.start();
 
@@ -167,6 +180,8 @@ pub const Server = struct {
         var events: [max_events]linux.epoll_event = undefined;
 
         while (self.running.load(.acquire)) {
+            self.maybeReload();
+            self.reapDrained();
             const n = self.main_ep.wait(&events, 100) catch continue;
             for (events[0..n]) |ev| {
                 const fd: posix.fd_t = @intCast(ev.data.ptr);
@@ -185,6 +200,56 @@ pub const Server = struct {
         self.shutdownReactors();
     }
 
+    /// SIGHUP reload: re-create the reactor set with the new handler; old
+    /// reactors drain in the background (existing connections finish, no new
+    /// ones are accepted) and are joined once empty.
+    fn maybeReload(self: *Server) void {
+        if (!reload_requested.load(.acquire)) return;
+        reload_requested.store(false, .release);
+        const new_handler = (self.reload_fn orelse return)(self.reload_userdata orelse return) orelse return;
+
+        var new_reactors = std.ArrayList(*reactor.Reactor).empty;
+        new_reactors.ensureTotalCapacity(self.allocator, self.reactors.items.len) catch return;
+        errdefer {
+            for (new_reactors.items) |r| r.deinit();
+            new_reactors.deinit(self.allocator);
+        }
+        for (0..self.reactors.items.len) |i| {
+            const r = self.allocator.create(reactor.Reactor) catch return;
+            r.* = reactor.Reactor.initWithHandlerTimeout(self.allocator, i, self.mode, new_handler, self.idle_timeout_seconds) catch {
+                self.allocator.destroy(r);
+                return;
+            };
+            new_reactors.appendAssumeCapacity(r);
+        }
+
+        var old = self.reactors;
+        self.reactors = new_reactors;
+        self.dispatch = dispatcher.Dispatcher.init(self.reactors.items);
+        self.http_handler = new_handler;
+        for (old.items) |r| r.drain();
+        self.draining.appendSlice(self.allocator, old.items) catch {};
+        old.deinit(self.allocator);
+        for (self.reactors.items) |r| r.start() catch {};
+        std.debug.print("reloaded: new route table active; draining {d} old reactor(s)\n", .{old.items.len});
+    }
+
+    /// Join and free drained reactors whose loops have exited.
+    fn reapDrained(self: *Server) void {
+        var i: usize = 0;
+        while (i < self.draining.items.len) {
+            const r = self.draining.items[i];
+            if (r.isDrained()) {
+                r.join();
+                r.deinit();
+                self.allocator.destroy(r);
+                _ = self.draining.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     fn drainAccepts(self: *Server) !void {
         while (true) {
             const conn_fd = sockets.acceptNonBlock(self.listener) catch |e| {
@@ -192,6 +257,7 @@ pub const Server = struct {
                 return e;
             };
             _ = self.total_accepted.fetchAdd(1, .monotonic);
+            if (self.http_handler) |h| _ = h.stats.accepted.fetchAdd(1, .monotonic);
 
             const conn = connection.Connection.create(self.allocator, conn_fd) catch |e| {
                 posix.close(conn_fd);
@@ -205,6 +271,13 @@ pub const Server = struct {
     fn shutdownReactors(self: *Server) void {
         for (self.reactors.items) |r| r.stop();
         for (self.reactors.items) |r| r.join();
+        // Any still-draining reactors are stopped and joined too.
+        for (self.draining.items) |r| r.stop();
+        for (self.draining.items) |r| {
+            r.join();
+            r.deinit();
+            self.allocator.destroy(r);
+        }
     }
 };
 
@@ -413,4 +486,22 @@ test "multi-reactor HTTP with JSON config echoes via the pipeline" {
 
     server.stop();
     run_thread.join();
+}
+// ---- SIGHUP graceful reload ----
+
+/// Set by the SIGHUP handler (async-signal-safe: an atomic store).
+var reload_requested = std.atomic.Value(bool).init(false);
+
+fn handleHup(_: posix.SIG) callconv(.c) void {
+    reload_requested.store(true, .release);
+}
+
+/// Install the SIGHUP handler (called by the embedder, e.g. main).
+pub fn installSignalHandlers() void {
+    var act = posix.Sigaction{
+        .handler = .{ .handler = handleHup },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.HUP, &act, null);
 }
