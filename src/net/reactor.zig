@@ -373,6 +373,7 @@ pub const Reactor = struct {
                         .req = &session.req,
                         .resp = &resp,
                         .allocator = self.allocator,
+                        .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0 },
                     };
                     const handler = self.http_handler orelse &default_http_handler;
 

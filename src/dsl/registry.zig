@@ -71,6 +71,9 @@ pub const Context = struct {
     /// modules. Set by e.g. a post_read-phase stat.
     etag: ?[]const u8 = null,
     last_modified: ?[]const u8 = null,
+    /// IPv4 address of the client (network byte order), for proxy headers
+    /// (Milestone 12). Zeroes when unknown (socketpair tests).
+    client_ip: [4]u8 = .{ 0, 0, 0, 0 },
 };
 
 pub const ModuleInfo = struct {
@@ -128,13 +131,14 @@ pub const default_registry = Registry(.{
     @import("modules/cache.zig").conditional_get,
     @import("modules/cache.zig").cache_headers,
     @import("modules/static.zig").static,
+    @import("modules/proxy.zig").proxy,
 });
 
 const testing = std.testing;
 
 test "modules register themselves with a name and a phase" {
     const infos = default_registry.infos();
-    try testing.expectEqual(@as(usize, 5), infos.len);
+    try testing.expectEqual(@as(usize, 6), infos.len);
     try testing.expectEqualStrings("echo", infos[0].name);
     try testing.expectEqual(Phase.content, infos[0].phase);
 }

@@ -197,6 +197,7 @@ pub const Server = struct {
                 posix.close(conn_fd);
                 return e;
             };
+            conn.peer_ip = sockets.peerIp(conn_fd);
             self.dispatch.pick().attach(conn);
         }
     }

@@ -168,6 +168,12 @@ fn assignDispatchImpl(comptime Registry: type, comptime routes: []const router.R
         if (r.response) |t| {
             out[i].response_bytes = router.serializeResponseTemplate(t);
         }
+        // Milestone 12: upstream sockaddrs pre-computed at compile time
+        // (host literals — no DNS, no runtime byte-swapping).
+        inline for (r.upstreams, 0..) |up, j| {
+            out[i].upstreams[j].sockaddr = router.Upstream.makeSockaddr(up.host, up.port) orelse
+                @compileError("proxy upstream host must be an IPv4 literal: " ++ up.host);
+        }
     }
     return out;
 }

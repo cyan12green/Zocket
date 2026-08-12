@@ -118,3 +118,15 @@ pub fn pinToCpu(cpu: usize) void {
     set[cpu_idx / 64] |= @as(usize, 1) << @intCast(cpu_idx % 64);
     linux.sched_setaffinity(0, &set) catch {};
 }
+/// IPv4 address of the peer (network byte order), or zeroes for non-INET
+/// peers (socketpairs in tests). Used for proxy headers (Milestone 12).
+pub fn peerIp(fd: posix.fd_t) [4]u8 {
+    var addr: sockaddr_in = undefined;
+    var len: posix.socklen_t = @sizeOf(sockaddr_in);
+    if (posix.getpeername(fd, @as(*posix.sockaddr, @ptrCast(&addr)), &len)) |_| {
+        if (addr.sin_family == AF_INET) {
+            return std.mem.toBytes(addr.sin_addr);
+        }
+    } else |_| {}
+    return .{ 0, 0, 0, 0 };
+}

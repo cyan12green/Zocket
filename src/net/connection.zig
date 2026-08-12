@@ -12,6 +12,9 @@ pub const Connection = struct {
     /// connection is registered and re-armed on every recv; the reactor's
     /// timer wheel unlinks and fires it when the connection goes idle.
     timer: timer_wheel.TimerEntry = .{},
+    /// IPv4 address of the peer, in network byte order (Milestone 12; set by
+    /// the accept path for the proxy module's X-Forwarded-For/X-Real-IP).
+    peer_ip: [4]u8 = .{ 0, 0, 0, 0 },
 
     pub fn create(allocator: std.mem.Allocator, fd: posix.fd_t) !*Connection {
         const conn = try allocator.create(Connection);

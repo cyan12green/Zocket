@@ -64,6 +64,8 @@ pub const Config = struct {
                 allocator.free(t.headers);
                 if (t.body.len > 0) allocator.free(t.body);
             }
+            for (r.upstreams) |up| allocator.free(up.host);
+            allocator.free(r.upstreams);
         }
         allocator.free(self.routes);
     }
@@ -128,6 +130,23 @@ pub const Config = struct {
                     .compress = jrsp.compress,
                 };
             }
+            var upstreams = std.ArrayList(router.Upstream).empty;
+            if (jr.upstreams) |jus| {
+                try upstreams.ensureTotalCapacity(allocator, jus.len);
+                for (jus) |ju| {
+                    const sock = router.Upstream.makeSockaddr(ju.host, ju.port) orelse return error.InvalidUpstreamHost;
+                    upstreams.appendAssumeCapacity(.{
+                        .host = try allocator.dupe(u8, ju.host),
+                        .port = ju.port,
+                        .sockaddr = sock,
+                    });
+                }
+            }
+            errdefer {
+                for (upstreams.items) |up| allocator.free(up.host);
+                upstreams.deinit(allocator);
+            }
+            const balance = if (jr.balance) |b| (router.Balance.parse(b) orelse return error.InvalidBalance) else router.Balance.round_robin;
             errdefer if (template) |*t| {
                 for (t.headers) |h| {
                     allocator.free(h.name);
@@ -146,6 +165,10 @@ pub const Config = struct {
                 .autoindex = jr.autoindex,
                 .embed = jr.embed,
                 .response = template,
+                .upstreams = try upstreams.toOwnedSlice(allocator),
+                .balance = balance,
+                .max_fails = jr.max_fails,
+                .fail_timeout_seconds = jr.fail_timeout_seconds,
             });
         }
 
@@ -175,6 +198,11 @@ const JsonResponse = struct {
     compress: bool = false,
 };
 
+const JsonUpstream = struct {
+    host: []const u8,
+    port: u16,
+};
+
 const JsonRoute = struct {
     path: []const u8,
     match: []const u8 = "prefix",
@@ -185,6 +213,10 @@ const JsonRoute = struct {
     autoindex: bool = false,
     embed: ?[]const u8 = null,
     response: ?JsonResponse = null,
+    upstreams: ?[]const JsonUpstream = null,
+    balance: ?[]const u8 = null,
+    max_fails: u32 = 3,
+    fail_timeout_seconds: u32 = 30,
 };
 
 const JsonConfig = struct {

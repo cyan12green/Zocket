@@ -47,6 +47,12 @@ pub const Route = struct {
     /// the template is applied when nothing claims the request.
     response: ?ResponseTemplate = null,
     response_bytes: ?FastResponse = null,
+    /// Reverse proxy (Milestone 12): upstream backends, load-balance
+    /// strategy and passive health-check parameters.
+    upstreams: []const Upstream = &.{},
+    balance: Balance = .round_robin,
+    max_fails: u32 = 3,
+    fail_timeout_seconds: u32 = 30,
 
     /// The module name bound to `phase` on this route, if any.
     pub fn moduleFor(self: *const Route, phase: Phase) ?[]const u8 {
@@ -81,6 +87,52 @@ pub const no_route = std.math.maxInt(u32);
 
 /// One header of a fixed-response template.
 pub const TemplateHeader = struct { name: []const u8, value: []const u8 };
+
+/// Load-balance strategy for a proxy route (Milestone 12). The dispatch is a
+/// comptime switch: dead strategies are eliminated from the binary.
+pub const Balance = enum {
+    round_robin,
+    least_connections,
+    ip_hash,
+
+    pub fn parse(s: []const u8) ?Balance {
+        if (std.mem.eql(u8, s, "round_robin")) return .round_robin;
+        if (std.mem.eql(u8, s, "least_connections")) return .least_connections;
+        if (std.mem.eql(u8, s, "ip_hash")) return .ip_hash;
+        return null;
+    }
+};
+
+/// One proxy backend (Milestone 12). The `sockaddr` is pre-computed: at
+/// compile time for struct-literal configs (host is a comptime IP literal —
+/// no DNS, no runtime byte-swapping), at startup for JSON configs.
+pub const Upstream = struct {
+    host: []const u8,
+    port: u16,
+    sockaddr: std.posix.sockaddr = .{ .family = 0, .data = [_]u8{0} ** 14 },
+
+    /// Build the kernel sockaddr for an IPv4 host literal ("127.0.0.1").
+    /// Works at comptime (struct-literal configs) and at runtime (JSON).
+    pub fn makeSockaddr(host: []const u8, port: u16) ?std.posix.sockaddr {
+        var octets: [4]u8 = undefined;
+        var it = std.mem.splitScalar(u8, host, '.');
+        var i: usize = 0;
+        while (it.next()) |part| {
+            if (i >= 4) return null;
+            const v = std.fmt.parseInt(u8, part, 10) catch return null;
+            octets[i] = v;
+            i += 1;
+        }
+        if (i != 4) return null;
+        var addr: std.posix.sockaddr = .{
+            .family = std.posix.AF.INET,
+            .data = [_]u8{0} ** 14,
+        };
+        std.mem.writeInt(u16, addr.data[0..2], port, .big);
+        std.mem.writeInt(u32, addr.data[2..6], std.mem.readInt(u32, &octets, .big), .big);
+        return addr;
+    }
+};
 
 /// A fixed response served from pre-serialised bytes (Milestone 11):
 /// redirects, healthchecks, error pages.

@@ -26,6 +26,7 @@ pub const dsl = struct {
         pub const gzip = @import("dsl/modules/gzip.zig");
         pub const cache = @import("dsl/modules/cache.zig");
         pub const static = @import("dsl/modules/static.zig");
+        pub const proxy = @import("dsl/modules/proxy.zig");
     };
 };
 
@@ -60,6 +61,7 @@ comptime {
     _ = @import("dsl/modules/gzip.zig");
     _ = @import("dsl/modules/cache.zig");
     _ = @import("dsl/modules/static.zig");
+    _ = @import("dsl/modules/proxy.zig");
     _ = @import("runtime/config.zig");
     _ = @import("runtime/server.zig");
 }

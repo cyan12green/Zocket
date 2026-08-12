@@ -396,6 +396,22 @@ in `.rodata`.
 
 ### M12 — Reverse proxy
 
+**Status: DONE** (2026-08-12). `dsl/modules/proxy.zig` (rewrite phase):
+per-backend keep-alive connection pool (thread-local, one socket per backend
+per reactor, lazily reaped after idle), request forwarding with Host
+rewriting, hop-by-hop header stripping and Content-Length bodies, comptime-
+switched load balancing (round-robin / least-connections / ip_hash), passive
+failure detection (skip for `fail_timeout_seconds` after `max_fails`
+consecutive errors, then retry), pre-computed upstream sockaddrs (comptime
+for struct configs — no DNS — startup for JSON), X-Forwarded-For/X-Real-IP
+from the peer address captured at accept (`Connection.peer_ip` +
+`Context.client_ip`). Upstream TLS deferred (roadmap note). Gates met:
+2 unit tests (comptime sockaddr byte-identity, balance parse) + e2e
+verification with `bench/config-proxy.json` (bodies echoed, pool reuse via
+the upstream connection counter, XFF observed, 502 on a dead upstream,
+round-robin), `zig build test` 145/145, M12 A/B in `bench/BENCH.md`
+(-3.6% / +6.5%, within gate).
+
 *Depends on*: M8 (header hashing) + M7 (trie + dispatch) + M5 (connection lifecycle).
 
 A `rewrite`-phase proxy module (`dsl/modules/proxy.zig`).

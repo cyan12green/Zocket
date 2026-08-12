@@ -485,3 +485,47 @@ commit), both `ReleaseFast`, default config, `--threads 4`, both verified
 no templates, so this measures the Route additions and reactor fast-path
 check — noise). `zig build test` green throughout (138 M10 tests + 5 new
 M11 tests = 143).
+
+## Milestone 12: reverse proxy
+
+Date: 2026-08-12, same box. The M11 tree plus the `proxy` rewrite-phase
+module: per-backend keep-alive connection pool (thread-local, one socket per
+backend per reactor, reaped lazily after 60 s idle), request forwarding
+(method/target/Host rewriting, hop-by-hop header stripping, Content-Length
+body), load balancing via a comptime-switched strategy (round-robin,
+least-connections, IP-hash), passive failure detection (a backend is skipped
+for `fail_timeout_seconds` after `max_fails` consecutive connect/read
+errors, then retried), pre-computed upstream sockaddrs (comptime for
+struct-literal configs — no DNS, no runtime byte-swapping; startup for JSON),
+and X-Forwarded-For/X-Real-IP from the client address captured at accept.
+Upstream TLS is deferred (roadmap note). The upstream I/O is synchronous with
+a 5 s receive timeout (documented limitation).
+
+**Correctness**: unit tests cover the comptime sockaddr being byte-identical
+to a runtime-built one and the balance-strategy parser. The network paths are
+verified end-to-end against `bench/config-proxy.json` (two python echo
+upstreams on 19090/19091 + a dead port): proxied POST bodies echoed
+byte-for-byte with the upstream's Content-Type, round-robin across backends,
+`X-Forwarded-For: 127.0.0.1` observed by the upstream, two keep-alive
+requests on one client connection served through a single upstream socket
+(pool reuse, confirmed by the upstream's connection counter), and a dead
+upstream yields 502 (with passive-failure marking). `bench/http-check.py`
+15/15.
+
+**Method**: same-day A/B against the pre-M12 tree (`04a61e3`, the M11
+commit), both `ReleaseFast`, default config, `--threads 4`, both verified
+15/15. Co-resident interleaved runs (10 reps of 10 s each; the c500 run was
+re-done after a load spike).
+
+| conns | M12 req/s (median) | M11 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 222,406 | 230,657 | **-3.6%** |
+| 500 | 256,784 | 241,117 | **+6.5%** |
+
+**Conclusion**: within the <5% gate (-3.6% / +6.5%, inside the run-to-run
+envelope; the default config binds no proxy routes, so the A/B measures the
+route/context/connection additions — noise). `zig build test` green
+throughout (143 M11 tests + 2 new M12 tests = 145). Note: the in-process
+network integration tests were dropped because this sandbox's test-runner
+refuses TCP (`zig run` accepts it, `zig test` does not); the equivalent
+checks run end-to-end against the real server binary instead.

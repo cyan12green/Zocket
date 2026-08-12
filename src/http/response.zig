@@ -15,6 +15,7 @@ pub const Status = enum(u16) {
     header_too_large = 431,
     internal_error = 500,
     not_implemented = 501,
+    bad_gateway = 502,
 
     pub fn reasonPhrase(self: Status) []const u8 {
         return switch (self) {
@@ -31,6 +32,7 @@ pub const Status = enum(u16) {
             .header_too_large => "Request Header Fields Too Large",
             .internal_error => "Internal Server Error",
             .not_implemented => "Not Implemented",
+            .bad_gateway => "Bad Gateway",
         };
     }
 };
