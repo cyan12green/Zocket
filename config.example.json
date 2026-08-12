@@ -17,6 +17,14 @@
       }
     },
     {
+      "path": "/static",
+      "match": "prefix",
+      "modules": { "content": "static" },
+      "root": "testdata",
+      "index": "index.html",
+      "autoindex": true
+    },
+    {
       "path": "/",
       "match": "prefix",
       "modules": { "content": "echo" }

@@ -128,6 +128,12 @@ fn assignDispatchImpl(comptime Registry: type, comptime routes: []const router.R
     inline for (routes, 0..) |r, i| {
         out[i] = r;
         out[i].dispatch = dispatchForRoute(Registry, r);
+        // Milestone 10: comptime-embedded static assets. An invalid embed
+        // path is a compile error here. Paths are project-root-relative
+        // (the `embeds` module lives at the root for @embedFile).
+        if (r.embed) |embed_path| {
+            out[i].embed_bytes = @import("embeds").embed(embed_path);
+        }
     }
     return out;
 }

@@ -54,6 +54,8 @@ pub const Config = struct {
             }
             allocator.free(r.modules);
             allocator.free(r.path);
+            if (r.root) |root| allocator.free(root);
+            if (r.index) |index| allocator.free(index);
         }
         allocator.free(self.routes);
     }
@@ -93,11 +95,20 @@ pub const Config = struct {
                 }
             }
 
+            const root = if (jr.root) |r| try allocator.dupe(u8, r) else null;
+            errdefer if (root) |r| allocator.free(r);
+            const index = if (jr.index) |ix| try allocator.dupe(u8, ix) else null;
+            errdefer if (index) |ix| allocator.free(ix);
+
             routes.appendAssumeCapacity(.{
                 .path = path,
                 .match = if (std.mem.eql(u8, jr.match, "exact")) .exact else .prefix,
                 .modules = try bindings.toOwnedSlice(allocator),
                 .max_age_seconds = jr.max_age,
+                .root = root,
+                .index = index,
+                .autoindex = jr.autoindex,
+                .embed = jr.embed,
             });
         }
 
@@ -123,6 +134,10 @@ const JsonRoute = struct {
     match: []const u8 = "prefix",
     modules: JsonModuleMap = .{},
     max_age: u32 = 0,
+    root: ?[]const u8 = null,
+    index: ?[]const u8 = null,
+    autoindex: bool = false,
+    embed: ?[]const u8 = null,
 };
 
 const JsonConfig = struct {

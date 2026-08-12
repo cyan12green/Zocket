@@ -281,6 +281,18 @@ deflate implementation or defer this sub-task).
 
 ### M10 — Static file serving (disk + comptime embedded)
 
+**Status: DONE** (2026-08-12). `dsl/modules/static.zig`: disk serving
+(`root`/`index`/`autoindex` route config; `..` traversal blocking and
+symlink-escape rejection via realpath comparison; MIME table; ETag
+`"mtime-size"` + Last-Modified; single ranges → 206, multi → full 200,
+unsatisfiable → 416; If-None-Match / If-Modified-Since → 304) and comptime
+embedded assets (`embed` route field resolved at compile time through the
+root-level `embeds` module — a compile error on a missing file — served from
+.rodata with zero disk I/O and an infinite cache lifetime; JSON configs use
+disk only). `testdata/` fixtures. Gates met: 9 new module tests + e2e curl
+checks (file/206/416/304/traversal/index/autoindex/embedded), `zig build
+test` 138/138, M10 A/B in `bench/BENCH.md` (-1.0% / +0.1%, within gate).
+
 *Depends on*: M6 (URL decoding, Content-Type) + M7 (trie + dispatch) +
 M9 (cache headers, gzip).
 

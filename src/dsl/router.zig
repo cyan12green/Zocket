@@ -32,6 +32,14 @@ pub const Route = struct {
     /// Default cache lifetime in seconds (Milestone 9): the cache-header
     /// module emits `Cache-Control: max-age=N` from this. 0 = no-cache.
     max_age_seconds: u32 = 0,
+    /// Static-file serving (Milestone 10): root directory on disk; optional
+    /// `index` file for directories; `autoindex` to list them. `embed` names
+    /// a file baked into .rodata at compile time (`embed_bytes`).
+    root: ?[]const u8 = null,
+    index: ?[]const u8 = null,
+    autoindex: bool = false,
+    embed: ?[]const u8 = null,
+    embed_bytes: []const u8 = &.{},
 
     /// The module name bound to `phase` on this route, if any.
     pub fn moduleFor(self: *const Route, phase: Phase) ?[]const u8 {

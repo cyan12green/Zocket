@@ -3,7 +3,9 @@ const buffer_mod = @import("../net/buffer.zig");
 
 pub const Status = enum(u16) {
     ok = 200,
+    partial_content = 206,
     not_modified = 304,
+    range_not_satisfiable = 416,
     bad_request = 400,
     not_found = 404,
     payload_too_large = 413,
@@ -14,7 +16,9 @@ pub const Status = enum(u16) {
     pub fn reasonPhrase(self: Status) []const u8 {
         return switch (self) {
             .ok => "OK",
+            .partial_content => "Partial Content",
             .not_modified => "Not Modified",
+            .range_not_satisfiable => "Range Not Satisfiable",
             .bad_request => "Bad Request",
             .not_found => "Not Found",
             .payload_too_large => "Payload Too Large",

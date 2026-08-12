@@ -403,3 +403,39 @@ so the A/B measures the pipeline post-processing hook, Context additions and
 the reactor's owned-body free — all in the noise envelope; the +6.7% at c500
 is measurement noise in M9's favour). `zig build test` green throughout
 (121 M8 tests + 8 new M9 tests = 129).
+
+## Milestone 10: static file serving (disk + comptime embedded)
+
+Date: 2026-08-12, same box (rebooted since the M9 session; load settled to
+~0.6 before the final measurement). The M9 tree plus the `static` content
+module: disk serving (`root`/`index`/`autoindex` route config; route-prefix
+stripping; `..` traversal blocking; symlink-escape rejection via realpath
+comparison against the route root; Content-Type from the M6 MIME table; ETag
+`"mtime-size"` + Last-Modified; single ranges → 206 + Content-Range,
+multi-range → full 200, unsatisfiable → 416; If-None-Match /
+If-Modified-Since → 304) and comptime-embedded assets (`embed` route field,
+baked into .rodata at compile time via the root-level `embeds` module, served
+with zero disk I/O and an infinite cache lifetime).
+
+**Correctness**: unit tests cover byte-identical file bodies, index serving,
+206/416/304 paths, traversal and missing-file 404s, and embedded-vs-disk
+byte equality. End-to-end against `config.example.json` (`/static` → testdata,
+autoindex on): file 200 with ETag/Last-Modified/Accept-Ranges, `Range:
+bytes=0-4` → 206, `bytes=999-` → 416, `/static/../gzip` → 404, `/static/dir/`
+→ index, `/static/listing/` → autoindex HTML, `If-None-Match: <etag>` → 304.
+Gzip/cache/echo routes from M9 verified unaffected. `bench/http-check.py`
+15/15.
+
+**Method**: same-day A/B against the pre-M10 tree (`8cf068e`, the M9 commit),
+both `ReleaseFast`, default config, `--threads 4`, both verified 15/15.
+Co-resident interleaved runs (10 reps of 10 s each; a load spike forced a
+c500 re-run, recorded clean).
+
+| conns | M10 req/s (median) | M9 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 264,483 | 267,158 | **-1.0%** |
+| 500 | 275,576 | 275,425 | **+0.1%** |
+
+**Conclusion**: within the <5% gate (-1.0% / +0.1%; the default config binds
+no new modules, so this measures the Route/registry additions — noise).
+`zig build test` green throughout (129 M9 tests + 9 new M10 tests = 138).

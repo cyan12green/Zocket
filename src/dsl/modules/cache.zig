@@ -51,8 +51,9 @@ fn notModified(ctx: *Context) Action {
 }
 
 /// True if a comma-separated If-None-Match value matches `etag` (a strong
-/// tag). `*` matches anything; `W/` weak prefixes are tolerated.
-fn etagMatches(value: []const u8, etag: []const u8) bool {
+/// tag). `*` matches anything; `W/` weak prefixes are tolerated. Exported for
+/// content modules (e.g. static) that answer their own conditional requests.
+pub fn etagMatches(value: []const u8, etag: []const u8) bool {
     var tokens = std.mem.tokenizeAny(u8, value, ",");
     while (tokens.next()) |t| {
         var tok = std.mem.trim(u8, t, " \t");

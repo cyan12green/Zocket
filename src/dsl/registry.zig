@@ -127,13 +127,14 @@ pub const default_registry = Registry(.{
     @import("modules/gzip.zig").gzip,
     @import("modules/cache.zig").conditional_get,
     @import("modules/cache.zig").cache_headers,
+    @import("modules/static.zig").static,
 });
 
 const testing = std.testing;
 
 test "modules register themselves with a name and a phase" {
     const infos = default_registry.infos();
-    try testing.expectEqual(@as(usize, 4), infos.len);
+    try testing.expectEqual(@as(usize, 5), infos.len);
     try testing.expectEqualStrings("echo", infos[0].name);
     try testing.expectEqual(Phase.content, infos[0].phase);
 }
