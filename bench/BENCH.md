@@ -358,3 +358,48 @@ the run-to-run envelope; a contaminated earlier run showed +15.5% and +6.3%
 respectively, and the 10-rep medians are the reliable numbers). `zig build
 test` green throughout (117 M7 tests + 4 new M8 tests = 121). Wire output is
 byte-identical (hash never changes serialisation).
+
+## Milestone 9: response transformation (gzip, cache headers, conditional GETs)
+
+Date: 2026-08-12 (machine rebooted overnight; post-boot load settled before
+measurement). The M8 tree plus: the `gzip` module (log phase, runs as
+pipeline post-processing after content claims) compressing the body with
+`std.compress.flate` (gzip container) when the client sends `Accept-Encoding:
+gzip` and the body is >= 20 bytes and shrinkable — setting `Content-Encoding:
+gzip` + `Vary: Accept-Encoding` on an allocator-owned body the reactor frees
+after writing; the `conditional_get` module (preaccess) answering 304 from
+`If-None-Match` / `If-Modified-Since` against content metadata
+(`ctx.etag`/`ctx.last_modified`, exposed pre-content); the `cache_headers`
+module (post_access) emitting `Cache-Control: max-age=N` from the route's
+`max_age_seconds` (0 → no-cache) plus ETag/Last-Modified. HTTP-date
+parse/format utilities are in `dsl/modules/cache.zig`. Part B (comptime
+pre-compression) is deferred to M11 as the roadmap specifies. The echo
+content module was fixed to mutate the response instead of resetting it
+(earlier-phase headers must survive content).
+
+**Correctness**: unit tests cover the gzip roundtrip (compress →
+decompressible output, byte-identical), skip cases (tiny bodies, missing or
+non-gzip accept tokens, 304s, non-shrinking bodies), 304 via ETag and
+If-Modified-Since (with a real HTTP-date parser), and cache-header output
+(max-age + no-cache). End-to-end against `config.example.json` with curl
+-style requests: `POST /gzip` + `Accept-Encoding: gzip` → `Content-Encoding:
+gzip` + `Cache-Control: max-age=3600` + `Vary` + python-gzip-decompressible
+body; same request without the header → raw body with cache headers; `/echo`
+routes untouched. `bench/http-check.py` 15/15.
+
+**Method**: same-day A/B against the pre-M9 tree (`6b6ceed`, the M8 commit),
+both `ReleaseFast`, default config, `--threads 4`, both verified 15/15 with
+`bench/http-check.py`. Co-resident interleaved runs (10 reps of 10 s each).
+The machine had just rebooted; load was 2-4 during measurement with a few
+crushed reps on both sides.
+
+| conns | M9 req/s (median) | M8 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 200,939 | 202,851 | **-0.9%** |
+| 500 | 219,512 | 205,692 | **+6.7%** |
+
+**Conclusion**: within the <5% gate (the default config binds no new modules,
+so the A/B measures the pipeline post-processing hook, Context additions and
+the reactor's owned-body free — all in the noise envelope; the +6.7% at c500
+is measurement noise in M9's favour). `zig build test` green throughout
+(121 M8 tests + 8 new M9 tests = 129).

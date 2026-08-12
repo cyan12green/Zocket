@@ -29,6 +29,9 @@ pub const Route = struct {
     /// struct-literal configs, where the whole route table is comptime-known;
     /// null for JSON-loaded routes, which use the loop-walk fallback.
     dispatch: ?registry.DispatchFn = null,
+    /// Default cache lifetime in seconds (Milestone 9): the cache-header
+    /// module emits `Cache-Control: max-age=N` from this. 0 = no-cache.
+    max_age_seconds: u32 = 0,
 
     /// The module name bound to `phase` on this route, if any.
     pub fn moduleFor(self: *const Route, phase: Phase) ?[]const u8 {

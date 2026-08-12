@@ -6,6 +6,17 @@
       "modules": { "content": "echo" }
     },
     {
+      "path": "/gzip",
+      "match": "prefix",
+      "max_age": 3600,
+      "modules": {
+        "content": "echo",
+        "preaccess": "conditional_get",
+        "post_access": "cache_headers",
+        "log": "gzip"
+      }
+    },
+    {
       "path": "/",
       "match": "prefix",
       "modules": { "content": "echo" }

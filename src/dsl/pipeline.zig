@@ -33,6 +33,12 @@ pub fn run(comptime Registry: type, routes: []const router.Route, ctx: *Context)
 /// Like `run`, but route matching goes through a pre-built `Router` (the
 /// comptime trie for struct-literal configs, the startup-built trie for JSON
 /// configs). Pass null to use the linear `matchRoutes` fallback.
+///
+/// The `log` phase is special: its module (if bound) runs as post-processing
+/// after the walk ends — whether a module claimed the request, short-circuited
+/// it, or nothing claimed it — so logging and response transforms (gzip) see
+/// the final response. The walk loop skips the log phase; this function runs
+/// it once at the end.
 pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr: ?*const router.Router, ctx: *Context) !Outcome {
     const route = if (rtr) |r| r.match(ctx.req.target) else router.matchRoutes(routes, ctx.req.target);
     ctx.route = route;
@@ -43,16 +49,25 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
     // Zero loops, zero moduleFor scans, zero Registry.resolve at runtime.
     if (r.dispatch) |f| return f(ctx);
 
-    for (Phase.all) |phase| {
-        const name = r.moduleFor(phase) orelse continue;
-        const run_fn = Registry.resolve(name) orelse return error.UnknownModule;
-        switch (try run_fn(ctx)) {
-            .pass => continue,
-            .handled => return .handled,
-            .short_circuit => return .not_handled,
+    const outcome = blk: {
+        for (Phase.all) |phase| {
+            if (phase == .log) continue;
+            const name = r.moduleFor(phase) orelse continue;
+            const run_fn = Registry.resolve(name) orelse return error.UnknownModule;
+            switch (try run_fn(ctx)) {
+                .pass => continue,
+                .handled => break :blk Outcome.handled,
+                .short_circuit => break :blk Outcome.not_handled,
+            }
         }
+        break :blk Outcome.not_handled;
+    };
+    if (r.moduleFor(.log)) |name| {
+        const run_fn = Registry.resolve(name).?;
+        // Post-processing: its action does not change the outcome.
+        _ = try run_fn(ctx);
     }
-    return .not_handled;
+    return outcome;
 }
 
 /// Comptime-specialised dispatch function for one route (Milestone 7 Part B).
@@ -70,17 +85,31 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
 pub fn dispatchForRoute(comptime Registry: type, comptime route: router.Route) DispatchFn {
     const Impl = struct {
         fn run(ctx: *Context) anyerror!Outcome {
+            var outcome: Outcome = .not_handled;
             inline for (Phase.all) |phase| {
+                if (phase == .log) continue;
                 if (route.moduleFor(phase)) |name| {
                     const run_fn = Registry.resolve(name).?;
                     switch (try run_fn(ctx)) {
                         .pass => {},
-                        .handled => return .handled,
-                        .short_circuit => return .not_handled,
+                        .handled => {
+                            outcome = .handled;
+                            break;
+                        },
+                        .short_circuit => {
+                            outcome = .not_handled;
+                            break;
+                        },
                     }
                 }
             }
-            return .not_handled;
+            // The log phase runs as post-processing (same contract as the
+            // loop-walk path).
+            if (route.moduleFor(.log)) |name| {
+                const run_fn = Registry.resolve(name).?;
+                _ = try run_fn(ctx);
+            }
+            return outcome;
         }
     };
     return Impl.run;

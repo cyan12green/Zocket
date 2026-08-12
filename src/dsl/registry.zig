@@ -63,6 +63,14 @@ pub const Context = struct {
     /// Ask the connection to close after the response is flushed (e.g. an
     /// error the client cannot keep alive past).
     close_after_write: bool = false,
+    /// Allocator for modules that allocate response data (gzip compression).
+    /// Set by the reactor; null where allocation is unsupported.
+    allocator: ?std.mem.Allocator = null,
+    /// Entity metadata a content module exposes before the content phase runs
+    /// (Milestone 9): consumed by the conditional-GET and cache-header
+    /// modules. Set by e.g. a post_read-phase stat.
+    etag: ?[]const u8 = null,
+    last_modified: ?[]const u8 = null,
 };
 
 pub const ModuleInfo = struct {
@@ -116,13 +124,16 @@ pub fn Registry(comptime modules: anytype) type {
 /// module file self-registers by exporting a `Module` value.
 pub const default_registry = Registry(.{
     @import("modules/echo.zig").echo,
+    @import("modules/gzip.zig").gzip,
+    @import("modules/cache.zig").conditional_get,
+    @import("modules/cache.zig").cache_headers,
 });
 
 const testing = std.testing;
 
 test "modules register themselves with a name and a phase" {
     const infos = default_registry.infos();
-    try testing.expectEqual(@as(usize, 1), infos.len);
+    try testing.expectEqual(@as(usize, 4), infos.len);
     try testing.expectEqualStrings("echo", infos[0].name);
     try testing.expectEqual(Phase.content, infos[0].phase);
 }

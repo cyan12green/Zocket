@@ -223,6 +223,20 @@ compile-time constant integer.
 
 ### M9 — Response transformation: gzip, cache headers, conditional GETs
 
+**Status: DONE** (2026-08-12). Part A: `dsl/modules/gzip.zig` (log phase =
+pipeline post-processing) — runtime compression with `std.compress.flate`
+(gzip container), `Accept-Encoding: gzip` token check via the M8 hasher,
+>= 20-byte shrinkable bodies only, `Content-Encoding: gzip` + `Vary`, body
+allocated from `ctx.allocator` and freed by the reactor (`resp.body_owned`).
+Part B (comptime pre-compression) deliberately deferred to M11 per the
+roadmap. Part C: `dsl/modules/cache.zig` — `conditional_get` (preaccess; 304
+from `If-None-Match`/`If-Modified-Since` vs `ctx.etag`/`ctx.last_modified`,
+with a real IMF-fixdate parser) and `cache_headers` (post_access;
+`Cache-Control: max-age=N` from the route's `max_age_seconds`, 0 → no-cache,
+plus ETag/Last-Modified). The echo module now mutates the response instead of
+resetting it. Gates met: 8 new module tests + e2e curl checks, `zig build
+test` 129/129, M9 A/B in `bench/BENCH.md` (-0.9% / +6.7%, within gate).
+
 *Depends on*: M6 (Content-Type) + M8 (header hashing).
 
 Modules that transform or gate responses.

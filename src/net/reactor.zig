@@ -369,7 +369,11 @@ pub const Reactor = struct {
                 },
                 .complete => {
                     var resp = http_response.Response.init(.ok);
-                    var ctx = dsl_pipeline.Context{ .req = &session.req, .resp = &resp };
+                    var ctx = dsl_pipeline.Context{
+                        .req = &session.req,
+                        .resp = &resp,
+                        .allocator = self.allocator,
+                    };
                     const handler = self.http_handler orelse &default_http_handler;
                     const request_outcome = handler.handleRequest(&ctx) catch {
                         self.respondAndClose(fd, .internal_error);
@@ -388,15 +392,18 @@ pub const Reactor = struct {
                         // HEAD: status line + headers only (Content-Length
                         // reflects the would-be body).
                         resp.writeHeadToBuffer(conn.send_buf) catch {
+                            if (resp.body_owned) self.allocator.free(resp.body);
                             self.removeConnection(fd);
                             return;
                         };
                     } else {
                         resp.writeToBuffer(conn.send_buf) catch {
+                            if (resp.body_owned) self.allocator.free(resp.body);
                             self.removeConnection(fd);
                             return;
                         };
                     }
+                    if (resp.body_owned) self.allocator.free(resp.body);
                     session.close_after_write = close;
                     session.writing = true;
                     self.flushHttp(fd);

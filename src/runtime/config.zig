@@ -97,6 +97,7 @@ pub const Config = struct {
                 .path = path,
                 .match = if (std.mem.eql(u8, jr.match, "exact")) .exact else .prefix,
                 .modules = try bindings.toOwnedSlice(allocator),
+                .max_age_seconds = jr.max_age,
             });
         }
 
@@ -121,6 +122,7 @@ const JsonRoute = struct {
     path: []const u8,
     match: []const u8 = "prefix",
     modules: JsonModuleMap = .{},
+    max_age: u32 = 0,
 };
 
 const JsonConfig = struct {

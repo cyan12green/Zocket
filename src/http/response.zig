@@ -3,6 +3,7 @@ const buffer_mod = @import("../net/buffer.zig");
 
 pub const Status = enum(u16) {
     ok = 200,
+    not_modified = 304,
     bad_request = 400,
     not_found = 404,
     payload_too_large = 413,
@@ -13,6 +14,7 @@ pub const Status = enum(u16) {
     pub fn reasonPhrase(self: Status) []const u8 {
         return switch (self) {
             .ok => "OK",
+            .not_modified => "Not Modified",
             .bad_request => "Bad Request",
             .not_found => "Not Found",
             .payload_too_large => "Payload Too Large",
@@ -35,6 +37,14 @@ pub const Response = struct {
     body: []const u8 = &.{},
     headers: [max_headers]Header = undefined,
     header_count: usize = 0,
+    /// True when `body` was allocated by a module (e.g. gzip) and the caller
+    /// must free it after serialising.
+    body_owned: bool = false,
+    /// Scratch space for module-generated header values (e.g. formatted
+    /// `Cache-Control: max-age=N`). Valid until the response is serialised;
+    /// the response itself lives on the caller's stack for the request.
+    scratch: [96]u8 = undefined,
+    scratch_used: usize = 0,
 
     pub const Header = struct { name: []const u8, value: []const u8 };
 
@@ -42,10 +52,23 @@ pub const Response = struct {
         return .{ .status = status };
     }
 
+    /// Set a header, appending it to the header list. The parser's
+    /// `header_hasher` is available for dedup (`setHeader` + hash compare)
+    /// where the caller controls header names; the pipeline's order tests
+    /// rely on append semantics, so no implicit dedup happens here.
     pub fn setHeader(self: *Response, name: []const u8, value: []const u8) void {
         std.debug.assert(self.header_count < max_headers);
         self.headers[self.header_count] = .{ .name = name, .value = value };
         self.header_count += 1;
+    }
+
+    /// Set a header whose value is formatted into the response's scratch
+    /// space (safe: the response outlives the write). Drops the header if the
+    /// scratch is exhausted.
+    pub fn setHeaderFmt(self: *Response, comptime name: []const u8, comptime fmt: []const u8, args: anytype) void {
+        const value = std.fmt.bufPrint(self.scratch[self.scratch_used..], fmt, args) catch return;
+        self.scratch_used += value.len;
+        self.setHeader(name, value);
     }
 
     pub fn setBody(self: *Response, body: []const u8) void {
