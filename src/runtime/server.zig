@@ -75,6 +75,19 @@ pub const Server = struct {
     pub fn handleRequest(self: *const Server, ctx: *pipeline.Context) !pipeline.Outcome {
         return pipeline.runWithRouter(registry.default_registry, self.cfg.routes, &self.router, ctx);
     }
+
+    /// Milestone 11 fast path: when the matched route is a module-less
+    /// response template, return its pre-serialised bytes so the caller can
+    /// write them straight to the wire — no pipeline, no response builder,
+    /// no function call through the phase chain. Returns null when any
+    /// module could still act on the request.
+    pub fn matchFast(self: *const Server, ctx: *pipeline.Context) ?router_mod.FastResponse {
+        const route = self.router.match(ctx.req.target) orelse return null;
+        if (route.modules.len != 0) return null;
+        const fb = route.response_bytes orelse return null;
+        ctx.route = route;
+        return fb;
+    }
 };
 
 const testing = std.testing;
@@ -239,4 +252,109 @@ test "JSON-config server with a startup trie routes identically to the plain ser
             try testing.expectEqualStrings(resp_a.body, resp_b.body);
         }
     }
+}
+
+// ---- Milestone 11: response templates ----
+
+test "comptime template route serves through the dispatch fallback" {
+    const cfg = comptime Config{
+        .routes = &.{
+            .{
+                .path = "/health",
+                .match = .exact,
+                .response = .{ .status = 200, .body = "ok" },
+            },
+            .{
+                .path = "/old",
+                .match = .exact,
+                .response = .{
+                    .status = 301,
+                    .headers = &.{.{ .name = "Location", .value = "/health" }},
+                },
+            },
+        },
+    };
+    const srv = Server.comptimeInit(cfg);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/health";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("ok", resp.body);
+
+    var req2 = registry.Request.init(testing.allocator);
+    defer req2.deinit();
+    req2.target = "/old";
+    var resp2 = registry.Response.init(.ok);
+    var ctx2 = pipeline.Context{ .req = &req2, .resp = &resp2 };
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx2));
+    try testing.expectEqual(registry.Status.moved_permanently, resp2.status);
+    try testing.expectEqualStrings("/health", resp2.headers[0].value);
+}
+
+test "matchFast returns pre-serialised bytes only for module-less template routes" {
+    const cfg = comptime Config{
+        .routes = &.{
+            .{ .path = "/health", .match = .exact, .response = .{ .body = "ok" } },
+            .{
+                .path = "/withmods",
+                .match = .exact,
+                .response = .{ .body = "x" },
+                .modules = &.{.{ .phase = .content, .module = "echo" }},
+            },
+            .{ .path = "/", .match = .prefix, .modules = &.{.{ .phase = .content, .module = "echo" }} },
+        },
+    };
+    const srv = Server.comptimeInit(cfg);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/health";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    const fb = srv.matchFast(&ctx).?;
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", fb.head);
+    try testing.expectEqualStrings("ok", fb.body);
+
+    // A template route WITH modules: the pipeline must run.
+    var req2 = registry.Request.init(testing.allocator);
+    defer req2.deinit();
+    req2.target = "/withmods";
+    var resp2 = registry.Response.init(.ok);
+    var ctx2 = pipeline.Context{ .req = &req2, .resp = &resp2 };
+    try testing.expectEqual(@as(?router_mod.FastResponse, null), srv.matchFast(&ctx2));
+
+    // Plain echo route: no fast path.
+    var req3 = registry.Request.init(testing.allocator);
+    defer req3.deinit();
+    req3.target = "/anything";
+    var resp3 = registry.Response.init(.ok);
+    var ctx3 = pipeline.Context{ .req = &req3, .resp = &resp3 };
+    try testing.expectEqual(@as(?router_mod.FastResponse, null), srv.matchFast(&ctx3));
+}
+
+test "JSON template route applies through the pipeline" {
+    const json =
+        \\{ "routes": [
+        \\    { "path": "/health", "match": "exact",
+        \\      "response": { "status": 200, "body": "ok-json" } }
+        \\  ] }
+    ;
+    var cfg = try Config.fromJson(testing.allocator, json);
+    defer cfg.deinit(testing.allocator);
+    try cfg.validate(registry.default_registry);
+    var srv = try Server.initWithTrie(testing.allocator, cfg);
+    defer srv.deinit(testing.allocator);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/health";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("ok-json", resp.body);
 }

@@ -47,7 +47,17 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
 
     // Milestone 7: comptime-specialised dispatch (struct-literal configs).
     // Zero loops, zero moduleFor scans, zero Registry.resolve at runtime.
-    if (r.dispatch) |f| return f(ctx);
+    if (r.dispatch) |f| {
+        const out = try f(ctx);
+        // Milestone 11: template fallback when no module claimed the request.
+        if (out == .not_handled) {
+            if (r.response) |t| {
+                applyTemplate(ctx, t);
+                return .handled;
+            }
+        }
+        return out;
+    }
 
     const outcome = blk: {
         for (Phase.all) |phase| {
@@ -67,7 +77,27 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
         // Post-processing: its action does not change the outcome.
         _ = try run_fn(ctx);
     }
+    if (outcome == .not_handled) {
+        // Milestone 11: a route with a response template and modules that did
+        // not claim the request falls back to the template.
+        if (r.response) |t| {
+            applyTemplate(ctx, t);
+            return .handled;
+        }
+    }
     return outcome;
+}
+
+/// Runtime application of a response template (JSON-config routes, whose
+/// templates cannot be pre-serialised at compile time). Comptime routes with
+/// modules use this too; module-less comptime routes take the reactor fast
+/// path instead.
+fn applyTemplate(ctx: *Context, t: router.ResponseTemplate) void {
+    ctx.resp.status = @enumFromInt(t.status);
+    for (t.headers) |h| {
+        ctx.resp.setHeader(h.name, h.value);
+    }
+    ctx.resp.body = t.body;
 }
 
 /// Comptime-specialised dispatch function for one route (Milestone 7 Part B).
@@ -133,6 +163,10 @@ fn assignDispatchImpl(comptime Registry: type, comptime routes: []const router.R
         // (the `embeds` module lives at the root for @embedFile).
         if (r.embed) |embed_path| {
             out[i].embed_bytes = @import("embeds").embed(embed_path);
+        }
+        // Milestone 11: fixed-response templates serialised at compile time.
+        if (r.response) |t| {
+            out[i].response_bytes = router.serializeResponseTemplate(t);
         }
     }
     return out;

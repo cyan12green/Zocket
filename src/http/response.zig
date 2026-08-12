@@ -4,7 +4,10 @@ const buffer_mod = @import("../net/buffer.zig");
 pub const Status = enum(u16) {
     ok = 200,
     partial_content = 206,
+    moved_permanently = 301,
+    found = 302,
     not_modified = 304,
+    forbidden = 403,
     range_not_satisfiable = 416,
     bad_request = 400,
     not_found = 404,
@@ -17,7 +20,10 @@ pub const Status = enum(u16) {
         return switch (self) {
             .ok => "OK",
             .partial_content => "Partial Content",
+            .moved_permanently => "Moved Permanently",
+            .found => "Found",
             .not_modified => "Not Modified",
+            .forbidden => "Forbidden",
             .range_not_satisfiable => "Range Not Satisfiable",
             .bad_request => "Bad Request",
             .not_found => "Not Found",
@@ -30,6 +36,27 @@ pub const Status = enum(u16) {
 };
 
 pub const max_headers = 8;
+
+/// Reason phrase for an arbitrary status code (comptime templates): known
+/// codes map to their phrases, unknown ones to the generic fallback.
+pub fn reasonPhraseForCode(comptime code: u16) []const u8 {
+    return switch (code) {
+        200 => "OK",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        413 => "Payload Too Large",
+        416 => "Range Not Satisfiable",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        else => "Unknown",
+    };
+}
 
 /// Minimal HTTP/1.1 response builder. Content-Length is always written, so
 /// serialization is unambiguous and keep-alive safe. The full response is

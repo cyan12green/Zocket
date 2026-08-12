@@ -1,6 +1,7 @@
 const std = @import("std");
 const phase_mod = @import("phase.zig");
 const registry = @import("registry.zig");
+const response_mod = @import("../http/response.zig");
 
 pub const Phase = phase_mod.Phase;
 
@@ -40,6 +41,12 @@ pub const Route = struct {
     autoindex: bool = false,
     embed: ?[]const u8 = null,
     embed_bytes: []const u8 = &.{},
+    /// Fixed-response template (Milestone 11): a route with `response` (and
+    /// no modules) is served from the pre-serialised `response_bytes` — no
+    /// pipeline, no response builder. Routes with modules keep the pipeline;
+    /// the template is applied when nothing claims the request.
+    response: ?ResponseTemplate = null,
+    response_bytes: ?FastResponse = null,
 
     /// The module name bound to `phase` on this route, if any.
     pub fn moduleFor(self: *const Route, phase: Phase) ?[]const u8 {
@@ -71,6 +78,64 @@ pub fn matchRoutes(route_list: []const Route, target: []const u8) ?*const Route 
 
 /// Sentinel: no route is bound at a trie node.
 pub const no_route = std.math.maxInt(u32);
+
+/// One header of a fixed-response template.
+pub const TemplateHeader = struct { name: []const u8, value: []const u8 };
+
+/// A fixed response served from pre-serialised bytes (Milestone 11):
+/// redirects, healthchecks, error pages.
+pub const ResponseTemplate = struct {
+    status: u16 = 200,
+    headers: []const TemplateHeader = &.{},
+    body: []const u8 = &.{},
+    /// Comptime pre-compression (M9 Part B) is DEFERRED: the runtime flate
+    /// compressor's dynamic-Huffman path hits a stdlib type-inference bug
+    /// under comptime evaluation, and a deterministic comptime encoder
+    /// cannot be byte-identical to it. Setting this is a compile error.
+    compress: bool = false,
+};
+
+/// The pre-serialised fast-path response. `head` is the status line plus the
+/// template headers, each line CRLF-terminated; the reactor appends
+/// `Connection`, `Content-Length`, the blank line, then `body` — byte
+/// order-identical to the pipeline/response-builder equivalent.
+pub const FastResponse = struct {
+    head: []const u8,
+    body: []const u8,
+};
+
+/// Serialise a response template at compile time: status line, template
+/// headers and (optionally gzip-compressed) body become constant byte arrays
+/// in .rodata.
+pub fn serializeResponseTemplate(comptime t: ResponseTemplate) FastResponse {
+    return comptime blk: {
+        if (t.compress) {
+            @compileError("template 'compress' (comptime pre-compression) is deferred: " ++
+                "the stdlib flate dynamic-Huffman path breaks at comptime in this Zig snapshot; " ++
+                "see docs/ROADMAP.md M9 Part B");
+        }
+        const body = t.body;
+
+        const head_bound = blk2: {
+            var n: usize = 64; // status line slack
+            for (t.headers) |h| n += h.name.len + h.value.len + 4;
+            break :blk2 n;
+        };
+        var head: [head_bound]u8 = undefined;
+        var used: usize = 0;
+        const status_line = std.fmt.bufPrint(head[used..], "HTTP/1.1 {d} {s}\r\n", .{
+            t.status,
+            response_mod.reasonPhraseForCode(t.status),
+        }) catch unreachable;
+        used += status_line.len;
+        for (t.headers) |h| {
+            const line = std.fmt.bufPrint(head[used..], "{s}: {s}\r\n", .{ h.name, h.value }) catch unreachable;
+            used += line.len;
+        }
+        const head_const = head;
+        break :blk .{ .head = head_const[0..used], .body = body };
+    };
+}
 
 /// One trie node: a byte of path plus the routes ending here.
 pub const TrieNode = struct {
@@ -529,4 +594,37 @@ test "Router.match falls back to the linear matcher without a trie" {
     var with_trie = Router{ .routes = &trie_routes, .trie = buildTrie(&trie_routes) };
     try testing.expectEqualStrings("/api", with_trie.match("/api/users").?.path);
     try testing.expectEqual(@as(?*const Route, null), with_trie.match(""));
+}
+
+// ---- Milestone 11: comptime response templates ----
+
+test "template serialisation is byte-identical to the response builder" {
+    const t = ResponseTemplate{
+        .status = 200,
+        .headers = &.{
+            .{ .name = "Content-Type", .value = "text/plain" },
+        },
+        .body = "ok",
+    };
+    const fb = serializeResponseTemplate(t);
+
+    // The reactor appends Connection + Content-Length + blank line, then the
+    // body — exactly what the response builder emits for the same template.
+    const suffix = "Connection: keep-alive\r\nContent-Length: 2\r\n\r\n";
+
+    var resp = response_mod.Response.init(.ok);
+    resp.setHeader("Content-Type", "text/plain");
+    resp.setBody("ok");
+    resp.setHeader("Connection", "keep-alive");
+
+    const buffer_mod = @import("../net/buffer.zig");
+    const buf = try buffer_mod.Buffer.init(testing.allocator);
+    defer buf.deinit(testing.allocator);
+    try resp.writeToBuffer(buf);
+
+    const expected = buf.peek();
+    try testing.expectEqual(fb.head.len + suffix.len + fb.body.len, expected.len);
+    try testing.expectEqualStrings(fb.head, expected[0..fb.head.len]);
+    try testing.expectEqualStrings(suffix, expected[fb.head.len .. fb.head.len + suffix.len]);
+    try testing.expectEqualStrings(fb.body, expected[expected.len - fb.body.len ..]);
 }

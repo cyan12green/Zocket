@@ -346,6 +346,22 @@ compile-time: an invalid path to `@embedFile` is a compile error.
 
 ### M11 — Comptime response templates (fast-path responses)
 
+**Status: DONE** (2026-08-12). A route `response` block (status + headers +
+body) is serialised at compile time (`Route.response_bytes`, in .rodata);
+module-less template routes are served by the reactor straight from those
+bytes (`Server.matchFast` — no pipeline, no response builder, byte-identical
+to the builder equivalent), routes with modules keep the pipeline and fall
+back to the template when nothing claims the request, and JSON-config
+templates apply through the pipeline at runtime. Comptime pre-compression
+(M9 Part B) is **deferred**: the stdlib flate dynamic-Huffman path breaks
+under comptime evaluation (u0 depth-field inference bug — verified), and a
+deterministic comptime encoder cannot be byte-identical to the runtime
+compressor; `compress: true` is a compile error documenting the deferral
+(the roadmap's fallback clause). Gates met: 5 new tests (serialisation
+byte-identity, matchFast gating, dispatch/loop-walk fallbacks, JSON
+templates, reactor wire test incl. pipelining), `zig build test` 143/143,
+fast-path-vs-pipeline and M11 A/B in `bench/BENCH.md` (+0.7% / +0.4%).
+
 *Depends on*: M7 (trie + dispatch) + M9 (cache headers).
 
 Routes that produce fixed responses (redirects, healthchecks, error pages)

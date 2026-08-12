@@ -56,6 +56,14 @@ pub const Config = struct {
             allocator.free(r.path);
             if (r.root) |root| allocator.free(root);
             if (r.index) |index| allocator.free(index);
+            if (r.response) |*t| {
+                for (t.headers) |h| {
+                    allocator.free(h.name);
+                    allocator.free(h.value);
+                }
+                allocator.free(t.headers);
+                if (t.body.len > 0) allocator.free(t.body);
+            }
         }
         allocator.free(self.routes);
     }
@@ -99,6 +107,34 @@ pub const Config = struct {
             errdefer if (root) |r| allocator.free(r);
             const index = if (jr.index) |ix| try allocator.dupe(u8, ix) else null;
             errdefer if (index) |ix| allocator.free(ix);
+            // Response template (Milestone 11): status + headers + body are
+            // copied; JSON routes apply it through the pipeline at runtime.
+            var template: ?router.ResponseTemplate = null;
+            if (jr.response) |jrsp| {
+                var t_headers = std.ArrayList(router.TemplateHeader).empty;
+                if (jrsp.headers) |jh| {
+                    try t_headers.ensureTotalCapacity(allocator, jh.len);
+                    for (jh) |h| {
+                        t_headers.appendAssumeCapacity(.{
+                            .name = try allocator.dupe(u8, h.name),
+                            .value = try allocator.dupe(u8, h.value),
+                        });
+                    }
+                }
+                template = .{
+                    .status = jrsp.status,
+                    .headers = try t_headers.toOwnedSlice(allocator),
+                    .body = if (jrsp.body) |b| try allocator.dupe(u8, b) else &.{},
+                    .compress = jrsp.compress,
+                };
+            }
+            errdefer if (template) |*t| {
+                for (t.headers) |h| {
+                    allocator.free(h.name);
+                    allocator.free(h.value);
+                }
+                allocator.free(t.headers);
+            };
 
             routes.appendAssumeCapacity(.{
                 .path = path,
@@ -109,6 +145,7 @@ pub const Config = struct {
                 .index = index,
                 .autoindex = jr.autoindex,
                 .embed = jr.embed,
+                .response = template,
             });
         }
 
@@ -129,6 +166,15 @@ const JsonModuleMap = struct {
     log: ?[]const u8 = null,
 };
 
+const JsonHeader = struct { name: []const u8, value: []const u8 };
+
+const JsonResponse = struct {
+    status: u16 = 200,
+    body: ?[]const u8 = null,
+    headers: ?[]const JsonHeader = null,
+    compress: bool = false,
+};
+
 const JsonRoute = struct {
     path: []const u8,
     match: []const u8 = "prefix",
@@ -138,6 +184,7 @@ const JsonRoute = struct {
     index: ?[]const u8 = null,
     autoindex: bool = false,
     embed: ?[]const u8 = null,
+    response: ?JsonResponse = null,
 };
 
 const JsonConfig = struct {

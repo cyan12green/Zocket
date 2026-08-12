@@ -25,6 +25,16 @@
       "autoindex": true
     },
     {
+      "path": "/health",
+      "match": "exact",
+      "response": { "status": 200, "body": "ok" }
+    },
+    {
+      "path": "/old",
+      "match": "exact",
+      "response": { "status": 301, "headers": [{ "name": "Location", "value": "/health" }] }
+    },
+    {
       "path": "/",
       "match": "prefix",
       "modules": { "content": "echo" }

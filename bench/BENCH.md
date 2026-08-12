@@ -439,3 +439,49 @@ c500 re-run, recorded clean).
 **Conclusion**: within the <5% gate (-1.0% / +0.1%; the default config binds
 no new modules, so this measures the Route/registry additions — noise).
 `zig build test` green throughout (129 M9 tests + 9 new M10 tests = 138).
+
+## Milestone 11: comptime response templates (fast-path responses)
+
+Date: 2026-08-12, same box. The M10 tree plus fixed-response templates: a
+route can declare a `response` block (status + headers + body); module-less
+template routes are served straight from bytes pre-serialised at compile time
+(`Route.response_bytes`, `.rodata`) — no pipeline, no response builder —
+with the reactor appending the dynamic Connection/Content-Length framing
+(byte-identical to the response-builder equivalent). Routes with modules keep
+the pipeline and fall back to the template when nothing claims the request;
+JSON-config templates apply through the pipeline at runtime. **Comptime
+pre-compression (M9 Part B) is deferred**: the stdlib flate dynamic-Huffman
+path breaks under comptime evaluation (`u0` depth-field inference bug), and a
+deterministic comptime encoder cannot be byte-identical to the runtime
+compressor; `compress: true` on a template is a compile error with that
+explanation (roadmap's fallback clause).
+
+**Correctness**: unit tests cover template serialisation being byte-identical
+to the response builder, `matchFast` firing only for module-less template
+routes, template fallback through the dispatch and loop-walk paths, and JSON
+templates through the pipeline. Reactor test serves `/health` (200 "ok") and
+a 301 redirect from pre-serialised bytes, including pipelined requests.
+End-to-end against `config.example.json`: `/health` → `200 OK` + "ok",
+`/old` → `301` + Location, HEAD keeps the would-be-body Content-Length,
+static/gzip/echo routes unaffected. `bench/http-check.py` 15/15.
+
+Fast-path vs pipeline ("ok" response): c=1 p50 and mean are identical
+(0.014 ms — network-RTT-dominated, below the harness resolution); c=500
+throughput -0.7% (median of 8 x 10 s interleaved reps). The fast path's win
+is structural (zero dispatch for module-less template routes — exercised by
+the matchFast unit test and the reactor wire test), not measurable at this
+harness's resolution.
+
+**Method**: same-day A/B against the pre-M11 tree (`038d8dc`, the M10
+commit), both `ReleaseFast`, default config, `--threads 4`, both verified
+15/15. Co-resident interleaved runs (10 reps of 10 s each).
+
+| conns | M11 req/s (median) | M10 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 258,377 | 256,588 | **+0.7%** |
+| 500 | 253,439 | 252,410 | **+0.4%** |
+
+**Conclusion**: within the <5% gate (+0.7% / +0.4%; the default config binds
+no templates, so this measures the Route additions and reactor fast-path
+check — noise). `zig build test` green throughout (138 M10 tests + 5 new
+M11 tests = 143).

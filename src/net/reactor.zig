@@ -375,6 +375,35 @@ pub const Reactor = struct {
                         .allocator = self.allocator,
                     };
                     const handler = self.http_handler orelse &default_http_handler;
+
+                    // Milestone 11 fast path: module-less response-template
+                    // routes are written straight from their pre-serialised
+                    // bytes (status line + template headers + Connection +
+                    // Content-Length + body), byte-identical to the pipeline
+                    // equivalent but with zero dispatch.
+                    if (handler.matchFast(&ctx)) |fb| {
+                        const close = !session.req.keep_alive;
+                        conn.send_buf.compact();
+                        _ = conn.send_buf.writeSlice(fb.head);
+                        var hdr_buf: [96]u8 = undefined;
+                        const hdr = std.fmt.bufPrint(&hdr_buf, "Connection: {s}\r\nContent-Length: {d}\r\n\r\n", .{
+                            if (close) "close" else "keep-alive",
+                            fb.body.len, // HEAD keeps the would-be body length
+                        }) catch unreachable;
+                        _ = conn.send_buf.writeSlice(hdr);
+                        if (session.req.method != .head) {
+                            _ = conn.send_buf.writeSlice(fb.body);
+                        }
+                        session.close_after_write = close;
+                        session.writing = true;
+                        self.flushHttp(fd);
+                        if (!self.connections.contains(fd)) return;
+                        const sess = self.http_sessions.getPtr(fd) orelse return;
+                        if (!sess.writing) continue; // flushed fully; next pipelined request
+                        self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
+                        return;
+                    }
+
                     const request_outcome = handler.handleRequest(&ctx) catch {
                         self.respondAndClose(fd, .internal_error);
                         return;
@@ -992,6 +1021,62 @@ test "reactor HEAD responds with head only and correct Content-Length" {
     try testing.expectEqualStrings(want2, buf[0..n2]);
     // The echoed body must NOT be sent: a short read window yields nothing.
     try testing.expectError(error.Timeout, readUntil(pair[0], &buf, 1, 500));
+
+    r.stop();
+    r.join();
+}
+
+// M11: a module-less response-template route is served from pre-serialised
+// bytes, byte-identical to the pipeline equivalent.
+test "reactor serves a comptime template route from pre-serialised bytes" {
+    const allocator = testing.allocator;
+    const cfg = comptime runtime_server.Config{
+        .routes = &.{
+            .{
+                .path = "/health",
+                .match = .exact,
+                .response = .{ .status = 200, .body = "ok" },
+            },
+            .{
+                .path = "/old",
+                .match = .exact,
+                .response = .{ .status = 301, .headers = &.{.{ .name = "Location", .value = "/health" }} },
+            },
+        },
+    };
+    const srv = runtime_server.Server.comptimeInit(cfg);
+    var r = try Reactor.initWithHandler(allocator, 0, .http, &srv);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok";
+    const n = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n]);
+
+    // Redirect template with a header.
+    try writeAll(pair[0], "GET /old HTTP/1.1\r\nHost: x\r\n\r\n");
+    const want2 = "HTTP/1.1 301 Moved Permanently\r\nLocation: /health\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
+    try testing.expectEqualStrings(want2, buf[0..n2]);
+
+    // A pipelined request after the fast-path responses keeps the connection.
+    try writeAll(pair[0], "GET /health HTTP/1.1\r\nHost: x\r\n\r\n" ++ "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    const n3 = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n3]);
+    const n4 = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n4]);
 
     r.stop();
     r.join();
