@@ -2,9 +2,11 @@ const std = @import("std");
 const registry = @import("../registry.zig");
 const http_response = @import("../../http/response.zig");
 
-/// Largest request body the echo response can hold: the response (head + body)
-/// must fit into the 16 KiB send buffer alongside the status line and headers.
-pub const max_echo_body = 16 * 1024 - 1024;
+/// Largest request body the echo module echoes. Since Milestone 14 the body
+/// goes out via writev (never through the send buffer), so the limit is the
+/// receive buffer's growth cap (`connection.Connection.max_recv_buffer`):
+/// anything the reactor can buffer can be echoed zero-copy.
+pub const max_echo_body = 16 * 1024 * 1024;
 
 /// The echo content module: responds 200 OK with the request body echoed,
 /// byte-identical to the Milestone 3 hardcoded HTTP handler. Bodies larger
@@ -49,8 +51,11 @@ test "echo module responds with the request body" {
 test "echo module rejects oversized bodies with 413 and close" {
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
-    var body = [_]u8{'x'} ** (max_echo_body + 1);
-    req.body = &body;
+    // 16 MiB does not fit a test stack; allocate.
+    const body = try testing.allocator.alloc(u8, max_echo_body + 1);
+    defer testing.allocator.free(body);
+    @memset(body, 'x');
+    req.body = body;
 
     var resp = http_response.Response.init(.ok);
     var ctx = registry.Context{ .req = &req, .resp = &resp };

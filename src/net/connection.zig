@@ -4,6 +4,10 @@ const buffer = @import("buffer.zig");
 const timer_wheel = @import("timer_wheel.zig");
 
 pub const Connection = struct {
+    /// Upper bound for receive-buffer growth (per connection). Requests that
+    /// still do not fit are rejected by the reactor's buffer-full path.
+    pub const max_recv_buffer = 16 * 1024 * 1024;
+
     fd: posix.fd_t,
     recv_buf: *buffer.Buffer,
     send_buf: *buffer.Buffer,
@@ -42,7 +46,17 @@ pub const Connection = struct {
         if (available == 0) {
             self.recv_buf.compact();
             if (self.recv_buf.availableWrite() == 0) {
-                return error.BufferFull;
+                if (self.recv_buf.data.len < max_recv_buffer) {
+                    // Request larger than the default buffer (e.g. a big body):
+                    // grow instead of rejecting, up to the per-connection cap.
+                    // Doubling lands exactly on the cap (powers of two), so the
+                    // buffer can never exceed it; at the cap recv returns
+                    // BufferFull and the reactor rejects the request.
+                    try self.recv_buf.grow(self.allocator, @min(max_recv_buffer, self.recv_buf.data.len * 2));
+                    std.debug.assert(self.recv_buf.data.len <= max_recv_buffer);
+                } else {
+                    return error.BufferFull;
+                }
             }
         }
 

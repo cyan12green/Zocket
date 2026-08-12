@@ -6,7 +6,7 @@ pub const Buffer = struct {
     read_pos: usize,
     write_pos: usize,
 
-    const default_size = 16384;
+    pub const default_size = 16384;
 
     pub fn init(allocator: std.mem.Allocator) !*Buffer {
         const buf = try allocator.create(Buffer);
@@ -72,7 +72,10 @@ pub const Buffer = struct {
             self.read_pos = 0;
             self.write_pos = 0;
         } else {
-            @memcpy(self.data[0..available], self.data[self.read_pos..self.write_pos]);
+            // The source and destination ranges may overlap (read_pos <
+            // available), so a plain memcpy would panic; copyForwards is a
+            // memmove here.
+            std.mem.copyForwards(u8, self.data[0..available], self.data[self.read_pos..self.write_pos]);
             self.read_pos = 0;
             self.write_pos = available;
         }
@@ -81,6 +84,22 @@ pub const Buffer = struct {
     pub fn reset(self: *Buffer) void {
         self.read_pos = 0;
         self.write_pos = 0;
+    }
+
+    /// Grow the buffer to at least `min_capacity` bytes, preserving the
+    /// unread contents. Used by the receive path so request bodies larger
+    /// than the default buffer can complete instead of being rejected.
+    pub fn grow(self: *Buffer, allocator: std.mem.Allocator, min_capacity: usize) !void {
+        if (min_capacity <= self.data.len) return;
+        var new_cap = self.data.len;
+        while (new_cap < min_capacity) new_cap *= 2;
+        const nd = try allocator.alloc(u8, new_cap);
+        const used = self.availableRead();
+        @memcpy(nd[0..used], self.data[self.read_pos..self.write_pos]);
+        allocator.free(self.data);
+        self.data = nd;
+        self.write_pos = used;
+        self.read_pos = 0;
     }
 
     pub fn peek(self: *const Buffer) []u8 {
@@ -147,4 +166,30 @@ test "buffer consume advances read position without copying" {
     buf.consume(0);
     buf.consume(6);
     try testing.expectEqual(0, buf.availableRead());
+}
+
+test "buffer grow preserves unread contents" {
+    const allocator = testing.allocator;
+    const buf = try Buffer.init(allocator);
+    defer buf.deinit(allocator);
+
+    _ = buf.writeSlice("prefix");
+    buf.consume(3);
+    try buf.grow(allocator, 65536);
+    try testing.expect(buf.data.len >= 65536);
+    try testing.expectEqualStrings("fix", buf.peek());
+    const written = buf.writeSlice(&[_]u8{'x'} ** 1000);
+    try testing.expectEqual(1000, written);
+    try testing.expectEqual(1003, buf.availableRead());
+}
+
+test "buffer grow is a no-op when already large enough" {
+    const allocator = testing.allocator;
+    const buf = try Buffer.init(allocator);
+    defer buf.deinit(allocator);
+
+    _ = buf.writeSlice("data");
+    try buf.grow(allocator, 1024);
+    try testing.expectEqual(@as(usize, 16384), buf.data.len);
+    try testing.expectEqualStrings("data", buf.peek());
 }

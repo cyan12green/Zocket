@@ -35,6 +35,11 @@ const HttpSession = struct {
     /// A response is queued in the send buffer and the fd is armed for
     /// EPOLLOUT until it has been fully flushed.
     writing: bool = false,
+    /// Whether EPOLLOUT is currently in the connection's epoll mask. Starts
+    /// true (connections are registered with In|Out|ET) and is cleared after
+    /// a full flush; used to skip the redundant In|Out -> In epoll_ctl when a
+    /// response flushed synchronously without ever arming EPOLLOUT.
+    out_armed: bool = true,
     /// Close the connection once the current response has been flushed
     /// (errors, and requests that asked for Connection: close).
     close_after_write: bool = false,
@@ -524,6 +529,7 @@ pub const Reactor = struct {
                         if (!self.connections.contains(fd)) return;
                         const sess = self.http_sessions.getPtr(fd) orelse return;
                         if (!sess.writing) continue; // flushed fully; next pipelined request
+                        sess.out_armed = true;
                         self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
                         return;
                     }
@@ -582,6 +588,7 @@ pub const Reactor = struct {
                     if (!sess.writing) continue; // flushed fully; next pipelined request
                     // Partially flushed: re-arm EPOLLOUT (epoll_ctl MOD
                     // re-evaluates readiness, so this delivers the event).
+                    sess.out_armed = true;
                     self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
                     return;
                 },
@@ -685,9 +692,19 @@ pub const Reactor = struct {
         }
         session.parser.reset();
         session.req.reset();
+        // The recv buffer keeps any capacity it grew for a large request:
+        // shrinking it here would reallocate (mmap/munmap) on every request,
+        // and a keep-alive connection sees similar-sized bodies, so the
+        // capacity is amortized. The allocation is bounded by
+        // connection.Connection.max_recv_buffer and dies with the connection.
         // Nothing to send: wait for the next request without spurious
-        // EPOLLOUT edges.
-        self.ep.modify(fd, epoll.Events.In | epoll.Events.EdgeTriggered, fd) catch {};
+        // EPOLLOUT edges. Only modify the epoll mask when EPOLLOUT was
+        // actually armed for this response (a fully synchronous flush never
+        // armed it), saving one epoll_ctl per request on the common path.
+        if (session.out_armed) {
+            self.ep.modify(fd, epoll.Events.In | epoll.Events.EdgeTriggered, fd) catch {};
+            session.out_armed = false;
+        }
         self.processHttp(fd);
     }
 
@@ -915,9 +932,13 @@ fn readUntil(sock: posix.fd_t, buf: []u8, expected_len: usize, timeout_ms: u64) 
 fn writeAll(sock: posix.fd_t, bytes: []const u8) !void {
     var remaining = bytes;
     while (remaining.len > 0) {
-        const n = posix.write(sock, remaining) catch {
-            std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
-            continue;
+        const n = posix.write(sock, remaining) catch |e| {
+            // A closed peer (EPIPE/ECONNRESET) must surface, not retry forever.
+            if (e == error.WouldBlock) {
+                std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+                continue;
+            }
+            return e;
         };
         remaining = remaining[n..];
     }
@@ -1178,7 +1199,7 @@ test "reactor HTTP error paths respond and close" {
     }
 }
 
-test "reactor HTTP oversized body yields 413 and closes" {
+test "reactor HTTP oversized body hits the buffer cap, yields 431 and closes" {
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
@@ -1195,19 +1216,83 @@ test "reactor HTTP oversized body yields 413 and closes" {
     r.attach(conn);
 
     const echo_mod = @import("../dsl/modules/echo.zig");
-    var body = [_]u8{'x'} ** (echo_mod.max_echo_body + 1);
-    var wire_buf: [echo_mod.max_echo_body + 256]u8 = undefined;
+    // 16 MiB does not fit a test stack; allocate and send in chunks (the
+    // recv buffer grows up to max_recv_buffer, then the buffer-full path
+    // rejects).
+    const body = try allocator.alloc(u8, echo_mod.max_echo_body + 1);
+    defer allocator.free(body);
+    @memset(body, 'x');
+    var wire_buf: [256]u8 = undefined;
     const wire = std.fmt.bufPrint(&wire_buf, "POST / HTTP/1.1\r\nContent-Length: {d}\r\n\r\n", .{body.len}) catch unreachable;
     try writeAll(pair[0], wire);
-    // Body arrives in a second chunk to exercise the partial-body path.
-    std.posix.nanosleep(0, 20 * std.time.ns_per_ms);
-    try writeAll(pair[0], &body);
+    var sent: usize = 0;
+    while (sent < body.len) : (sent += 65536) {
+        // Body arrives in chunks to exercise the partial-body path. The
+        // server 431s and closes as soon as the buffer cap is hit, so a
+        // BrokenPipe mid-stream is expected.
+        std.posix.nanosleep(0, 5 * std.time.ns_per_ms);
+        writeAll(pair[0], body[sent..@min(sent + 65536, body.len)]) catch |e| {
+            if (e == error.BrokenPipe) break;
+            return e;
+        };
+    }
 
-    const want = "HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\nContent-Length: 17\r\n\r\nPayload Too Large";
+    // The recv buffer grows only up to max_recv_buffer, so a body over the
+    // cap is rejected by the buffer-full path (431) before the echo module's
+    // 413 can apply; the module's 413 path is covered by its own unit test.
+    const want = "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 31\r\n\r\nRequest Header Fields Too Large";
     var buf: [512]u8 = undefined;
     const n = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n]);
     try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+}
+
+test "reactor HTTP 64 KiB POST is echoed with 200 (regression: was 431) and keeps the connection alive" {
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // 64 KiB body: larger than the 16 KiB default buffer, so the receive
+    // path must grow it (in steps) before the request can complete. Before
+    // the buffer-growth fix this request was rejected with 431 (buffer full,
+    // request incomplete) — this test locks in the 200 + full-body echo.
+    const body_len = 64 * 1024;
+    var body = [_]u8{'z'} ** body_len;
+    var wire_buf: [body_len + 128]u8 = undefined;
+    const wire = std.fmt.bufPrint(&wire_buf, "POST / HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ body_len, body }) catch unreachable;
+
+    var sent: usize = 0;
+    while (sent < wire.len) : (sent += 4096) {
+        try writeAll(pair[0], wire[sent..@min(sent + 4096, wire.len)]);
+        std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+    }
+
+    const head = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 65536\r\n\r\n";
+    const total = head.len + body_len;
+    var resp_buf: [head.len + body_len]u8 = undefined;
+    const got = try readUntil(pair[0], &resp_buf, total, 5000);
+    try testing.expectEqual(total, got);
+    try testing.expectEqualStrings(head, resp_buf[0..head.len]);
+    try testing.expectEqualSlices(u8, &body, resp_buf[head.len..total]);
+
+    // The connection must survive the large request: the grown recv-buffer
+    // capacity is kept (no per-request realloc) and a follow-up request is
+    // served normally.
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var small: [128]u8 = undefined;
+    const n2 = try readUntil(pair[0], &small, http_ok_empty.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty, small[0..n2]);
 }
 
 // A JSON config loaded at runtime, driving requests through the pipeline in a
