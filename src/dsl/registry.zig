@@ -11,6 +11,24 @@ pub const Request = http_parser.Request;
 pub const Response = http_response.Response;
 pub const Status = http_response.Status;
 
+/// Result of a full pipeline walk for one request. Defined here (not in the
+/// pipeline) so the router's `DispatchFn` can reference it without an import
+/// cycle; the pipeline re-exports it as `pipeline.Outcome`.
+pub const Outcome = enum {
+    /// A module produced a response (`ctx.resp` is valid).
+    handled,
+    /// The chain ended without a module claiming the request (no route
+    /// matched, a short-circuit, or no module attached). The caller sends the
+    /// default response.
+    not_handled,
+};
+
+/// A comptime-specialised per-route dispatch function (Milestone 7): directly
+/// calls the modules bound to a route's phases — no phase loop, no moduleFor
+/// scans, no Registry.resolve at runtime. Stored on `Route.dispatch` for
+/// struct-literal configs; null for JSON-loaded routes (loop-walk fallback).
+pub const DispatchFn = *const fn (ctx: *Context) anyerror!Outcome;
+
 /// The standard module interface. A module is a comptime value of this type,
 /// exported by its source file; the registry below enumerates them. `run` is
 /// the per-request handler: it may mutate the context and returns an `Action`
@@ -45,6 +63,37 @@ pub const Context = struct {
     /// Ask the connection to close after the response is flushed (e.g. an
     /// error the client cannot keep alive past).
     close_after_write: bool = false,
+    /// Allocator for modules that allocate response data (gzip compression).
+    /// Set by the reactor; null where allocation is unsupported.
+    allocator: ?std.mem.Allocator = null,
+    /// Entity metadata a content module exposes before the content phase runs
+    /// (Milestone 9): consumed by the conditional-GET and cache-header
+    /// modules. Set by e.g. a post_read-phase stat.
+    etag: ?[]const u8 = null,
+    last_modified: ?[]const u8 = null,
+    /// IPv4 address of the client (network byte order), for proxy headers
+    /// (Milestone 12). Zeroes when unknown (socketpair tests).
+    client_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    /// Shared server counters for the stub status page (Milestone 13),
+    /// updated atomically by the reactors.
+    stats: ?*const ServerStats = null,
+};
+
+/// Shared connection/request counters (Milestone 13): updated atomically by
+/// the reactors, rendered by the stub_status module. Defined here so the
+/// Context can reference it without an import cycle; the runtime Server
+/// re-exports it.
+pub const ServerStats = struct {
+    accepted: std.atomic.Value(u64) = .init(0),
+    active: std.atomic.Value(u64) = .init(0),
+    requests: std.atomic.Value(u64) = .init(0),
+    reading: std.atomic.Value(u64) = .init(0),
+    writing: std.atomic.Value(u64) = .init(0),
+    waiting: std.atomic.Value(u64) = .init(0),
+
+    pub fn init() ServerStats {
+        return .{};
+    }
 };
 
 pub const ModuleInfo = struct {
@@ -98,13 +147,21 @@ pub fn Registry(comptime modules: anytype) type {
 /// module file self-registers by exporting a `Module` value.
 pub const default_registry = Registry(.{
     @import("modules/echo.zig").echo,
+    @import("modules/gzip.zig").gzip,
+    @import("modules/cache.zig").conditional_get,
+    @import("modules/cache.zig").cache_headers,
+    @import("modules/static.zig").static,
+    @import("modules/proxy.zig").proxy,
+    @import("modules/access_log.zig").access_log,
+    @import("modules/error_log.zig").error_log,
+    @import("modules/stub_status.zig").stub_status,
 });
 
 const testing = std.testing;
 
 test "modules register themselves with a name and a phase" {
     const infos = default_registry.infos();
-    try testing.expectEqual(@as(usize, 1), infos.len);
+    try testing.expectEqual(@as(usize, 9), infos.len);
     try testing.expectEqualStrings("echo", infos[0].name);
     try testing.expectEqual(Phase.content, infos[0].phase);
 }

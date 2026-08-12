@@ -7,9 +7,11 @@ pub const eventfd = @import("net/eventfd.zig");
 pub const sockets = @import("net/sockets.zig");
 pub const buffer = @import("net/buffer.zig");
 pub const connection = @import("net/connection.zig");
+pub const timer_wheel = @import("net/timer_wheel.zig");
 pub const epoll = @import("net/epoll.zig");
 
 pub const http = struct {
+    pub const mime = @import("http/mime.zig");
     pub const parser = @import("http/parser.zig");
     pub const response = @import("http/response.zig");
 };
@@ -21,6 +23,13 @@ pub const dsl = struct {
     pub const pipeline = @import("dsl/pipeline.zig");
     pub const modules = struct {
         pub const echo = @import("dsl/modules/echo.zig");
+        pub const gzip = @import("dsl/modules/gzip.zig");
+        pub const cache = @import("dsl/modules/cache.zig");
+        pub const static = @import("dsl/modules/static.zig");
+        pub const proxy = @import("dsl/modules/proxy.zig");
+        pub const access_log = @import("dsl/modules/access_log.zig");
+        pub const error_log = @import("dsl/modules/error_log.zig");
+        pub const stub_status = @import("dsl/modules/stub_status.zig");
     };
 };
 
@@ -36,6 +45,7 @@ pub const runtime = struct {
 comptime {
     _ = @import("net/buffer.zig");
     _ = @import("net/connection.zig");
+    _ = @import("net/timer_wheel.zig");
     _ = @import("net/epoll.zig");
     _ = @import("net/eventfd.zig");
     _ = @import("net/sockets.zig");
@@ -45,11 +55,19 @@ comptime {
     _ = @import("net/multireactor.zig");
     _ = @import("http/parser.zig");
     _ = @import("http/response.zig");
+    _ = @import("http/mime.zig");
     _ = @import("dsl/phase.zig");
     _ = @import("dsl/router.zig");
     _ = @import("dsl/registry.zig");
     _ = @import("dsl/pipeline.zig");
     _ = @import("dsl/modules/echo.zig");
+    _ = @import("dsl/modules/gzip.zig");
+    _ = @import("dsl/modules/cache.zig");
+    _ = @import("dsl/modules/static.zig");
+    _ = @import("dsl/modules/proxy.zig");
+    _ = @import("dsl/modules/access_log.zig");
+    _ = @import("dsl/modules/error_log.zig");
+    _ = @import("dsl/modules/stub_status.zig");
     _ = @import("runtime/config.zig");
     _ = @import("runtime/server.zig");
 }

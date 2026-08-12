@@ -9,6 +9,7 @@ pub fn main() !void {
     var single = false;
     var mode: tcp_server.reactor.Mode = .http;
     var config_path: ?[]const u8 = null;
+    var idle_timeout: u32 = tcp_server.reactor.default_idle_timeout_seconds;
 
     var args = std.process.args();
     while (args.next()) |arg| {
@@ -18,6 +19,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--threads")) {
             const v = args.next() orelse return error.MissingThreadsArgument;
             threads = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, arg, "--idle-timeout")) {
+            const v = args.next() orelse return error.MissingIdleTimeoutArgument;
+            idle_timeout = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, arg, "--single")) {
             single = true;
         } else if (std.mem.eql(u8, arg, "--echo")) {
@@ -39,9 +43,10 @@ pub fn main() !void {
     }
 
     // HTTP mode runs through the config-driven pipeline (Milestone 4). The
-    // default config (echo on every path) is a comptime struct literal; an
-    // explicit JSON config is parsed at startup with std.json and lives for
-    // the process duration.
+    // default config (echo on every path) is a comptime struct literal: its
+    // route trie and per-route dispatch functions are built at compile time
+    // (Milestone 7). An explicit JSON config is parsed at startup with
+    // std.json; its trie is built at startup and freed with the server.
     var json_buf: ?[]u8 = null;
     var loaded_cfg: ?tcp_server.runtime.config.Config = null;
     if (config_path) |p| {
@@ -53,14 +58,68 @@ pub fn main() !void {
     defer if (loaded_cfg) |*cfg| cfg.deinit(allocator);
 
     var http_srv: tcp_server.runtime.server.Server = tcp_server.runtime.server.Server.default();
-    if (loaded_cfg) |cfg| http_srv = tcp_server.runtime.server.Server.init(cfg);
+    var http_srv_owns_trie = false;
+    if (loaded_cfg) |cfg| {
+        http_srv = try tcp_server.runtime.server.Server.initWithTrie(allocator, cfg);
+        http_srv_owns_trie = true;
+    }
+    defer if (http_srv_owns_trie) http_srv.deinit(allocator);
 
     const n = threads orelse (std.Thread.getCpuCount() catch 1);
-    var s = try tcp_server.multireactor.Server.initWithThreadsAndHandler(allocator, port, n, mode, &http_srv);
+    var s = try tcp_server.multireactor.Server.initWithThreadsAndHandlerTimeout(allocator, port, n, mode, &http_srv, idle_timeout);
     defer s.deinit();
+
+    // Graceful reload (Milestone 13): SIGHUP re-parses the config and swaps
+    // in a fresh reactor set; old connections drain on the old set. Only
+    // meaningful with --config; old handlers stay alive until process exit.
+    tcp_server.multireactor.installSignalHandlers();
+    var reload_handlers = std.ArrayList(*tcp_server.runtime.server.Server).empty;
+    defer reload_handlers.deinit(allocator);
+    if (config_path) |path| {
+        const ReloadState = struct {
+            allocator: std.mem.Allocator,
+            config_path: []const u8,
+            handlers: *std.ArrayList(*tcp_server.runtime.server.Server),
+
+            fn reload(userdata: *anyopaque) ?*const tcp_server.runtime.server.Server {
+                const st: *@This() = @ptrCast(@alignCast(userdata));
+                const json = std.fs.cwd().readFileAlloc(st.config_path, st.allocator, .limited(1 << 20)) catch return null;
+                defer st.allocator.free(json);
+                var cfg = tcp_server.runtime.config.Config.fromJson(st.allocator, json) catch return null;
+                cfg.validate(tcp_server.dsl.registry.default_registry) catch return null;
+                // The config memory must outlive the handler (the server's
+                // route table points into it); it is freed at process exit
+                // along with the handler itself (one leak per reload).
+                const srv = st.allocator.create(tcp_server.runtime.server.Server) catch return null;
+                srv.* = tcp_server.runtime.server.Server.initWithTrie(st.allocator, cfg) catch {
+                    st.allocator.destroy(srv);
+                    return null;
+                };
+                st.handlers.append(st.allocator, srv) catch {
+                    st.allocator.destroy(srv);
+                    return null;
+                };
+                std.debug.print("reload: config re-parsed\n", .{});
+                return srv;
+            }
+        };
+        var reload_state = ReloadState{
+            .allocator = allocator,
+            .config_path = path,
+            .handlers = &reload_handlers,
+        };
+        s.reload_fn = ReloadState.reload;
+        s.reload_userdata = &reload_state;
+    }
+
     switch (mode) {
         .echo => std.debug.print("Starting multi-reactor TCP echo server on port {} with {} threads\n", .{ port, n }),
         .http => std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads\n", .{ port, n }),
+    }
+    if (idle_timeout > 0) {
+        std.debug.print("Idle timeout: {}s\n", .{idle_timeout});
+    } else {
+        std.debug.print("Idle timeout: disabled\n", .{});
     }
     try s.run();
 }

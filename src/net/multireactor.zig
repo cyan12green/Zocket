@@ -11,26 +11,35 @@ const runtime_server = @import("../runtime/server.zig");
 
 const max_events = 1024;
 
-/// Multi-reactor server (README Milestone 2): one epoll loop per core, each
-/// running on its own reactor thread that exclusively owns its connections.
-/// The calling thread owns the single listener socket, drains inbound
-/// connections and hands each one to a reactor through the round-robin
-/// `Dispatcher`. Connection dispatch is queue-based (reactor-local mutex +
-/// eventfd wakeup), so no locks are ever taken in the reactor's event path.
+/// Multi-reactor server: one epoll loop per core, each running on its own
+/// reactor thread that exclusively owns its connections. Since Milestone 14
+/// every reactor binds its own SO_REUSEPORT listener on the same port: the
+/// kernel load-balances inbound connections across reactors and each reactor
+/// accepts directly — no accept loop, no dispatcher, no eventfd wakeup per
+/// connection. The main thread only watches for stop/reload.
 pub const Server = struct {
     allocator: std.mem.Allocator,
     port: u16,
-    listener: posix.fd_t,
-    main_ep: epoll.Epoll,
     stop_ev: eventfd.EventFd,
     reactors: std.ArrayList(*reactor.Reactor),
-    dispatch: dispatcher.Dispatcher,
     running: std.atomic.Value(bool),
-    total_accepted: std.atomic.Value(usize),
+    /// Heap-allocated so per-reactor accept counters can share a stable
+    /// address across Server copies and reloads.
+    total_accepted: *std.atomic.Value(usize),
     mode: reactor.Mode,
     /// Config-driven HTTP request processor shared by the reactors (HTTP mode
     /// only; null falls back to each reactor's default handler).
     http_handler: ?*const runtime_server.Server,
+    /// Connection idle timeout in seconds, forwarded to every reactor (zero
+    /// disables idle reaping).
+    idle_timeout_seconds: u32,
+    /// Graceful reload (Milestone 13): set by the embedder along with
+    /// `reload_userdata`; on SIGHUP the loop calls it to get a new HTTP
+    /// handler, swaps in a fresh reactor set and drains the old one.
+    reload_fn: ?*const fn (*anyopaque) ?*const runtime_server.Server = null,
+    reload_userdata: ?*anyopaque = null,
+    /// Old reactor sets waiting for their connections to finish.
+    draining: std.ArrayList(*reactor.Reactor) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !Server {
         const n = try std.Thread.getCpuCount();
@@ -48,59 +57,71 @@ pub const Server = struct {
         mode: reactor.Mode,
         http_handler: ?*const runtime_server.Server,
     ) !Server {
+        return initWithThreadsAndHandlerTimeout(allocator, port, n_threads, mode, http_handler, reactor.default_idle_timeout_seconds);
+    }
+
+    /// Full constructor: reactor count, HTTP handler, and the idle timeout in
+    /// seconds (zero disables idle reaping).
+    pub fn initWithThreadsAndHandlerTimeout(
+        allocator: std.mem.Allocator,
+        port: u16,
+        n_threads: usize,
+        mode: reactor.Mode,
+        http_handler: ?*const runtime_server.Server,
+        idle_timeout_seconds: u32,
+    ) !Server {
         const n = @max(n_threads, 1);
-
-        const listener = try sockets.createListeningSocket(port, 4096);
-        errdefer posix.close(listener);
-
-        const main_ep = try epoll.Epoll.create();
-        errdefer main_ep.close();
 
         const stop_ev = try eventfd.EventFd.create();
         errdefer stop_ev.close();
 
         var reactors_list = std.ArrayList(*reactor.Reactor).empty;
-        // Fix the backing storage up front so reactor addresses stay stable
-        // for the dispatcher pointers.
+        var listeners = std.ArrayList(posix.fd_t).empty;
         {
             errdefer {
                 for (reactors_list.items) |r| r.deinit();
                 reactors_list.deinit(allocator);
+                for (listeners.items) |l| posix.close(l);
+                listeners.deinit(allocator);
             }
             try reactors_list.ensureTotalCapacity(allocator, n);
+            try listeners.ensureTotalCapacity(allocator, n);
+            // Milestone 14: one SO_REUSEPORT listener per reactor; the kernel
+            // distributes inbound connections across them.
+            var shared_accepted = std.atomic.Value(usize).init(0);
             for (0..n) |i| {
+                const listener = try sockets.createListeningSocketReusePort(port, 4096);
+                listeners.appendAssumeCapacity(listener);
                 const r = try allocator.create(reactor.Reactor);
-                const init_res = reactor.Reactor.initWithHandler(allocator, i, mode, http_handler) catch |e| {
+                const init_res = reactor.Reactor.initWithHandlerListener(allocator, i, mode, http_handler, idle_timeout_seconds, listener) catch |e| {
                     allocator.destroy(r);
                     return e;
                 };
                 r.* = init_res;
+                r.accepted_counter = &shared_accepted;
                 reactors_list.appendAssumeCapacity(r);
             }
         }
 
+        const accepted_counter = try allocator.create(std.atomic.Value(usize));
+        accepted_counter.* = std.atomic.Value(usize).init(0);
+
         var self = Server{
             .allocator = allocator,
             .port = port,
-            .listener = listener,
-            .main_ep = main_ep,
             .stop_ev = stop_ev,
             .reactors = reactors_list,
-            .dispatch = dispatcher.Dispatcher.init(reactors_list.items),
             .running = std.atomic.Value(bool).init(false),
-            .total_accepted = std.atomic.Value(usize).init(0),
+            .total_accepted = accepted_counter,
             .mode = mode,
             .http_handler = http_handler,
+            .idle_timeout_seconds = idle_timeout_seconds,
+            .reload_fn = null,
+            .reload_userdata = null,
+            .draining = .empty,
         };
-
-        self.main_ep.add(self.listener, epoll.Events.In | epoll.Events.EdgeTriggered, self.listener) catch |e| {
-            self.reactorsCleanup();
-            return e;
-        };
-        self.main_ep.add(self.stop_ev.fd, epoll.Events.In, self.stop_ev.fd) catch |e| {
-            self.reactorsCleanup();
-            return e;
-        };
+        // The reactors' accept counters share the server's counter.
+        for (self.reactors.items) |r| r.accepted_counter = accepted_counter;
 
         return self;
     }
@@ -110,9 +131,9 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         for (self.reactors.items) |r| r.deinit();
         self.reactors.deinit(self.allocator);
-        self.main_ep.close();
+        self.draining.deinit(self.allocator);
         self.stop_ev.close();
-        posix.close(self.listener);
+        self.allocator.destroy(self.total_accepted);
     }
 
     fn reactorsCleanup(self: *Server) void {
@@ -124,9 +145,11 @@ pub const Server = struct {
         return self.reactors.items.len;
     }
 
-    /// Actual port the listener is bound to (may differ from init(port) when 0).
+    /// Actual port the listeners are bound to (may differ from init(port)
+    /// when 0; all SO_REUSEPORT listeners share the port).
     pub fn boundPort(self: *const Server) !u16 {
-        return sockets.boundPort(self.listener);
+        const first = self.reactors.items[0].listener;
+        return sockets.boundPort(first);
     }
 
     /// Total connections accepted so far (atomic, observable from any thread).
@@ -142,51 +165,91 @@ pub const Server = struct {
 
     /// Blocking event loop. Starts the reactor threads, accepts connections and
     /// dispatches them round-robin; returns when `stop` is called (or an error
-    /// is fatal), then stops and joins all reactor threads.
+    /// is fatal), then stops and joins all reactor threads. On SIGHUP
+    /// (`reload_requested`), swaps in a fresh reactor set with the reload
+    /// callback's handler and drains the old set.
     pub fn run(self: *Server) !void {
         for (self.reactors.items) |r| try r.start();
 
         self.running.store(true, .release);
-        var events: [max_events]linux.epoll_event = undefined;
 
+        // With SO_REUSEPORT the reactors accept directly; the main thread
+        // only polls for stop/reload/drain completion.
         while (self.running.load(.acquire)) {
-            const n = self.main_ep.wait(&events, 100) catch continue;
-            for (events[0..n]) |ev| {
-                const fd: posix.fd_t = @intCast(ev.data.ptr);
-                if (fd == self.stop_ev.fd) {
-                    self.stop_ev.read();
-                    self.running.store(false, .release);
-                    break;
-                }
-                if (fd == self.listener) {
-                    if (ev.events & epoll.Events.In == 0) continue;
-                    try self.drainAccepts();
-                }
-            }
+            self.maybeReload();
+            self.reapDrained();
+            self.stop_ev.read();
+            std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
         }
 
         self.shutdownReactors();
     }
 
-    fn drainAccepts(self: *Server) !void {
-        while (true) {
-            const conn_fd = sockets.acceptNonBlock(self.listener) catch |e| {
-                if (e == error.WouldBlock) return;
-                return e;
-            };
-            _ = self.total_accepted.fetchAdd(1, .monotonic);
+    /// SIGHUP reload: re-create the reactor set with the new handler; old
+    /// reactors drain in the background (existing connections finish, no new
+    /// ones are accepted) and are joined once empty.
+    fn maybeReload(self: *Server) void {
+        if (!reload_requested.load(.acquire)) return;
+        reload_requested.store(false, .release);
+        const new_handler = (self.reload_fn orelse return)(self.reload_userdata orelse return) orelse return;
 
-            const conn = connection.Connection.create(self.allocator, conn_fd) catch |e| {
-                posix.close(conn_fd);
-                return e;
+        var new_reactors = std.ArrayList(*reactor.Reactor).empty;
+        new_reactors.ensureTotalCapacity(self.allocator, self.reactors.items.len) catch return;
+        errdefer {
+            for (new_reactors.items) |r| r.deinit();
+            new_reactors.deinit(self.allocator);
+        }
+        for (0..self.reactors.items.len) |i| {
+            // Milestone 14: each reloaded reactor gets its own SO_REUSEPORT
+            // listener (the kernel balances across old + new listeners while
+            // the old ones drain).
+            const listener = sockets.createListeningSocketReusePort(self.port, 4096) catch return;
+            const r = self.allocator.create(reactor.Reactor) catch return;
+            r.* = reactor.Reactor.initWithHandlerListener(self.allocator, i, self.mode, new_handler, self.idle_timeout_seconds, listener) catch {
+                posix.close(listener);
+                self.allocator.destroy(r);
+                return;
             };
-            self.dispatch.pick().attach(conn);
+            new_reactors.appendAssumeCapacity(r);
+        }
+
+        var old = self.reactors;
+        self.reactors = new_reactors;
+        self.http_handler = new_handler;
+        for (self.reactors.items) |r| r.accepted_counter = self.total_accepted;
+        for (old.items) |r| r.drain();
+        self.draining.appendSlice(self.allocator, old.items) catch {};
+        old.deinit(self.allocator);
+        for (self.reactors.items) |r| r.start() catch {};
+        std.debug.print("reloaded: new route table active; draining {d} old reactor(s)\n", .{old.items.len});
+    }
+
+    /// Join and free drained reactors whose loops have exited.
+    fn reapDrained(self: *Server) void {
+        var i: usize = 0;
+        while (i < self.draining.items.len) {
+            const r = self.draining.items[i];
+            if (r.isDrained()) {
+                r.join();
+                r.deinit();
+                self.allocator.destroy(r);
+                _ = self.draining.swapRemove(i);
+            } else {
+                i += 1;
+            }
         }
     }
 
     fn shutdownReactors(self: *Server) void {
         for (self.reactors.items) |r| r.stop();
         for (self.reactors.items) |r| r.join();
+        // Any still-draining reactors are stopped and joined too.
+        for (self.draining.items) |r| r.stop();
+        for (self.draining.items) |r| {
+            r.join();
+            r.deinit();
+            self.allocator.destroy(r);
+        }
     }
 };
 
@@ -395,4 +458,22 @@ test "multi-reactor HTTP with JSON config echoes via the pipeline" {
 
     server.stop();
     run_thread.join();
+}
+// ---- SIGHUP graceful reload ----
+
+/// Set by the SIGHUP handler (async-signal-safe: an atomic store).
+var reload_requested = std.atomic.Value(bool).init(false);
+
+fn handleHup(_: posix.SIG) callconv(.c) void {
+    reload_requested.store(true, .release);
+}
+
+/// Install the SIGHUP handler (called by the embedder, e.g. main).
+pub fn installSignalHandlers() void {
+    var act = posix.Sigaction{
+        .handler = .{ .handler = handleHup },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.HUP, &act, null);
 }

@@ -1,0 +1,27 @@
+{
+  "routes": [
+    {
+      "path": "/proxy",
+      "match": "prefix",
+      "modules": { "rewrite": "proxy" },
+      "upstreams": [
+        { "host": "127.0.0.1", "port": 19090 },
+        { "host": "127.0.0.1", "port": 19091 }
+      ],
+      "balance": "round_robin"
+    },
+    {
+      "path": "/dead",
+      "match": "prefix",
+      "modules": { "rewrite": "proxy" },
+      "upstreams": [ { "host": "127.0.0.1", "port": 19299 } ],
+      "max_fails": 2,
+      "fail_timeout_seconds": 5
+    },
+    {
+      "path": "/",
+      "match": "prefix",
+      "modules": { "content": "echo" }
+    }
+  ]
+}

@@ -18,13 +18,15 @@ pub const echo: registry.Module = .{
 
 fn run(ctx: *registry.Context) !registry.Action {
     if (ctx.req.body.len > max_echo_body) {
-        ctx.resp.* = http_response.Response.init(.payload_too_large);
+        // Mutate in place: earlier-phase modules (cache headers, conditional
+        // GETs) may have set response state that must survive content.
+        ctx.resp.status = .payload_too_large;
         ctx.resp.setBody(http_response.Status.payload_too_large.reasonPhrase());
         ctx.close_after_write = true;
         return .handled;
     }
-    ctx.resp.* = http_response.Response.init(.ok);
-    if (ctx.req.body.len > 0) ctx.resp.setBody(ctx.req.body);
+    ctx.resp.status = .ok;
+    ctx.resp.body = if (ctx.req.body.len > 0) ctx.req.body else &.{};
     return .handled;
 }
 

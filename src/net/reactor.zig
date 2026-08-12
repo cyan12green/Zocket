@@ -5,12 +5,17 @@ const epoll = @import("epoll.zig");
 const eventfd = @import("eventfd.zig");
 const connection = @import("connection.zig");
 const sockets = @import("sockets.zig");
+const timer_wheel = @import("timer_wheel.zig");
 const http_parser = @import("../http/parser.zig");
 const http_response = @import("../http/response.zig");
 const dsl_pipeline = @import("../dsl/pipeline.zig");
 const runtime_server = @import("../runtime/server.zig");
 
 const max_events = 1024;
+
+/// Default connection idle timeout in seconds (Milestone 5). Zero disables
+/// idle reaping.
+pub const default_idle_timeout_seconds: u32 = 60;
 
 /// Fallback HTTP request processor used when a reactor is created without an
 /// explicit handler (e.g. in tests): the default echo-on-everything config.
@@ -33,6 +38,19 @@ const HttpSession = struct {
     /// Close the connection once the current response has been flushed
     /// (errors, and requests that asked for Connection: close).
     close_after_write: bool = false,
+    /// Stub-status accounting state (Milestone 13): which shared counter the
+    /// connection currently contributes to.
+    stat_state: enum { waiting, reading, writing } = .waiting,
+    /// sendfile state (Milestone 14): while `file_remaining > 0` the body is
+    /// pushed from this fd into the socket.
+    file_fd: posix.fd_t = -1,
+    file_offset: u64 = 0,
+    file_remaining: u64 = 0,
+    /// writev body (Milestone 14): the head lives in the send buffer, the
+    /// body here; both go out in one writev. `pending_body_owned` marks a
+    /// module-allocated body that must be freed once fully sent.
+    pending_body: []const u8 = &.{},
+    pending_body_owned: bool = false,
 };
 
 /// A single-reactor worker: its own thread, its own epoll instance and its own
@@ -63,9 +81,37 @@ pub const Reactor = struct {
     /// monotonic, so tests can assert dispatch happened without racing
     /// connection reaping.
     registered: std.atomic.Value(usize),
+    /// Idle timeout in wheel ticks (1 s each); zero disables idle reaping.
+    idle_timeout_ticks: u64,
+    /// Wall-clock epoch the timer ticks are measured from.
+    epoch: std.time.Instant,
+    /// Timer wheel advancing on every loop iteration; idle connections expire
+    /// and close.
+    wheel: timer_wheel.default_wheel,
+    /// Connections the wheel expired in the current advance pass; drained
+    /// after `advanceTo` returns (the wheel callback must not tear down
+    /// objects whose entries are still linked).
+    expired_fds: std.ArrayList(posix.fd_t),
+    /// Shared connection/request counters (Milestone 13); null in echo mode.
+    stats: ?*runtime_server.ServerStats = null,
+    /// Per-reactor listener (Milestone 14, SO_REUSEPORT): when set, this
+    /// reactor accepts connections directly from the kernel; -1 otherwise.
+    listener: posix.fd_t = -1,
+    /// Total accepted counter shared with the server (bumped per accept).
+    accepted_counter: ?*std.atomic.Value(usize) = null,
+    /// Graceful-drain mode (Milestone 13): stop accepting new connections
+    /// and exit the loop once the connection map empties (or a timeout).
+    draining: std.atomic.Value(bool) = .init(false),
+    drained: std.atomic.Value(bool) = .init(false),
+    drain_started: std.time.Instant = undefined,
 
     pub fn init(allocator: std.mem.Allocator, id: usize, mode: Mode) !Reactor {
-        return initWithHandler(allocator, id, mode, null);
+        return initWithTimeout(allocator, id, mode, default_idle_timeout_seconds);
+    }
+
+    /// Like `init`, with an explicit idle timeout in seconds (zero disables).
+    pub fn initWithTimeout(allocator: std.mem.Allocator, id: usize, mode: Mode, idle_timeout_seconds: u32) !Reactor {
+        return initWithHandlerTimeout(allocator, id, mode, null, idle_timeout_seconds);
     }
 
     /// Like `init`, but with an explicit HTTP request processor (used in HTTP
@@ -75,6 +121,42 @@ pub const Reactor = struct {
         id: usize,
         mode: Mode,
         http_handler: ?*const runtime_server.Server,
+    ) !Reactor {
+        return initWithHandlerTimeout(allocator, id, mode, http_handler, default_idle_timeout_seconds);
+    }
+
+    /// Like `initWithHandlerTimeout`, with a per-reactor listener
+    /// (SO_REUSEPORT accept path, Milestone 14).
+    pub fn initWithHandlerListener(
+        allocator: std.mem.Allocator,
+        id: usize,
+        mode: Mode,
+        http_handler: ?*const runtime_server.Server,
+        idle_timeout_seconds: u32,
+        listener: posix.fd_t,
+    ) !Reactor {
+        var self = try initWithHandlerTimeout(allocator, id, mode, http_handler, idle_timeout_seconds);
+        self.listener = listener;
+        self.ep.add(listener, epoll.Events.In | epoll.Events.EdgeTriggered, listener) catch {
+            self.ep.close();
+            self.wakeup.close();
+            self.connections.deinit();
+            self.http_sessions.deinit();
+            self.pending.deinit(self.allocator);
+            self.expired_fds.deinit(self.allocator);
+            return error.ListenerRegisterFailed;
+        };
+        return self;
+    }
+
+    /// Full constructor: HTTP handler + idle timeout in seconds (zero
+    /// disables idle reaping).
+    pub fn initWithHandlerTimeout(
+        allocator: std.mem.Allocator,
+        id: usize,
+        mode: Mode,
+        http_handler: ?*const runtime_server.Server,
+        idle_timeout_seconds: u32,
     ) !Reactor {
         var self = Reactor{
             .allocator = allocator,
@@ -90,6 +172,15 @@ pub const Reactor = struct {
             .pending = .empty,
             .pending_lock = .{},
             .registered = std.atomic.Value(usize).init(0),
+            .idle_timeout_ticks = timer_wheel.default_wheel.tickForNs(@as(u64, idle_timeout_seconds) * std.time.ns_per_s),
+            .epoch = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
+            .wheel = .{},
+            .expired_fds = .empty,
+            .stats = if (mode == .http)
+                @constCast((http_handler orelse &default_http_handler).stats)
+            else
+                null,
+            .drain_started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
         };
         errdefer self.ep.close();
         self.ep.add(self.wakeup.fd, epoll.Events.In, self.wakeup.fd) catch {
@@ -99,6 +190,16 @@ pub const Reactor = struct {
             self.http_sessions.deinit();
             self.pending.deinit(self.allocator);
         };
+        if (self.listener >= 0) {
+            self.ep.add(self.listener, epoll.Events.In | epoll.Events.EdgeTriggered, self.listener) catch {
+                self.ep.close();
+                self.wakeup.close();
+                self.connections.deinit();
+                self.http_sessions.deinit();
+                self.pending.deinit(self.allocator);
+                return error.ListenerRegisterFailed;
+            };
+        }
         return self;
     }
 
@@ -107,11 +208,13 @@ pub const Reactor = struct {
         // Tear down connections while the epoll fd is still open: they deregister
         // via epoll_ctl DEL, which would EBADF-panic on a closed epoll fd.
         self.closeAllConnections();
+        if (self.listener >= 0) posix.close(self.listener);
         self.ep.close();
         self.wakeup.close();
         self.connections.deinit();
         self.http_sessions.deinit();
         self.pending.deinit(self.allocator);
+        self.expired_fds.deinit(self.allocator);
     }
 
     pub fn start(self: *Reactor) !void {
@@ -133,8 +236,29 @@ pub const Reactor = struct {
         }
     }
 
+    /// Graceful drain (Milestone 13): stop accepting new connections; the
+    /// loop exits once every existing connection has finished (or after
+    /// `drain_timeout_ns`). The reactor thread must be joined afterwards.
+    pub fn drain(self: *Reactor) void {
+        self.draining.store(true, .release);
+        self.drain_started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+        self.wakeup.write();
+    }
+
+    /// True once the reactor loop has exited after a drain (polled by the
+    /// server to join and free drained reactors).
+    pub fn isDrained(self: *const Reactor) bool {
+        return self.drained.load(.acquire);
+    }
+
     /// Hand a new connection to this reactor. Safe to call from any thread.
+    /// Rejected (and closed) while the reactor is draining.
     pub fn attach(self: *Reactor, conn: *connection.Connection) void {
+        if (self.draining.load(.acquire)) {
+            conn.close();
+            conn.destroy();
+            return;
+        }
         self.pending_lock.lock();
         defer self.pending_lock.unlock();
         self.pending.append(self.allocator, conn) catch {
@@ -149,10 +273,18 @@ pub const Reactor = struct {
         return self.connections.count();
     }
 
+    const drain_timeout_ns = 30 * std.time.ns_per_s;
+
     fn reactorLoop(self: *Reactor) void {
         sockets.pinToCpu(self.id);
         var events: [max_events]linux.epoll_event = undefined;
         while (self.running.load(.acquire)) {
+            if (self.draining.load(.acquire)) {
+                if (self.connections.count() == 0) break;
+                const now = std.time.Instant.now() catch break;
+                if (now.since(self.drain_started) > drain_timeout_ns) break;
+            }
+            self.advanceTimers();
             const n = self.ep.wait(&events, 100) catch continue;
             for (events[0..n]) |ev| {
                 self.handleEvent(ev.events, @intCast(ev.data.ptr));
@@ -162,12 +294,61 @@ pub const Reactor = struct {
         // even if a connection arrived between the last wakeup and stop.
         self.wakeup.read();
         self.drainPending();
+        self.drained.store(true, .release);
+    }
+
+    /// Advance the timer wheel to the current wall tick and close every
+    /// connection that expired. One clock read and (usually) one empty slot
+    /// walk per loop iteration.
+    fn advanceTimers(self: *Reactor) void {
+        if (self.idle_timeout_ticks == 0) return;
+        const tick = self.nowTick();
+        self.wheel.advanceTo(tick, self, onExpired);
+        for (self.expired_fds.items) |fd| self.removeConnection(fd);
+        self.expired_fds.clearRetainingCapacity();
+    }
+
+    /// Wall-clock time in wheel ticks (1 s granularity), relative to `epoch`.
+    fn nowTick(self: *const Reactor) u64 {
+        const now = std.time.Instant.now() catch return 0;
+        return timer_wheel.default_wheel.tickForNs(now.since(self.epoch));
+    }
+
+    /// Timer wheel fired an entry: record its connection for teardown. Runs
+    /// on the reactor thread inside `advanceTo`; only appends (the wheel may
+    /// hold pointers to connections whose destruction must be deferred).
+    fn onExpired(self: *Reactor, entry: *timer_wheel.TimerEntry) void {
+        const conn: *connection.Connection = @fieldParentPtr("timer", entry);
+        self.expired_fds.append(self.allocator, conn.fd) catch {};
+    }
+
+    /// Stub-status accounting: the session moved from reading to writing
+    /// (a response has been queued).
+    fn markWriting(self: *Reactor, fd: posix.fd_t) void {
+        const stats = self.stats orelse return;
+        const session = self.http_sessions.getPtr(fd) orelse return;
+        if (session.stat_state == .reading) {
+            session.stat_state = .writing;
+            _ = stats.reading.fetchSub(1, .monotonic);
+            _ = stats.writing.fetchAdd(1, .monotonic);
+        }
+    }
+
+    /// (Re)arm the idle timer for `conn` at the current tick. Any recv is
+    /// activity, so the timer is pushed back on every read.
+    fn rearmTimer(self: *Reactor, conn: *connection.Connection) void {
+        if (self.idle_timeout_ticks == 0) return;
+        self.wheel.rearm(&conn.timer, self.nowTick(), self.idle_timeout_ticks);
     }
 
     fn handleEvent(self: *Reactor, events: u32, fd: posix.fd_t) void {
         if (fd == self.wakeup.fd) {
             self.wakeup.read();
             self.drainPending();
+            return;
+        }
+        if (fd == self.listener) {
+            if (events & epoll.Events.In != 0) self.acceptConnections();
             return;
         }
 
@@ -194,6 +375,7 @@ pub const Reactor = struct {
                 self.removeConnection(fd);
                 return;
             }
+            self.rearmTimer(conn);
             self.onMessage(conn) catch {
                 self.removeConnection(fd);
             };
@@ -224,6 +406,7 @@ pub const Reactor = struct {
 
         if (events & epoll.Events.In != 0) {
             const conn = self.connections.get(fd) orelse return;
+            var got_data = false;
             while (true) {
                 const n = conn.recv() catch |e| switch (e) {
                     error.WouldBlock => break,
@@ -238,6 +421,18 @@ pub const Reactor = struct {
                 if (n == 0) {
                     self.removeConnection(fd);
                     return;
+                }
+                got_data = true;
+            }
+            if (got_data) {
+                self.rearmTimer(conn);
+                if (self.stats) |s| {
+                    const session = self.http_sessions.getPtr(fd) orelse return;
+                    if (session.stat_state == .waiting) {
+                        session.stat_state = .reading;
+                        _ = s.waiting.fetchSub(1, .monotonic);
+                        _ = s.reading.fetchAdd(1, .monotonic);
+                    }
                 }
             }
             const session = self.http_sessions.getPtr(fd) orelse return;
@@ -284,14 +479,55 @@ pub const Reactor = struct {
                     self.respondAndClose(fd, .not_implemented);
                     return;
                 },
+                .payload_too_large => {
+                    self.respondAndClose(fd, .payload_too_large);
+                    return;
+                },
                 .out_of_memory => {
                     self.respondAndClose(fd, .internal_error);
                     return;
                 },
                 .complete => {
                     var resp = http_response.Response.init(.ok);
-                    var ctx = dsl_pipeline.Context{ .req = &session.req, .resp = &resp };
+                    var ctx = dsl_pipeline.Context{
+                        .req = &session.req,
+                        .resp = &resp,
+                        .allocator = self.allocator,
+                        .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0 },
+                        .stats = self.stats,
+                    };
                     const handler = self.http_handler orelse &default_http_handler;
+
+                    // Milestone 11 fast path: module-less response-template
+                    // routes are written straight from their pre-serialised
+                    // bytes (status line + template headers + Connection +
+                    // Content-Length + body), byte-identical to the pipeline
+                    // equivalent but with zero dispatch.
+                    if (handler.matchFast(&ctx)) |fb| {
+                        const close = !session.req.keep_alive;
+                        conn.send_buf.compact();
+                        _ = conn.send_buf.writeSlice(fb.head);
+                        var hdr_buf: [96]u8 = undefined;
+                        const hdr = std.fmt.bufPrint(&hdr_buf, "Connection: {s}\r\nContent-Length: {d}\r\n\r\n", .{
+                            if (close) "close" else "keep-alive",
+                            fb.body.len, // HEAD keeps the would-be body length
+                        }) catch unreachable;
+                        _ = conn.send_buf.writeSlice(hdr);
+                        if (session.req.method != .head) {
+                            _ = conn.send_buf.writeSlice(fb.body);
+                        }
+                        session.close_after_write = close;
+                        if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+                        self.markWriting(fd);
+                        session.writing = true;
+                        self.flushHttp(fd);
+                        if (!self.connections.contains(fd)) return;
+                        const sess = self.http_sessions.getPtr(fd) orelse return;
+                        if (!sess.writing) continue; // flushed fully; next pipelined request
+                        self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
+                        return;
+                    }
+
                     const request_outcome = handler.handleRequest(&ctx) catch {
                         self.respondAndClose(fd, .internal_error);
                         return;
@@ -305,11 +541,40 @@ pub const Reactor = struct {
                     const close = ctx.close_after_write or !session.req.keep_alive;
                     resp.setHeader("Connection", if (close) "close" else "keep-alive");
                     conn.send_buf.compact();
-                    resp.writeToBuffer(conn.send_buf) catch {
-                        self.removeConnection(fd);
-                        return;
-                    };
+                    // Milestone 14 writev: the head goes into the send
+                    // buffer, the body stays put and both are flushed in one
+                    // writev — no body memcpy through the send buffer.
+                    if (resp.body_from_file) {
+                        resp.writeHeadToBufferWithLength(conn.send_buf, resp.file_len) catch {
+                            if (resp.body_owned) self.allocator.free(resp.body);
+                            self.removeConnection(fd);
+                            return;
+                        };
+                    } else {
+                        resp.writeHeadToBuffer(conn.send_buf) catch {
+                            if (resp.body_owned) self.allocator.free(resp.body);
+                            self.removeConnection(fd);
+                            return;
+                        };
+                    }
+                    if (session.req.method == .head or resp.body.len == 0) {
+                        session.pending_body = &.{};
+                        session.pending_body_owned = false;
+                        if (resp.body_owned) self.allocator.free(resp.body);
+                    } else {
+                        session.pending_body = resp.body;
+                        session.pending_body_owned = resp.body_owned;
+                    }
+                    if (resp.body_from_file) {
+                        // Take ownership of the module's fd; the body goes via
+                        // sendfile once the head has flushed.
+                        session.file_fd = resp.file_fd;
+                        session.file_offset = resp.file_offset;
+                        session.file_remaining = if (session.req.method == .head) 0 else resp.file_len;
+                    }
                     session.close_after_write = close;
+                    if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+                    self.markWriting(fd);
                     session.writing = true;
                     self.flushHttp(fd);
                     if (!self.connections.contains(fd)) return;
@@ -331,19 +596,75 @@ pub const Reactor = struct {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
 
-        while (conn.send_buf.availableRead() > 0) {
-            const n = conn.send() catch |e| {
-                if (e == error.WouldBlock) break;
+        // Milestone 14: one writev for the remaining head + the body.
+        if (session.pending_body.len > 0) {
+            var iov = [_]posix.iovec_const{
+                .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() },
+                .{ .base = session.pending_body.ptr, .len = session.pending_body.len },
+            };
+            const n = posix.writev(fd, &iov) catch |e| {
+                if (e == error.WouldBlock) return;
+                if (session.pending_body_owned) self.allocator.free(session.pending_body);
+                session.pending_body = &.{};
                 self.removeConnection(fd);
                 return;
             };
-            if (n == 0) break;
+            const head_avail = conn.send_buf.availableRead();
+            if (n <= head_avail) {
+                conn.send_buf.consume(n);
+            } else {
+                conn.send_buf.consume(head_avail);
+                session.pending_body = session.pending_body[n - head_avail ..];
+            }
+            if (session.pending_body.len > 0) {
+                // Socket buffer full; continue on the next EPOLLOUT edge.
+                return;
+            }
+            if (session.pending_body_owned) self.allocator.free(session.pending_body);
+            session.pending_body_owned = false;
+            session.pending_body = &.{};
+            if (conn.send_buf.availableRead() > 0) return;
+        } else {
+            while (conn.send_buf.availableRead() > 0) {
+                const n = conn.send() catch |e| {
+                    if (e == error.WouldBlock) break;
+                    self.removeConnection(fd);
+                    return;
+                };
+                if (n == 0) break;
+            }
+            if (conn.send_buf.availableRead() > 0) {
+                // Socket buffer full; the next EPOLLOUT edge (socket became
+                // writable again) will continue the flush.
+                return;
+            }
         }
 
-        if (conn.send_buf.availableRead() > 0) {
-            // Socket buffer full; the next EPOLLOUT edge (socket became
-            // writable again) will continue the flush.
-            return;
+        // Milestone 14: push any file body straight into the socket.
+        if (session.file_remaining > 0) {
+            var off: i64 = @intCast(session.file_offset);
+            while (session.file_remaining > 0) {
+                const rc = linux.sendfile(fd, session.file_fd, &off, @intCast(@min(session.file_remaining, 1 << 20)));
+                const err = posix.errno(rc);
+                if (err != .SUCCESS) {
+                    if (err == .AGAIN or err == .INTR) break; // wait for EPOLLOUT
+                    posix.close(session.file_fd);
+                    session.file_fd = -1;
+                    self.removeConnection(fd);
+                    return;
+                }
+                const n = rc;
+                session.file_offset += n;
+                session.file_remaining -= n;
+                off = @intCast(session.file_offset);
+            }
+            if (session.file_remaining > 0) {
+                // Socket buffer full mid-sendfile: continue on the next
+                // EPOLLOUT edge.
+                return;
+            }
+            posix.close(session.file_fd);
+            session.file_fd = -1;
         }
 
         if (session.close_after_write) {
@@ -355,6 +676,13 @@ pub const Reactor = struct {
         }
 
         session.writing = false;
+        if (self.stats) |s| {
+            if (session.stat_state == .writing) {
+                session.stat_state = .waiting;
+                _ = s.writing.fetchSub(1, .monotonic);
+                _ = s.waiting.fetchAdd(1, .monotonic);
+            }
+        }
         session.parser.reset();
         session.req.reset();
         // Nothing to send: wait for the next request without spurious
@@ -378,6 +706,22 @@ pub const Reactor = struct {
     fn respondAndClose(self: *Reactor, fd: posix.fd_t, status: http_response.Status) void {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
+        // Milestone 13: error-log line for errors the pipeline never sees
+        // (parse failures). Pipeline-visible errors are logged by the
+        // error_log module when bound.
+        {
+            const code = @intFromEnum(status);
+            var ip_buf: [16]u8 = undefined;
+            const ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ conn.peer_ip[0], conn.peer_ip[1], conn.peer_ip[2], conn.peer_ip[3] }) catch "-";
+            var line_buf: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "[{s}] {s} - -> {d} {s}\n", .{
+                if (code >= 500) "error" else "warn",
+                ip,
+                code,
+                status.reasonPhrase(),
+            }) catch return;
+            _ = std.posix.write(2, line) catch {};
+        }
 
         var resp = http_response.Response.init(status);
         resp.setBody(status.reasonPhrase());
@@ -388,8 +732,73 @@ pub const Reactor = struct {
             return;
         };
         session.close_after_write = true;
+        if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+        self.markWriting(fd);
         session.writing = true;
         self.flushHttp(fd);
+    }
+
+    /// Accept from the per-reactor listener (SO_REUSEPORT, Milestone 14) and
+    /// register each connection directly — no accept loop, no dispatcher, no
+    /// eventfd wakeup. Connections are rejected while draining.
+    fn acceptConnections(self: *Reactor) void {
+        while (true) {
+            const conn_fd = sockets.acceptNonBlock(self.listener) catch |e| switch (e) {
+                error.WouldBlock => return,
+                else => return,
+            };
+            if (self.accepted_counter) |c| _ = c.fetchAdd(1, .monotonic);
+            if (self.draining.load(.acquire)) {
+                posix.close(conn_fd);
+                continue;
+            }
+            const conn = connection.Connection.create(self.allocator, conn_fd) catch {
+                posix.close(conn_fd);
+                return;
+            };
+            conn.peer_ip = sockets.peerIp(conn_fd);
+            self.registerConnection(conn);
+        }
+    }
+
+    /// Register a freshly created connection with this reactor's epoll and
+    /// registries (shared by the pending queue and the accept path).
+    fn registerConnection(self: *Reactor, conn: *connection.Connection) void {
+        self.ep.add(conn.fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, conn.fd) catch {
+            conn.close();
+            conn.destroy();
+            return;
+        };
+        if (self.connections.put(conn.fd, conn)) |_| {
+            _ = self.registered.fetchAdd(1, .monotonic);
+        } else |_| {
+            self.ep.remove(conn.fd) catch {};
+            conn.close();
+            conn.destroy();
+            return;
+        }
+        if (self.idle_timeout_ticks > 0) {
+            self.wheel.insert(&conn.timer, self.nowTick(), self.idle_timeout_ticks);
+        }
+        if (self.stats) |s| {
+            _ = s.active.fetchAdd(1, .monotonic);
+            _ = s.waiting.fetchAdd(1, .monotonic);
+        }
+        if (self.mode == .http) {
+            var session = HttpSession{
+                .parser = http_parser.Parser.init(self.allocator),
+                .req = http_parser.Request.init(self.allocator),
+            };
+            if (self.http_sessions.put(conn.fd, session)) |_| {
+            } else |_| {
+                session.parser.deinit();
+                session.req.deinit();
+                self.wheel.remove(&conn.timer);
+                self.ep.remove(conn.fd) catch {};
+                conn.close();
+                conn.destroy();
+            }
+        }
     }
 
     /// Echo semantics identical to the Milestone 1 server: whatever was read is
@@ -430,45 +839,31 @@ pub const Reactor = struct {
         defer self.allocator.free(items);
 
         for (items) |conn| {
-            self.ep.add(conn.fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, conn.fd) catch {
-                conn.close();
-                conn.destroy();
-                continue;
-            };
-            if (self.connections.put(conn.fd, conn)) |_| {
-                _ = self.registered.fetchAdd(1, .monotonic);
-            } else |_| {
-                self.ep.remove(conn.fd) catch {};
-                conn.close();
-                conn.destroy();
-                continue;
-            }
-            if (self.mode == .http) {
-                var session = HttpSession{
-                    .parser = http_parser.Parser.init(self.allocator),
-                    .req = http_parser.Request.init(self.allocator),
-                };
-                if (self.http_sessions.put(conn.fd, session)) |_| {
-                } else |_| {
-                    session.parser.deinit();
-                    session.req.deinit();
-                    self.ep.remove(conn.fd) catch {};
-                    conn.close();
-                    conn.destroy();
-                }
-            }
+            self.registerConnection(conn);
         }
     }
 
     fn removeConnection(self: *Reactor, fd: posix.fd_t) void {
         if (self.connections.fetchRemove(fd)) |kv| {
             const conn = kv.value;
+            // Unlink the idle timer so the wheel never points at freed memory.
+            self.wheel.remove(&conn.timer);
             self.ep.remove(fd) catch {};
             conn.close();
             conn.destroy();
         }
         if (self.http_sessions.fetchRemove(fd)) |kv| {
             var sess = kv.value;
+            if (sess.file_fd >= 0) posix.close(sess.file_fd);
+            if (sess.pending_body_owned) self.allocator.free(sess.pending_body);
+            if (self.stats) |s| {
+                switch (sess.stat_state) {
+                    .waiting => _ = s.waiting.fetchSub(1, .monotonic),
+                    .reading => _ = s.reading.fetchSub(1, .monotonic),
+                    .writing => _ = s.writing.fetchSub(1, .monotonic),
+                }
+                _ = s.active.fetchSub(1, .monotonic);
+            }
             sess.parser.deinit();
             sess.req.deinit();
         }
@@ -479,6 +874,7 @@ pub const Reactor = struct {
         var it = self.connections.valueIterator();
         while (it.next()) |c| {
             const conn = c.*;
+            self.wheel.remove(&conn.timer);
             self.ep.remove(conn.fd) catch {};
             conn.close();
             conn.destroy();
@@ -486,6 +882,8 @@ pub const Reactor = struct {
         self.connections.clearRetainingCapacity();
         var sit = self.http_sessions.valueIterator();
         while (sit.next()) |s| {
+            if (s.file_fd >= 0) posix.close(s.file_fd);
+            if (s.pending_body_owned) self.allocator.free(s.pending_body);
             s.parser.deinit();
             s.req.deinit();
         }
@@ -856,4 +1254,231 @@ test "reactor runs a JSON-config pipeline with default 404 fallback" {
 
     r.stop();
     r.join();
+}
+
+
+test "reactor HEAD responds with head only and correct Content-Length" {
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // HEAD on a path the echo module answers with an empty body.
+    try writeAll(pair[0], "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    var buf: [512]u8 = undefined;
+    const n = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n]);
+
+    // HEAD on a POST-shaped path: Content-Length must reflect the would-be
+    // body, but no body bytes may follow the head.
+    try writeAll(pair[0], "HEAD /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    const want2 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\n";
+    const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
+    try testing.expectEqualStrings(want2, buf[0..n2]);
+    // The echoed body must NOT be sent: a short read window yields nothing.
+    try testing.expectError(error.Timeout, readUntil(pair[0], &buf, 1, 500));
+
+    r.stop();
+    r.join();
+}
+
+// M11: a module-less response-template route is served from pre-serialised
+// bytes, byte-identical to the pipeline equivalent.
+test "reactor serves a comptime template route from pre-serialised bytes" {
+    const allocator = testing.allocator;
+    const cfg = comptime runtime_server.Config{
+        .routes = &.{
+            .{
+                .path = "/health",
+                .match = .exact,
+                .response = .{ .status = 200, .body = "ok" },
+            },
+            .{
+                .path = "/old",
+                .match = .exact,
+                .response = .{ .status = 301, .headers = &.{.{ .name = "Location", .value = "/health" }} },
+            },
+        },
+    };
+    const srv = runtime_server.Server.comptimeInit(cfg);
+    var r = try Reactor.initWithHandler(allocator, 0, .http, &srv);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok";
+    const n = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n]);
+
+    // Redirect template with a header.
+    try writeAll(pair[0], "GET /old HTTP/1.1\r\nHost: x\r\n\r\n");
+    const want2 = "HTTP/1.1 301 Moved Permanently\r\nLocation: /health\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
+    try testing.expectEqualStrings(want2, buf[0..n2]);
+
+    // A pipelined request after the fast-path responses keeps the connection.
+    try writeAll(pair[0], "GET /health HTTP/1.1\r\nHost: x\r\n\r\n" ++ "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    const n3 = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n3]);
+    const n4 = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n4]);
+
+    r.stop();
+    r.join();
+}
+
+test "reactor serves a chunked request end to end" {
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0],
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 11\r\n\r\nhello world";
+    const n = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n]);
+
+    r.stop();
+    r.join();
+}
+
+// M5: idle timeout. A 1 s timeout is used so the tests finish quickly; the
+// wheel's tick granularity is 100 ms, so deadlines land within ~100 ms of the
+// nominal second (the loop re-advances the wheel before every epoll_wait,
+// timeout 100 ms). Sleeps below leave generous margins on both sides of every
+// deadline.
+test "reactor closes a connection that goes idle" {
+    const allocator = testing.allocator;
+    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // No traffic at all: the reactor expires the connection ~1 s after it was
+    // registered. EOF (error.Eof) proves the close; Timeout would mean the
+    // timer never fired.
+    std.posix.nanosleep(2, 0);
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 1000));
+
+    r.stop();
+    r.join();
+    try testing.expectEqual(@as(usize, 0), r.countConnections());
+}
+
+test "reactor resets the idle timer on active traffic" {
+    const allocator = testing.allocator;
+    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Request 1: arms the timer with a ~1 s deadline.
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const n1 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty, buf[0..n1]);
+
+    // Request 2 just before the deadline: pushes the deadline to ~1.5 s.
+    std.posix.nanosleep(0, 500 * std.time.ns_per_ms);
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const n2 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty, buf[0..n2]);
+
+    // Request 3 *after* the original ~1 s deadline: answered, which proves the
+    // timer was re-armed (without rearming the connection would already be
+    // closed and this write would fail).
+    std.posix.nanosleep(0, 600 * std.time.ns_per_ms);
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const n3 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty, buf[0..n3]);
+
+    // Idle again past the re-armed deadline (~2.5 s): now it does expire.
+    std.posix.nanosleep(2, 0);
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 1000));
+
+    r.stop();
+    r.join();
+    try testing.expectEqual(@as(usize, 0), r.countConnections());
+}
+
+test "idle timeout of zero disables reaping" {
+    const allocator = testing.allocator;
+    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 0);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Well past any plausible 1 s window: the connection must still be alive.
+    std.posix.nanosleep(2, 0);
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const n1 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty, buf[0..n1]);
+
+    r.stop();
+    r.join();
+    try testing.expectEqual(@as(usize, 1), r.countConnections());
 }

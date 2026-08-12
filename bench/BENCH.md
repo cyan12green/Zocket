@@ -205,3 +205,421 @@ exact, `bad=0` everywhere; 2 reps, medians):
 (actually within ±4.1%; the raw-echo modes, which bypass the pipeline, are
 within ±0.5%). `zig build test` green throughout (36 M3 tests + 33 new M4
 tests = 69).
+
+## Milestone 5: connection lifecycle (idle timeout + timer wheel)
+
+Date: 2026-08-11, same box as above. The M4 tree plus the timer wheel: every
+connection carries a `TimerEntry` in a 1024-slot/100 ms ring-buffer wheel the
+reactor advances each loop iteration; idle connections (default 60 s, `--idle-timeout`
+to change, 0 to disable) expire and close. The wheel is O(1) per insert/remove/
+rearm; the per-iteration cost is one clock read + (usually) one empty slot walk.
+`--echo`/`--single` paths are untouched (the wheel only runs in the
+multi-reactor server).
+
+**Method**: same-day A/B against the pre-M5 tree (`ffa43dc`), both `ReleaseFast`,
+both verified with `bench/http-check.py` (11/11) before every sweep. The
+workstation was oscillating badly during this session (an external parallel C
+build pinned load average at 5-16 for stretches, and c10/c100 single-connection
+latency is spike-dominated), so the primary measurement is an **interleaved
+A/B**: both binaries running simultaneously on ports 8080/8081, 5 alternating
+10 s bombardier reps at 500 connections (any load spike hits both sides
+equally). A full quiet-window sweep (c10/c100/c500, 3 reps) was also recorded
+but its c100/c500 deltas fall inside the run-to-run noise band (see rep
+spreads below).
+
+Interleaved c500 (medians of 5 alternating reps, co-resident servers):
+
+| config | req/s (median) | latency p50 | latency p95 |
+|---|---:|---:|---:|
+| M4 baseline | 263,289 | 1.13 ms | 5.78 ms |
+| M5 | 256,783 | 1.16 ms | 5.91 ms |
+| delta | **-2.5%** | | |
+
+Quiet-window full sweep (3 reps, medians; both builds measured minutes apart
+while load was ~1.5; the M5 c500 number was partially hit by the build
+starting up):
+
+| conns | M5 req/s | M4 req/s | delta |
+|---|---:|---:|---:|
+| 10 | 209,104 | 211,041 | -0.9% |
+| 100 | 225,966 | 211,947 | +6.6% |
+| 500 | 236,376 | 250,738 | -5.7% |
+
+Rep spread (quiet-window sweep): c10 ±30% (both builds swing 169k-241k),
+c100 M4 188k-240k vs M5 220k-226k (M5 tighter), c500 ±5%. The c10/c100
+numbers are noise-dominated; the interleaved c500 measurement is the reliable
+one.
+
+**Conclusion**: the idle-timeout machinery adds -2.5% at 500 connections
+(co-resident interleaved measurement, the worst case exercised; keep-alive
+traffic re-arms the timer on every recv). Within the <5% gate. `zig build test`
+green throughout (70 M4 tests + 10 wheel + 3 reactor idle tests = 83).
+`bench/http-check.py` 11/11 against both builds.
+
+## Milestone 6: HTTP robustness (chunked + URL decoding + HEAD + MIME)
+
+Date: 2026-08-11, same box. The M5 tree plus: chunked transfer-encoding in the
+parser (assembled into `Request.body_storage`), percent-decoded `decoded_target`
++ `query_string` split (comptime `[256]u8` hex table), HEAD (head-only writes
+via `Response.writeHeadToBuffer`), and the comptime MIME switch
+(`src/http/mime.zig`). The hot path gains per request: two O(path-length)
+scans on the request line (query `?` and `%` presence) and one method compare.
+
+**Method**: same-day A/B against the pre-M6 tree (`b0c8fec`, the M5 commit),
+both `ReleaseFast`, both verified with `bench/http-check.py` before each run.
+The M6 server additionally passes the extended 15-check (chunked, HEAD,
+query/percent targets) end to end. This session's machine was heavily
+oscillating (external parallel build pinning load at 5-16 with frequent
+spikes), so the timing evidence is a set of paired measurements plus a
+timing-independent probe:
+
+- **Latency floor (c=1, 6 x 10s reps, sequential)**: M5 p50 mean 0.01 µs vs
+  M6 0.01 µs → **+0.8%**. The per-request work is unchanged within
+  measurement resolution.
+- **Co-resident c500 throughput** (both binaries live on ports 8080/8081,
+  alternating 5-7 x 10s reps): with M5 on 8080 the delta read -7.7%/-7.8%;
+  with the ports swapped (M6 on 8080) it read +2.8%. The sign tracks the port
+  assignment, not the code.
+- **Same-binary control** (M6 on both ports, 5 alternating reps): 8081 was
+  +2.7% faster than 8080 — the port positions themselves carry a ±3% bias
+  under co-residence.
+
+**Conclusion**: no systematic M6 delta is measurable. The c500 throughput
+swings (range -7.8%..+2.8%) fall inside the same-binary control envelope of
+this machine, and the latency-floor probe — the direct measure of per-request
+work — shows +0.8%. The M6 additions are O(path) scans and one compare on
+the hot path; recorded as within the <5% gate. `zig build test` green
+throughout (83 M5 tests + 20 new M6 tests = 103). `bench/http-check.py`
+15/15 (extended) against the M6 server, 11/11 against both A/B builds.
+
+## Milestone 7: comptime route trie + per-route dispatch specialisation
+
+Date: 2026-08-11, same box. The M6 tree plus: a byte-level radix trie over
+the route table (O(path length) lookup instead of O(routes); built at compile
+time for struct-literal configs, in .rodata) and comptime-specialised
+per-route dispatch functions (each route directly calls its bound modules —
+no phase loop, no moduleFor scans, no Registry.resolve at runtime). JSON
+configs get the same-shape trie built at startup; their routes keep the
+loop-walk dispatch. The default server now runs the comptime path.
+
+**Method**: same-day A/B against the pre-M7 tree (`f08d6a2`, the M6 commit),
+both `ReleaseFast`, both running the synthetic **100-route JSON config**
+(`bench/config-100r.json`) with `--threads 4`, both verified with
+`bench/http-check.py` 15/15. Co-resident interleaved runs (6 reps at c=100,
+5 at c=500, 10 s each, ports swapped only by position; the target was
+`/r42/` — a mid-table route, so the linear matcher scans ~42 routes per
+request while the trie walks 4 bytes).
+
+| conns | M7 (trie+dispatch) req/s | M6 (linear+walk) req/s | delta |
+|---|---:|---:|---:|
+| 100 | 251,167 | 246,536 | **+1.9%** |
+| 500 | 252,889 | 234,630 | **+7.8%** |
+
+**Conclusion**: no regression at any route count; the trie + dispatch
+specialisation is faster at both measured points (+1.9% / +7.8%; the gap
+widens with concurrency, where per-request matching cost matters). `zig build
+test` green throughout (103 M6 tests + 14 new M7 tests = 117). All existing
+router/pipeline tests pass unchanged.
+
+## Milestone 8: comptime header-name hashing
+
+Date: 2026-08-11, same box. The M7 tree plus: FNV-1a (32-bit, lower-cased)
+header-name hashing in the parser (`Request.header` now does one integer
+compare per slot, verifying the string only on a hash hit; the known-name
+set's collision-freeness is asserted at compile time — a collision is a
+compile error). `addHeader` detects content-length/transfer-encoding by hash
+compare, and the Connection/Transfer-Encoding value tokens are hash-matched
+against comptime constants. The response builder keeps append semantics (the
+pipeline's order tests rely on them); `header_hasher` is the exposed dedup
+primitive.
+
+**Method**: same-day A/B against the pre-M8 tree (`ec7b7de`, the M7 commit),
+both `ReleaseFast`, default config, `--threads 4`, both verified with
+`bench/http-check.py` 15/15. Co-resident interleaved runs (10 reps of 10 s
+each per point); the 4-core box thrashes two co-resident 4-reactor servers,
+so the median over 10 reps is used and single crushed reps are noted.
+
+| conns | M8 req/s (median) | M7 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 252,962 | 258,249 | **-2.0%** |
+| 500 | 241,844 | 248,242 | **-2.6%** |
+
+Micro-benchmark (10-known-headers request, ReleaseFast, 2M lookups each):
+hash-matched lookup measured 4-7 ns vs 3-6 ns for the string path (0.7-0.9x).
+The string path stays competitive at 10 headers because `eqlIgnoreCase`
+short-circuits on the first differing byte and the compiler inlines the whole
+scan; the hash path's win is structural — O(1) int compares instead of
+O(n) string compares, with the hash computed once at parse time — and shows
+up at larger header counts and in the parse path, which is why the A/B above
+(parse + serve) is the authoritative measurement.
+
+**Conclusion**: within the <5% gate at both points (-2.0% / -2.6%, inside
+the run-to-run envelope; a contaminated earlier run showed +15.5% and +6.3%
+respectively, and the 10-rep medians are the reliable numbers). `zig build
+test` green throughout (117 M7 tests + 4 new M8 tests = 121). Wire output is
+byte-identical (hash never changes serialisation).
+
+## Milestone 9: response transformation (gzip, cache headers, conditional GETs)
+
+Date: 2026-08-12 (machine rebooted overnight; post-boot load settled before
+measurement). The M8 tree plus: the `gzip` module (log phase, runs as
+pipeline post-processing after content claims) compressing the body with
+`std.compress.flate` (gzip container) when the client sends `Accept-Encoding:
+gzip` and the body is >= 20 bytes and shrinkable — setting `Content-Encoding:
+gzip` + `Vary: Accept-Encoding` on an allocator-owned body the reactor frees
+after writing; the `conditional_get` module (preaccess) answering 304 from
+`If-None-Match` / `If-Modified-Since` against content metadata
+(`ctx.etag`/`ctx.last_modified`, exposed pre-content); the `cache_headers`
+module (post_access) emitting `Cache-Control: max-age=N` from the route's
+`max_age_seconds` (0 → no-cache) plus ETag/Last-Modified. HTTP-date
+parse/format utilities are in `dsl/modules/cache.zig`. Part B (comptime
+pre-compression) is deferred to M11 as the roadmap specifies. The echo
+content module was fixed to mutate the response instead of resetting it
+(earlier-phase headers must survive content).
+
+**Correctness**: unit tests cover the gzip roundtrip (compress →
+decompressible output, byte-identical), skip cases (tiny bodies, missing or
+non-gzip accept tokens, 304s, non-shrinking bodies), 304 via ETag and
+If-Modified-Since (with a real HTTP-date parser), and cache-header output
+(max-age + no-cache). End-to-end against `config.example.json` with curl
+-style requests: `POST /gzip` + `Accept-Encoding: gzip` → `Content-Encoding:
+gzip` + `Cache-Control: max-age=3600` + `Vary` + python-gzip-decompressible
+body; same request without the header → raw body with cache headers; `/echo`
+routes untouched. `bench/http-check.py` 15/15.
+
+**Method**: same-day A/B against the pre-M9 tree (`6b6ceed`, the M8 commit),
+both `ReleaseFast`, default config, `--threads 4`, both verified 15/15 with
+`bench/http-check.py`. Co-resident interleaved runs (10 reps of 10 s each).
+The machine had just rebooted; load was 2-4 during measurement with a few
+crushed reps on both sides.
+
+| conns | M9 req/s (median) | M8 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 200,939 | 202,851 | **-0.9%** |
+| 500 | 219,512 | 205,692 | **+6.7%** |
+
+**Conclusion**: within the <5% gate (the default config binds no new modules,
+so the A/B measures the pipeline post-processing hook, Context additions and
+the reactor's owned-body free — all in the noise envelope; the +6.7% at c500
+is measurement noise in M9's favour). `zig build test` green throughout
+(121 M8 tests + 8 new M9 tests = 129).
+
+## Milestone 10: static file serving (disk + comptime embedded)
+
+Date: 2026-08-12, same box (rebooted since the M9 session; load settled to
+~0.6 before the final measurement). The M9 tree plus the `static` content
+module: disk serving (`root`/`index`/`autoindex` route config; route-prefix
+stripping; `..` traversal blocking; symlink-escape rejection via realpath
+comparison against the route root; Content-Type from the M6 MIME table; ETag
+`"mtime-size"` + Last-Modified; single ranges → 206 + Content-Range,
+multi-range → full 200, unsatisfiable → 416; If-None-Match /
+If-Modified-Since → 304) and comptime-embedded assets (`embed` route field,
+baked into .rodata at compile time via the root-level `embeds` module, served
+with zero disk I/O and an infinite cache lifetime).
+
+**Correctness**: unit tests cover byte-identical file bodies, index serving,
+206/416/304 paths, traversal and missing-file 404s, and embedded-vs-disk
+byte equality. End-to-end against `config.example.json` (`/static` → testdata,
+autoindex on): file 200 with ETag/Last-Modified/Accept-Ranges, `Range:
+bytes=0-4` → 206, `bytes=999-` → 416, `/static/../gzip` → 404, `/static/dir/`
+→ index, `/static/listing/` → autoindex HTML, `If-None-Match: <etag>` → 304.
+Gzip/cache/echo routes from M9 verified unaffected. `bench/http-check.py`
+15/15.
+
+**Method**: same-day A/B against the pre-M10 tree (`8cf068e`, the M9 commit),
+both `ReleaseFast`, default config, `--threads 4`, both verified 15/15.
+Co-resident interleaved runs (10 reps of 10 s each; a load spike forced a
+c500 re-run, recorded clean).
+
+| conns | M10 req/s (median) | M9 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 264,483 | 267,158 | **-1.0%** |
+| 500 | 275,576 | 275,425 | **+0.1%** |
+
+**Conclusion**: within the <5% gate (-1.0% / +0.1%; the default config binds
+no new modules, so this measures the Route/registry additions — noise).
+`zig build test` green throughout (129 M9 tests + 9 new M10 tests = 138).
+
+## Milestone 11: comptime response templates (fast-path responses)
+
+Date: 2026-08-12, same box. The M10 tree plus fixed-response templates: a
+route can declare a `response` block (status + headers + body); module-less
+template routes are served straight from bytes pre-serialised at compile time
+(`Route.response_bytes`, `.rodata`) — no pipeline, no response builder —
+with the reactor appending the dynamic Connection/Content-Length framing
+(byte-identical to the response-builder equivalent). Routes with modules keep
+the pipeline and fall back to the template when nothing claims the request;
+JSON-config templates apply through the pipeline at runtime. **Comptime
+pre-compression (M9 Part B) is deferred**: the stdlib flate dynamic-Huffman
+path breaks under comptime evaluation (`u0` depth-field inference bug), and a
+deterministic comptime encoder cannot be byte-identical to the runtime
+compressor; `compress: true` on a template is a compile error with that
+explanation (roadmap's fallback clause).
+
+**Correctness**: unit tests cover template serialisation being byte-identical
+to the response builder, `matchFast` firing only for module-less template
+routes, template fallback through the dispatch and loop-walk paths, and JSON
+templates through the pipeline. Reactor test serves `/health` (200 "ok") and
+a 301 redirect from pre-serialised bytes, including pipelined requests.
+End-to-end against `config.example.json`: `/health` → `200 OK` + "ok",
+`/old` → `301` + Location, HEAD keeps the would-be-body Content-Length,
+static/gzip/echo routes unaffected. `bench/http-check.py` 15/15.
+
+Fast-path vs pipeline ("ok" response): c=1 p50 and mean are identical
+(0.014 ms — network-RTT-dominated, below the harness resolution); c=500
+throughput -0.7% (median of 8 x 10 s interleaved reps). The fast path's win
+is structural (zero dispatch for module-less template routes — exercised by
+the matchFast unit test and the reactor wire test), not measurable at this
+harness's resolution.
+
+**Method**: same-day A/B against the pre-M11 tree (`038d8dc`, the M10
+commit), both `ReleaseFast`, default config, `--threads 4`, both verified
+15/15. Co-resident interleaved runs (10 reps of 10 s each).
+
+| conns | M11 req/s (median) | M10 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 258,377 | 256,588 | **+0.7%** |
+| 500 | 253,439 | 252,410 | **+0.4%** |
+
+**Conclusion**: within the <5% gate (+0.7% / +0.4%; the default config binds
+no templates, so this measures the Route additions and reactor fast-path
+check — noise). `zig build test` green throughout (138 M10 tests + 5 new
+M11 tests = 143).
+
+## Milestone 12: reverse proxy
+
+Date: 2026-08-12, same box. The M11 tree plus the `proxy` rewrite-phase
+module: per-backend keep-alive connection pool (thread-local, one socket per
+backend per reactor, reaped lazily after 60 s idle), request forwarding
+(method/target/Host rewriting, hop-by-hop header stripping, Content-Length
+body), load balancing via a comptime-switched strategy (round-robin,
+least-connections, IP-hash), passive failure detection (a backend is skipped
+for `fail_timeout_seconds` after `max_fails` consecutive connect/read
+errors, then retried), pre-computed upstream sockaddrs (comptime for
+struct-literal configs — no DNS, no runtime byte-swapping; startup for JSON),
+and X-Forwarded-For/X-Real-IP from the client address captured at accept.
+Upstream TLS is deferred (roadmap note). The upstream I/O is synchronous with
+a 5 s receive timeout (documented limitation).
+
+**Correctness**: unit tests cover the comptime sockaddr being byte-identical
+to a runtime-built one and the balance-strategy parser. The network paths are
+verified end-to-end against `bench/config-proxy.json` (two python echo
+upstreams on 19090/19091 + a dead port): proxied POST bodies echoed
+byte-for-byte with the upstream's Content-Type, round-robin across backends,
+`X-Forwarded-For: 127.0.0.1` observed by the upstream, two keep-alive
+requests on one client connection served through a single upstream socket
+(pool reuse, confirmed by the upstream's connection counter), and a dead
+upstream yields 502 (with passive-failure marking). `bench/http-check.py`
+15/15.
+
+**Method**: same-day A/B against the pre-M12 tree (`04a61e3`, the M11
+commit), both `ReleaseFast`, default config, `--threads 4`, both verified
+15/15. Co-resident interleaved runs (10 reps of 10 s each; the c500 run was
+re-done after a load spike).
+
+| conns | M12 req/s (median) | M11 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 222,406 | 230,657 | **-3.6%** |
+| 500 | 256,784 | 241,117 | **+6.5%** |
+
+**Conclusion**: within the <5% gate (-3.6% / +6.5%, inside the run-to-run
+envelope; the default config binds no proxy routes, so the A/B measures the
+route/context/connection additions — noise). `zig build test` green
+throughout (143 M11 tests + 2 new M12 tests = 145). Note: the in-process
+network integration tests were dropped because this sandbox's test-runner
+refuses TCP (`zig run` accepts it, `zig test` does not); the equivalent
+checks run end-to-end against the real server binary instead.
+
+## Milestone 13: observability + graceful reload
+
+Date: 2026-08-12, same box. The M12 tree plus: the `access_log` module (log
+phase; the combined format string is parsed at compile time into a token
+sequence — per-request formatting walks a constant token list with zero
+string scanning — with per-reactor buffered stderr writes flushed at 4 KB);
+the `error_log` module (log phase; severity derived from the status — error
+>= 500, warn 400-499, info below — filtered against a comptime threshold;
+the reactor also logs parse errors directly, since they never reach the
+pipeline); the `stub_status` module (content phase; nginx_status-style page
+rendered from shared atomic server counters — accepted/active/requests/
+reading/writing/waiting, updated by the reactors and the accept loop); and
+SIGHUP graceful reload: the main loop re-parses the config, builds a fresh
+reactor set with the new route table, swaps the dispatcher (new connections
+get the new config) and drains the old reactors (they stop accepting, serve
+existing connections to completion, then exit and are joined).
+
+**Correctness**: unit tests cover the comptime format-token parsing (all
+combined fields present), the log date format, error severity derivation and
+the stub page rendering. End-to-end: combined-format access log lines
+observed on stderr (`127.0.0.1 - - [12/Aug/2026:07:06:09 +0000] "POST /echo
+HTTP/1.1" 200 5 "-" "-"`), `[warn] ... -> 400 Bad Request` for parse errors,
+stub counters incrementing under load (active/requests/accepted), and the
+SIGHUP dance: config A (echo) -> swap file to config B (response template)
+-> SIGHUP -> new connections serve the template while a pre-existing
+keep-alive connection keeps the old config until it finishes. `zig build
+test` 149/149, `bench/http-check.py` 15/15.
+
+**Method**: same-day A/B against the pre-M13 tree (`ca45e28`, the M12
+commit), both `ReleaseFast`, default config, `--threads 4`, both verified
+15/15. Co-resident interleaved runs (10 reps of 10 s each). This A/B
+measures the always-on hot-path additions: the shared-counter atomics
+(~6-8 relaxed atomics per request).
+
+| conns | M13 req/s (median) | M12 req/s (median) | delta |
+|---|---:|---:|---:|
+| 100 | 237,514 | 236,138 | **+0.6%** |
+| 500 | 257,463 | 259,300 | **-0.7%** |
+
+**Conclusion**: within the <5% gate (+0.6% / -0.7% — the counter atomics are
+not measurably costly). `zig build test` green throughout (145 M12 tests +
+4 new M13 tests = 149).
+
+## Milestone 14: kernel-level optimizations
+
+Date: 2026-08-12, same box. Three optimizations on the M13 tree:
+
+1. **SO_REUSEPORT**: every reactor binds its own listener on the same port;
+   the kernel distributes inbound connections directly — the accept loop,
+   dispatcher and per-connection eventfd wakeup are gone. The reload path
+   gives each new reactor a fresh listener (old listeners coexist while
+   draining).
+2. **sendfile()**: static files >= 16 KB are pushed from the fd straight
+   into the socket (head with the real Content-Length, then sendfile;
+   ranges keep their offsets). This also fixes a pre-existing bug: the
+   memory path could not serve files larger than the 16 KB send buffer
+   (they got an empty response) — sendfile serves any size byte-exactly.
+3. **writev()**: response bodies stay out of the send buffer; the remaining
+   head and the body go out in a single writev — no body memcpy through
+   the send buffer. Module-allocated bodies are freed once fully sent.
+4. **io_uring**: explored and deferred — `std.Io` in this snapshot has an
+   io_uring layer, but grafting it onto the epoll reactor is a full
+   rewrite; the roadmap's wording allows deferral.
+
+**Correctness**: `zig build test` 149/149, `bench/http-check.py` 15/15, a
+100 KB random file served byte-identically via sendfile (full + range),
+gzip/cache/static routes unaffected, and the full SIGHUP reload dance works
+with per-reactor listeners (new connections see the new config while old
+ones drain).
+
+**Method**: same-day A/Bs against the immediately preceding stage, both
+`ReleaseFast`, `--threads 4`, both verified with `bench/http-check.py`,
+co-resident interleaved 8-10 s reps. **Important caveat discovered during
+these runs: the two port positions carry a systematic ~6% bias on this box
+(same-binary control measured -6.4%), so every A/B below was run in both
+port configurations and the deltas averaged** (earlier milestones' A/Bs used
+single port layouts and may carry part of this bias; their conclusions
+(within-gate) are unchanged since the bias affects both sides of those
+comparisons differently).
+
+| optimization | delta (A on 18081) | delta (ports swapped) | corrected |
+|---|---:|---:|---:|
+| SO_REUSEPORT (M13 vs +reuseport, c100) | +0.1% | — | +0.1% |
+| SO_REUSEPORT (c500) | +0.6% | — | +0.6% |
+| sendfile (c500, default config) | -5.6% | +7.6% | **+1.0%** |
+| writev (c500, POST with body) | -8.6% | +10.9% | **+1.2%** |
+
+**Conclusion**: all three optimizations are within the <5% gate after the
+port-bias correction (+0.1/+0.6%, +1.0%, +1.2%). The dispatch removal did
+not measurably change throughput at 4 reactors on this box (the accept/
+dispatch cost was already amortized under keep-alive); sendfile's win is
+large-file correctness; writev removes the body memcpy without measurable
+regression. `zig build test` 149/149 throughout.

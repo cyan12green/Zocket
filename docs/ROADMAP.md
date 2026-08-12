@@ -29,6 +29,14 @@ module plugs into one of the 10 phases and is wired from config.
 
 ### M5 — Connection lifecycle: idle timeout + timer wheel
 
+**Status: DONE** (2026-08-11). `src/net/timer_wheel.zig` ring-buffer wheel
+(1024 slots, 100 ms ticks — both comptime constants), `Connection.timer`
+entry, reactor advances the wheel each loop iteration and closes expired
+connections; `--idle-timeout N` CLI flag (default 60, 0 disables) wired via
+`multireactor.Server`. Gates met: 10 wheel unit tests + 3 reactor idle
+integration tests, `zig build test` 83/83, `bench/http-check.py` 11/11, M5 A/B
+in `bench/BENCH.md` (-2.5% at c500, interleaved).
+
 *Depends on*: M4 (reactor, connection struct).
 
 A ring-buffer timer wheel (`src/net/timer_wheel.zig`, O(1) insert/remove/rearm).
@@ -51,6 +59,17 @@ the comptime win is configuration, not algorithm).
 ---
 
 ### M6 — HTTP robustness: chunked encoding + URL decoding + HEAD
+
+**Status: DONE** (2026-08-11). Chunked transfer-encoding in the parser
+(`chunk_size`/`chunk_data`/`chunk_crlf`/`chunk_trailers` states; trailer
+headers dropped; `max_chunked_body` cap → 413), percent-decoded
+`Request.decoded_target` (comptime `[256]u8` hex table; escape-free targets
+stay zero-copy) + `Request.query_string` split, HEAD (head-only wire output
+with the would-be-body Content-Length), comptime MIME switch
+(`src/http/mime.zig`). Gates met: 20 new parser/response/mime/reactor tests,
+`zig build test` 103/103, `bench/http-check.py` extended to 15 checks and
+passing, M6 A/B in `bench/BENCH.md` (latency floor +0.8%; throughput deltas
+inside the same-binary control envelope).
 
 *Depends on*: M3 (parser, response builder).
 
@@ -80,6 +99,20 @@ hex-decoding table for URL decoding (`%XX` → byte) is a comptime
 ---
 
 ### M7 — Comptime route resolution and dispatch
+
+**Status: DONE** (2026-08-11). Part A: byte-level radix trie in
+`dsl/router.zig` (O(path length) lookup; exact beats prefix; prefix nodes
+carry their longest-prefix chain; comptime-built into .rodata for
+struct-literal configs via `buildTrie`, startup-built for JSON via
+`buildTrieRuntime`; duplicate (path, match) routes are a compile error for
+struct configs, `error.AmbiguousRoutes` at runtime; `matchRoutes` unchanged
+and still used as the no-trie fallback). Part B: `dispatchForRoute` +
+`assignDispatch` in `dsl/pipeline.zig` generate a comptime-specialised
+`*const fn (ctx) anyerror!Outcome` per route (stored on `Route.dispatch`,
+called directly from the pipeline walk). `Server.comptimeInit` builds both at
+compile time; `Server.initWithTrie` builds the trie at startup for JSON.
+Gates met: 14 new router/pipeline/server tests, `zig build test` 117/117,
+100-route A/B in `bench/BENCH.md` (+1.9% @c100, +7.8% @c500 — no regression).
 
 *Depends on*: M4 (`dsl/router.zig`, `dsl/pipeline.zig`).
 
@@ -140,6 +173,18 @@ resolution run at compile time.
 
 ### M8 — Comptime header-name hashing
 
+**Status: DONE** (2026-08-11). FNV-1a (32-bit, lower-cased) hashing in
+`http/parser.zig`: the known header-name set (`header_hasher.known`) is
+collision-checked at compile time (a collision is a compile error);
+`Slot.name_hash` stores the wire name's hash; `Request.header(comptime name)`
+scans with one integer compare per slot and verifies the string only on a
+hash hit; `addHeader` detects content-length/transfer-encoding by hash; the
+Connection/Transfer-Encoding value tokens are hash-matched against comptime
+constants. `header_hasher` is exported for the response builder's dedup.
+Gates met: 4 new parser tests, `zig build test` 121/121 (wire output
+byte-identical), micro-benchmark recorded, M8 A/B in `bench/BENCH.md`
+(-2.0% / -2.6%, within gate).
+
 *Depends on*: M3 (`http/parser.zig`, `http/response.zig`).
 
 Replace case-insensitive string comparison in header lookups with integer
@@ -177,6 +222,20 @@ compile-time constant integer.
 ---
 
 ### M9 — Response transformation: gzip, cache headers, conditional GETs
+
+**Status: DONE** (2026-08-12). Part A: `dsl/modules/gzip.zig` (log phase =
+pipeline post-processing) — runtime compression with `std.compress.flate`
+(gzip container), `Accept-Encoding: gzip` token check via the M8 hasher,
+>= 20-byte shrinkable bodies only, `Content-Encoding: gzip` + `Vary`, body
+allocated from `ctx.allocator` and freed by the reactor (`resp.body_owned`).
+Part B (comptime pre-compression) deliberately deferred to M11 per the
+roadmap. Part C: `dsl/modules/cache.zig` — `conditional_get` (preaccess; 304
+from `If-None-Match`/`If-Modified-Since` vs `ctx.etag`/`ctx.last_modified`,
+with a real IMF-fixdate parser) and `cache_headers` (post_access;
+`Cache-Control: max-age=N` from the route's `max_age_seconds`, 0 → no-cache,
+plus ETag/Last-Modified). The echo module now mutates the response instead of
+resetting it. Gates met: 8 new module tests + e2e curl checks, `zig build
+test` 129/129, M9 A/B in `bench/BENCH.md` (-0.9% / +6.7%, within gate).
 
 *Depends on*: M6 (Content-Type) + M8 (header hashing).
 
@@ -221,6 +280,18 @@ deflate implementation or defer this sub-task).
 ---
 
 ### M10 — Static file serving (disk + comptime embedded)
+
+**Status: DONE** (2026-08-12). `dsl/modules/static.zig`: disk serving
+(`root`/`index`/`autoindex` route config; `..` traversal blocking and
+symlink-escape rejection via realpath comparison; MIME table; ETag
+`"mtime-size"` + Last-Modified; single ranges → 206, multi → full 200,
+unsatisfiable → 416; If-None-Match / If-Modified-Since → 304) and comptime
+embedded assets (`embed` route field resolved at compile time through the
+root-level `embeds` module — a compile error on a missing file — served from
+.rodata with zero disk I/O and an infinite cache lifetime; JSON configs use
+disk only). `testdata/` fixtures. Gates met: 9 new module tests + e2e curl
+checks (file/206/416/304/traversal/index/autoindex/embedded), `zig build
+test` 138/138, M10 A/B in `bench/BENCH.md` (-1.0% / +0.1%, within gate).
 
 *Depends on*: M6 (URL decoding, Content-Type) + M7 (trie + dispatch) +
 M9 (cache headers, gzip).
@@ -275,6 +346,22 @@ compile-time: an invalid path to `@embedFile` is a compile error.
 
 ### M11 — Comptime response templates (fast-path responses)
 
+**Status: DONE** (2026-08-12). A route `response` block (status + headers +
+body) is serialised at compile time (`Route.response_bytes`, in .rodata);
+module-less template routes are served by the reactor straight from those
+bytes (`Server.matchFast` — no pipeline, no response builder, byte-identical
+to the builder equivalent), routes with modules keep the pipeline and fall
+back to the template when nothing claims the request, and JSON-config
+templates apply through the pipeline at runtime. Comptime pre-compression
+(M9 Part B) is **deferred**: the stdlib flate dynamic-Huffman path breaks
+under comptime evaluation (u0 depth-field inference bug — verified), and a
+deterministic comptime encoder cannot be byte-identical to the runtime
+compressor; `compress: true` is a compile error documenting the deferral
+(the roadmap's fallback clause). Gates met: 5 new tests (serialisation
+byte-identity, matchFast gating, dispatch/loop-walk fallbacks, JSON
+templates, reactor wire test incl. pipelining), `zig build test` 143/143,
+fast-path-vs-pipeline and M11 A/B in `bench/BENCH.md` (+0.7% / +0.4%).
+
 *Depends on*: M7 (trie + dispatch) + M9 (cache headers).
 
 Routes that produce fixed responses (redirects, healthchecks, error pages)
@@ -308,6 +395,22 @@ in `.rodata`.
 ---
 
 ### M12 — Reverse proxy
+
+**Status: DONE** (2026-08-12). `dsl/modules/proxy.zig` (rewrite phase):
+per-backend keep-alive connection pool (thread-local, one socket per backend
+per reactor, lazily reaped after idle), request forwarding with Host
+rewriting, hop-by-hop header stripping and Content-Length bodies, comptime-
+switched load balancing (round-robin / least-connections / ip_hash), passive
+failure detection (skip for `fail_timeout_seconds` after `max_fails`
+consecutive errors, then retry), pre-computed upstream sockaddrs (comptime
+for struct configs — no DNS — startup for JSON), X-Forwarded-For/X-Real-IP
+from the peer address captured at accept (`Connection.peer_ip` +
+`Context.client_ip`). Upstream TLS deferred (roadmap note). Gates met:
+2 unit tests (comptime sockaddr byte-identity, balance parse) + e2e
+verification with `bench/config-proxy.json` (bodies echoed, pool reuse via
+the upstream connection counter, XFF observed, 502 on a dead upstream,
+round-robin), `zig build test` 145/145, M12 A/B in `bench/BENCH.md`
+(-3.6% / +6.5%, within gate).
 
 *Depends on*: M8 (header hashing) + M7 (trie + dispatch) + M5 (connection lifecycle).
 
@@ -347,6 +450,23 @@ rewriting rules can be validated at comptime for struct-literal configs.
 
 ### M13 — Observability + graceful reload
 
+**Status: DONE** (2026-08-12). `access_log` module (log phase): the combined
+format string is parsed at comptime into a token sequence (zero per-request
+string scanning), buffered per-reactor stderr writes. `error_log` module:
+severity derived from the status, filtered against a comptime threshold; the
+reactor also logs parse errors directly (they never reach the pipeline).
+`stub_status` module: nginx_status-style page from shared atomic server
+counters (`ServerStats`; accepted/active/requests/reading/writing/waiting,
+updated by the reactors and accept loop). SIGHUP graceful reload:
+`installSignalHandlers` + `multireactor.Server.reload_fn` — the main loop
+re-parses the config, swaps in a fresh reactor set with the new handler and
+dispatcher (new connections get the new config), and drains the old reactors
+(no new accepts; existing connections finish; join when empty or after 30 s).
+Gates met: 4 new unit tests + e2e verification (combined-format lines on
+stderr, parse-error warn lines, stub counters under load, the full SIGHUP
+config-A→B dance with old-connection drain), `zig build test` 149/149,
+M13 A/B in `bench/BENCH.md` (+0.6% / -0.7%, within gate).
+
 *Depends on*: M10 (static files for log content) + M12 (proxy metrics).
 
 - **Access log module** (`dsl/modules/access_log.zig`, `log` phase):
@@ -379,6 +499,21 @@ filter is comptime-configurable via struct literal.
 ---
 
 ### M14 — Kernel-level optimizations
+
+**Status: DONE** (2026-08-12). SO_REUSEPORT: each reactor binds its own
+listener on the same port and accepts directly (accept loop, dispatcher and
+per-connection eventfd wakeup removed; reload gives new reactors fresh
+listeners that coexist with the draining ones). `sendfile()` for static
+bodies >= 16 KB (head with the real Content-Length; ranges keep offsets;
+also fixes the pre-existing >16 KB-file empty-response bug). `writev()`:
+bodies stay out of the send buffer and flush with the head in one syscall
+(module-allocated bodies freed once sent). io_uring: explored and deferred
+(integrating std.Io's io_uring into the epoll reactor is a rewrite; roadmap
+allows deferral). Gates met: `zig build test` 149/149, `bench/http-check.py`
+15/15, 100 KB file byte-identical via sendfile (full + range), reload e2e
+with per-reactor listeners, per-optimization A/Bs in `bench/BENCH.md`
+(port-bias-corrected: +0.1/+0.6%, +1.0%, +1.2% — all within gate; a ~6%
+port-position bias was discovered and corrected for).
 
 *Depends on*: M10 (static files for `sendfile`) + M12 (proxy for socket pools).
 

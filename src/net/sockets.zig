@@ -30,9 +30,23 @@ pub fn setNonBlock(fd: posix.fd_t) !void {
 /// Create a non-blocking IPv4 TCP listener bound to 127.0.0.1:port with
 /// SO_REUSEADDR, listening on the given backlog.
 pub fn createListeningSocket(port: u16, backlog: usize) !posix.fd_t {
+    return createListeningSocketFlags(port, backlog, false);
+}
+
+/// Like `createListeningSocket`, but with SO_REUSEPORT (Milestone 14): the
+/// kernel load-balances inbound connections across every listener on the
+/// port, letting each reactor accept directly.
+pub fn createListeningSocketReusePort(port: u16, backlog: usize) !posix.fd_t {
+    return createListeningSocketFlags(port, backlog, true);
+}
+
+fn createListeningSocketFlags(port: u16, backlog: usize, reuse_port: bool) !posix.fd_t {
     const listener = try posix.socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     errdefer posix.close(listener);
     try posix.setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    if (reuse_port) {
+        try posix.setsockopt(listener, SOL_SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
+    }
     try setNonBlock(listener);
 
     const addr = sockaddr_in{
@@ -117,4 +131,16 @@ pub fn pinToCpu(cpu: usize) void {
     const cpu_idx = target orelse return;
     set[cpu_idx / 64] |= @as(usize, 1) << @intCast(cpu_idx % 64);
     linux.sched_setaffinity(0, &set) catch {};
+}
+/// IPv4 address of the peer (network byte order), or zeroes for non-INET
+/// peers (socketpairs in tests). Used for proxy headers (Milestone 12).
+pub fn peerIp(fd: posix.fd_t) [4]u8 {
+    var addr: sockaddr_in = undefined;
+    var len: posix.socklen_t = @sizeOf(sockaddr_in);
+    if (posix.getpeername(fd, @as(*posix.sockaddr, @ptrCast(&addr)), &len)) |_| {
+        if (addr.sin_family == AF_INET) {
+            return std.mem.toBytes(addr.sin_addr);
+        }
+    } else |_| {}
+    return .{ 0, 0, 0, 0 };
 }

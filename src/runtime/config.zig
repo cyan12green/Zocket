@@ -54,6 +54,18 @@ pub const Config = struct {
             }
             allocator.free(r.modules);
             allocator.free(r.path);
+            if (r.root) |root| allocator.free(root);
+            if (r.index) |index| allocator.free(index);
+            if (r.response) |*t| {
+                for (t.headers) |h| {
+                    allocator.free(h.name);
+                    allocator.free(h.value);
+                }
+                allocator.free(t.headers);
+                if (t.body.len > 0) allocator.free(t.body);
+            }
+            for (r.upstreams) |up| allocator.free(up.host);
+            allocator.free(r.upstreams);
         }
         allocator.free(self.routes);
     }
@@ -93,10 +105,70 @@ pub const Config = struct {
                 }
             }
 
+            const root = if (jr.root) |r| try allocator.dupe(u8, r) else null;
+            errdefer if (root) |r| allocator.free(r);
+            const index = if (jr.index) |ix| try allocator.dupe(u8, ix) else null;
+            errdefer if (index) |ix| allocator.free(ix);
+            // Response template (Milestone 11): status + headers + body are
+            // copied; JSON routes apply it through the pipeline at runtime.
+            var template: ?router.ResponseTemplate = null;
+            if (jr.response) |jrsp| {
+                var t_headers = std.ArrayList(router.TemplateHeader).empty;
+                if (jrsp.headers) |jh| {
+                    try t_headers.ensureTotalCapacity(allocator, jh.len);
+                    for (jh) |h| {
+                        t_headers.appendAssumeCapacity(.{
+                            .name = try allocator.dupe(u8, h.name),
+                            .value = try allocator.dupe(u8, h.value),
+                        });
+                    }
+                }
+                template = .{
+                    .status = jrsp.status,
+                    .headers = try t_headers.toOwnedSlice(allocator),
+                    .body = if (jrsp.body) |b| try allocator.dupe(u8, b) else &.{},
+                    .compress = jrsp.compress,
+                };
+            }
+            var upstreams = std.ArrayList(router.Upstream).empty;
+            if (jr.upstreams) |jus| {
+                try upstreams.ensureTotalCapacity(allocator, jus.len);
+                for (jus) |ju| {
+                    const sock = router.Upstream.makeSockaddr(ju.host, ju.port) orelse return error.InvalidUpstreamHost;
+                    upstreams.appendAssumeCapacity(.{
+                        .host = try allocator.dupe(u8, ju.host),
+                        .port = ju.port,
+                        .sockaddr = sock,
+                    });
+                }
+            }
+            errdefer {
+                for (upstreams.items) |up| allocator.free(up.host);
+                upstreams.deinit(allocator);
+            }
+            const balance = if (jr.balance) |b| (router.Balance.parse(b) orelse return error.InvalidBalance) else router.Balance.round_robin;
+            errdefer if (template) |*t| {
+                for (t.headers) |h| {
+                    allocator.free(h.name);
+                    allocator.free(h.value);
+                }
+                allocator.free(t.headers);
+            };
+
             routes.appendAssumeCapacity(.{
                 .path = path,
                 .match = if (std.mem.eql(u8, jr.match, "exact")) .exact else .prefix,
                 .modules = try bindings.toOwnedSlice(allocator),
+                .max_age_seconds = jr.max_age,
+                .root = root,
+                .index = index,
+                .autoindex = jr.autoindex,
+                .embed = jr.embed,
+                .response = template,
+                .upstreams = try upstreams.toOwnedSlice(allocator),
+                .balance = balance,
+                .max_fails = jr.max_fails,
+                .fail_timeout_seconds = jr.fail_timeout_seconds,
             });
         }
 
@@ -117,10 +189,34 @@ const JsonModuleMap = struct {
     log: ?[]const u8 = null,
 };
 
+const JsonHeader = struct { name: []const u8, value: []const u8 };
+
+const JsonResponse = struct {
+    status: u16 = 200,
+    body: ?[]const u8 = null,
+    headers: ?[]const JsonHeader = null,
+    compress: bool = false,
+};
+
+const JsonUpstream = struct {
+    host: []const u8,
+    port: u16,
+};
+
 const JsonRoute = struct {
     path: []const u8,
     match: []const u8 = "prefix",
     modules: JsonModuleMap = .{},
+    max_age: u32 = 0,
+    root: ?[]const u8 = null,
+    index: ?[]const u8 = null,
+    autoindex: bool = false,
+    embed: ?[]const u8 = null,
+    response: ?JsonResponse = null,
+    upstreams: ?[]const JsonUpstream = null,
+    balance: ?[]const u8 = null,
+    max_fails: u32 = 3,
+    fail_timeout_seconds: u32 = 30,
 };
 
 const JsonConfig = struct {

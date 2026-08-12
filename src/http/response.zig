@@ -1,29 +1,66 @@
 const std = @import("std");
 const buffer_mod = @import("../net/buffer.zig");
 
+const posix_fd = std.posix.fd_t;
+
 pub const Status = enum(u16) {
     ok = 200,
+    partial_content = 206,
+    moved_permanently = 301,
+    found = 302,
+    not_modified = 304,
+    forbidden = 403,
+    range_not_satisfiable = 416,
     bad_request = 400,
     not_found = 404,
     payload_too_large = 413,
     header_too_large = 431,
     internal_error = 500,
     not_implemented = 501,
+    bad_gateway = 502,
 
     pub fn reasonPhrase(self: Status) []const u8 {
         return switch (self) {
             .ok => "OK",
+            .partial_content => "Partial Content",
+            .moved_permanently => "Moved Permanently",
+            .found => "Found",
+            .not_modified => "Not Modified",
+            .forbidden => "Forbidden",
+            .range_not_satisfiable => "Range Not Satisfiable",
             .bad_request => "Bad Request",
             .not_found => "Not Found",
             .payload_too_large => "Payload Too Large",
             .header_too_large => "Request Header Fields Too Large",
             .internal_error => "Internal Server Error",
             .not_implemented => "Not Implemented",
+            .bad_gateway => "Bad Gateway",
         };
     }
 };
 
 pub const max_headers = 8;
+
+/// Reason phrase for an arbitrary status code (comptime templates): known
+/// codes map to their phrases, unknown ones to the generic fallback.
+pub fn reasonPhraseForCode(comptime code: u16) []const u8 {
+    return switch (code) {
+        200 => "OK",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        413 => "Payload Too Large",
+        416 => "Range Not Satisfiable",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        else => "Unknown",
+    };
+}
 
 /// Minimal HTTP/1.1 response builder. Content-Length is always written, so
 /// serialization is unambiguous and keep-alive safe. The full response is
@@ -35,6 +72,21 @@ pub const Response = struct {
     body: []const u8 = &.{},
     headers: [max_headers]Header = undefined,
     header_count: usize = 0,
+    /// True when `body` was allocated by a module (e.g. gzip) and the caller
+    /// must free it after serialising.
+    body_owned: bool = false,
+    /// Scratch space for module-generated header values (e.g. formatted
+    /// `Cache-Control: max-age=N`). Valid until the response is serialised;
+    /// the response itself lives on the caller's stack for the request.
+    scratch: [96]u8 = undefined,
+    scratch_used: usize = 0,
+    /// sendfile body (Milestone 14): when set, the body is pushed from the
+    /// file directly into the socket instead of being copied through
+    /// userspace. The caller (reactor) takes ownership of `file_fd`.
+    body_from_file: bool = false,
+    file_fd: posix_fd = -1,
+    file_offset: u64 = 0,
+    file_len: u64 = 0,
 
     pub const Header = struct { name: []const u8, value: []const u8 };
 
@@ -42,10 +94,23 @@ pub const Response = struct {
         return .{ .status = status };
     }
 
+    /// Set a header, appending it to the header list. The parser's
+    /// `header_hasher` is available for dedup (`setHeader` + hash compare)
+    /// where the caller controls header names; the pipeline's order tests
+    /// rely on append semantics, so no implicit dedup happens here.
     pub fn setHeader(self: *Response, name: []const u8, value: []const u8) void {
         std.debug.assert(self.header_count < max_headers);
         self.headers[self.header_count] = .{ .name = name, .value = value };
         self.header_count += 1;
+    }
+
+    /// Set a header whose value is formatted into the response's scratch
+    /// space (safe: the response outlives the write). Drops the header if the
+    /// scratch is exhausted.
+    pub fn setHeaderFmt(self: *Response, comptime name: []const u8, comptime fmt: []const u8, args: anytype) void {
+        const value = std.fmt.bufPrint(self.scratch[self.scratch_used..], fmt, args) catch return;
+        self.scratch_used += value.len;
+        self.setHeader(name, value);
     }
 
     pub fn setBody(self: *Response, body: []const u8) void {
@@ -88,6 +153,29 @@ pub const Response = struct {
     /// compact or grow first.
     pub fn writeToBuffer(self: *const Response, buf: *buffer_mod.Buffer) !void {
         try self.write(BufferSink{ .buf = buf });
+    }
+
+    /// Serialize only the head (status line + headers + blank line) into a
+    /// connection send buffer. `Content-Length` still reflects the body
+    /// length, but the body bytes are not written — the HEAD method response
+    /// (RFC 9110 §9.3.2). Same framing and sizes as `write`, minus the body.
+    pub fn writeHeadToBuffer(self: *const Response, buf: *buffer_mod.Buffer) !void {
+        return writeHeadToBufferWithLength(self, buf, self.body.len);
+    }
+
+    /// Head-only serialisation with an explicit Content-Length (sendfile
+    /// bodies, whose bytes never sit in `body`).
+    pub fn writeHeadToBufferWithLength(self: *const Response, buf: *buffer_mod.Buffer, content_length: usize) !void {
+        var scratch: [96]u8 = undefined;
+        const sink = BufferSink{ .buf = buf };
+        try sink.writeAll(try std.fmt.bufPrint(&scratch, "HTTP/1.1 {d} {s}\r\n", .{
+            @intFromEnum(self.status),
+            self.status.reasonPhrase(),
+        }));
+        for (self.headers[0..self.header_count]) |h| {
+            try sink.writeAll(try std.fmt.bufPrint(&scratch, "{s}: {s}\r\n", .{ h.name, h.value }));
+        }
+        try sink.writeAll(try std.fmt.bufPrint(&scratch, "Content-Length: {d}\r\n\r\n", .{content_length}));
     }
 };
 
@@ -205,6 +293,23 @@ test "writeToBuffer fails cleanly when the buffer is too small" {
     // Nothing was written.
     try testing.expectEqual(@as(usize, 0), buf.availableRead());
     try testing.expectEqual(@as(usize, 0), buf.write_pos);
+}
+
+test "writeHeadToBuffer writes head only with full Content-Length" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.ok);
+    resp.setHeader("Connection", "keep-alive");
+    resp.setBody("the body that must not be sent");
+
+    const buf = try buffer_mod.Buffer.init(allocator);
+    defer buf.deinit(allocator);
+    try resp.writeHeadToBuffer(buf);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 30\r\n\r\n",
+        buf.peek(),
+    );
+    // Head-only serialization is exactly the full wire size minus the body.
+    try testing.expectEqual(resp.wireSize() - resp.body.len, buf.availableRead());
 }
 
 test "wireSize matches written bytes across configurations" {

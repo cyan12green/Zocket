@@ -28,6 +28,13 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    // Comptime-embedded assets (Milestone 10): `embeds.zig` lives at the
+    // project root so route `embed` paths resolve root-relative.
+    const embeds_mod = b.addModule("embeds", .{
+        .root_source_file = b.path("embeds.zig"),
+        .target = target,
+    });
+
     const mod = b.addModule("tcp_server", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -39,6 +46,9 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .imports = &.{
+            .{ .name = "embeds", .module = embeds_mod },
+        },
     });
 
     // Here we define an executable. An executable needs to have a root module

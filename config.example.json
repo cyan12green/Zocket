@@ -6,6 +6,35 @@
       "modules": { "content": "echo" }
     },
     {
+      "path": "/gzip",
+      "match": "prefix",
+      "max_age": 3600,
+      "modules": {
+        "content": "echo",
+        "preaccess": "conditional_get",
+        "post_access": "cache_headers",
+        "log": "gzip"
+      }
+    },
+    {
+      "path": "/static",
+      "match": "prefix",
+      "modules": { "content": "static" },
+      "root": "testdata",
+      "index": "index.html",
+      "autoindex": true
+    },
+    {
+      "path": "/health",
+      "match": "exact",
+      "response": { "status": 200, "body": "ok" }
+    },
+    {
+      "path": "/old",
+      "match": "exact",
+      "response": { "status": 301, "headers": [{ "name": "Location", "value": "/health" }] }
+    },
+    {
       "path": "/",
       "match": "prefix",
       "modules": { "content": "echo" }
