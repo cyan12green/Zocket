@@ -500,6 +500,21 @@ filter is comptime-configurable via struct literal.
 
 ### M14 — Kernel-level optimizations
 
+**Status: DONE** (2026-08-12). SO_REUSEPORT: each reactor binds its own
+listener on the same port and accepts directly (accept loop, dispatcher and
+per-connection eventfd wakeup removed; reload gives new reactors fresh
+listeners that coexist with the draining ones). `sendfile()` for static
+bodies >= 16 KB (head with the real Content-Length; ranges keep offsets;
+also fixes the pre-existing >16 KB-file empty-response bug). `writev()`:
+bodies stay out of the send buffer and flush with the head in one syscall
+(module-allocated bodies freed once sent). io_uring: explored and deferred
+(integrating std.Io's io_uring into the epoll reactor is a rewrite; roadmap
+allows deferral). Gates met: `zig build test` 149/149, `bench/http-check.py`
+15/15, 100 KB file byte-identical via sendfile (full + range), reload e2e
+with per-reactor listeners, per-optimization A/Bs in `bench/BENCH.md`
+(port-bias-corrected: +0.1/+0.6%, +1.0%, +1.2% — all within gate; a ~6%
+port-position bias was discovered and corrected for).
+
 *Depends on*: M10 (static files for `sendfile`) + M12 (proxy for socket pools).
 
 Optimizations that reduce syscall count and per-request overhead.

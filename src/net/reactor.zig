@@ -41,6 +41,16 @@ const HttpSession = struct {
     /// Stub-status accounting state (Milestone 13): which shared counter the
     /// connection currently contributes to.
     stat_state: enum { waiting, reading, writing } = .waiting,
+    /// sendfile state (Milestone 14): while `file_remaining > 0` the body is
+    /// pushed from this fd into the socket.
+    file_fd: posix.fd_t = -1,
+    file_offset: u64 = 0,
+    file_remaining: u64 = 0,
+    /// writev body (Milestone 14): the head lives in the send buffer, the
+    /// body here; both go out in one writev. `pending_body_owned` marks a
+    /// module-allocated body that must be freed once fully sent.
+    pending_body: []const u8 = &.{},
+    pending_body_owned: bool = false,
 };
 
 /// A single-reactor worker: its own thread, its own epoll instance and its own
@@ -84,6 +94,11 @@ pub const Reactor = struct {
     expired_fds: std.ArrayList(posix.fd_t),
     /// Shared connection/request counters (Milestone 13); null in echo mode.
     stats: ?*runtime_server.ServerStats = null,
+    /// Per-reactor listener (Milestone 14, SO_REUSEPORT): when set, this
+    /// reactor accepts connections directly from the kernel; -1 otherwise.
+    listener: posix.fd_t = -1,
+    /// Total accepted counter shared with the server (bumped per accept).
+    accepted_counter: ?*std.atomic.Value(usize) = null,
     /// Graceful-drain mode (Milestone 13): stop accepting new connections
     /// and exit the loop once the connection map empties (or a timeout).
     draining: std.atomic.Value(bool) = .init(false),
@@ -108,6 +123,30 @@ pub const Reactor = struct {
         http_handler: ?*const runtime_server.Server,
     ) !Reactor {
         return initWithHandlerTimeout(allocator, id, mode, http_handler, default_idle_timeout_seconds);
+    }
+
+    /// Like `initWithHandlerTimeout`, with a per-reactor listener
+    /// (SO_REUSEPORT accept path, Milestone 14).
+    pub fn initWithHandlerListener(
+        allocator: std.mem.Allocator,
+        id: usize,
+        mode: Mode,
+        http_handler: ?*const runtime_server.Server,
+        idle_timeout_seconds: u32,
+        listener: posix.fd_t,
+    ) !Reactor {
+        var self = try initWithHandlerTimeout(allocator, id, mode, http_handler, idle_timeout_seconds);
+        self.listener = listener;
+        self.ep.add(listener, epoll.Events.In | epoll.Events.EdgeTriggered, listener) catch {
+            self.ep.close();
+            self.wakeup.close();
+            self.connections.deinit();
+            self.http_sessions.deinit();
+            self.pending.deinit(self.allocator);
+            self.expired_fds.deinit(self.allocator);
+            return error.ListenerRegisterFailed;
+        };
+        return self;
     }
 
     /// Full constructor: HTTP handler + idle timeout in seconds (zero
@@ -151,6 +190,16 @@ pub const Reactor = struct {
             self.http_sessions.deinit();
             self.pending.deinit(self.allocator);
         };
+        if (self.listener >= 0) {
+            self.ep.add(self.listener, epoll.Events.In | epoll.Events.EdgeTriggered, self.listener) catch {
+                self.ep.close();
+                self.wakeup.close();
+                self.connections.deinit();
+                self.http_sessions.deinit();
+                self.pending.deinit(self.allocator);
+                return error.ListenerRegisterFailed;
+            };
+        }
         return self;
     }
 
@@ -159,6 +208,7 @@ pub const Reactor = struct {
         // Tear down connections while the epoll fd is still open: they deregister
         // via epoll_ctl DEL, which would EBADF-panic on a closed epoll fd.
         self.closeAllConnections();
+        if (self.listener >= 0) posix.close(self.listener);
         self.ep.close();
         self.wakeup.close();
         self.connections.deinit();
@@ -295,6 +345,10 @@ pub const Reactor = struct {
         if (fd == self.wakeup.fd) {
             self.wakeup.read();
             self.drainPending();
+            return;
+        }
+        if (fd == self.listener) {
+            if (events & epoll.Events.In != 0) self.acceptConnections();
             return;
         }
 
@@ -487,22 +541,37 @@ pub const Reactor = struct {
                     const close = ctx.close_after_write or !session.req.keep_alive;
                     resp.setHeader("Connection", if (close) "close" else "keep-alive");
                     conn.send_buf.compact();
-                    if (session.req.method == .head) {
-                        // HEAD: status line + headers only (Content-Length
-                        // reflects the would-be body).
-                        resp.writeHeadToBuffer(conn.send_buf) catch {
+                    // Milestone 14 writev: the head goes into the send
+                    // buffer, the body stays put and both are flushed in one
+                    // writev — no body memcpy through the send buffer.
+                    if (resp.body_from_file) {
+                        resp.writeHeadToBufferWithLength(conn.send_buf, resp.file_len) catch {
                             if (resp.body_owned) self.allocator.free(resp.body);
                             self.removeConnection(fd);
                             return;
                         };
                     } else {
-                        resp.writeToBuffer(conn.send_buf) catch {
+                        resp.writeHeadToBuffer(conn.send_buf) catch {
                             if (resp.body_owned) self.allocator.free(resp.body);
                             self.removeConnection(fd);
                             return;
                         };
                     }
-                    if (resp.body_owned) self.allocator.free(resp.body);
+                    if (session.req.method == .head or resp.body.len == 0) {
+                        session.pending_body = &.{};
+                        session.pending_body_owned = false;
+                        if (resp.body_owned) self.allocator.free(resp.body);
+                    } else {
+                        session.pending_body = resp.body;
+                        session.pending_body_owned = resp.body_owned;
+                    }
+                    if (resp.body_from_file) {
+                        // Take ownership of the module's fd; the body goes via
+                        // sendfile once the head has flushed.
+                        session.file_fd = resp.file_fd;
+                        session.file_offset = resp.file_offset;
+                        session.file_remaining = if (session.req.method == .head) 0 else resp.file_len;
+                    }
                     session.close_after_write = close;
                     if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
                     self.markWriting(fd);
@@ -527,19 +596,75 @@ pub const Reactor = struct {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
 
-        while (conn.send_buf.availableRead() > 0) {
-            const n = conn.send() catch |e| {
-                if (e == error.WouldBlock) break;
+        // Milestone 14: one writev for the remaining head + the body.
+        if (session.pending_body.len > 0) {
+            var iov = [_]posix.iovec_const{
+                .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() },
+                .{ .base = session.pending_body.ptr, .len = session.pending_body.len },
+            };
+            const n = posix.writev(fd, &iov) catch |e| {
+                if (e == error.WouldBlock) return;
+                if (session.pending_body_owned) self.allocator.free(session.pending_body);
+                session.pending_body = &.{};
                 self.removeConnection(fd);
                 return;
             };
-            if (n == 0) break;
+            const head_avail = conn.send_buf.availableRead();
+            if (n <= head_avail) {
+                conn.send_buf.consume(n);
+            } else {
+                conn.send_buf.consume(head_avail);
+                session.pending_body = session.pending_body[n - head_avail ..];
+            }
+            if (session.pending_body.len > 0) {
+                // Socket buffer full; continue on the next EPOLLOUT edge.
+                return;
+            }
+            if (session.pending_body_owned) self.allocator.free(session.pending_body);
+            session.pending_body_owned = false;
+            session.pending_body = &.{};
+            if (conn.send_buf.availableRead() > 0) return;
+        } else {
+            while (conn.send_buf.availableRead() > 0) {
+                const n = conn.send() catch |e| {
+                    if (e == error.WouldBlock) break;
+                    self.removeConnection(fd);
+                    return;
+                };
+                if (n == 0) break;
+            }
+            if (conn.send_buf.availableRead() > 0) {
+                // Socket buffer full; the next EPOLLOUT edge (socket became
+                // writable again) will continue the flush.
+                return;
+            }
         }
 
-        if (conn.send_buf.availableRead() > 0) {
-            // Socket buffer full; the next EPOLLOUT edge (socket became
-            // writable again) will continue the flush.
-            return;
+        // Milestone 14: push any file body straight into the socket.
+        if (session.file_remaining > 0) {
+            var off: i64 = @intCast(session.file_offset);
+            while (session.file_remaining > 0) {
+                const rc = linux.sendfile(fd, session.file_fd, &off, @intCast(@min(session.file_remaining, 1 << 20)));
+                const err = posix.errno(rc);
+                if (err != .SUCCESS) {
+                    if (err == .AGAIN or err == .INTR) break; // wait for EPOLLOUT
+                    posix.close(session.file_fd);
+                    session.file_fd = -1;
+                    self.removeConnection(fd);
+                    return;
+                }
+                const n = rc;
+                session.file_offset += n;
+                session.file_remaining -= n;
+                off = @intCast(session.file_offset);
+            }
+            if (session.file_remaining > 0) {
+                // Socket buffer full mid-sendfile: continue on the next
+                // EPOLLOUT edge.
+                return;
+            }
+            posix.close(session.file_fd);
+            session.file_fd = -1;
         }
 
         if (session.close_after_write) {
@@ -613,6 +738,69 @@ pub const Reactor = struct {
         self.flushHttp(fd);
     }
 
+    /// Accept from the per-reactor listener (SO_REUSEPORT, Milestone 14) and
+    /// register each connection directly — no accept loop, no dispatcher, no
+    /// eventfd wakeup. Connections are rejected while draining.
+    fn acceptConnections(self: *Reactor) void {
+        while (true) {
+            const conn_fd = sockets.acceptNonBlock(self.listener) catch |e| switch (e) {
+                error.WouldBlock => return,
+                else => return,
+            };
+            if (self.accepted_counter) |c| _ = c.fetchAdd(1, .monotonic);
+            if (self.draining.load(.acquire)) {
+                posix.close(conn_fd);
+                continue;
+            }
+            const conn = connection.Connection.create(self.allocator, conn_fd) catch {
+                posix.close(conn_fd);
+                return;
+            };
+            conn.peer_ip = sockets.peerIp(conn_fd);
+            self.registerConnection(conn);
+        }
+    }
+
+    /// Register a freshly created connection with this reactor's epoll and
+    /// registries (shared by the pending queue and the accept path).
+    fn registerConnection(self: *Reactor, conn: *connection.Connection) void {
+        self.ep.add(conn.fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, conn.fd) catch {
+            conn.close();
+            conn.destroy();
+            return;
+        };
+        if (self.connections.put(conn.fd, conn)) |_| {
+            _ = self.registered.fetchAdd(1, .monotonic);
+        } else |_| {
+            self.ep.remove(conn.fd) catch {};
+            conn.close();
+            conn.destroy();
+            return;
+        }
+        if (self.idle_timeout_ticks > 0) {
+            self.wheel.insert(&conn.timer, self.nowTick(), self.idle_timeout_ticks);
+        }
+        if (self.stats) |s| {
+            _ = s.active.fetchAdd(1, .monotonic);
+            _ = s.waiting.fetchAdd(1, .monotonic);
+        }
+        if (self.mode == .http) {
+            var session = HttpSession{
+                .parser = http_parser.Parser.init(self.allocator),
+                .req = http_parser.Request.init(self.allocator),
+            };
+            if (self.http_sessions.put(conn.fd, session)) |_| {
+            } else |_| {
+                session.parser.deinit();
+                session.req.deinit();
+                self.wheel.remove(&conn.timer);
+                self.ep.remove(conn.fd) catch {};
+                conn.close();
+                conn.destroy();
+            }
+        }
+    }
+
     /// Echo semantics identical to the Milestone 1 server: whatever was read is
     /// copied into the send buffer and the fd is armed for writability.
     fn onMessage(self: *Reactor, conn: *connection.Connection) !void {
@@ -651,41 +839,7 @@ pub const Reactor = struct {
         defer self.allocator.free(items);
 
         for (items) |conn| {
-            self.ep.add(conn.fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, conn.fd) catch {
-                conn.close();
-                conn.destroy();
-                continue;
-            };
-            if (self.connections.put(conn.fd, conn)) |_| {
-                _ = self.registered.fetchAdd(1, .monotonic);
-            } else |_| {
-                self.ep.remove(conn.fd) catch {};
-                conn.close();
-                conn.destroy();
-                continue;
-            }
-            if (self.idle_timeout_ticks > 0) {
-                self.wheel.insert(&conn.timer, self.nowTick(), self.idle_timeout_ticks);
-            }
-            if (self.stats) |s| {
-                _ = s.active.fetchAdd(1, .monotonic);
-                _ = s.waiting.fetchAdd(1, .monotonic);
-            }
-            if (self.mode == .http) {
-                var session = HttpSession{
-                    .parser = http_parser.Parser.init(self.allocator),
-                    .req = http_parser.Request.init(self.allocator),
-                };
-                if (self.http_sessions.put(conn.fd, session)) |_| {
-                } else |_| {
-                    session.parser.deinit();
-                    session.req.deinit();
-                    self.wheel.remove(&conn.timer);
-                    self.ep.remove(conn.fd) catch {};
-                    conn.close();
-                    conn.destroy();
-                }
-            }
+            self.registerConnection(conn);
         }
     }
 
@@ -700,6 +854,8 @@ pub const Reactor = struct {
         }
         if (self.http_sessions.fetchRemove(fd)) |kv| {
             var sess = kv.value;
+            if (sess.file_fd >= 0) posix.close(sess.file_fd);
+            if (sess.pending_body_owned) self.allocator.free(sess.pending_body);
             if (self.stats) |s| {
                 switch (sess.stat_state) {
                     .waiting => _ = s.waiting.fetchSub(1, .monotonic),
@@ -726,6 +882,8 @@ pub const Reactor = struct {
         self.connections.clearRetainingCapacity();
         var sit = self.http_sessions.valueIterator();
         while (sit.next()) |s| {
+            if (s.file_fd >= 0) posix.close(s.file_fd);
+            if (s.pending_body_owned) self.allocator.free(s.pending_body);
             s.parser.deinit();
             s.req.deinit();
         }

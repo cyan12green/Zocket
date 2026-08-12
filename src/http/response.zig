@@ -1,6 +1,8 @@
 const std = @import("std");
 const buffer_mod = @import("../net/buffer.zig");
 
+const posix_fd = std.posix.fd_t;
+
 pub const Status = enum(u16) {
     ok = 200,
     partial_content = 206,
@@ -78,6 +80,13 @@ pub const Response = struct {
     /// the response itself lives on the caller's stack for the request.
     scratch: [96]u8 = undefined,
     scratch_used: usize = 0,
+    /// sendfile body (Milestone 14): when set, the body is pushed from the
+    /// file directly into the socket instead of being copied through
+    /// userspace. The caller (reactor) takes ownership of `file_fd`.
+    body_from_file: bool = false,
+    file_fd: posix_fd = -1,
+    file_offset: u64 = 0,
+    file_len: u64 = 0,
 
     pub const Header = struct { name: []const u8, value: []const u8 };
 
@@ -151,6 +160,12 @@ pub const Response = struct {
     /// length, but the body bytes are not written — the HEAD method response
     /// (RFC 9110 §9.3.2). Same framing and sizes as `write`, minus the body.
     pub fn writeHeadToBuffer(self: *const Response, buf: *buffer_mod.Buffer) !void {
+        return writeHeadToBufferWithLength(self, buf, self.body.len);
+    }
+
+    /// Head-only serialisation with an explicit Content-Length (sendfile
+    /// bodies, whose bytes never sit in `body`).
+    pub fn writeHeadToBufferWithLength(self: *const Response, buf: *buffer_mod.Buffer, content_length: usize) !void {
         var scratch: [96]u8 = undefined;
         const sink = BufferSink{ .buf = buf };
         try sink.writeAll(try std.fmt.bufPrint(&scratch, "HTTP/1.1 {d} {s}\r\n", .{
@@ -160,7 +175,7 @@ pub const Response = struct {
         for (self.headers[0..self.header_count]) |h| {
             try sink.writeAll(try std.fmt.bufPrint(&scratch, "{s}: {s}\r\n", .{ h.name, h.value }));
         }
-        try sink.writeAll(try std.fmt.bufPrint(&scratch, "Content-Length: {d}\r\n\r\n", .{self.body.len}));
+        try sink.writeAll(try std.fmt.bufPrint(&scratch, "Content-Length: {d}\r\n\r\n", .{content_length}));
     }
 };
 

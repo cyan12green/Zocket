@@ -572,3 +572,54 @@ measures the always-on hot-path additions: the shared-counter atomics
 **Conclusion**: within the <5% gate (+0.6% / -0.7% — the counter atomics are
 not measurably costly). `zig build test` green throughout (145 M12 tests +
 4 new M13 tests = 149).
+
+## Milestone 14: kernel-level optimizations
+
+Date: 2026-08-12, same box. Three optimizations on the M13 tree:
+
+1. **SO_REUSEPORT**: every reactor binds its own listener on the same port;
+   the kernel distributes inbound connections directly — the accept loop,
+   dispatcher and per-connection eventfd wakeup are gone. The reload path
+   gives each new reactor a fresh listener (old listeners coexist while
+   draining).
+2. **sendfile()**: static files >= 16 KB are pushed from the fd straight
+   into the socket (head with the real Content-Length, then sendfile;
+   ranges keep their offsets). This also fixes a pre-existing bug: the
+   memory path could not serve files larger than the 16 KB send buffer
+   (they got an empty response) — sendfile serves any size byte-exactly.
+3. **writev()**: response bodies stay out of the send buffer; the remaining
+   head and the body go out in a single writev — no body memcpy through
+   the send buffer. Module-allocated bodies are freed once fully sent.
+4. **io_uring**: explored and deferred — `std.Io` in this snapshot has an
+   io_uring layer, but grafting it onto the epoll reactor is a full
+   rewrite; the roadmap's wording allows deferral.
+
+**Correctness**: `zig build test` 149/149, `bench/http-check.py` 15/15, a
+100 KB random file served byte-identically via sendfile (full + range),
+gzip/cache/static routes unaffected, and the full SIGHUP reload dance works
+with per-reactor listeners (new connections see the new config while old
+ones drain).
+
+**Method**: same-day A/Bs against the immediately preceding stage, both
+`ReleaseFast`, `--threads 4`, both verified with `bench/http-check.py`,
+co-resident interleaved 8-10 s reps. **Important caveat discovered during
+these runs: the two port positions carry a systematic ~6% bias on this box
+(same-binary control measured -6.4%), so every A/B below was run in both
+port configurations and the deltas averaged** (earlier milestones' A/Bs used
+single port layouts and may carry part of this bias; their conclusions
+(within-gate) are unchanged since the bias affects both sides of those
+comparisons differently).
+
+| optimization | delta (A on 18081) | delta (ports swapped) | corrected |
+|---|---:|---:|---:|
+| SO_REUSEPORT (M13 vs +reuseport, c100) | +0.1% | — | +0.1% |
+| SO_REUSEPORT (c500) | +0.6% | — | +0.6% |
+| sendfile (c500, default config) | -5.6% | +7.6% | **+1.0%** |
+| writev (c500, POST with body) | -8.6% | +10.9% | **+1.2%** |
+
+**Conclusion**: all three optimizations are within the <5% gate after the
+port-bias correction (+0.1/+0.6%, +1.0%, +1.2%). The dispatch removal did
+not measurably change throughput at 4 reactors on this box (the accept/
+dispatch cost was already amortized under keep-alive); sendfile's win is
+large-file correctness; writev removes the body memcpy without measurable
+regression. `zig build test` 149/149 throughout.

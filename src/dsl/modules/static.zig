@@ -215,7 +215,18 @@ fn serveFile(ctx: *Context, path: []const u8, meta: Meta, root_real: []const u8)
 
     const allocator = ctx.allocator orelse return .pass;
     const file = std.fs.cwd().openFile(path, .{}) catch return notFound(ctx);
-    defer file.close();
+    errdefer file.close();
+
+    if (length >= sendfile_threshold) {
+        // Milestone 14: push the body from the file straight into the socket.
+        // The reactor takes ownership of the fd.
+        resp.body_from_file = true;
+        resp.file_fd = file.handle;
+        resp.file_offset = offset;
+        resp.file_len = length;
+        return .handled;
+    }
+
     const body = allocator.alloc(u8, @intCast(length)) catch return error.OutOfMemory;
     errdefer allocator.free(body);
     if (offset > 0) {
@@ -231,6 +242,10 @@ fn serveFile(ctx: *Context, path: []const u8, meta: Meta, root_real: []const u8)
     resp.body_owned = true;
     return .handled;
 }
+
+/// Files at least this large are served via sendfile (Milestone 14); smaller
+/// ones via the read loop (one write, no extra syscall state).
+pub const sendfile_threshold = 16 * 1024;
 
 fn notFound(ctx: *Context) Action {
     ctx.resp.status = .not_found;
