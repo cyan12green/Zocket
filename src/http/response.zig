@@ -41,6 +41,70 @@ pub const Status = enum(u16) {
 
 pub const max_headers = 8;
 
+/// digits4[i] holds the 4 ASCII digits of i (0..9999) packed so that a
+/// little-endian write of the u32 produces "dddd" in memory order:
+/// byte0 = thousands, byte1 = hundreds, byte2 = tens, byte3 = units.
+const digits4_table = blk: {
+    @setEvalBranchQuota(100_000);
+    var t: [10000]u32 = undefined;
+    for (0..10000) |i| {
+        const d0: u32 = i % 10;
+        const d1: u32 = (i / 10) % 10;
+        const d2: u32 = (i / 100) % 10;
+        const d3: u32 = i / 1000;
+        t[i] = @as(u32, '0' + d3) |
+            (@as(u32, '0' + d2) << 8) |
+            (@as(u32, '0' + d1) << 16) |
+            (@as(u32, '0' + d0) << 24);
+    }
+    break :blk t;
+};
+
+/// Number of decimal digits of `v` (>= 1). Used for sizing headers without
+/// running any format machinery.
+pub fn digitCount(v: u64) usize {
+    var n: usize = 1;
+    var p: u64 = 10;
+    while (p <= v) : (p *= 10) {
+        n += 1;
+        if (p > std.math.maxInt(u64) / 10) break;
+    }
+    return n;
+}
+
+/// Write the decimal representation of `v` into `buf` starting at `pos`,
+/// returning the position just past the digits. Caller guarantees space
+/// (digitCount(v) bytes). 4 digits per step via the lookup table; the
+/// leading block (1..4 digits) is written without leading zeros.
+pub fn formatUInt(buf: []u8, pos: usize, v: u64) usize {
+    const n = digitCount(v);
+    var i = pos + n;
+    var x = v;
+    while (x >= 10000) : (x /= 10000) {
+        i -= 4;
+        std.mem.writeInt(u32, buf[i..][0..4], digits4_table[@intCast(x % 10000)], .little);
+    }
+    const r: u32 = @intCast(x);
+    const block = digits4_table[r];
+    if (r >= 1000) {
+        i -= 4;
+        std.mem.writeInt(u32, buf[i..][0..4], block, .little);
+    } else if (r >= 100) {
+        i -= 3;
+        buf[i] = @truncate(block >> 8);
+        buf[i + 1] = @truncate(block >> 16);
+        buf[i + 2] = @truncate(block >> 24);
+    } else if (r >= 10) {
+        i -= 2;
+        buf[i] = @truncate(block >> 16);
+        buf[i + 1] = @truncate(block >> 24);
+    } else {
+        i -= 1;
+        buf[i] = @truncate(block >> 24);
+    }
+    return pos + n;
+}
+
 /// Reason phrase for an arbitrary status code (comptime templates): known
 /// codes map to their phrases, unknown ones to the generic fallback.
 pub fn reasonPhraseForCode(comptime code: u16) []const u8 {
@@ -117,42 +181,61 @@ pub const Response = struct {
         self.body = body;
     }
 
-    /// Exact number of bytes `write` will emit. Uses the same format strings
-    /// as `write`, so the two can never drift.
+    /// Exact number of bytes `write` will emit. Pure arithmetic: no format
+    /// machinery, and no second formatting pass at write time.
     pub fn wireSize(self: *const Response) usize {
-        var size: usize = std.fmt.count("HTTP/1.1 {d} {s}\r\n", .{
-            @intFromEnum(self.status),
-            self.status.reasonPhrase(),
-        });
+        return self.headWireSize(self.body.len) + self.body.len;
+    }
+
+    /// Size of the head only (status line + headers + Content-Length +
+    /// blank line), for HEAD and sendfile bodies whose bytes never sit in
+    /// `body`.
+    fn headWireSize(self: *const Response, content_length: usize) usize {
+        var size: usize = 9 + // "HTTP/1.1 "
+            digitCount(@intFromEnum(self.status)) + 1 + self.status.reasonPhrase().len + 2;
         for (self.headers[0..self.header_count]) |h| {
-            size += std.fmt.count("{s}: {s}\r\n", .{ h.name, h.value });
+            size += h.name.len + 2 + h.value.len + 2;
         }
-        size += std.fmt.count("Content-Length: {d}\r\n", .{self.body.len});
-        size += 2; // terminating blank line
-        size += self.body.len;
+        size += 16 + digitCount(content_length) + 4; // "Content-Length: " + digits + "\r\n\r\n"
         return size;
+    }
+
+    /// Single-pass head serialisation over any sink exposing
+    /// `writeAll([]const u8) !void`. Integers go through `formatUInt` (no
+    /// format-string machinery, no separate sizing pass).
+    fn writeHeadTo(self: *const Response, sink: anytype, content_length: usize) !void {
+        var num: [24]u8 = undefined;
+        try sink.writeAll("HTTP/1.1 ");
+        try sink.writeAll(num[0..formatUInt(&num, 0, @intFromEnum(self.status))]);
+        try sink.writeAll(" ");
+        try sink.writeAll(self.status.reasonPhrase());
+        try sink.writeAll("\r\n");
+        for (self.headers[0..self.header_count]) |h| {
+            try sink.writeAll(h.name);
+            try sink.writeAll(": ");
+            try sink.writeAll(h.value);
+            try sink.writeAll("\r\n");
+        }
+        try sink.writeAll("Content-Length: ");
+        try sink.writeAll(num[0..formatUInt(&num, 0, content_length)]);
+        try sink.writeAll("\r\n\r\n");
     }
 
     /// Serialize the response into any sink exposing
     /// `writeAll([]const u8) !void`.
     pub fn write(self: *const Response, sink: anytype) !void {
-        var scratch: [96]u8 = undefined;
-        try sink.writeAll(try std.fmt.bufPrint(&scratch, "HTTP/1.1 {d} {s}\r\n", .{
-            @intFromEnum(self.status),
-            self.status.reasonPhrase(),
-        }));
-        for (self.headers[0..self.header_count]) |h| {
-            try sink.writeAll(try std.fmt.bufPrint(&scratch, "{s}: {s}\r\n", .{ h.name, h.value }));
-        }
-        try sink.writeAll(try std.fmt.bufPrint(&scratch, "Content-Length: {d}\r\n\r\n", .{self.body.len}));
+        try self.writeHeadTo(sink, self.body.len);
         try sink.writeAll(self.body);
     }
 
     /// Serialize into a connection send buffer. Fails with `error.BufferFull`
     /// (leaving the buffer untouched) if it does not fit; callers should
-    /// compact or grow first.
+    /// compact or grow first. One capacity check for the whole response, then
+    /// raw memcpy writes — no per-segment checks, no format machinery.
     pub fn writeToBuffer(self: *const Response, buf: *buffer_mod.Buffer) !void {
-        try self.write(BufferSink{ .buf = buf });
+        const needed = self.wireSize();
+        if (needed > buf.availableWrite()) return error.BufferFull;
+        try self.write(RawSink{ .buf = buf });
     }
 
     /// Serialize only the head (status line + headers + blank line) into a
@@ -166,16 +249,9 @@ pub const Response = struct {
     /// Head-only serialisation with an explicit Content-Length (sendfile
     /// bodies, whose bytes never sit in `body`).
     pub fn writeHeadToBufferWithLength(self: *const Response, buf: *buffer_mod.Buffer, content_length: usize) !void {
-        var scratch: [96]u8 = undefined;
-        const sink = BufferSink{ .buf = buf };
-        try sink.writeAll(try std.fmt.bufPrint(&scratch, "HTTP/1.1 {d} {s}\r\n", .{
-            @intFromEnum(self.status),
-            self.status.reasonPhrase(),
-        }));
-        for (self.headers[0..self.header_count]) |h| {
-            try sink.writeAll(try std.fmt.bufPrint(&scratch, "{s}: {s}\r\n", .{ h.name, h.value }));
-        }
-        try sink.writeAll(try std.fmt.bufPrint(&scratch, "Content-Length: {d}\r\n\r\n", .{content_length}));
+        const needed = self.headWireSize(content_length);
+        if (needed > buf.availableWrite()) return error.BufferFull;
+        try self.writeHeadTo(RawSink{ .buf = buf }, content_length);
     }
 };
 
@@ -187,6 +263,18 @@ pub const BufferSink = struct {
     pub fn writeAll(self: BufferSink, bytes: []const u8) !void {
         if (bytes.len > self.buf.availableWrite()) return error.BufferFull;
         _ = self.buf.writeSlice(bytes);
+    }
+};
+
+/// Sink for the send-buffer path after `writeToBuffer` has done its single
+/// capacity check: writes are raw memcpy's with no per-segment checks.
+const RawSink = struct {
+    buf: *buffer_mod.Buffer,
+
+    pub fn writeAll(self: RawSink, bytes: []const u8) !void {
+        const pos = self.buf.write_pos;
+        @memcpy(self.buf.data[pos..][0..bytes.len], bytes);
+        self.buf.write_pos = pos + bytes.len;
     }
 };
 

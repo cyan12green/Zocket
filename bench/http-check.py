@@ -106,16 +106,17 @@ def main() -> int:
     s.close()
     check("Connection: close -> EOF after response", data.startswith(b"HTTP/1.1 200 OK") and data.endswith(b"\r\n\r\n"))
 
-    # 7. Oversized body -> 413 (body completes in the buffer but exceeds the
-    #    echo cap).
-    body = b"x" * 15900
+    # 7. Chunked request body over the parser cap -> 413 (no payload needed:
+    #    the chunk-size line alone announces more than the cap).
     got = raw_request(
-        f"POST / HTTP/1.1\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        b"65537\r\n"
     )
-    check("413 oversized body", b"413 Payload Too Large" in got)
+    check("413 chunked body over cap", b"413 Payload Too Large" in got)
 
-    # 8. Body larger than the read buffer can never complete -> 431, clean FIN.
-    body = b"x" * 20000
+    # 8. Body larger than the receive-buffer cap (16 MiB, grows to
+    #    connection.Connection.max_recv_buffer) can never complete -> 431.
+    body = b"x" * (16 * 1024 * 1024 + 1000)
     got = raw_request(
         f"POST / HTTP/1.1\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
     )

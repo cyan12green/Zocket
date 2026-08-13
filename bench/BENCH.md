@@ -624,6 +624,41 @@ dispatch cost was already amortized under keep-alive); sendfile's win is
 large-file correctness; writev removes the body memcpy without measurable
 regression. `zig build test` 149/149 throughout.
 
+## Response serialisation fast path (fast itoa + single pass)
+
+Date: 2026-08-13, same box. The response builder serialised via
+`std.fmt.bufPrint`/`count` — a sizing pass and a write pass, both running
+the format machinery, with a capacity check per segment. Replaced with a
+single-pass writer: response size computed by plain arithmetic
+(`digitCount`), integers formatted by a 4-digits-at-a-time table itoa
+(`Response.formatUInt`, 40 KB comptime table), one capacity check for the
+whole response, raw memcpy segments into the send buffer. Output is
+byte-identical (correctness gate: 1M `formatUInt` values + all response
+variants vs the std.fmt path; `zig build test` 153/153, `bench/http-check.py`
+15/15 unchanged).
+
+The interesting finding: the itoa itself is only ~1.2-1.4x faster than
+std's `{d}` (std already uses a 2-digit table in `printIntAny`); the ~2.5-3x
+win comes from eliminating the double formatting pass and per-segment
+checks, not from decimal conversion.
+
+Micro-benchmarks (`bench/itoa_bench.zig`, same binary, ReleaseFast, medians):
+
+| op | before (std.fmt 2-pass) | after (single-pass) | speedup |
+|---|---:|---:|---:|
+| response build, empty | 43.3 ns | 16.0 ns | **2.7x** |
+| response build, small (1 hdr) | 60.4 ns | 24.0 ns | **2.5x** |
+| response build, medium (6 hdr + 256 B) | 172.6 ns | 59.5 ns | **2.9x** |
+| response build, notfound | 59.2 ns | 22.9 ns | **2.6x** |
+| itoa, rotating u64 | 24.8 ns | 21.5 ns | 1.15x |
+
+Official `bench/reqresp_bench.zig` after (5 rounds x 300k): empty 18.4,
+small 26.9, medium 55.5, notfound 26.8 ns/op — consistent with the
+controlled A/B. The send-buffer hot path (`writeToBuffer`) is the fast
+path; the generic-sink `write` keeps per-segment writes for non-buffer
+sinks (test-only). Head-only serialisation (HEAD/sendfile) uses the same
+writer.
+
 ## Cross-server comparison: tcp-server vs httpx.zig
 
 Date: 2026-08-12, same box. A head-to-head HTTP server throughput and
