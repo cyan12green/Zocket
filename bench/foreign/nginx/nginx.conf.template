@@ -23,6 +23,10 @@ http {
     # echo_request_body only sees bodies that fit a memory buffer (larger
     # ones are spooled to disk and $request_body comes back empty).
     client_body_buffer_size 32m;
+    # Static files via sendfile (production nginx static configs always
+    # enable it; the default is off and falls back to pread+writev).
+    sendfile on;
+    sendfile_max_chunk 1m;
 
     server {
         listen 127.0.0.1:@@PORT@@;

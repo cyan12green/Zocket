@@ -10,6 +10,9 @@ const posix = std.posix;
 /// within the window; the cached fd is shared between requests until then.
 pub const valid_ns = 1 * std.time.ns_per_s;
 const max_entries = 16;
+/// Files at most this large have their content cached (served as one writev
+/// instead of writev + sendfile); larger files keep the sendfile path.
+pub const content_cache_max = 16384;
 
 pub const Entry = struct {
     in_use: bool = false,
@@ -23,6 +26,11 @@ pub const Entry = struct {
     etag_len: usize = 0,
     lm: [48]u8 = undefined,
     lm_len: usize = 0,
+    /// Full content of small files (<= content_cache_max), owned by the
+    /// entry: serving them is one writev (head + cached bytes), no
+    /// open/sendfile per request.
+    content: []u8 = &.{},
+    content_cached: bool = false,
     /// When the entry was last revalidated.
     refreshed: std.time.Instant = undefined,
 };
@@ -84,6 +92,23 @@ pub const StaticCache = struct {
         e.fd = fd;
         e.size = size;
         e.mtime_secs = mtime_secs;
+        if (size <= content_cache_max) {
+            const content = self.allocator.alloc(u8, @intCast(size)) catch null;
+            if (content) |buf| {
+                var got: usize = 0;
+                while (got < buf.len) {
+                    const n = posix.read(fd, buf[got..]) catch break;
+                    if (n == 0) break;
+                    got += n;
+                }
+                if (got == buf.len) {
+                    e.content = buf;
+                    e.content_cached = true;
+                } else {
+                    self.allocator.free(buf);
+                }
+            }
+        }
         const etag = std.fmt.bufPrint(&e.etag, "\"{d}-{d}\"", .{ mtime_secs, size }) catch return null;
         e.etag_len = etag.len;
         const lm = cache_date(mtime_secs, &e.lm) orelse return null;
@@ -116,6 +141,7 @@ pub const StaticCache = struct {
         if (!e.in_use) return;
         if (e.fd >= 0) posix.close(e.fd);
         self.allocator.free(e.path);
+        if (e.content_cached) self.allocator.free(e.content);
         e.* = .{};
     }
 };

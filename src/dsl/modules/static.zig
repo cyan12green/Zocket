@@ -223,6 +223,7 @@ fn serveDiskBeneath(ctx: *Context, route: *const registry.Route, target: []const
                     .cached = true,
                     .etag = e.etag[0..e.etag_len],
                     .last_modified = e.lm[0..e.lm_len],
+                    .content = if (e.content_cached) e.content else "",
                 });
             }
         }
@@ -360,6 +361,9 @@ const ServeFdOptions = struct {
     /// Preformatted entity headers (cache entries); empty = compute.
     etag: []const u8 = "",
     last_modified: []const u8 = "",
+    /// Cached file content (small files): served as the response body in
+    /// one writev — no sendfile syscall. Empty = file path.
+    content: []const u8 = "",
 };
 
 /// Shared file-response logic (conditional GETs, ranges, sendfile handoff).
@@ -417,6 +421,13 @@ fn serveFd(ctx: *Context, opts: ServeFdOptions) !Action {
                 resp.setHeaderFmt("Content-Range", "bytes {d}-{d}/{d}", .{ offset, offset + length - 1, meta.size });
             },
         }
+    }
+
+    if (opts.content.len > 0) {
+        // Cached small-file content: one writev (head + body), no sendfile.
+        resp.body = opts.content[offset .. offset + length];
+        transferred = true;
+        return .handled;
     }
 
     // Milestone 14: push the body from the file straight into the socket.
@@ -774,4 +785,52 @@ test "openat2 fast path serves beneath the root fd and blocks symlink escapes" {
     try testing.expectEqual(@as(usize, 0), ranged.resp.file_offset);
     try testing.expectEqual(@as(usize, 5), ranged.resp.file_len);
     posix.close(ranged.resp.file_fd);
+}
+
+test "cached small-file content serves as the response body (no sendfile)" {
+    const allocator = testing.allocator;
+    var cache = @import("../static_cache.zig").StaticCache.init(allocator);
+    defer cache.deinit();
+    const file = std.fs.cwd().openFile("testdata/hello.txt", .{}) catch return error.SkipZigTest;
+    const st = file.stat() catch return error.SkipZigTest;
+    const mtime: u64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+    const dup = posix.dup(file.handle) catch return error.SkipZigTest;
+    const entry = cache.insert("testdata/hello.txt", dup, st.size, mtime) orelse return error.SkipZigTest;
+    try testing.expect(entry.content_cached);
+    try testing.expectEqualStrings("hello static world\n", entry.content);
+
+    // Serve straight from the cached content: no sendfile, no fd transfer.
+    var served = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\n\r\n", &registry.Route{ .path = "/", .root = "testdata" });
+    defer served.deinit();
+    served.resp = registry.Response.init(.ok);
+    var ctx = registry.Context{ .req = &served.req, .resp = &served.resp, .allocator = allocator };
+    _ = try serveFd(&ctx, .{
+        .fd = entry.fd,
+        .meta = .{ .size = entry.size, .mtime_secs = entry.mtime_secs, .is_dir = false },
+        .mime_path = "hello.txt",
+        .cached = true,
+        .etag = entry.etag[0..entry.etag_len],
+        .last_modified = entry.lm[0..entry.lm_len],
+        .content = entry.content,
+    });
+    try testing.expectEqual(registry.Status.ok, served.resp.status);
+    try testing.expectEqualStrings("hello static world\n", served.resp.body);
+    try testing.expect(!served.resp.body_from_file);
+
+    // A range over cached content slices memory.
+    var ranged = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n", &registry.Route{ .path = "/", .root = "testdata" });
+    defer ranged.deinit();
+    ranged.resp = registry.Response.init(.ok);
+    var ctx2 = registry.Context{ .req = &ranged.req, .resp = &ranged.resp, .allocator = allocator };
+    _ = try serveFd(&ctx2, .{
+        .fd = entry.fd,
+        .meta = .{ .size = entry.size, .mtime_secs = entry.mtime_secs, .is_dir = false },
+        .mime_path = "hello.txt",
+        .cached = true,
+        .etag = entry.etag[0..entry.etag_len],
+        .last_modified = entry.lm[0..entry.lm_len],
+        .content = entry.content,
+    });
+    try testing.expectEqual(registry.Status.partial_content, ranged.resp.status);
+    try testing.expectEqualStrings("hello", ranged.resp.body);
 }

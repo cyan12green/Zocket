@@ -1310,3 +1310,31 @@ work: sendfile everywhere, stack paths, openat2 containment, TCP_NODELAY,
 root-realpath-at-load, static fd cache). The pool + bump arena are
 connection/request-allocation wins (visible under churn, invisible under
 stable keep-alive).
+
+## Static content cache: 1 KB static now 1.68x ours (was 1.11x behind)
+
+Two findings + one change:
+- The earlier "nginx gap" was partly config: nginx's `sendfile` defaults to
+  OFF, so the comparison ran against its pread+writev path (which happens
+  to be fast for small files). With the production config (`sendfile on;
+  sendfile_max_chunk 1m`) nginx uses writev+sendfile and drops to ~159k on
+  1 KB static.
+- The static fd cache now also caches the CONTENT of small files
+  (<= 16 KiB): a hit serves head + cached bytes in ONE writev — no
+  sendfile syscall, no fd transfer, ranges slice the cached memory.
+  Correctness: full 200 byte-exact, 206 ranges, 304 conditionals all
+  verified (174 tests).
+
+Final interleaved A/B (c=100, same box):
+
+| workload | tcp-server | nginx (sendfile on) | vs |
+|---|---:|---:|---:|
+| GET / empty | 250.5k | 285.3k | nginx 1.14x |
+| POST /echo 1 KB | 179.7k | 91.8k | 1.96x ours |
+| 1 KB static (12-rep median) | 267,693 | 159,176 | 1.68x ours |
+| 1 MB static | 11.9k | 11.6k | parity (bandwidth-bound) |
+
+Remaining gap: GET / empty (nginx 1.14x) - our edge-triggered drain adds
+one EAGAIN probe read per request (3 syscalls vs nginx's 2 on the empty
+path) plus slightly heavier per-request user-space. Closing that is
+io_uring territory (batch read+write, no probe) - deferred as before.
