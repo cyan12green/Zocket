@@ -30,16 +30,16 @@ bombardier metrics for `--http` runs are fully valid (verified by
 zig build -Doptimize=ReleaseFast
 
 # M1/M2 raw echo: bombardier sweeps (client-limited; consistent comparison)
-bench/bench.sh zig-out/bin/tcp_server single_threaded --single
-bench/bench.sh zig-out/bin/tcp_server multi_threaded_4 --threads 4 --echo
+bench/bench.sh zig-out/bin/ziglet single_threaded --single
+bench/bench.sh zig-out/bin/ziglet multi_threaded_4 --threads 4 --echo
 
 # M3 HTTP: valid bombardier metrics
-CHECK=http-check.py bench/bench.sh zig-out/bin/tcp_server http_1thread --http --threads 1
-CHECK=http-check.py bench/bench.sh zig-out/bin/tcp_server http_4threads --http --threads 4
+CHECK=http-check.py bench/bench.sh zig-out/bin/ziglet http_1thread --http --threads 1
+CHECK=http-check.py bench/bench.sh zig-out/bin/ziglet http_4threads --http --threads 4
 
 # true-capacity sweeps with the custom echo client (raw-echo modes only)
-bench/bench2.sh zig-out/bin/tcp_server single_threaded --single
-bench/bench2.sh zig-out/bin/tcp_server multi_threaded_4 --threads 4 --echo
+bench/bench2.sh zig-out/bin/ziglet single_threaded --single
+bench/bench2.sh zig-out/bin/ziglet multi_threaded_4 --threads 4 --echo
 
 python3 bench/summarize.py bench/results <tag>   # bombardier table
 python3 bench/summarize2.py bench/results        # echo-client table
@@ -712,7 +712,7 @@ syscall level by the extra iovec segments — net neutral at server
 throughput, as expected. `zig build test` 164/164, `bench/echo-check.py`
 clean.
 
-## Cross-server comparison: tcp-server vs httpx.zig
+## Cross-server comparison: Ziglet vs httpx.zig
 
 Date: 2026-08-12, same box. A head-to-head HTTP server throughput and
 latency comparison against [`httpx.zig`](https://github.com/muhammad-fiaz/httpx.zig)
@@ -728,7 +728,7 @@ latency comparison against [`httpx.zig`](https://github.com/muhammad-fiaz/httpx.
   in particular may not reflect the project's intended performance under
   this snapshot.
 - Both servers: ReleaseFast, GET / -> 200 with an empty body
-  (tcp-server default config; httpx bench server with `ctx.text("")`),
+  (Ziglet default config; httpx bench server with `ctx.text("")`),
   `--threads 4` / `threads: 4` respectively, co-resident on 127.0.0.1,
   interleaved bombardier reps in both port positions (the ~6% port bias
   found in M14 is negligible at these deltas).
@@ -737,7 +737,7 @@ latency comparison against [`httpx.zig`](https://github.com/muhammad-fiaz/httpx.
   executor it measured 5.6k req/s (executor threads at ~20% CPU — the
   dispatch path, not the cores, is the bottleneck under this snapshot).
 
-| metric | tcp-server (this repo) | httpx.zig | ratio |
+| metric | Ziglet (this repo) | httpx.zig | ratio |
 |---|---:|---:|---:|
 | c=500 req/s (median, port-swapped passes) | 243,741 / 243,658 | 5,533 / 5,645 | **~44x** |
 | c=100 req/s (median) | 244,605 | 5,197 | **~47x** |
@@ -755,10 +755,10 @@ server-side bottleneck driver.
 
 **Caveat**: this is a single-day, single-machine comparison against a
 patched build of an actively-developed library; the result should be read
-as "tcp-server's architecture sustains ~44x this build's server throughput
+as "Ziglet's architecture sustains ~44x this build's server throughput
 on this workload", not as a general statement about httpx.zig's ceiling.
 
-### Request/response parsing micro-benchmark (tcp-server vs httpx.zig)
+### Request/response parsing micro-benchmark (Ziglet vs httpx.zig)
 
 Date: 2026-08-12, same box, both `ReleaseFast`, identical harness (warmup
 1000, 5 rounds x 100k iters, min/avg/max ns/op), identical operations:
@@ -767,7 +767,7 @@ Date: 2026-08-12, same box, both `ReleaseFast`, identical harness (warmup
 - `response_build`: build + serialize one 200 response (Content-Type
   header + "ok" body)
 
-| operation | tcp-server ns/op (avg) | httpx.zig ns/op (avg) | ratio |
+| operation | Ziglet ns/op (avg) | httpx.zig ns/op (avg) | ratio |
 |---|---:|---:|---:|
 | request_parse | **213** | **15,929** | **~75x** |
 | response_build | **57** | **9,216** | **~161x** |
@@ -778,7 +778,7 @@ Date: 2026-08-12, same box, both `ReleaseFast`, identical harness (warmup
 per-request parse/build path, and it is a *comptime-first vs allocation-heavy*
 design difference:
 
-- tcp-server: parse state machine over a zero-copy connection buffer with
+- Ziglet: parse state machine over a zero-copy connection buffer with
   comptime header-name hashing (M8) and per-request struct reuse
   (`clearRetainingCapacity`, no per-request allocations); the response
   builder is a stack struct with comptime status/header formatting and no
@@ -789,7 +789,7 @@ design difference:
 
 The ~75x/161x micro gap is fully consistent with the ~44x server-level
 throughput gap measured earlier: at 15.6 us per parse+build httpx.zig's
-per-request CPU cost alone exceeds tcp-server's entire keep-alive request
+per-request CPU cost alone exceeds Ziglet's entire keep-alive request
 cycle (~4 us at 244k req/s).
 
 **Caveat**: same snapshot-mismatch caveat as the server comparison —
@@ -797,7 +797,7 @@ httpx.zig was built with local compatibility patches against the pinned
 0.16.0-dev.1503 snapshot; its benchmark numbers may not reflect the
 project's intended performance on its target revision.
 
-### Parameterized request/response matrix (tcp-server vs httpx.zig)
+### Parameterized request/response matrix (Ziglet vs httpx.zig)
 
 Date: 2026-08-12, same box. httpx.zig now lives in this repo as the
 `third_party/httpx.zig` git submodule (pinned to upstream 1fbf025), built
@@ -814,7 +814,7 @@ bash bench/compare.sh --iters 50000 --rounds 3         # tune the harness
 
 Variant matrix, avg ns/op (5 rounds x 100k iters unless noted):
 
-| operation | variant | tcp-server | httpx.zig | ratio |
+| operation | variant | Ziglet | httpx.zig | ratio |
 |---|---:|---:|---:|---:|
 | request_parse | get_min (no headers) | 80 | 3,537 | 44x |
 | request_parse | get_4h (4 headers) | 436 | 33,611 | 77x |
@@ -828,19 +828,19 @@ Variant matrix, avg ns/op (5 rounds x 100k iters unless noted):
 **Findings**:
 - The parse gap grows with request complexity (44x minimal -> ~90x at 8
   headers + 1KB body): httpx.zig's per-header cost is allocation-driven,
-  tcp-server's is a comptime-hashed append into reused storage.
+  Ziglet's is a comptime-hashed append into reused storage.
 - The response gap is the most extreme: the **empty** response builds in
   the same time on both sides (~42 ns), but any headers flip it to 150-244x
   — each httpx `headers.set` allocates owned name/value copies and its
-  serialize path formats through an allocating printer, while tcp-server's
+  serialize path formats through an allocating printer, while Ziglet's
   builder is a stack struct with comptime status/header strings.
-- Both codebases scale linearly-ish with header count; tcp-server's slope
+- Both codebases scale linearly-ish with header count; Ziglet's slope
   is ~60-80 ns/header vs httpx's ~8 us/header.
 
 Same snapshot-mismatch caveat applies (patched build of httpx.zig; see the
 server-comparison section above).
 
-## Cross-framework server comparison (tcp-server vs actix-web / Bun.serve / httpx.zig)
+## Cross-framework server comparison (Ziglet vs actix-web / Bun.serve / httpx.zig)
 
 Date: 2026-08-12, same box. Foreign frameworks live in this repo as pinned
 third-party git submodules (`third_party/actix-web` @ web-v4.14.1,
@@ -850,13 +850,13 @@ bench servers are `bench/foreign/{actix,bun}` (+ the httpx bench server from
 all four co-resident on 4 ports, interleaved reps, both port layouts for
 bias control; raw results in `bench/results/servers/`).
 
-Servers: tcp-server (4 reactors, default config), actix-web (4 tokio
+Servers: Ziglet (4 reactors, default config), actix-web (4 tokio
 workers, LTO, GET / empty + POST /echo body echo), Bun.serve 1.3.14 (GET /
 empty + POST /echo echo), httpx.zig (patched build; GET / empty + POST
 /echo echo). Workloads: GET / (empty 200) and POST /echo (33-byte body
 echo). Medians of 6 x 10 s reps per layout, both port layouts combined.
 
-| workload | conns | tcp-server | actix-web | Bun.serve | httpx.zig |
+| workload | conns | Ziglet | actix-web | Bun.serve | httpx.zig |
 |---|---|---:|---:|---:|---:|
 | GET / | 500 | 154,432 | 256,218 (1.66x) | 88,679 (0.57x) | 5,780 (0.04x) |
 | GET / | 100 | 155,640 | 256,290 (1.65x) | 94,837 (0.61x) | 5,345 (0.03x) |
@@ -864,20 +864,20 @@ echo). Medians of 6 x 10 s reps per layout, both port layouts combined.
 | POST /echo | 100 | 131,178 | 233,080 (1.78x) | 76,804 (0.59x) | 3,717 (0.03x) |
 
 **Readings**:
-- actix-web is the fastest at every point (1.65-1.78x tcp-server). It is a
+- actix-web is the fastest at every point (1.65-1.78x Ziglet). It is a
   mature, heavily optimized Rust framework; the gap is widest on the POST
   workload. Our server's per-request parse/build cost is far lower (see the
   micro-benchmark), so the server-level gap here is elsewhere: actix's
   epoll/tokio reactor and its per-connection machinery are ahead of ours,
   and all four servers share the box's cores.
-- tcp-server is solidly second (Bun ~0.5-0.6x of us, httpx ~0.03x).
+- Ziglet is solidly second (Bun ~0.5-0.6x of us, httpx ~0.03x).
 - Bun.serve at roughly half of our throughput with a single runtime process
   is respectable, especially given its higher-level request model.
 - httpx.zig (patched build, synchronous + executor dispatch) trails by
   24-35x, consistent with its ~15us/request parse+build cost.
 
 **Caveats**: all four servers ran co-resident (CPU contention; the
-tcp-server absolute numbers are lower than the earlier two-server
+Ziglet absolute numbers are lower than the earlier two-server
 comparisons for that reason — relative ordering is the meaningful output);
 machine load varied during the session; actix was built with LTO and 4
 workers; httpx is the snapshot-patched build. Same-day, single-machine.
@@ -889,42 +889,42 @@ Driver: `bench/compare-servers.sh --matrix` (bodies 1024/8192/65536 B x
 conns 10/100/1000 + GET / empty baseline; interleaved reps, both port
 layouts, medians). Raw JSON in `bench/results/servers/matrix/`.
 
-| cell | server | reqs/sec | vs tcp-server | p50 | p95 | p99 | throughput |
+| cell | server | reqs/sec | vs Ziglet | p50 | p95 | p99 | throughput |
 |---|---|---:|---:|---:|---:|---:|---:|
-| GET / empty, c=100 | tcp-server | 292,645 | 1.00x | 0.23 ms | 0.95 ms | 2.29 ms | 18 MB/s |
+| GET / empty, c=100 | Ziglet | 292,645 | 1.00x | 0.23 ms | 0.95 ms | 2.29 ms | 18 MB/s |
 | | actix-web | 284,437 | 0.97x | 0.25 ms | 0.91 ms | 1.94 ms | 21 MB/s |
 | | Bun.serve | 93,137 | 0.32x | 1.09 ms | 1.41 ms | 1.69 ms | 7 MB/s |
 | | httpx.zig | 5,238 | 0.02x | 0.72 ms | 1.37 ms | 1.76 ms | 0.2 MB/s |
-| POST /echo 1 KB, c=10 | tcp-server | 166,345 | 1.00x | 0.05 ms | 0.11 ms | 0.15 ms | 181 MB/s |
+| POST /echo 1 KB, c=10 | Ziglet | 166,345 | 1.00x | 0.05 ms | 0.11 ms | 0.15 ms | 181 MB/s |
 | | actix-web | 129,957 | 0.78x | 0.07 ms | 0.14 ms | 0.20 ms | 143 MB/s |
 | | Bun.serve | 71,771 | 0.43x | 0.14 ms | 0.29 ms | 0.40 ms | 82 MB/s |
 | | httpx.zig | 3,856 | 0.02x | 1.00 ms | 1.69 ms | 2.08 ms | 3.6 MB/s |
-| POST /echo 1 KB, c=100 | tcp-server | 246,642 | 1.00x | 0.28 ms | 1.10 ms | 2.32 ms | 269 MB/s |
+| POST /echo 1 KB, c=100 | Ziglet | 246,642 | 1.00x | 0.28 ms | 1.10 ms | 2.32 ms | 269 MB/s |
 | | actix-web | 217,856 | 0.88x | 0.36 ms | 1.06 ms | 1.91 ms | 240 MB/s |
 | | Bun.serve | 70,895 | 0.29x | 1.42 ms | 1.98 ms | 2.26 ms | 81 MB/s |
-| POST /echo 1 KB, c=1000 | tcp-server | 197,172 | 1.00x | 4.34 ms | 10.55 ms | 15.39 ms | 213 MB/s |
+| POST /echo 1 KB, c=1000 | Ziglet | 197,172 | 1.00x | 4.34 ms | 10.55 ms | 15.39 ms | 213 MB/s |
 | | actix-web | 187,567 | 0.95x | 4.67 ms | 10.84 ms | 15.29 ms | 205 MB/s |
 | | Bun.serve | 60,990 | 0.31x | 16.56 ms | 19.50 ms | 20.47 ms | 69 MB/s |
-| POST /echo 8 KB, c=10 | tcp-server | 113,968 | 1.00x | 0.07 ms | 0.16 ms | 0.26 ms | 941 MB/s |
+| POST /echo 8 KB, c=10 | Ziglet | 113,968 | 1.00x | 0.07 ms | 0.16 ms | 0.26 ms | 941 MB/s |
 | | actix-web | 93,039 | 0.82x | 0.09 ms | 0.20 ms | 0.32 ms | 769 MB/s |
 | | Bun.serve | 52,870 | 0.46x | 0.18 ms | 0.37 ms | 0.58 ms | 439 MB/s |
-| POST /echo 8 KB, c=100 | tcp-server | 149,660 | 1.00x | 0.48 ms | 1.88 ms | 3.39 ms | 1235 MB/s |
+| POST /echo 8 KB, c=100 | Ziglet | 149,660 | 1.00x | 0.48 ms | 1.88 ms | 3.39 ms | 1235 MB/s |
 | | actix-web | 130,271 | 0.87x | 0.60 ms | 1.89 ms | 3.15 ms | 1077 MB/s |
 | | Bun.serve | 49,242 | 0.33x | 2.10 ms | 2.71 ms | 3.27 ms | 409 MB/s |
-| POST /echo 8 KB, c=1000 | tcp-server | 99,388 | 1.00x | 8.89 ms | 19.64 ms | 27.71 ms | 816 MB/s |
+| POST /echo 8 KB, c=1000 | Ziglet | 99,388 | 1.00x | 8.89 ms | 19.64 ms | 27.71 ms | 816 MB/s |
 | | actix-web | 94,191 | 0.95x | 9.53 ms | 20.59 ms | 28.92 ms | 772 MB/s |
 | | Bun.serve | 44,874 | 0.45x | 22.35 ms | 26.73 ms | 29.62 ms | 371 MB/s |
-| POST /echo 64 KB, c=10 | tcp-server | 12,264 | 1.00x* | 0.71 ms | 1.69 ms | 2.32 ms | 1.4 MB/s* |
+| POST /echo 64 KB, c=10 | Ziglet | 12,264 | 1.00x* | 0.71 ms | 1.69 ms | 2.32 ms | 1.4 MB/s* |
 | | actix-web | 45,607 | 3.72x | 0.18 ms | 0.41 ms | 0.67 ms | 2993 MB/s |
 | | Bun.serve | 24,366 | 1.99x | 0.32 ms | 0.80 ms | 1.02 ms | 1600 MB/s |
-| POST /echo 64 KB, c=100 | tcp-server | 11,109 | 1.00x* | 7.00 ms | 22.22 ms | 27.29 ms | 1.3 MB/s* |
+| POST /echo 64 KB, c=100 | Ziglet | 11,109 | 1.00x* | 7.00 ms | 22.22 ms | 27.29 ms | 1.3 MB/s* |
 | | actix-web | 25,690 | 2.31x | 3.10 ms | 9.31 ms | 13.68 ms | 1685 MB/s |
 | | Bun.serve | 22,110 | 1.99x | 4.25 ms | 6.05 ms | 6.68 ms | 1451 MB/s |
-| POST /echo 64 KB, c=1000 | tcp-server | 10,088 | 1.00x* | 95.06 ms | 162.19 ms | 184.48 ms | 1.2 MB/s* |
+| POST /echo 64 KB, c=1000 | Ziglet | 10,088 | 1.00x* | 95.06 ms | 162.19 ms | 184.48 ms | 1.2 MB/s* |
 | | actix-web | 18,605 | 1.84x | 47.95 ms | 100.55 ms | 134.13 ms | 1217 MB/s |
 | | Bun.serve | 20,401 | 2.02x | 48.77 ms | 54.87 ms | 58.74 ms | 1333 MB/s |
 
-`*` the tcp-server 64 KB cells are the 431 error path, not echo: the request
+`*` the Ziglet 64 KB cells are the 431 error path, not echo: the request
 buffer is a fixed 16 KB and the parser needs the whole Content-Length body
 buffered at once (`http/parser.zig` `.body` state; `net/reactor.zig` buffer
 full -> 431 close), so every 64 KB POST is rejected (bytesRead ~58 B/req =
@@ -932,7 +932,7 @@ the 431 page). actix/bun stream bodies incrementally into a growing pooled
 buffer and handle 64 KB fine.
 
 **Readings**:
-- Small-payload echo (1 KB / 8 KB): tcp-server is at parity or ahead of
+- Small-payload echo (1 KB / 8 KB): Ziglet is at parity or ahead of
   actix at every concurrency (actix 0.78-0.95x), and far ahead of Bun
   (0.29-0.46x). The zero-copy body slice + single writev pays off.
 - GET / empty: parity with actix (0.97x this run; the 1.35-1.66x actix lead
@@ -960,34 +960,34 @@ buffer and handle 64 KB fine.
 
 **Matrix after the fix** (same harness, re-run):
 
-| cell | server | reqs/sec | vs tcp-server | p50 | p95 | p99 | throughput |
+| cell | server | reqs/sec | vs Ziglet | p50 | p95 | p99 | throughput |
 |---|---|---:|---:|---:|---:|---:|---:|
-| GET / empty, c=100 | tcp-server | 303,124 | 1.00x | 0.21 ms | 0.93 ms | 2.64 ms | 19 MB/s |
+| GET / empty, c=100 | Ziglet | 303,124 | 1.00x | 0.21 ms | 0.93 ms | 2.64 ms | 19 MB/s |
 | | actix-web | 286,453 | 0.95x | 0.25 ms | 0.89 ms | 1.99 ms | 22 MB/s |
 | | Bun.serve | 93,718 | 0.31x | 1.09 ms | 1.41 ms | 1.69 ms | 7 MB/s |
-| POST /echo 1 KB, c=10 | tcp-server | 168,916 | 1.00x | 0.05 ms | 0.10 ms | 0.15 ms | 184 MB/s |
+| POST /echo 1 KB, c=10 | Ziglet | 168,916 | 1.00x | 0.05 ms | 0.10 ms | 0.15 ms | 184 MB/s |
 | | actix-web | 130,845 | 0.77x | 0.07 ms | 0.14 ms | 0.20 ms | 144 MB/s |
-| POST /echo 1 KB, c=100 | tcp-server | 252,824 | 1.00x | 0.27 ms | 1.11 ms | 2.37 ms | 275 MB/s |
+| POST /echo 1 KB, c=100 | Ziglet | 252,824 | 1.00x | 0.27 ms | 1.11 ms | 2.37 ms | 275 MB/s |
 | | actix-web | 219,271 | 0.87x | 0.36 ms | 1.07 ms | 1.93 ms | 242 MB/s |
-| POST /echo 1 KB, c=1000 | tcp-server | 202,943 | 1.00x | 4.21 ms | 10.29 ms | 15.09 ms | 220 MB/s |
+| POST /echo 1 KB, c=1000 | Ziglet | 202,943 | 1.00x | 4.21 ms | 10.29 ms | 15.09 ms | 220 MB/s |
 | | actix-web | 190,300 | 0.94x | 4.61 ms | 10.59 ms | 14.79 ms | 208 MB/s |
-| POST /echo 8 KB, c=10 | tcp-server | 113,043 | 1.00x | 0.07 ms | 0.16 ms | 0.24 ms | 933 MB/s |
+| POST /echo 8 KB, c=10 | Ziglet | 113,043 | 1.00x | 0.07 ms | 0.16 ms | 0.24 ms | 933 MB/s |
 | | actix-web | 93,300 | 0.83x | 0.09 ms | 0.20 ms | 0.32 ms | 772 MB/s |
-| POST /echo 8 KB, c=100 | tcp-server | 145,267 | 1.00x | 0.47 ms | 1.95 ms | 3.51 ms | 1199 MB/s |
+| POST /echo 8 KB, c=100 | Ziglet | 145,267 | 1.00x | 0.47 ms | 1.95 ms | 3.51 ms | 1199 MB/s |
 | | actix-web | 127,126 | 0.88x | 0.61 ms | 1.92 ms | 3.18 ms | 1051 MB/s |
-| POST /echo 8 KB, c=1000 | tcp-server | 96,817 | 1.00x | 9.08 ms | 20.69 ms | 29.54 ms | 794 MB/s |
+| POST /echo 8 KB, c=1000 | Ziglet | 96,817 | 1.00x | 9.08 ms | 20.69 ms | 29.54 ms | 794 MB/s |
 | | actix-web | 92,989 | 0.96x | 9.58 ms | 20.91 ms | 28.92 ms | 767 MB/s |
-| POST /echo 64 KB, c=10 | tcp-server | 54,405 | 1.00x | 0.16 ms | 0.32 ms | 0.47 ms | 3569 MB/s |
+| POST /echo 64 KB, c=10 | Ziglet | 54,405 | 1.00x | 0.16 ms | 0.32 ms | 0.47 ms | 3569 MB/s |
 | | actix-web | 45,071 | 0.83x | 0.18 ms | 0.41 ms | 0.69 ms | 2957 MB/s |
 | | Bun.serve | 24,063 | 0.44x | 0.33 ms | 0.82 ms | 1.03 ms | 1580 MB/s |
-| POST /echo 64 KB, c=100 | tcp-server | 29,189 | 1.00x | 2.64 ms | 8.56 ms | 13.11 ms | 1915 MB/s |
+| POST /echo 64 KB, c=100 | Ziglet | 29,189 | 1.00x | 2.64 ms | 8.56 ms | 13.11 ms | 1915 MB/s |
 | | actix-web | 25,733 | 0.88x | 3.09 ms | 9.29 ms | 13.75 ms | 1688 MB/s |
 | | Bun.serve | 21,922 | 0.75x | 4.28 ms | 6.03 ms | 6.65 ms | 1439 MB/s |
-| POST /echo 64 KB, c=1000 | tcp-server | 21,141 | 1.00x | 41.79 ms | 89.61 ms | 121.19 ms | 1374 MB/s |
+| POST /echo 64 KB, c=1000 | Ziglet | 21,141 | 1.00x | 41.79 ms | 89.61 ms | 121.19 ms | 1374 MB/s |
 | | actix-web | 19,289 | 0.91x | 46.59 ms | 99.65 ms | 131.26 ms | 1249 MB/s |
 | | Bun.serve | 20,863 | 0.99x | 47.32 ms | 53.75 ms | 56.35 ms | 1363 MB/s |
 
-**After the fix tcp-server leads every cell** (actix 0.77-0.96x, i.e. us
+**After the fix Ziglet leads every cell** (actix 0.77-0.96x, i.e. us
 1.04-1.3x faster; the earlier 1.65-1.78x actix numbers were the 431 error
 path at 64 KiB plus load variance on the empty-body cells). Bun ties us at
 64 KiB c=1000 (bandwidth-bound).
@@ -1010,55 +1010,55 @@ the same endpoints (GET / -> empty, POST /echo -> body echo) and the same
 harness (compare-servers.sh, now six ports per layout). Raw JSON in
 bench/results/servers/matrix/.
 
-| cell | server | reqs/sec | vs tcp-server | p50 | p95 | p99 | throughput |
+| cell | server | reqs/sec | vs Ziglet | p50 | p95 | p99 | throughput |
 |---|---|---:|---:|---:|---:|---:|---:|
-| GET / empty, c=100 | tcp-server | 259,321 | 1.00x | 0.25 ms | 1.10 ms | 2.85 ms | 16 MB/s |
+| GET / empty, c=100 | Ziglet | 259,321 | 1.00x | 0.25 ms | 1.10 ms | 2.85 ms | 16 MB/s |
 | | actix-web | 253,331 | 0.98x | 0.28 ms | 1.02 ms | 2.24 ms | 19 MB/s |
 | | nginx | 280,378 | 1.08x | 0.30 ms | 0.77 ms | 1.52 ms | 43 MB/s |
 | | Bun.serve | 94,743 | 0.37x | 1.07 ms | 1.39 ms | 1.66 ms | 7 MB/s |
 | | Caddy | 81,820 | 0.32x | 0.99 ms | 3.33 ms | 4.48 ms | 7 MB/s |
 | | httpx.zig | 5,440 | 0.02x | 0.70 ms | 1.31 ms | 1.71 ms | 0 MB/s |
-| POST /echo 1 KB, c=10 | tcp-server | 159,837 | 1.00x | 0.05 ms | 0.11 ms | 0.16 ms | 174 MB/s |
+| POST /echo 1 KB, c=10 | Ziglet | 159,837 | 1.00x | 0.05 ms | 0.11 ms | 0.16 ms | 174 MB/s |
 | | actix-web | 130,907 | 0.82x | 0.07 ms | 0.14 ms | 0.20 ms | 144 MB/s |
 | | nginx | 123,751 | 0.77x | 0.07 ms | 0.15 ms | 0.25 ms | 147 MB/s |
 | | Bun.serve | 72,964 | 0.46x | 0.13 ms | 0.28 ms | 0.39 ms | 83 MB/s |
 | | Caddy | 54,341 | 0.34x | 0.15 ms | 0.41 ms | 0.78 ms | 63 MB/s |
-| POST /echo 1 KB, c=100 | tcp-server | 238,577 | 1.00x | 0.28 ms | 1.18 ms | 2.52 ms | 260 MB/s |
+| POST /echo 1 KB, c=100 | Ziglet | 238,577 | 1.00x | 0.28 ms | 1.18 ms | 2.52 ms | 260 MB/s |
 | | actix-web | 215,154 | 0.90x | 0.36 ms | 1.08 ms | 2.13 ms | 237 MB/s |
 | | nginx | 170,192 | 0.71x | 0.36 ms | 2.16 ms | 3.62 ms | 202 MB/s |
 | | Bun.serve | 70,708 | 0.30x | 1.55 ms | 1.98 ms | 2.25 ms | 81 MB/s |
 | | Caddy | 53,471 | 0.22x | 1.42 ms | 5.27 ms | 6.92 ms | 62 MB/s |
-| POST /echo 1 KB, c=1000 | tcp-server | 208,925 | 1.00x | 4.15 ms | 9.88 ms | 13.81 ms | 226 MB/s |
+| POST /echo 1 KB, c=1000 | Ziglet | 208,925 | 1.00x | 4.15 ms | 9.88 ms | 13.81 ms | 226 MB/s |
 | | actix-web | 190,992 | 0.91x | 4.58 ms | 10.71 ms | 14.95 ms | 209 MB/s |
 | | nginx | 150,713 | 0.72x | 4.60 ms | 19.59 ms | 27.92 ms | 178 MB/s |
 | | Bun.serve | 61,678 | 0.30x | 16.36 ms | 19.24 ms | 21.10 ms | 70 MB/s |
 | | Caddy | 45,784 | 0.22x | 22.62 ms | 31.81 ms | 37.48 ms | 53 MB/s |
-| POST /echo 8 KB, c=10 | tcp-server | 107,454 | 1.00x | 0.08 ms | 0.17 ms | 0.25 ms | 887 MB/s |
+| POST /echo 8 KB, c=10 | Ziglet | 107,454 | 1.00x | 0.08 ms | 0.17 ms | 0.25 ms | 887 MB/s |
 | | actix-web | 94,712 | 0.88x | 0.09 ms | 0.20 ms | 0.31 ms | 783 MB/s |
 | | nginx | 55,590 | 0.52x | 0.13 ms | 0.47 ms | 0.71 ms | 464 MB/s |
 | | Bun.serve | 53,053 | 0.49x | 0.18 ms | 0.37 ms | 0.58 ms | 441 MB/s |
 | | Caddy | 27,295 | 0.25x | 0.28 ms | 0.90 ms | 1.43 ms | 228 MB/s |
-| POST /echo 8 KB, c=100 | tcp-server | 137,636 | 1.00x | 0.50 ms | 2.03 ms | 3.60 ms | 1137 MB/s |
+| POST /echo 8 KB, c=100 | Ziglet | 137,636 | 1.00x | 0.50 ms | 2.03 ms | 3.60 ms | 1137 MB/s |
 | | actix-web | 128,251 | 0.93x | 0.60 ms | 1.91 ms | 3.21 ms | 1061 MB/s |
 | | nginx | 73,493 | 0.53x | 0.82 ms | 3.76 ms | 5.45 ms | 614 MB/s |
 | | Bun.serve | 49,566 | 0.36x | 2.10 ms | 2.66 ms | 3.13 ms | 412 MB/s |
 | | Caddy | 27,051 | 0.20x | 2.98 ms | 9.66 ms | 13.73 ms | 226 MB/s |
-| POST /echo 8 KB, c=1000 | tcp-server | 99,044 | 1.00x | 8.93 ms | 20.19 ms | 27.97 ms | 811 MB/s |
+| POST /echo 8 KB, c=1000 | Ziglet | 99,044 | 1.00x | 8.93 ms | 20.19 ms | 27.97 ms | 811 MB/s |
 | | actix-web | 94,708 | 0.96x | 9.39 ms | 20.81 ms | 28.37 ms | 777 MB/s |
 | | nginx | 71,365 | 0.72x | 4.84 ms | 64.77 ms | 91.28 ms | 594 MB/s |
 | | Bun.serve | 45,302 | 0.46x | 22.07 ms | 25.55 ms | 26.65 ms | 375 MB/s |
 | | Caddy | 26,111 | 0.26x | 29.08 ms | 113.59 ms | 192.15 ms | 217 MB/s |
-| POST /echo 64 KB, c=10 | tcp-server | 55,861 | 1.00x | 0.15 ms | 0.31 ms | 0.48 ms | 3665 MB/s |
+| POST /echo 64 KB, c=10 | Ziglet | 55,861 | 1.00x | 0.15 ms | 0.31 ms | 0.48 ms | 3665 MB/s |
 | | actix-web | 45,579 | 0.82x | 0.18 ms | 0.40 ms | 0.67 ms | 2991 MB/s |
 | | nginx | 21,955 | 0.39x | 0.28 ms | 1.08 ms | 1.35 ms | 1443 MB/s |
 | | Bun.serve | 24,252 | 0.43x | 0.32 ms | 0.82 ms | 1.02 ms | 1592 MB/s |
 | | Caddy | 10,664 | 0.19x | 0.74 ms | 2.11 ms | 2.69 ms | 701 MB/s |
-| POST /echo 64 KB, c=100 | tcp-server | 29,155 | 1.00x | 2.67 ms | 8.50 ms | 12.88 ms | 1911 MB/s |
+| POST /echo 64 KB, c=100 | Ziglet | 29,155 | 1.00x | 2.67 ms | 8.50 ms | 12.88 ms | 1911 MB/s |
 | | actix-web | 23,288 | 0.80x | 3.36 ms | 10.63 ms | 16.40 ms | 1526 MB/s |
 | | nginx | 24,397 | 0.84x | 2.40 ms | 13.39 ms | 19.39 ms | 1604 MB/s |
 | | Bun.serve | 21,163 | 0.73x | 4.50 ms | 6.39 ms | 7.34 ms | 1389 MB/s |
 | | Caddy | 10,254 | 0.35x | 5.83 ms | 32.24 ms | 51.68 ms | 673 MB/s |
-| POST /echo 64 KB, c=1000 | tcp-server | 22,178 | 1.00x | 40.83 ms | 79.37 ms | 102.08 ms | 1440 MB/s |
+| POST /echo 64 KB, c=1000 | Ziglet | 22,178 | 1.00x | 40.83 ms | 79.37 ms | 102.08 ms | 1440 MB/s |
 | | actix-web | 19,798 | 0.89x | 45.59 ms | 90.53 ms | 120.67 ms | 1290 MB/s |
 | | nginx | 23,632 | 1.07x | 12.65 ms | 283.10 ms | 366.03 ms | 1541 MB/s |
 | | Bun.serve | 21,525 | 0.97x | 44.63 ms | 52.50 ms | 54.59 ms | 1406 MB/s |
@@ -1085,34 +1085,34 @@ bench/results/servers/matrix/.
 
 Date: 2026-08-13, same box/conditions as the matrices above. All six
 servers serve the same generated file (deterministic xorshift64 fill, named
-"static") at GET /static: tcp-server via its static module (read loop below
+"static") at GET /static: Ziglet via its static module (read loop below
 16 KB, sendfile above), nginx via `location = /static { root ...; }`
 (sendfile on by default), Caddy via file_server, actix via actix-files
 NamedFile (open_async), Bun via Bun.file, httpx preloaded into memory at
 startup (it has no file path; noted). Raw JSON in
 bench/results/servers/static/.
 
-| cell | server | reqs/sec | vs tcp-server | p50 | p95 | p99 | throughput |
+| cell | server | reqs/sec | vs Ziglet | p50 | p95 | p99 | throughput |
 |---|---|---:|---:|---:|---:|---:|---:|
 | GET /static 1 KB, c=100 | nginx | 219,881 | 4.59x | 0.40 ms | 0.88 ms | 1.47 ms | 276 MB/s |
 | | actix-web | 90,786 | 1.90x | 0.97 ms | 2.09 ms | 3.26 ms | 118 MB/s |
 | | Bun.serve | 56,081 | 1.17x | 1.68 ms | 2.44 ms | 2.81 ms | 66 MB/s |
-| | tcp-server | 47,870 | 1.00x | 2.02 ms | 2.92 ms | 3.85 ms | 59 MB/s |
+| | Ziglet | 47,870 | 1.00x | 2.02 ms | 2.92 ms | 3.85 ms | 59 MB/s |
 | | Caddy | 44,423 | 0.93x | 1.71 ms | 6.47 ms | 8.90 ms | 55 MB/s |
 | | httpx.zig | 5,136 | 0.11x | 0.74 ms | 1.36 ms | 1.78 ms | 3 MB/s |
 | GET /static 1 KB, c=1000 | nginx | 177,647 | 3.77x | 5.08 ms | 10.57 ms | 15.05 ms | 222 MB/s |
 | | actix-web | 82,519 | 1.75x | 14.68 ms | 25.28 ms | 34.04 ms | 107 MB/s |
 | | Bun.serve | 51,250 | 1.09x | 18.80 ms | 24.06 ms | 26.06 ms | 60 MB/s |
-| | tcp-server | 47,116 | 1.00x | 20.56 ms | 25.00 ms | 30.18 ms | 57 MB/s |
+| | Ziglet | 47,116 | 1.00x | 20.56 ms | 25.00 ms | 30.18 ms | 57 MB/s |
 | | Caddy | 35,783 | 0.76x | 29.64 ms | 43.19 ms | 50.56 ms | 44 MB/s |
 | | httpx.zig | 5,649 | 0.12x | 1.20 ms | 370.56 ms | 2253.97 ms | 5 MB/s |
-| GET /static 1 MB, c=100 | tcp-server | 11,082 | 1.00x | 8.61 ms | 13.95 ms | 17.93 ms | 11614 MB/s |
+| GET /static 1 MB, c=100 | Ziglet | 11,082 | 1.00x | 8.61 ms | 13.95 ms | 17.93 ms | 11614 MB/s |
 | | Caddy | 10,790 | 0.97x | 7.23 ms | 24.04 ms | 32.81 ms | 11311 MB/s |
 | | Bun.serve | 8,255 | 0.74x | 10.54 ms | 17.51 ms | 18.70 ms | 8665 MB/s |
 | | nginx | 5,107 | 0.46x | 17.73 ms | 35.01 ms | 53.58 ms | 5330 MB/s |
 | | actix-web | 2,464 | 0.22x | 40.26 ms | 52.40 ms | 59.51 ms | 2584 MB/s |
 | | httpx.zig | 1,541 | 0.14x | 2.57 ms | 3.45 ms | 10003.14 ms | 812 MB/s |
-| GET /static 1 MB, c=1000 | tcp-server | 10,533 | 1.00x | 93.11 ms | 112.64 ms | 127.94 ms | 11001 MB/s |
+| GET /static 1 MB, c=1000 | Ziglet | 10,533 | 1.00x | 93.11 ms | 112.64 ms | 127.94 ms | 11001 MB/s |
 | | Caddy | 9,909 | 0.94x | 98.19 ms | 182.16 ms | 271.17 ms | 10336 MB/s |
 | | Bun.serve | 8,254 | 0.78x | 117.73 ms | 150.32 ms | 178.86 ms | 8613 MB/s |
 | | nginx | 4,525 | 0.43x | 128.61 ms | 326.48 ms | 5057.48 ms | 4499 MB/s |
@@ -1127,7 +1127,7 @@ bench/results/servers/static/.
   Nagle/delayed-ACK interlock; with it on the same build goes 2.5k ->
   90.8k req/s). We are mid-pack on small files (bun just ahead, caddy just
   behind).
-- Large static (1 MB) flips the table: tcp-server wins on sendfile +
+- Large static (1 MB) flips the table: Ziglet wins on sendfile +
   zero-copy writev, Caddy (userspace copy) is within 3-7%, Bun ~0.75x.
   nginx drops to ~0.45x - surprising for sendfile, but it re-stats and
   opens the file per request (no open_file_cache) and pays a two-phase
@@ -1145,10 +1145,10 @@ Bun needs BUN_STATIC; httpx needs --static with a startup preload.
 ## How nginx wins small static — and what we adopted
 
 After the initial six-server static run, the 1 KB cell showed nginx at
-4.6x tcp-server (219.9k vs 47.9k co-resident; 233k vs 67k isolated).
+4.6x Ziglet (219.9k vs 47.9k co-resident; 233k vs 67k isolated).
 nginx's per-request recipe for that path, versus ours at the time:
 
-| step | nginx | tcp-server (before) |
+| step | nginx | Ziglet (before) |
 |---|---|---|
 | body | sendfile for every size (0 allocs, 1 syscall) | read into a heap buffer for files < 16 KB (1 mmap+munmap pair, 1 read, 1 user copy) |
 | path | pre-resolved in config | per-request path ArrayList (another alloc) |
@@ -1171,7 +1171,7 @@ src/runtime/config.zig):
 
 Measured effect on the 1 KB static cell:
 
-| run | tcp-server | vs nginx |
+| run | Ziglet | vs nginx |
 |---|---:|---:|
 | baseline (read path, per-request allocs/realpaths) | 47,870 co-resident / 67,449 isolated | 4.6x / 3.5x behind |
 | + sendfile everywhere + nodelay | 54,836 co-resident | 4.0x behind |
@@ -1185,30 +1185,30 @@ instruction-level.
 
 Final static matrix (six servers, co-resident, after the changes):
 
-| cell | server | reqs/sec | vs tcp-server | p50 | p95 | p99 | throughput |
+| cell | server | reqs/sec | vs Ziglet | p50 | p95 | p99 | throughput |
 |---|---|---:|---:|---:|---:|---:|---:|
 | GET /static 1 KB, c=100 | nginx | 211,638 | 1.45x | 0.43 ms | 1.00 ms | 1.47 ms | 266 MB/s |
-| | tcp-server | 146,041 | 1.00x | 0.58 ms | 1.50 ms | 2.91 ms | 179 MB/s |
+| | Ziglet | 146,041 | 1.00x | 0.58 ms | 1.50 ms | 2.91 ms | 179 MB/s |
 | | actix-web | 83,793 | 0.57x | 1.00 ms | 2.50 ms | 4.06 ms | 109 MB/s |
 | | Bun.serve | 57,995 | 0.40x | 1.65 ms | 2.39 ms | 2.75 ms | 68 MB/s |
 | | Caddy | 43,152 | 0.30x | 1.83 ms | 6.38 ms | 8.77 ms | 53 MB/s |
 | GET /static 1 KB, c=1000 | nginx | 174,029 | 1.23x | 5.25 ms | 10.75 ms | 15.62 ms | 218 MB/s |
-| | tcp-server | 141,586 | 1.00x | 6.47 ms | 12.02 ms | 16.67 ms | 172 MB/s |
+| | Ziglet | 141,586 | 1.00x | 6.47 ms | 12.02 ms | 16.67 ms | 172 MB/s |
 | | actix-web | 78,635 | 0.56x | 11.92 ms | 27.99 ms | 38.19 ms | 102 MB/s |
 | | Bun.serve | 51,013 | 0.36x | 19.22 ms | 24.54 ms | 26.37 ms | 60 MB/s |
 | | Caddy | 35,886 | 0.25x | 29.98 ms | 43.28 ms | 51.71 ms | 44 MB/s |
-| GET /static 1 MB, c=100 | tcp-server | 11,543 | 1.00x | 6.97 ms | 20.15 ms | 31.56 ms | 12083 MB/s |
+| GET /static 1 MB, c=100 | Ziglet | 11,543 | 1.00x | 6.97 ms | 20.15 ms | 31.56 ms | 12083 MB/s |
 | | Caddy | 10,851 | 0.94x | 7.42 ms | 24.70 ms | 32.79 ms | 11362 MB/s |
 | | Bun.serve | 8,294 | 0.72x | 10.60 ms | 17.48 ms | 18.84 ms | 8689 MB/s |
 | | nginx | 4,960 | 0.43x | 17.30 ms | 40.08 ms | 58.84 ms | 5184 MB/s |
 | | actix-web | 2,393 | 0.21x | 40.48 ms | 59.58 ms | 76.31 ms | 2509 MB/s |
-| GET /static 1 MB, c=1000 | tcp-server | 10,196 | 1.00x | 86.08 ms | 194.13 ms | 345.51 ms | 10560 MB/s |
+| GET /static 1 MB, c=1000 | Ziglet | 10,196 | 1.00x | 86.08 ms | 194.13 ms | 345.51 ms | 10560 MB/s |
 | | Caddy | 9,907 | 0.97x | 93.29 ms | 177.03 ms | 295.62 ms | 10271 MB/s |
 | | Bun.serve | 8,183 | 0.80x | 119.34 ms | 150.37 ms | 177.06 ms | 8576 MB/s |
 | | nginx | 4,656 | 0.46x | 144.21 ms | 289.39 ms | 3875.98 ms | 4681 MB/s |
 | | actix-web | 2,170 | 0.21x | 450.74 ms | 558.84 ms | 732.74 ms | 2309 MB/s |
 
-tcp-server now takes the 1 MB cell outright (sendfile + zero-copy writev,
+Ziglet now takes the 1 MB cell outright (sendfile + zero-copy writev,
 2.1-2.3x nginx) and is within 1.2-1.5x of nginx on 1 KB static. Raw JSON
 in bench/results/servers/static/.
 
@@ -1298,7 +1298,7 @@ Steady-state keep-alive requests are unchanged (micro parse ~parity).
 Re-check with all optimisations in (fd cache, connection pool, embedded
 buffers, request bump arena; 2026-08-13, isolated, interleaved):
 
-| workload (c=100) | tcp-server | nginx | vs |
+| workload (c=100) | Ziglet | nginx | vs |
 |---|---:|---:|---:|
 | GET / empty | 225.0k | 281.5k | nginx 1.25x (parity on other runs - box variance) |
 | POST /echo 1 KB | 171.3k | 98.3k | 1.74x ours |
@@ -1327,7 +1327,7 @@ Two findings + one change:
 
 Final interleaved A/B (c=100, same box):
 
-| workload | tcp-server | nginx (sendfile on) | vs |
+| workload | Ziglet | nginx (sendfile on) | vs |
 |---|---:|---:|---:|
 | GET / empty | 250.5k | 285.3k | nginx 1.14x |
 | POST /echo 1 KB | 179.7k | 91.8k | 1.96x ours |
@@ -1392,7 +1392,7 @@ comptime improvements where possible:
 3. **Cached Date header**: implemented (nginx ngx_cached_http_time
    equivalent): the IMF-fixdate string is formatted once per wall-clock
    second into a reactor cache and copied into every pipeline response,
-   plus a comptime "Server: tcp-server" header. Responses now match
+   plus a comptime "Server: Ziglet" header. Responses now match
    nginx's header shape. Cost measured at ~0 (GET unchanged within noise;
    ring-vs-epoll A/B +0.2%).
 4. **Lean state machines**: parse is comptime-DFA driven (get_min 60 ns,
@@ -1404,12 +1404,12 @@ Current standing (c=100, interleaved): 1 KB static 1.66x ours, POST /echo
    sometimes parity). The GET residue is per-request user-space (pipeline
    dispatch + timer + stats + parse) that is already at ~350 ns/request.
 
-## Final: tcp-server now leads every workload (12-rep interleaved A/B)
+## Final: Ziglet now leads every workload (12-rep interleaved A/B)
 
 With the nginx-shaped responses (cached Date + Server) and all previous
 work, the last measured gap (GET / empty) is closed:
 
-| workload (c=100, 12-rep interleaved medians) | tcp-server | nginx | vs |
+| workload (c=100, 12-rep interleaved medians) | Ziglet | nginx | vs |
 |---|---:|---:|---:|
 | GET / empty | 292,218 | 278,181 | 1.05x ours |
 | 1 KB static | 262-278k | 157-168k | 1.66x ours |
@@ -1418,7 +1418,7 @@ work, the last measured gap (GET / empty) is closed:
 
 Earlier "nginx 1.14x on GET" readings were run variance (the co-resident
 and single-pass numbers swung parity to 1.2x); the interleaved medians
-with the same response shape put tcp-server ahead. The nginx-feature
+with the same response shape put Ziglet ahead. The nginx-feature
 replication is complete: cached date (done), pool (superseded by the bump
 arena), lean state machines (comptime DFA, 60-292 ns parse), read-once
 model (implemented, reverted with evidence - the drain loop's probe is

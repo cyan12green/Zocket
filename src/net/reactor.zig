@@ -633,7 +633,7 @@ pub const Reactor = struct {
                     // from the once-per-second cache, Server is a comptime
                     // literal.
                     session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
-                    session.resp.setHeader("Server", "tcp-server");
+                    session.resp.setHeader("Server", "Ziglet");
                     conn.send_buf.compact();
                     // The head (fast single-pass writer, fast itoa) goes into
                     // the send buffer, the body stays put: one writev of two
@@ -1509,12 +1509,12 @@ fn httpOkEmpty(buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 0" ++ "\r\n\r\n", .{testDateLine(&dbuf)}) catch unreachable;
 }
 
-/// Expected "Date: ...\r\nServer: tcp-server\r\n" for the current wall
+/// Expected "Date: ...\r\nServer: Ziglet\r\n" for the current wall
 /// second (the reactor caches the date and refreshes it once per second).
 fn testDateLine(buf: []u8) []const u8 {
     const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
     const date = cache_mod.formatHttpDate(@intCast(ts.sec), buf) orelse unreachable;
-    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: tcp-server\r\n", .{date}) catch unreachable;
+    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Ziglet\r\n", .{date}) catch unreachable;
 }
 
 test "reactor serves HTTP with keep-alive and body echo" {

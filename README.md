@@ -1,4 +1,4 @@
-# zig-tcp-server
+# Ziglet
 
 High-performance TCP/HTTP server in Zig (0.16.0-dev, pinned in
 `build.zig.zon`): multi-reactor epoll transport, HTTP/1.1, an nginx-style
@@ -88,6 +88,6 @@ zig build run -- --uring               experimental io_uring batch I/O backend
 - `bench/compare-servers.sh` — cross-language comparison against actix-web,
   Bun.serve, httpx.zig, nginx and Caddy (pinned third-party submodules);
   single-cell, payload-size matrix, and `--static` file-serving modes.
-  tcp-server leads every measured workload (nginx comparison in
+  Ziglet leads every measured workload (nginx comparison in
   `bench/BENCH.md`).
 - `bench/http-check.py`, `bench/echo-check.py` — end-to-end correctness checks.

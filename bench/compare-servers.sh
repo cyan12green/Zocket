@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Server-level comparison: tcp-server vs actix-web (Rust) vs Bun.serve
+# Server-level comparison: Ziglet vs actix-web (Rust) vs Bun.serve
 # (JavaScript) vs httpx.zig, all built from third-party submodules.
 #
 # Single cell:
@@ -40,7 +40,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-TCP_BIN="$ROOT/zig-out/bin/tcp_server"
+TCP_BIN="$ROOT/zig-out/bin/ziglet"
 ACTIX_BIN="$ROOT/bench/foreign/actix/target/release/actix_bench"
 BUN_BIN="$ROOT/bench/.cache/bun/bun"
 BUN_SRV="$ROOT/bench/foreign/bun/server.ts"
@@ -62,9 +62,9 @@ pkill_servers() {
     pkill -f "actix_benc[h]" 2>/dev/null || true
     pkill -f "bench_serve[r]" 2>/dev/null || true
     pkill -f "server\.t[s]" 2>/dev/null || true
-    pkill -f "tcp_server_m14fu[l]l" 2>/dev/null || true
+    pkill -f "ziglet_m14fu[l]l" 2>/dev/null || true
     pkill -f "caddy ru[n]" 2>/dev/null || true
-    pkill -x tcp_server 2>/dev/null || true
+    pkill -x ziglet 2>/dev/null || true
     pkill -x nginx 2>/dev/null || true
     sleep 0.3
 }
@@ -98,7 +98,7 @@ while len(out) < n:
     out += (seed & 0xFFFF).to_bytes(2, 'big')
 open(sys.argv[2], 'wb').write(out[:n])
 " "$size" "$STATIC_FILE"
-    # tcp-server config: prefix route "/" rooted at the static dir; the
+    # Ziglet config: prefix route "/" rooted at the static dir; the
     # static module resolves /static -> $DIR/static (sendfile >= 16 KB).
     cat > "$STATIC_CONFIG" <<JSON
 { "routes": [ { "path": "/", "match": "prefix", "root": "$STATIC_DIR", "modules": { "content": "static" } } ] }
@@ -238,7 +238,7 @@ root = sys.argv[1]
 matrix = sys.argv[2] == "1"
 cells = sys.argv[3].split()
 
-servers = [("tcp", "tcp-server"), ("actix", "actix-web"), ("bun", "Bun.serve"), ("hx", "httpx.zig"), ("nginx", "nginx"), ("caddy", "Caddy")]
+servers = [("tcp", "Ziglet"), ("actix", "actix-web"), ("bun", "Bun.serve"), ("hx", "httpx.zig"), ("nginx", "nginx"), ("caddy", "Caddy")]
 
 def stats(d, name):
     vals = {"rps": [], "p50": [], "p95": [], "p99": [], "tput": []}
@@ -271,7 +271,7 @@ for entry in cells:
     label, rel = entry.split("|")
     d = os.path.join(root, rel)
     print(f"\n### {label}")
-    print("| server | reqs/sec | vs tcp-server | latency p50 | latency p95 | latency p99 | throughput |")
+    print("| server | reqs/sec | vs Ziglet | latency p50 | latency p95 | latency p99 | throughput |")
     print("|---|---:|---:|---:|---:|---:|---:|")
     tcp = None
     for tag, name in servers:

@@ -1,5 +1,5 @@
 //! Parameterized request-parse / response-build micro-benchmark (httpx.zig
-//! side), paired with bench/reqresp_bench.zig (tcp-server side). The variant
+//! side), paired with bench/reqresp_bench.zig (Ziglet side). The variant
 //! tables and CLI are identical on both sides.
 //!
 //!   --req <name>     only the named request variant (parse op)

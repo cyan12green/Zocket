@@ -2,7 +2,7 @@
 //!
 //! Measures, under identical conditions:
 //!   1. Integer formatting: `std.fmt.bufPrint("{d}")` vs
-//!      `tcp_server.http.response.formatUInt` (the 4-digits-at-a-time table
+//!      `ziglet.http.response.formatUInt` (the 4-digits-at-a-time table
 //!      itoa now used by the response builder; `std.fmt.printIntAny` already
 //!      uses a 2-digit table but pays the format-machinery + bounds-check
 //!      funnel).
@@ -15,15 +15,15 @@
 //! fast path (std.fmt double-pass vs single-pass) is recorded in
 //! bench/BENCH.md (Milestone 14, response serialisation).
 //!
-//! Usage:  zig build-exe -OReleaseFast --dep tcp_server \
-//!           -Mroot=bench/itoa_bench.zig -Mtcp_server=src/root.zig \
+//! Usage:  zig build-exe -OReleaseFast --dep ziglet \
+//!           -Mroot=bench/itoa_bench.zig -Mziglet=src/root.zig \
 //!           -femit-bin=zig-out/bin/itoa_bench
 //!         zig-out/bin/itoa_bench [--iters N] [--rounds N]
 
 const std = @import("std");
-const tcp_server = @import("tcp_server");
-const http_response = tcp_server.http.response;
-const buffer_mod = tcp_server.buffer;
+const ziglet = @import("ziglet");
+const http_response = ziglet.http.response;
+const buffer_mod = ziglet.buffer;
 
 const formatUInt = http_response.formatUInt;
 const digitCount = http_response.digitCount;
