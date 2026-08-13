@@ -538,6 +538,76 @@ userspace before the syscall boundary).
 
 ---
 
+### M15 — Benchmark-driven hardening (nginx comparison)
+
+**Status: DONE** (2026-08-13). Motivated by cross-framework comparison
+(tcp-server vs actix-web, Bun.serve, httpx.zig, nginx, Caddy — all pinned
+as `third_party/` submodules, driven by `bench/compare-servers.sh`): fix
+what the benchmarks exposed, then replicate nginx's per-request recipe
+with comptime improvements.
+
+- **Request-buffer growth** (`connection.zig`, `buffer.zig`): the recv
+  buffer was a fixed 16 KiB and the parser needs the whole Content-Length
+  body buffered, so every POST over ~16 KiB was rejected with 431. The
+  buffer now grows on demand (doubling to a 16 MiB per-connection cap;
+  past the cap still 431). Grown capacity is kept for the connection
+  (per-request shrink was ~4 mmap+munmap pairs per 64 KiB request) and
+  the echo module's stale 15 KiB cap was raised to match (writev made it
+  moot). Regression test: 64 KiB POST -> 200 + full echo + keep-alive.
+- **Static fd cache** (`dsl/static_cache.zig`, nginx `open_file_cache`
+  equivalent): per-reactor cache of open fds + metadata + preformatted
+  ETag/Last-Modified, mtime-revalidated in a 1 s window. Serving a cached
+  file costs zero open/stat/close syscalls and zero date formatting. For
+  files <= 16 KiB the cache also holds the content: head + bytes go out in
+  ONE writev (no sendfile syscall), ranges slice the cached memory.
+  openat2(RESOLVE_BENEATH) against a config-loaded root fd replaced the
+  per-request open + realpath pair (one kernel-enforced syscall, no
+  TOCTOU; falls back to the legacy realpath path when unavailable).
+- **Connection pool** (`connection.zig` ConnectionPool): page_allocator
+  made each connection 5 allocations (struct + 2 buffer structs + 2 x
+  16 KiB data) = 5 mmap/munmap pairs. Buffers are embedded in the
+  Connection (one allocation; grows switch to heap and keep capacity) and
+  connections recycle through a per-reactor free list (cap 1024), so warm
+  accept/close is allocation-free. mmap+munmap pairs per connection under
+  churn: 7.0 -> 2.0 (with the arena).
+- **Request bump arena** (`http/arena.zig`): header strings, decoded
+  target and query live in a bump arena (embedded 16 KiB + overflow heap
+  blocks kept warm); `reset()` rewinds between requests; typical requests
+  cost zero heap allocations. `Slot` stores slices (arena blocks are not
+  contiguous).
+- **Cached Date header** (nginx `ngx_cached_http_time` equivalent): the
+  IMF-fixdate string is formatted once per wall-clock second into a
+  reactor cache and copied into every pipeline response, plus a comptime
+  `Server: tcp-server` header; per-request date formatting is zero.
+- **io_uring backend** (`net/iouring.zig`, opt-in `--uring`): batch
+  connection reads/writes on a ring (one in-flight read per connection,
+  no EAGAIN drain probe; completions drained via the ring fd on epoll;
+  sendfile resumed via poll_add; deferred close via async cancel). nginx
+  1.28.0 contains zero io_uring code — its probe-free model comes from
+  edge-triggered epoll + read-once semantics whose `rev->ready` flag is
+  only cleared by EAGAIN. Measured at parity with epoll on keep-alive and
+  regressing at high connection counts, so it is opt-in and epoll stays
+  the default. (A pure epoll read-once variant was tried and reverted:
+  15k vs 304k on GET — the drain loop's probe is not the bottleneck.)
+- **Lean state machines**: comptime DFA header classification
+  (`header_dfa.zig`, 60-292 ns parse), single-pass response serialisation
+  with a table itoa, two-iov flush (the zero-copy writev-parts variant
+  regressed ~8%: 13 iovecs per writev cost more than the serialisation
+  saved).
+
+**Verification**: every step has its A/B in `bench/BENCH.md` (1 KB static:
+  47.9k -> 268k co-resident, gap to nginx 4.6x -> 1.66x ours; 64 KiB
+  POST error path -> real echo; churn mmap pairs 7 -> 2 per connection;
+  GET / empty 12-rep interleaved 292k vs nginx 278k). Final interleaved
+  comparison: tcp-server leads every workload (GET / 1.05x, 1 KB static
+  1.66x, POST /echo 1.82x, 1 MB static parity). 175 tests.
+
+**Comptime**: DFA transition table, MIME/date tables, header templates and
+the registry are comptime-built; the request arena and connection pool
+eliminate runtime allocation entirely on the hot path.
+
+---
+
 ## Dependent milestones (blocked on Zig snapshot)
 
 ### DM1 — Comptime JSON config validation

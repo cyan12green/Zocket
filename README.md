@@ -3,7 +3,9 @@
 High-performance TCP/HTTP server in Zig (0.16.0-dev, pinned in
 `build.zig.zon`): multi-reactor epoll transport, HTTP/1.1, an nginx-style
 config-driven phase pipeline, static file serving, reverse proxying, and
-kernel-level optimizations (SO_REUSEPORT, sendfile, writev).
+kernel-level optimizations (SO_REUSEPORT, sendfile, writev). In the
+nginx-feature comparison it leads on every measured workload (see
+`bench/BENCH.md`).
 
 ## Status
 
@@ -22,7 +24,8 @@ kernel-level optimizations (SO_REUSEPORT, sendfile, writev).
 | M11 | DONE | Comptime response templates: module-less template routes pre-serialised and served from `.rodata`. |
 | M12 | DONE | Reverse proxy: per-backend keep-alive pools, load balancing (round-robin / least-connections / ip_hash), passive health checks, X-Forwarded-For / X-Real-IP. |
 | M13 | DONE | Observability: access log, error log, stub_status page, SIGHUP graceful reload. |
-| M14 | DONE | Kernel-level: SO_REUSEPORT per-reactor accept, sendfile for static bodies, writev for head+body; io_uring explored and deferred. |
+| M14 | DONE | Kernel-level: SO_REUSEPORT per-reactor accept, sendfile for static bodies, writev for head+body. |
+| M15 | DONE | Benchmark-driven hardening: on-demand request-buffer growth (large bodies), nginx `open_file_cache`-style static fd cache (+ small-file content cache served as one writev), connection pooling with embedded buffers, request bump arena (zero hot-path allocations), cached Date header, experimental io_uring backend (opt-in `--uring`). Docs: `docs/ROADMAP.md`, `bench/BENCH.md`. |
 
 Roadmap: `docs/ROADMAP.md`.
 
@@ -33,26 +36,31 @@ src/
   main.zig            CLI entry (flags only; all logic lives below)
   root.zig            library root; re-exports + comptime test imports
   embeds.zig          comptime embedded assets (@embedFile)
-  net/                transport + lifecycle (M1/M2/M5/M13/M14)
+  ct_pool.zig         typed comptime arena for comptime builders (M15)
+  net/                transport + lifecycle (M1/M2/M5/M13/M14/M15)
     server.zig        M1 single-threaded echo (A/B)
     multireactor.zig  reactor orchestration
     reactor.zig       per-core epoll thread (echo or HTTP mode)
     dispatcher.zig    lock-free round-robin (M2; removed by SO_REUSEPORT)
     timer_wheel.zig   idle-timeout timer wheel (M5)
-    connection.zig    per-connection recv/send buffers
+    connection.zig    pooled connections with embedded 16 KiB buffers (M15)
     buffer.zig        growable byte buffer (memmove-safe)
+    iouring.zig       io_uring batch I/O backend (opt-in, M15)
     epoll.zig         epoll wrapper (raw syscalls)
     eventfd.zig       wakeup primitive
     sockets.zig       raw socket syscall helpers
-  http/               HTTP/1.1 layer (M3/M6/M8)
-    parser.zig        incremental request parser
+  http/               HTTP/1.1 layer (M3/M6/M8/M15)
+    parser.zig        incremental request parser (DFA header classification)
     response.zig      response builder (Content-Length always set)
+    arena.zig         request bump arena: embedded 16 KiB, zero allocs (M15)
     mime.zig          comptime MIME table (M6)
-  dsl/                config pipeline (M4/M7/M9-M12)
+    header_dfa.zig    comptime DFA for header-name classification (M15)
+  dsl/                config pipeline (M4/M7/M9-M12/M15)
     phase.zig         nginx-style phase enum
     router.zig        prefix/exact routing + comptime trie (M7)
     registry.zig      comptime module registry + Context
     pipeline.zig      phase dispatch loop
+    static_cache.zig  nginx open_file_cache equivalent: fd + content cache (M15)
     modules/          echo, gzip, cache, access_log, error_log,
                       proxy, static, stub_status
   runtime/            config loading + server wiring (M4)
@@ -68,13 +76,18 @@ zig build run -- --config <file>       HTTP with a JSON config (routes + module 
 zig build run -- --echo                raw byte-echo protocol (M1/M2 semantics)
 zig build run -- --single              M1 single-threaded echo server (A/B)
 zig build run -- --idle-timeout S      idle connection timeout in seconds (0 disables)
+zig build run -- --uring               experimental io_uring batch I/O backend
+                                       (epoll is the default)
 ```
 
 ## Tests and benchmarks
 
-- `zig build test` — unit + concurrency tests (152 passing).
+- `zig build test` — unit + concurrency tests (175 passing).
 - `bench/bench.sh`, `bench/bench2.sh`, `bench/summarize.py` — reproducible
   benchmark harness; results and methodology in `bench/BENCH.md`.
 - `bench/compare-servers.sh` — cross-language comparison against actix-web,
-  Bun.serve and httpx.zig (pinned third-party submodules).
+  Bun.serve, httpx.zig, nginx and Caddy (pinned third-party submodules);
+  single-cell, payload-size matrix, and `--static` file-serving modes.
+  tcp-server leads every measured workload (nginx comparison in
+  `bench/BENCH.md`).
 - `bench/http-check.py`, `bench/echo-check.py` — end-to-end correctness checks.
