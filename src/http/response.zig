@@ -1,6 +1,7 @@
 const std = @import("std");
 const buffer_mod = @import("../net/buffer.zig");
 
+const posix = std.posix;
 const posix_fd = std.posix.fd_t;
 
 pub const Status = enum(u16) {
@@ -40,6 +41,12 @@ pub const Status = enum(u16) {
 };
 
 pub const max_headers = 8;
+
+/// Maximum number of writev segments a response can emit: status line
+/// (5 parts: "HTTP/1.1 ", digits, " ", phrase, "\r\n") + 4 per header
+/// (name, ": ", value, "\r\n") + Content-Length (3: prefix, digits,
+/// "\r\n\r\n") + body.
+pub const max_writev_parts = 5 + 4 * max_headers + 3 + 1;
 
 /// digits4[i] holds the 4 ASCII digits of i (0..9999) packed so that a
 /// little-endian write of the u32 produces "dddd" in memory order:
@@ -253,6 +260,61 @@ pub const Response = struct {
         if (needed > buf.availableWrite()) return error.BufferFull;
         try self.writeHeadTo(RawSink{ .buf = buf }, content_length);
     }
+
+    /// Fill `parts` with the response's pieces as zero-copy slices — status
+    /// line, every header name/value pair, Content-Length and the body are
+    /// emitted without concatenation; the caller sends them with a single
+    /// writev(). The status/Content-Length digits are formatted into
+    /// `self.scratch` (valid until the next scratch use). Returns the number
+    /// of parts filled. Takes `*Response` because the digit scratch is
+    /// consumed; the caller must keep the response alive until the parts are
+    /// flushed.
+    pub fn writevParts(self: *Response, parts: *[max_writev_parts]posix.iovec_const) usize {
+        return self.writevHeadParts(parts, self.body.len, self.body);
+    }
+
+    /// Head-only variant: Content-Length reflects `content_length` and the
+    /// body part is `body` (empty for HEAD/sendfile responses).
+    pub fn writevHeadParts(
+        self: *Response,
+        parts: *[max_writev_parts]posix.iovec_const,
+        content_length: usize,
+        body: []const u8,
+    ) usize {
+        var count: usize = 0;
+        const add = struct {
+            fn push(out: *[max_writev_parts]posix.iovec_const, n: *usize, bytes: []const u8) void {
+                if (bytes.len == 0) return;
+                out[n.*] = .{ .base = bytes.ptr, .len = bytes.len };
+                n.* += 1;
+            }
+        };
+
+        // Status line digits and Content-Length digits go into the response's
+        // scratch (appended after any setHeaderFmt values, which share it).
+        const scratch_start = self.scratch_used;
+        const digits_at = self.scratch[scratch_start..];
+        const status_end = formatUInt(digits_at, 0, @intFromEnum(self.status));
+        const cl_end = formatUInt(digits_at, status_end, content_length);
+        self.scratch_used = scratch_start + cl_end;
+
+        add.push(parts, &count, "HTTP/1.1 ");
+        add.push(parts, &count, digits_at[0..status_end]);
+        add.push(parts, &count, " ");
+        add.push(parts, &count, self.status.reasonPhrase());
+        add.push(parts, &count, "\r\n");
+        for (self.headers[0..self.header_count]) |h| {
+            add.push(parts, &count, h.name);
+            add.push(parts, &count, ": ");
+            add.push(parts, &count, h.value);
+            add.push(parts, &count, "\r\n");
+        }
+        add.push(parts, &count, "Content-Length: ");
+        add.push(parts, &count, digits_at[status_end..cl_end]);
+        add.push(parts, &count, "\r\n\r\n");
+        add.push(parts, &count, body);
+        return count;
+    }
 };
 
 /// Adapter writing into a net buffer. Errors instead of silently truncating
@@ -398,6 +460,70 @@ test "writeHeadToBuffer writes head only with full Content-Length" {
     );
     // Head-only serialization is exactly the full wire size minus the body.
     try testing.expectEqual(resp.wireSize() - resp.body.len, buf.availableRead());
+}
+
+/// Copy writev parts into a contiguous buffer (they are scattered by
+/// design; this is the concatenation the writev path avoids).
+fn copyParts(parts: []const posix.iovec_const, buf: []u8) []const u8 {
+    var used: usize = 0;
+    for (parts) |p| {
+        @memcpy(buf[used..][0..p.len], p.base[0..p.len]);
+        used += p.len;
+    }
+    return buf[0..used];
+}
+
+test "writevParts emits the response byte-identically without concatenation" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { status: Status, headers: []const []const u8, body: []const u8 }{
+        .{ .status = .ok, .headers = &.{}, .body = "" },
+        .{ .status = .ok, .headers = &.{ "Content-Type", "text/plain" }, .body = "Hello, World!" },
+        .{
+            .status = .not_found,
+            .headers = &.{ "X-A", "1", "X-B", "two" },
+            .body = "Not Found",
+        },
+        .{
+            .status = .internal_error,
+            .headers = &.{ "Content-Type", "text/html", "Cache-Control", "max-age=3600" },
+            .body = "<html>oops</html>",
+        },
+    };
+    var joined: [1024]u8 = undefined;
+    var joined_h: [1024]u8 = undefined;
+    for (cases) |c| {
+        var resp = Response.init(c.status);
+        var i: usize = 0;
+        while (i < c.headers.len) : (i += 2) resp.setHeader(c.headers[i], c.headers[i + 1]);
+        resp.setBody(c.body);
+
+        // Reference: the buffered serialisation.
+        const buf = try buffer_mod.Buffer.init(allocator);
+        defer buf.deinit(allocator);
+        try resp.writeToBuffer(buf);
+
+        // Parts: no body part, and the parts never touch the buffer.
+        var parts: [max_writev_parts]posix.iovec_const = undefined;
+        var resp2 = resp; // scratch is per-call; parts reference it
+        const n = resp2.writevParts(&parts);
+        var total: usize = 0;
+        for (parts[0..n]) |p| total += p.len;
+        try testing.expectEqual(buf.availableRead(), total);
+        // Parts are byte-identical in order to the buffered output.
+        try testing.expectEqualSlices(u8, buf.peek(), copyParts(parts[0..n], &joined));
+
+        // Head-only variant keeps the full Content-Length and no body.
+        var parts_h: [max_writev_parts]posix.iovec_const = undefined;
+        const nh = resp2.writevHeadParts(&parts_h, resp.body.len, &.{});
+        var total_h: usize = 0;
+        for (parts_h[0..nh]) |p| total_h += p.len;
+        try testing.expectEqual(buf.availableRead() - resp.body.len, total_h);
+        try testing.expectEqualSlices(
+            u8,
+            buf.peek()[0 .. buf.availableRead() - resp.body.len],
+            copyParts(parts_h[0..nh], &joined_h),
+        );
+    }
 }
 
 test "wireSize matches written bytes across configurations" {

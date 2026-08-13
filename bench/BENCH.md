@@ -680,6 +680,38 @@ path; the generic-sink `write` keeps per-segment writes for non-buffer
 sinks (test-only). Head-only serialisation (HEAD/sendfile) uses the same
 writer.
 
+## Milestone 15: vectored-I/O response emission (writev parts)
+
+Date: 2026-08-13, same box. The response fast path above serialises the
+head into the send buffer; the M14 writev sends head + body as two slices.
+M15 extends the same idea to the head: the whole response — status line,
+every header name/value pair, Content-Length and the body — is now emitted
+as zero-copy slices (`Response.writevParts`/`writevHeadParts` filling a
+`[41]posix.iovec_const` array; digits formatted into the response's scratch)
+and sent in one writev, so the head is never concatenated at all. The
+session owns the response across EPOLLOUT retries (`part_index`/
+`part_offset` resume a partial flush); sendfile bodies still follow the
+head parts. The M11 template fast path, error responses and echo mode keep
+the buffered path. Output is byte-identical (gated by a
+writevParts-vs-writeToBuffer test, `bench/http-check.py` 15/15, and
+sendfile full + range byte-compares).
+
+**Method**: same-day A/B against the pre-M15 tree, both `ReleaseFast`,
+default config (echo), bombardier 3 x 10 s, readiness-polled startup
+(`bench.sh`'s 0.5 s sleep races under load on this box).
+
+| conns | M15 req/s | M14 baseline req/s | delta |
+|---|---:|---:|---:|
+| 100 | 276,181 | 280,284 | -1.5% |
+| 500 | 240,327 | 243,295 | -1.2% |
+
+**Conclusion**: within the <5% gate (and inside the box's ~6% port-bias
+envelope noted in M14). The head-serialisation pass eliminated at the
+micro level (~16-60 ns/response in the build path) is offset at the
+syscall level by the extra iovec segments — net neutral at server
+throughput, as expected. `zig build test` 164/164, `bench/echo-check.py`
+clean.
+
 ## Cross-server comparison: tcp-server vs httpx.zig
 
 Date: 2026-08-12, same box. A head-to-head HTTP server throughput and

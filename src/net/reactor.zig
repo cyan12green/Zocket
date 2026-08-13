@@ -51,11 +51,19 @@ const HttpSession = struct {
     file_fd: posix.fd_t = -1,
     file_offset: u64 = 0,
     file_remaining: u64 = 0,
-    /// writev body (Milestone 14): the head lives in the send buffer, the
-    /// body here; both go out in one writev. `pending_body_owned` marks a
-    /// module-allocated body that must be freed once fully sent.
-    pending_body: []const u8 = &.{},
-    pending_body_owned: bool = false,
+    /// The response currently being flushed (Milestone 15): its scratch and
+    /// header/body slices are what the send_parts iovs reference, so it must
+    /// outlive the flush (kept here instead of on the processHttp stack).
+    resp: http_response.Response = http_response.Response.init(.ok),
+    /// writev parts of the current response (Milestone 15): the whole
+    /// response — status line, every header, Content-Length and the body —
+    /// is emitted as zero-copy slices in one writev, so the head is never
+    /// concatenated into the send buffer. `part_index`/`part_offset` track a
+    /// partially flushed response across EPOLLOUT edges.
+    send_parts: [http_response.max_writev_parts]posix.iovec_const = undefined,
+    part_count: usize = 0,
+    part_index: usize = 0,
+    part_offset: usize = 0,
 };
 
 /// A single-reactor worker: its own thread, its own epoll instance and its own
@@ -493,10 +501,10 @@ pub const Reactor = struct {
                     return;
                 },
                 .complete => {
-                    var resp = http_response.Response.init(.ok);
+                    session.resp = http_response.Response.init(.ok);
                     var ctx = dsl_pipeline.Context{
                         .req = &session.req,
-                        .resp = &resp,
+                        .resp = &session.resp,
                         .allocator = self.allocator,
                         .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0 },
                         .stats = self.stats,
@@ -541,42 +549,35 @@ pub const Reactor = struct {
                     if (request_outcome == .not_handled) {
                         // No module claimed the request (no route matched, a
                         // short-circuit, or no module attached): default 404.
-                        resp = http_response.Response.init(.not_found);
-                        resp.setBody(http_response.Status.not_found.reasonPhrase());
+                        session.resp = http_response.Response.init(.not_found);
+                        session.resp.setBody(http_response.Status.not_found.reasonPhrase());
                     }
                     const close = ctx.close_after_write or !session.req.keep_alive;
-                    resp.setHeader("Connection", if (close) "close" else "keep-alive");
-                    conn.send_buf.compact();
-                    // Milestone 14 writev: the head goes into the send
-                    // buffer, the body stays put and both are flushed in one
-                    // writev — no body memcpy through the send buffer.
-                    if (resp.body_from_file) {
-                        resp.writeHeadToBufferWithLength(conn.send_buf, resp.file_len) catch {
-                            if (resp.body_owned) self.allocator.free(resp.body);
-                            self.removeConnection(fd);
-                            return;
-                        };
+                    session.resp.setHeader("Connection", if (close) "close" else "keep-alive");
+                    // Milestone 15 writev parts: the whole response — status
+                    // line, every header, Content-Length and the body — is
+                    // emitted as zero-copy slices in one writev, so the head
+                    // is never concatenated into the send buffer.
+                    session.part_count = 0;
+                    session.part_index = 0;
+                    session.part_offset = 0;
+                    if (session.resp.body_from_file) {
+                        session.part_count = session.resp.writevHeadParts(&session.send_parts, session.resp.file_len, &.{});
+                    } else if (session.req.method == .head) {
+                        session.part_count = session.resp.writevHeadParts(&session.send_parts, session.resp.body.len, &.{});
+                        if (session.resp.body_owned) {
+                            self.allocator.free(session.resp.body);
+                            session.resp.body_owned = false;
+                        }
                     } else {
-                        resp.writeHeadToBuffer(conn.send_buf) catch {
-                            if (resp.body_owned) self.allocator.free(resp.body);
-                            self.removeConnection(fd);
-                            return;
-                        };
+                        session.part_count = session.resp.writevParts(&session.send_parts);
                     }
-                    if (session.req.method == .head or resp.body.len == 0) {
-                        session.pending_body = &.{};
-                        session.pending_body_owned = false;
-                        if (resp.body_owned) self.allocator.free(resp.body);
-                    } else {
-                        session.pending_body = resp.body;
-                        session.pending_body_owned = resp.body_owned;
-                    }
-                    if (resp.body_from_file) {
+                    if (session.resp.body_from_file) {
                         // Take ownership of the module's fd; the body goes via
                         // sendfile once the head has flushed.
-                        session.file_fd = resp.file_fd;
-                        session.file_offset = resp.file_offset;
-                        session.file_remaining = if (session.req.method == .head) 0 else resp.file_len;
+                        session.file_fd = session.resp.file_fd;
+                        session.file_offset = session.resp.file_offset;
+                        session.file_remaining = if (session.req.method == .head) 0 else session.resp.file_len;
                     }
                     session.close_after_write = close;
                     if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
@@ -603,34 +604,42 @@ pub const Reactor = struct {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
 
-        // Milestone 14: one writev for the remaining head + the body.
-        if (session.pending_body.len > 0) {
-            var iov = [_]posix.iovec_const{
-                .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() },
-                .{ .base = session.pending_body.ptr, .len = session.pending_body.len },
-            };
-            const n = posix.writev(fd, &iov) catch |e| {
+        // Milestone 15: pipeline responses are emitted as writev parts —
+        // status line, every header, Content-Length and the body as
+        // zero-copy slices, no head concatenation. `part_index`/`part_offset`
+        // resume a partially flushed response on the next EPOLLOUT edge.
+        if (session.part_count > 0) {
+            var iov = session.send_parts[session.part_index..session.part_count];
+            if (session.part_offset > 0 and iov.len > 0) {
+                iov[0].base += session.part_offset;
+                iov[0].len -= session.part_offset;
+            }
+            const n = posix.writev(fd, iov) catch |e| {
                 if (e == error.WouldBlock) return;
-                if (session.pending_body_owned) self.allocator.free(session.pending_body);
-                session.pending_body = &.{};
+                self.freeResponseBody(session);
                 self.removeConnection(fd);
                 return;
             };
-            const head_avail = conn.send_buf.availableRead();
-            if (n <= head_avail) {
-                conn.send_buf.consume(n);
-            } else {
-                conn.send_buf.consume(head_avail);
-                session.pending_body = session.pending_body[n - head_avail ..];
+            var left = n;
+            while (left > 0 and session.part_index < session.part_count) {
+                const avail = session.send_parts[session.part_index].len - session.part_offset;
+                if (left < avail) {
+                    session.part_offset += left;
+                    left = 0;
+                } else {
+                    left -= avail;
+                    session.part_index += 1;
+                    session.part_offset = 0;
+                }
             }
-            if (session.pending_body.len > 0) {
-                // Socket buffer full; continue on the next EPOLLOUT edge.
+            if (session.part_index < session.part_count) {
+                // Socket buffer full mid-response; continue on EPOLLOUT.
                 return;
             }
-            if (session.pending_body_owned) self.allocator.free(session.pending_body);
-            session.pending_body_owned = false;
-            session.pending_body = &.{};
-            if (conn.send_buf.availableRead() > 0) return;
+            session.part_count = 0;
+            session.part_index = 0;
+            session.part_offset = 0;
+            self.freeResponseBody(session);
         } else {
             while (conn.send_buf.availableRead() > 0) {
                 const n = conn.send() catch |e| {
@@ -706,6 +715,15 @@ pub const Reactor = struct {
             session.out_armed = false;
         }
         self.processHttp(fd);
+    }
+
+    /// Free a module-allocated response body once its parts are fully sent
+    /// (or the connection dies mid-flush).
+    fn freeResponseBody(self: *Reactor, session: *HttpSession) void {
+        if (session.resp.body_owned) {
+            self.allocator.free(session.resp.body);
+            session.resp.body_owned = false;
+        }
     }
 
     /// Read and discard up to `max` bytes from the socket.
@@ -877,7 +895,7 @@ pub const Reactor = struct {
         if (self.http_sessions.fetchRemove(fd)) |kv| {
             var sess = kv.value;
             if (sess.file_fd >= 0) posix.close(sess.file_fd);
-            if (sess.pending_body_owned) self.allocator.free(sess.pending_body);
+            if (sess.resp.body_owned) self.allocator.free(sess.resp.body);
             if (self.stats) |s| {
                 switch (sess.stat_state) {
                     .waiting => _ = s.waiting.fetchSub(1, .monotonic),
@@ -905,7 +923,7 @@ pub const Reactor = struct {
         var sit = self.http_sessions.valueIterator();
         while (sit.next()) |s| {
             if (s.file_fd >= 0) posix.close(s.file_fd);
-            if (s.pending_body_owned) self.allocator.free(s.pending_body);
+            if (s.resp.body_owned) self.allocator.free(s.resp.body);
             s.parser.deinit();
             s.req.deinit();
         }
