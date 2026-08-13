@@ -909,3 +909,86 @@ instead of rejected; plus drop the redundant per-request epoll_ctl MOD (the
 In|Out->In re-arm after a fully-synchronous flush when EPOLLOUT was never
 armed) - two small, localized changes that should close the 64 KB cell and
 trim one syscall per request on the common path.
+
+## nginx and Caddy join the comparison (six servers)
+
+Date: 2026-08-13, same box, all six servers co-resident (4 workers each;
+nginx 4 worker processes, caddy GOMAXPROCS=4). nginx is the new
+third_party/nginx submodule (release-1.28.0) built minimal (no
+rewrite/gzip/ssl) with the echo-nginx-module (third_party/echo-nginx-module,
+v0.65) for body echo; Caddy is third_party/caddy (v2.9.1) built from
+source, serving the echo via the {http.request.body} placeholder. Both use
+the same endpoints (GET / -> empty, POST /echo -> body echo) and the same
+harness (compare-servers.sh, now six ports per layout). Raw JSON in
+bench/results/servers/matrix/.
+
+| cell | server | reqs/sec | vs tcp-server | p50 | p95 | p99 | throughput |
+|---|---|---:|---:|---:|---:|---:|---:|
+| GET / empty, c=100 | tcp-server | 259,321 | 1.00x | 0.25 ms | 1.10 ms | 2.85 ms | 16 MB/s |
+| | actix-web | 253,331 | 0.98x | 0.28 ms | 1.02 ms | 2.24 ms | 19 MB/s |
+| | nginx | 280,378 | 1.08x | 0.30 ms | 0.77 ms | 1.52 ms | 43 MB/s |
+| | Bun.serve | 94,743 | 0.37x | 1.07 ms | 1.39 ms | 1.66 ms | 7 MB/s |
+| | Caddy | 81,820 | 0.32x | 0.99 ms | 3.33 ms | 4.48 ms | 7 MB/s |
+| | httpx.zig | 5,440 | 0.02x | 0.70 ms | 1.31 ms | 1.71 ms | 0 MB/s |
+| POST /echo 1 KB, c=10 | tcp-server | 159,837 | 1.00x | 0.05 ms | 0.11 ms | 0.16 ms | 174 MB/s |
+| | actix-web | 130,907 | 0.82x | 0.07 ms | 0.14 ms | 0.20 ms | 144 MB/s |
+| | nginx | 123,751 | 0.77x | 0.07 ms | 0.15 ms | 0.25 ms | 147 MB/s |
+| | Bun.serve | 72,964 | 0.46x | 0.13 ms | 0.28 ms | 0.39 ms | 83 MB/s |
+| | Caddy | 54,341 | 0.34x | 0.15 ms | 0.41 ms | 0.78 ms | 63 MB/s |
+| POST /echo 1 KB, c=100 | tcp-server | 238,577 | 1.00x | 0.28 ms | 1.18 ms | 2.52 ms | 260 MB/s |
+| | actix-web | 215,154 | 0.90x | 0.36 ms | 1.08 ms | 2.13 ms | 237 MB/s |
+| | nginx | 170,192 | 0.71x | 0.36 ms | 2.16 ms | 3.62 ms | 202 MB/s |
+| | Bun.serve | 70,708 | 0.30x | 1.55 ms | 1.98 ms | 2.25 ms | 81 MB/s |
+| | Caddy | 53,471 | 0.22x | 1.42 ms | 5.27 ms | 6.92 ms | 62 MB/s |
+| POST /echo 1 KB, c=1000 | tcp-server | 208,925 | 1.00x | 4.15 ms | 9.88 ms | 13.81 ms | 226 MB/s |
+| | actix-web | 190,992 | 0.91x | 4.58 ms | 10.71 ms | 14.95 ms | 209 MB/s |
+| | nginx | 150,713 | 0.72x | 4.60 ms | 19.59 ms | 27.92 ms | 178 MB/s |
+| | Bun.serve | 61,678 | 0.30x | 16.36 ms | 19.24 ms | 21.10 ms | 70 MB/s |
+| | Caddy | 45,784 | 0.22x | 22.62 ms | 31.81 ms | 37.48 ms | 53 MB/s |
+| POST /echo 8 KB, c=10 | tcp-server | 107,454 | 1.00x | 0.08 ms | 0.17 ms | 0.25 ms | 887 MB/s |
+| | actix-web | 94,712 | 0.88x | 0.09 ms | 0.20 ms | 0.31 ms | 783 MB/s |
+| | nginx | 55,590 | 0.52x | 0.13 ms | 0.47 ms | 0.71 ms | 464 MB/s |
+| | Bun.serve | 53,053 | 0.49x | 0.18 ms | 0.37 ms | 0.58 ms | 441 MB/s |
+| | Caddy | 27,295 | 0.25x | 0.28 ms | 0.90 ms | 1.43 ms | 228 MB/s |
+| POST /echo 8 KB, c=100 | tcp-server | 137,636 | 1.00x | 0.50 ms | 2.03 ms | 3.60 ms | 1137 MB/s |
+| | actix-web | 128,251 | 0.93x | 0.60 ms | 1.91 ms | 3.21 ms | 1061 MB/s |
+| | nginx | 73,493 | 0.53x | 0.82 ms | 3.76 ms | 5.45 ms | 614 MB/s |
+| | Bun.serve | 49,566 | 0.36x | 2.10 ms | 2.66 ms | 3.13 ms | 412 MB/s |
+| | Caddy | 27,051 | 0.20x | 2.98 ms | 9.66 ms | 13.73 ms | 226 MB/s |
+| POST /echo 8 KB, c=1000 | tcp-server | 99,044 | 1.00x | 8.93 ms | 20.19 ms | 27.97 ms | 811 MB/s |
+| | actix-web | 94,708 | 0.96x | 9.39 ms | 20.81 ms | 28.37 ms | 777 MB/s |
+| | nginx | 71,365 | 0.72x | 4.84 ms | 64.77 ms | 91.28 ms | 594 MB/s |
+| | Bun.serve | 45,302 | 0.46x | 22.07 ms | 25.55 ms | 26.65 ms | 375 MB/s |
+| | Caddy | 26,111 | 0.26x | 29.08 ms | 113.59 ms | 192.15 ms | 217 MB/s |
+| POST /echo 64 KB, c=10 | tcp-server | 55,861 | 1.00x | 0.15 ms | 0.31 ms | 0.48 ms | 3665 MB/s |
+| | actix-web | 45,579 | 0.82x | 0.18 ms | 0.40 ms | 0.67 ms | 2991 MB/s |
+| | nginx | 21,955 | 0.39x | 0.28 ms | 1.08 ms | 1.35 ms | 1443 MB/s |
+| | Bun.serve | 24,252 | 0.43x | 0.32 ms | 0.82 ms | 1.02 ms | 1592 MB/s |
+| | Caddy | 10,664 | 0.19x | 0.74 ms | 2.11 ms | 2.69 ms | 701 MB/s |
+| POST /echo 64 KB, c=100 | tcp-server | 29,155 | 1.00x | 2.67 ms | 8.50 ms | 12.88 ms | 1911 MB/s |
+| | actix-web | 23,288 | 0.80x | 3.36 ms | 10.63 ms | 16.40 ms | 1526 MB/s |
+| | nginx | 24,397 | 0.84x | 2.40 ms | 13.39 ms | 19.39 ms | 1604 MB/s |
+| | Bun.serve | 21,163 | 0.73x | 4.50 ms | 6.39 ms | 7.34 ms | 1389 MB/s |
+| | Caddy | 10,254 | 0.35x | 5.83 ms | 32.24 ms | 51.68 ms | 673 MB/s |
+| POST /echo 64 KB, c=1000 | tcp-server | 22,178 | 1.00x | 40.83 ms | 79.37 ms | 102.08 ms | 1440 MB/s |
+| | actix-web | 19,798 | 0.89x | 45.59 ms | 90.53 ms | 120.67 ms | 1290 MB/s |
+| | nginx | 23,632 | 1.07x | 12.65 ms | 283.10 ms | 366.03 ms | 1541 MB/s |
+| | Bun.serve | 21,525 | 0.97x | 44.63 ms | 52.50 ms | 54.59 ms | 1406 MB/s |
+| | Caddy | 10,528 | 0.47x | 26.07 ms | 426.77 ms | 712.33 ms | 688 MB/s |
+
+**Readings**:
+- nginx is the strongest competitor: it takes the trivial GET cell (1.08x,
+  its fast path: pre-serialised empty response, no per-request work) and the
+  64 KB cell at c=1000 (1.07x, though with a heavy tail: p95 283 ms vs our
+  79 ms). On body echo at low/mid concurrency we lead by 1.3-2.5x; nginx's
+  echo goes through its request-body buffering machinery, and its epoll
+  wakeup pattern costs it on small pipelined bursts.
+- Caddy (Go) is the slowest of the six (0.19-0.47x): runtime + placeholder
+  body handling, consistent with Bun.serve being ~1.5x faster than it.
+- actix-web stays the closest rival on echo workloads (0.80-0.96x).
+- Config parity notes: nginx needed echo-nginx-module (its echo_request_body
+  is a no-op unless the body is read first; return lives in the disabled
+  rewrite module so GET / uses `echo -n ""`), and client_body_buffer_size is
+  raised so bodies stay in memory (the spool-to-disk path empties
+  $request_body). Caddy needs `admin off`, discarded logs, and the
+  request_body max_size for the 64 KB cell. Both pinned in .gitmodules.

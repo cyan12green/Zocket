@@ -1,0 +1,22 @@
+# Caddy benchmark config (template): one server, two endpoints.
+#   GET  /      -> 200, empty body
+#   POST /echo  -> 200, request body echoed ({http.request.body} placeholder)
+# Placeholder: @@PORT@@ (listen port).
+{
+    admin off
+}
+
+:@@PORT@@ {
+    log {
+        output discard
+    }
+    handle /echo {
+        request_body {
+            max_size 1GB
+        }
+        respond "{http.request.body}" 200
+    }
+    handle {
+        respond "" 200
+    }
+}

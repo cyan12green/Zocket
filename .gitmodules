@@ -7,3 +7,12 @@
 [submodule "third_party/bun"]
 	path = third_party/bun
 	url = https://github.com/oven-sh/bun.git
+[submodule "third_party/nginx"]
+	path = third_party/nginx
+	url = https://github.com/nginx/nginx.git
+[submodule "third_party/echo-nginx-module"]
+	path = third_party/echo-nginx-module
+	url = https://github.com/openresty/echo-nginx-module.git
+[submodule "third_party/caddy"]
+	path = third_party/caddy
+	url = https://github.com/caddyserver/caddy.git

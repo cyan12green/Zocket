@@ -44,30 +44,49 @@ ACTIX_BIN="$ROOT/bench/foreign/actix/target/release/actix_bench"
 BUN_BIN="$ROOT/bench/.cache/bun/bun"
 BUN_SRV="$ROOT/bench/foreign/bun/server.ts"
 HX_BIN="$ROOT/third_party/httpx.zig/zig-out/bin/bench_server"
+NGINX_BIN="$ROOT/bench/.cache/nginx-build/sbin/nginx"
+NGINX_TEMPLATE="$ROOT/bench/foreign/nginx/nginx.conf.template"
+CADDY_BIN="$ROOT/bench/.cache/caddy/caddy"
+CADDY_TEMPLATE="$ROOT/bench/foreign/caddy/Caddyfile.template"
 
 echo "== ensuring builds =="
 [ -x "$TCP_BIN" ] || (cd "$ROOT" && zig build -Doptimize=ReleaseFast)
 [ -x "$ACTIX_BIN" ] || (cd "$ROOT/bench/foreign/actix" && cargo build --release >/dev/null)
 [ -x "$BUN_BIN" ] || bash "$ROOT/bench/fetch-bun.sh"
 [ -x "$HX_BIN" ] || bash "$ROOT/bench/build-httpx.sh" >/dev/null
+[ -x "$NGINX_BIN" ] || bash "$ROOT/bench/build-nginx.sh" >/dev/null
+[ -x "$CADDY_BIN" ] || bash "$ROOT/bench/build-caddy.sh" >/dev/null
 
 pkill_servers() {
     pkill -f "actix_benc[h]" 2>/dev/null || true
     pkill -f "bench_serve[r]" 2>/dev/null || true
     pkill -f "server\.t[s]" 2>/dev/null || true
     pkill -f "tcp_server_m14fu[l]l" 2>/dev/null || true
+    pkill -f "caddy ru[n]" 2>/dev/null || true
     pkill -x tcp_server 2>/dev/null || true
+    pkill -x nginx 2>/dev/null || true
     sleep 0.3
 }
 pkill_servers
 
 start_servers() {
-    # $1 = tcp port, $2 = actix port, $3 = bun port, $4 = httpx port
+    # $1 = tcp port, $2 = actix port, $3 = bun port, $4 = httpx port,
+    # $5 = nginx port, $6 = caddy port
     "$TCP_BIN" --port "$1" --threads 4 >/dev/null 2>&1 &
     "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 &
     "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 &
     "$HX_BIN" --port "$4" >/dev/null 2>&1 &
-    sleep 1.5
+    # nginx: per-port runtime prefix (pid file) and config.
+    NGINX_PREFIX="$ROOT/bench/.cache/nginx-p$5"
+    mkdir -p "$NGINX_PREFIX"
+    sed -e "s/@@PORT@@/$5/" \
+        -e "s|@@ERRLOG@@|$ROOT/bench/.cache/nginx-err-$5.log|" \
+        -e "s|@@PREFIX@@|$NGINX_PREFIX|" "$NGINX_TEMPLATE" > "$ROOT/bench/.cache/nginx-$5.conf"
+    "$NGINX_BIN" -p "$NGINX_PREFIX" -c "$ROOT/bench/.cache/nginx-$5.conf" >/dev/null 2>&1 &
+    # caddy: GOMAXPROCS=4 for parity with the other 4-worker servers.
+    sed -e "s/@@PORT@@/$6/" "$CADDY_TEMPLATE" > "$ROOT/bench/.cache/caddy-$6.caddyfile"
+    GOMAXPROCS=4 "$CADDY_BIN" run --config "$ROOT/bench/.cache/caddy-$6.caddyfile" --adapter caddyfile >/dev/null 2>&1 &
+    sleep 2
 }
 
 stop_servers() { pkill_servers; }
@@ -89,11 +108,11 @@ run_cell() {
     fi
 
     run_layout() {
-        # $1 = label prefix, $2..$5 = ports
-        local pref="$1" tcp_port=$2 actix_port=$3 bun_port=$4 hx_port=$5
-        start_servers "$tcp_port" "$actix_port" "$bun_port" "$hx_port"
+        # $1 = label prefix, $2..$7 = ports
+        local pref="$1" tcp_port=$2 actix_port=$3 bun_port=$4 hx_port=$5 nginx_port=$6 caddy_port=$7
+        start_servers "$tcp_port" "$actix_port" "$bun_port" "$hx_port" "$nginx_port" "$caddy_port"
 
-        for srv in "$tcp_port" "$actix_port" "$bun_port" "$hx_port"; do
+        for srv in "$tcp_port" "$actix_port" "$bun_port" "$hx_port" "$nginx_port" "$caddy_port"; do
             path="/"
             [ "$body" != "0" ] && path="/echo"
             code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://127.0.0.1:${srv}${path}" || echo 000)
@@ -101,12 +120,14 @@ run_cell() {
         done
 
         for r in $(seq 1 "$REPS"); do
-            for srv in tcp actix bun hx; do
+            for srv in tcp actix bun hx nginx caddy; do
                 case "$srv" in
                     tcp) port="$tcp_port" ;;
                     actix) port="$actix_port" ;;
                     bun) port="$bun_port" ;;
                     hx) port="$hx_port" ;;
+                    nginx) port="$nginx_port" ;;
+                    caddy) port="$caddy_port" ;;
                 esac
                 path="/"
                 [ "$body" != "0" ] && path="/echo"
@@ -116,8 +137,8 @@ run_cell() {
         stop_servers
     }
 
-    run_layout A "$BASE" "$((BASE+1))" "$((BASE+2))" "$((BASE+3))"
-    run_layout B "$((BASE+3))" "$((BASE+2))" "$((BASE+1))" "$BASE"
+    run_layout A "$BASE" "$((BASE+1))" "$((BASE+2))" "$((BASE+3))" "$((BASE+4))" "$((BASE+5))"
+    run_layout B "$((BASE+5))" "$((BASE+4))" "$((BASE+3))" "$((BASE+2))" "$((BASE+1))" "$BASE"
 }
 
 trap 'stop_servers' EXIT
@@ -150,7 +171,7 @@ root = sys.argv[1]
 matrix = sys.argv[2] == "1"
 cells = sys.argv[3].split()
 
-servers = [("tcp", "tcp-server"), ("actix", "actix-web"), ("bun", "Bun.serve"), ("hx", "httpx.zig")]
+servers = [("tcp", "tcp-server"), ("actix", "actix-web"), ("bun", "Bun.serve"), ("hx", "httpx.zig"), ("nginx", "nginx"), ("caddy", "Caddy")]
 
 def stats(d, name):
     vals = {"rps": [], "p50": [], "p95": [], "p99": [], "tput": []}

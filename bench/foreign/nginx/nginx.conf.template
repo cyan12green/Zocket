@@ -1,0 +1,38 @@
+# nginx benchmark config (template): one server, two endpoints.
+#   GET  /      -> 200, empty body
+#   POST /echo  -> 200, request body echoed (echo-nginx-module)
+# Placeholders: @@PORT@@ (listen port), @@ERRLOG@@ (error log path),
+# @@PREFIX@@ (runtime prefix: pid file location).
+worker_processes 4;
+daemon off;
+error_log @@ERRLOG@@ crit;
+pid @@PREFIX@@/nginx.pid;
+
+events {
+    worker_connections 16384;
+}
+
+http {
+    access_log off;
+    server_tokens off;
+    keepalive_timeout 65;
+    keepalive_requests 100000;
+    client_max_body_size 32m;
+    # echo_request_body only sees bodies that fit a memory buffer (larger
+    # ones are spooled to disk and $request_body comes back empty).
+    client_body_buffer_size 32m;
+
+    server {
+        listen 127.0.0.1:@@PORT@@;
+        # GET / -> 200 empty; POST /echo -> body echo. echo-nginx-module is
+        # used for both (plain nginx's `return` lives in the rewrite module,
+        # which is disabled for the minimal build).
+        location = / { echo -n ""; }
+        location = /echo {
+            # echo_request_body needs the body read first (it is a no-op
+            # otherwise).
+            echo_read_request_body;
+            echo_request_body;
+        }
+    }
+}

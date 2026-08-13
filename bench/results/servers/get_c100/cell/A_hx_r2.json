@@ -1,0 +1,4 @@
+Bombarding http://127.0.0.1:18504/ for 3s using 100 connection(s)
+ 00m02s 00m01s 00m01s 00m01s 00m01s 00m01s 3s
+Done!
+{"spec":{"numberOfConnections":100,"testType":"timed","testDurationSeconds":3,"method":"GET","url":"http://127.0.0.1:18504/","body":"","stream":false,"timeoutSeconds":2,"client":"fasthttp"},"result":{"bytesRead":1299471,"bytesWritten":1063125,"timeTakenSeconds":10.003124373,"req1xx":0,"req2xx":16449,"req3xx":0,"req4xx":0,"req5xx":0,"others":68,"errors":[{"description":"timeout","count":68}],"latency":{"mean":52319.54192649997,"stddev":689253.2429269433,"max":1.0002777e+07,"percentiles":{"50":698,"75":925,"90":1157,"95":1319,"99":1828}},"rps":{"mean":5436.4361115021375,"stddev":591.1221700143554,"max":6398.694706586594,"percentiles":{"50":5322.418959,"75":5821.174997,"90":6100.324013,"95":6180.575071,"99":6376.532753}}}}
