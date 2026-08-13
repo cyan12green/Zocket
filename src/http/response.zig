@@ -156,6 +156,10 @@ pub const Response = struct {
     /// userspace. The caller (reactor) takes ownership of `file_fd`.
     body_from_file: bool = false,
     file_fd: posix_fd = -1,
+    /// The file fd comes from the reactor's static cache (Milestone 14
+    /// follow-up, nginx open_file_cache): the reactor must NOT close it
+    /// after sendfile — the cache owns it.
+    file_fd_cached: bool = false,
     file_offset: u64 = 0,
     file_len: u64 = 0,
 

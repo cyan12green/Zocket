@@ -9,6 +9,7 @@ const timer_wheel = @import("timer_wheel.zig");
 const http_parser = @import("../http/parser.zig");
 const http_response = @import("../http/response.zig");
 const dsl_pipeline = @import("../dsl/pipeline.zig");
+const static_cache_mod = @import("../dsl/static_cache.zig");
 const runtime_server = @import("../runtime/server.zig");
 
 const max_events = 1024;
@@ -49,6 +50,9 @@ const HttpSession = struct {
     /// sendfile state (Milestone 14): while `file_remaining > 0` the body is
     /// pushed from this fd into the socket.
     file_fd: posix.fd_t = -1,
+    /// The fd is owned by the reactor's static cache (nginx open_file_cache
+    /// equivalent): do not close it after sendfile.
+    file_fd_cached: bool = false,
     file_offset: u64 = 0,
     file_remaining: u64 = 0,
     /// The response currently being flushed: its scratch and header/body
@@ -104,6 +108,13 @@ pub const Reactor = struct {
     expired_fds: std.ArrayList(posix.fd_t),
     /// Shared connection/request counters (Milestone 13); null in echo mode.
     stats: ?*runtime_server.ServerStats = null,
+    /// Static-file fd cache (nginx open_file_cache equivalent, Milestone 14
+    /// follow-up): per-reactor, no locks. Served from it, a cached file
+    /// costs zero open/stat/close syscalls and zero ETag/date formatting.
+    static_cache: static_cache_mod.StaticCache = undefined,
+    /// Connection pool (Milestone 14 follow-up): accepts recycle pooled
+    /// connections, so steady-state connection churn costs zero allocations.
+    conn_pool: connection.ConnectionPool = undefined,
     /// Per-reactor listener (Milestone 14, SO_REUSEPORT): when set, this
     /// reactor accepts connections directly from the kernel; -1 otherwise.
     listener: posix.fd_t = -1,
@@ -190,6 +201,8 @@ pub const Reactor = struct {
                 @constCast((http_handler orelse &default_http_handler).stats)
             else
                 null,
+            .static_cache = static_cache_mod.StaticCache.init(allocator),
+            .conn_pool = connection.ConnectionPool.init(allocator),
             .drain_started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
         };
         errdefer self.ep.close();
@@ -345,10 +358,15 @@ pub const Reactor = struct {
     }
 
     /// (Re)arm the idle timer for `conn` at the current tick. Any recv is
-    /// activity, so the timer is pushed back on every read.
+    /// activity, so the timer is pushed back on every read; the rearm is
+    /// skipped when the entry is already armed at this tick (back-to-back
+    /// requests inside one 100 ms wheel tick cost nothing).
     fn rearmTimer(self: *Reactor, conn: *connection.Connection) void {
         if (self.idle_timeout_ticks == 0) return;
-        self.wheel.rearm(&conn.timer, self.nowTick(), self.idle_timeout_ticks);
+        const tick = self.nowTick();
+        if (conn.timer.active and tick == conn.timer_last_tick) return;
+        conn.timer_last_tick = tick;
+        self.wheel.rearm(&conn.timer, tick, self.idle_timeout_ticks);
     }
 
     fn handleEvent(self: *Reactor, events: u32, fd: posix.fd_t) void {
@@ -466,7 +484,7 @@ pub const Reactor = struct {
             const conn = self.connections.get(fd) orelse return;
             if (session.writing) return;
 
-            const outcome = session.parser.parse(conn.recv_buf, &session.req);
+            const outcome = session.parser.parse(&conn.recv_buf, &session.req);
             switch (outcome) {
                 .incomplete => {
                     // The buffer can hold the whole request, so an incomplete
@@ -505,6 +523,7 @@ pub const Reactor = struct {
                         .allocator = self.allocator,
                         .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0 },
                         .stats = self.stats,
+                        .static_cache = &self.static_cache,
                     };
                     const handler = self.http_handler orelse &default_http_handler;
 
@@ -558,13 +577,13 @@ pub const Reactor = struct {
                     // cost more kernel iov handling than the serialisation
                     // saved — measured -8% on the echo workload.)
                     if (session.resp.body_from_file) {
-                        session.resp.writeHeadToBufferWithLength(conn.send_buf, session.resp.file_len) catch {
+                        session.resp.writeHeadToBufferWithLength(&conn.send_buf, session.resp.file_len) catch {
                             self.freeResponseBody(session);
                             self.removeConnection(fd);
                             return;
                         };
                     } else {
-                        session.resp.writeHeadToBuffer(conn.send_buf) catch {
+                        session.resp.writeHeadToBuffer(&conn.send_buf) catch {
                             self.freeResponseBody(session);
                             self.removeConnection(fd);
                             return;
@@ -580,8 +599,10 @@ pub const Reactor = struct {
                     }
                     if (session.resp.body_from_file) {
                         // Take ownership of the module's fd; the body goes via
-                        // sendfile once the head has flushed.
+                        // sendfile once the head has flushed. Cached fds stay
+                        // with the cache.
                         session.file_fd = session.resp.file_fd;
+                        session.file_fd_cached = session.resp.file_fd_cached;
                         session.file_offset = session.resp.file_offset;
                         session.file_remaining = if (session.req.method == .head) 0 else session.resp.file_len;
                     }
@@ -662,7 +683,7 @@ pub const Reactor = struct {
                 const err = posix.errno(rc);
                 if (err != .SUCCESS) {
                     if (err == .AGAIN or err == .INTR) break; // wait for EPOLLOUT
-                    posix.close(session.file_fd);
+                    if (!session.file_fd_cached) posix.close(session.file_fd);
                     session.file_fd = -1;
                     self.removeConnection(fd);
                     return;
@@ -677,7 +698,8 @@ pub const Reactor = struct {
                 // EPOLLOUT edge.
                 return;
             }
-            posix.close(session.file_fd);
+            if (!session.file_fd_cached) posix.close(session.file_fd);
+            session.file_fd_cached = false;
             session.file_fd = -1;
         }
 
@@ -760,7 +782,7 @@ pub const Reactor = struct {
         resp.setBody(status.reasonPhrase());
         resp.setHeader("Connection", "close");
         conn.send_buf.compact();
-        resp.writeToBuffer(conn.send_buf) catch {
+        resp.writeToBuffer(&conn.send_buf) catch {
             self.removeConnection(fd);
             return;
         };
@@ -790,7 +812,7 @@ pub const Reactor = struct {
                 posix.close(conn_fd);
                 continue;
             }
-            const conn = connection.Connection.create(self.allocator, conn_fd) catch {
+            const conn = self.conn_pool.acquire(conn_fd) catch {
                 posix.close(conn_fd);
                 return;
             };
@@ -799,20 +821,29 @@ pub const Reactor = struct {
         }
     }
 
+    /// Close a connection and recycle it: pool-owned objects go back to the
+    /// pool, external ones (tests, attach path) are destroyed.
+    fn dropConnection(self: *Reactor, conn: *connection.Connection) void {
+        conn.close();
+        if (conn.from_pool) {
+            self.conn_pool.release(conn);
+        } else {
+            conn.destroy();
+        }
+    }
+
     /// Register a freshly created connection with this reactor's epoll and
     /// registries (shared by the pending queue and the accept path).
     fn registerConnection(self: *Reactor, conn: *connection.Connection) void {
         self.ep.add(conn.fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, conn.fd) catch {
-            conn.close();
-            conn.destroy();
+            self.dropConnection(conn);
             return;
         };
         if (self.connections.put(conn.fd, conn)) |_| {
             _ = self.registered.fetchAdd(1, .monotonic);
         } else |_| {
             self.ep.remove(conn.fd) catch {};
-            conn.close();
-            conn.destroy();
+            self.dropConnection(conn);
             return;
         }
         if (self.idle_timeout_ticks > 0) {
@@ -833,8 +864,7 @@ pub const Reactor = struct {
                 session.req.deinit();
                 self.wheel.remove(&conn.timer);
                 self.ep.remove(conn.fd) catch {};
-                conn.close();
-                conn.destroy();
+                self.dropConnection(conn);
             }
         }
     }
@@ -887,12 +917,11 @@ pub const Reactor = struct {
             // Unlink the idle timer so the wheel never points at freed memory.
             self.wheel.remove(&conn.timer);
             self.ep.remove(fd) catch {};
-            conn.close();
-            conn.destroy();
+            self.dropConnection(conn);
         }
         if (self.http_sessions.fetchRemove(fd)) |kv| {
             var sess = kv.value;
-            if (sess.file_fd >= 0) posix.close(sess.file_fd);
+            if (sess.file_fd >= 0 and !sess.file_fd_cached) posix.close(sess.file_fd);
             if (sess.resp.body_owned) self.allocator.free(sess.resp.body);
             if (self.stats) |s| {
                 switch (sess.stat_state) {
@@ -920,7 +949,7 @@ pub const Reactor = struct {
         self.connections.clearRetainingCapacity();
         var sit = self.http_sessions.valueIterator();
         while (sit.next()) |s| {
-            if (s.file_fd >= 0) posix.close(s.file_fd);
+            if (s.file_fd >= 0 and !s.file_fd_cached) posix.close(s.file_fd);
             if (s.resp.body_owned) self.allocator.free(s.resp.body);
             s.parser.deinit();
             s.req.deinit();

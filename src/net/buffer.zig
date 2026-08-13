@@ -5,8 +5,18 @@ pub const Buffer = struct {
     data: []u8,
     read_pos: usize,
     write_pos: usize,
+    /// Whether `data` is heap-owned and must be freed on deinit/grow.
+    /// False when the buffer views embedded storage (pooled connections):
+    /// grow() then switches to a heap allocation.
+    owns_data: bool = false,
 
     pub const default_size = 16384;
+
+    /// A buffer viewing externally owned storage (e.g. a pooled connection's
+    /// embedded array). Never freed by the buffer.
+    pub fn fromSlice(slice: []u8) Buffer {
+        return .{ .data = slice, .read_pos = 0, .write_pos = 0, .owns_data = false };
+    }
 
     pub fn init(allocator: std.mem.Allocator) !*Buffer {
         const buf = try allocator.create(Buffer);
@@ -14,6 +24,7 @@ pub const Buffer = struct {
             .data = try allocator.alloc(u8, default_size),
             .read_pos = 0,
             .write_pos = 0,
+            .owns_data = true,
         };
         return buf;
     }
@@ -24,13 +35,22 @@ pub const Buffer = struct {
             .data = try allocator.alloc(u8, size),
             .read_pos = 0,
             .write_pos = 0,
+            .owns_data = true,
         };
         return buf;
     }
 
+    /// Free heap-owned data (embedded storage is left alone) and the Buffer
+    /// struct itself (heap-path buffers created by `init`).
     pub fn deinit(self: *Buffer, allocator: std.mem.Allocator) void {
-        allocator.free(self.data);
+        if (self.owns_data) allocator.free(self.data);
         allocator.destroy(self);
+    }
+
+    /// Free only heap-owned data; the struct itself is owned by the caller
+    /// (value buffers embedded in pooled connections).
+    pub fn deinitData(self: *Buffer, allocator: std.mem.Allocator) void {
+        if (self.owns_data) allocator.free(self.data);
     }
 
     pub fn availableWrite(self: *const Buffer) usize {
@@ -89,6 +109,8 @@ pub const Buffer = struct {
     /// Grow the buffer to at least `min_capacity` bytes, preserving the
     /// unread contents. Used by the receive path so request bodies larger
     /// than the default buffer can complete instead of being rejected.
+    /// Embedded storage is never freed; the buffer switches to heap
+    /// ownership on the first grow.
     pub fn grow(self: *Buffer, allocator: std.mem.Allocator, min_capacity: usize) !void {
         if (min_capacity <= self.data.len) return;
         var new_cap = self.data.len;
@@ -96,8 +118,9 @@ pub const Buffer = struct {
         const nd = try allocator.alloc(u8, new_cap);
         const used = self.availableRead();
         @memcpy(nd[0..used], self.data[self.read_pos..self.write_pos]);
-        allocator.free(self.data);
+        if (self.owns_data) allocator.free(self.data);
         self.data = nd;
+        self.owns_data = true;
         self.write_pos = used;
         self.read_pos = 0;
     }

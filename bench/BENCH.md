@@ -1245,3 +1245,33 @@ Focused tcp-vs-nginx re-check (isolated, interleaved, c=100, after the
 fix): GET / parity (~115k each), POST /echo 1 KB 3.4x ours (133k vs 40k;
 nginx's echo path copies the body twice), 1 KB static nginx 1.30x
 (169k vs 130k), 1 MB static 2.3x ours (10.7k vs 4.6k).
+
+## Closing the 1 KB static gap: nginx open_file_cache recipe + connection pooling
+
+nginx beat us 1.30x on 1 KB static (isolated). Per-request strace showed
+7 syscalls (read + EAGAIN probe, openat2, statx, close, write, sendfile)
+plus per-request ETag/date formatting vs nginx's 5-6 and its cached date
+string. Two adoptions:
+
+1. Static-file fd cache (src/dsl/static_cache.zig, nginx `open_file_cache`
+   equivalent): per-reactor cache of open fds + size/mtime + preformatted
+   ETag/Last-Modified, revalidated against the path's mtime when older
+   than 1 s (replaced files are picked up within the window). Served
+   requests now cost zero open/stat/close syscalls and zero date
+   formatting (strace: 7 -> 4 syscalls/request). Also skips the idle-timer
+   rearm when the wheel tick is unchanged.
+   Interleaved A/B (12 reps, 1 KB static c=100): tcp 188,380 vs nginx
+   209,546 -> gap 1.30x -> 1.11x.
+2. Connection pool (src/net/connection.zig ConnectionPool): the server ran
+   on page_allocator, so each connection was 5 allocations (Connection +
+   2 Buffer structs + 2 x 16 KiB data) = 5 mmap+munmap pairs. Connections
+   now embed their 16 KiB read/write buffers in the struct (one allocation
+   for the whole object; grown buffers switch to heap, capacity retained)
+   and are recycled through a per-reactor free list (bounded at 1024),
+   so warm accept/close costs zero allocations. mmap+munmap pairs per
+   connection dropped ~2.7x under churn.
+   High-churn A/B (bombardier -a, 1.5M connections, no keep-alive):
+   289,670 -> 307,573 req/s (+6.2%); keep-alive workloads unaffected.
+
+All 170 tests pass (cache unit tests incl. revalidation + symlink escape,
+pool recycle tests).

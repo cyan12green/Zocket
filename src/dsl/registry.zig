@@ -3,6 +3,7 @@ const phase_mod = @import("phase.zig");
 const router = @import("router.zig");
 const http_parser = @import("../http/parser.zig");
 const http_response = @import("../http/response.zig");
+const static_cache = @import("static_cache.zig");
 
 pub const Phase = phase_mod.Phase;
 pub const ModuleBinding = router.ModuleBinding;
@@ -77,6 +78,10 @@ pub const Context = struct {
     /// Shared server counters for the stub status page (Milestone 13),
     /// updated atomically by the reactors.
     stats: ?*const ServerStats = null,
+    /// Static-file fd cache (Milestone 14 follow-up, nginx open_file_cache
+    /// equivalent). Owned by the reactor (per-reactor, no locks); null in
+    /// tests and module-level invocation.
+    static_cache: ?*static_cache.StaticCache = null,
 };
 
 /// Shared connection/request counters (Milestone 13): updated atomically by

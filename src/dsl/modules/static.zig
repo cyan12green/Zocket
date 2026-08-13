@@ -209,14 +209,32 @@ fn serveDiskBeneath(ctx: *Context, route: *const registry.Route, target: []const
     while (rel.len > 0 and rel[0] == '/') rel = rel[1..];
     if (rel.len == 0) rel = ".";
 
+    // nginx open_file_cache equivalent: a hit costs zero open/stat/close
+    // syscalls and zero ETag/date formatting.
+    var key_buf: [max_path]u8 = undefined;
+    const key = cacheKey(&key_buf, route, rel);
+    if (key != null) {
+        if (ctx.static_cache) |cache| {
+            if (cache.lookup(key.?)) |e| {
+                return serveFd(ctx, .{
+                    .fd = e.fd,
+                    .meta = .{ .size = e.size, .mtime_secs = e.mtime_secs, .is_dir = false },
+                    .mime_path = rel,
+                    .cached = true,
+                    .etag = e.etag[0..e.etag_len],
+                    .last_modified = e.lm[0..e.lm_len],
+                });
+            }
+        }
+    }
+
     // openat2 unavailable (old kernel / sandbox): fall back to the legacy
     // realpath path for this request.
     const fd = openat2Beneath(route.root_fd, rel) catch |e| switch (e) {
         error.Unsupported => return serveDiskLegacy(ctx, route, target),
         error.NotFound => return notFound(ctx),
     };
-    const meta = statFd(fd) catch |e| {
-        std.debug.print("beneath: statFd failed {}\n", .{e});
+    const meta = statFd(fd) catch {
         posix.close(fd);
         return notFound(ctx);
     };
@@ -243,14 +261,37 @@ fn serveDiskBeneath(ctx: *Context, route: *const registry.Route, target: []const
                 return if (route.autoindex) autoindex(ctx, fd, rel) else notFound(ctx);
             }
             posix.close(fd);
-            return serveFd(ctx, idx_fd, idx_meta, idx_buf[0..idx_rel]);
+            return serveFd(ctx, .{ .fd = idx_fd, .meta = idx_meta, .mime_path = idx_buf[0..idx_rel] });
         }
         if (route.autoindex) return autoindex(ctx, fd, rel);
         posix.close(fd);
         return notFound(ctx);
     }
 
-    return serveFd(ctx, fd, meta, rel);
+    if (key != null) {
+        if (ctx.static_cache) |cache| {
+            if (cache.insert(key.?, fd, meta.size, meta.mtime_secs)) |e| {
+                return serveFd(ctx, .{
+                    .fd = e.fd,
+                    .meta = .{ .size = e.size, .mtime_secs = e.mtime_secs, .is_dir = false },
+                    .mime_path = rel,
+                    .cached = true,
+                    .etag = e.etag[0..e.etag_len],
+                    .last_modified = e.lm[0..e.lm_len],
+                });
+            }
+        }
+    }
+
+    return serveFd(ctx, .{ .fd = fd, .meta = meta, .mime_path = rel });
+}
+
+/// Cache key for the resolved file: root_real (or root) + "/" + rel. Null
+/// when the route has no root string.
+fn cacheKey(buf: []u8, route: *const registry.Route, rel: []const u8) ?[]const u8 {
+    const base = route.root_real orelse route.root orelse return null;
+    const used = buildRelPath(buf, base, rel) orelse return null;
+    return buf[0..used];
 }
 
 /// rel + "/" + sub into `buf`; null when it would not fit.
@@ -306,22 +347,39 @@ fn realpathWithinRoot(path: []const u8, root_real: []const u8) bool {
 fn serveFile(ctx: *Context, path: []const u8, meta: Meta, root_real: []const u8) !Action {
     if (!realpathWithinRoot(path, root_real)) return notFound(ctx);
     const file = std.fs.cwd().openFile(path, .{}) catch return notFound(ctx);
-    return serveFd(ctx, file.handle, meta, path);
+    return serveFd(ctx, .{ .fd = file.handle, .meta = meta, .mime_path = path });
 }
 
+const ServeFdOptions = struct {
+    fd: posix.fd_t,
+    meta: Meta,
+    mime_path: []const u8,
+    /// Cached fd (static_cache): never closed here and not closed by the
+    /// reactor after sendfile either.
+    cached: bool = false,
+    /// Preformatted entity headers (cache entries); empty = compute.
+    etag: []const u8 = "",
+    last_modified: []const u8 = "",
+};
+
 /// Shared file-response logic (conditional GETs, ranges, sendfile handoff).
-/// Takes ownership of `fd`: closes it on early returns, transfers it to the
-/// response on success.
-fn serveFd(ctx: *Context, fd: posix.fd_t, meta: Meta, mime_path: []const u8) !Action {
+/// Takes ownership of `fd` unless `cached`: closes it on early returns,
+/// transfers it to the response on success.
+fn serveFd(ctx: *Context, opts: ServeFdOptions) !Action {
     var resp = ctx.resp;
+    const meta = opts.meta;
     var transferred = false;
-    defer if (!transferred) posix.close(fd);
+    defer if (!transferred and !opts.cached) posix.close(opts.fd);
 
     // Entity metadata for the conditional-GET / cache machinery.
     var scratch: [160]u8 = undefined;
-    const etag = std.fmt.bufPrint(&scratch, "\"{d}-{d}\"", .{ meta.mtime_secs, meta.size }) catch return error.InternalError;
+    const etag = if (opts.etag.len > 0) opts.etag else blk: {
+        break :blk std.fmt.bufPrint(&scratch, "\"{d}-{d}\"", .{ meta.mtime_secs, meta.size }) catch return error.InternalError;
+    };
     ctx.etag = etag;
-    const lm = cache_mod.formatHttpDate(meta.mtime_secs, scratch[etag.len..]) orelse return error.InternalError;
+    const lm = if (opts.last_modified.len > 0) opts.last_modified else blk: {
+        break :blk cache_mod.formatHttpDate(meta.mtime_secs, scratch[etag.len..]) orelse return error.InternalError;
+    };
     ctx.last_modified = lm;
 
     // Conditional requests: 304 when the client's copy is current.
@@ -334,7 +392,7 @@ fn serveFd(ctx: *Context, fd: posix.fd_t, meta: Meta, mime_path: []const u8) !Ac
     }
 
     resp.status = .ok;
-    resp.setHeader("Content-Type", mime.mimeForPath(mime_path));
+    resp.setHeader("Content-Type", mime.mimeForPath(opts.mime_path));
     resp.setHeaderFmt("ETag", "{s}", .{etag});
     resp.setHeaderFmt("Last-Modified", "{s}", .{lm});
     resp.setHeader("Accept-Ranges", "bytes");
@@ -366,7 +424,8 @@ fn serveFd(ctx: *Context, fd: posix.fd_t, meta: Meta, mime_path: []const u8) !Ac
     // buffer, no per-request allocation. The reactor takes ownership of
     // the fd.
     resp.body_from_file = true;
-    resp.file_fd = fd;
+    resp.file_fd = opts.fd;
+    resp.file_fd_cached = opts.cached;
     resp.file_offset = offset;
     resp.file_len = length;
     transferred = true;
