@@ -359,6 +359,27 @@ respectively, and the 10-rep medians are the reliable numbers). `zig build
 test` green throughout (117 M7 tests + 4 new M8 tests = 121). Wire output is
 byte-identical (hash never changes serialisation).
 
+### M8 follow-up: header classification as a comptime DFA
+
+Date: 2026-08-13, same box. The hash-based known-name detection was replaced
+by a comptime-built deterministic finite automaton (`src/http/header_dfa.zig`):
+a trie over the known-name set whose transition table is generated at compile
+time into `.rodata` (163 nodes x 38-class alphabet, ~13 KB). Classifying a
+wire name is one table lookup per byte (ASCII letters lower-cased in the
+class map, so classification stays case-insensitive) and the terminal state
+is the exact `HeaderTag` — no hash computation, no collision handling, no
+string verification on lookup. `Request.header` scans slots by tag (integer
+compare); unknown names fall back to the string scan; `header_hasher` remains
+for the response-side modules (gzip/proxy). A comptime assertion keeps the
+DFA name set and the hasher known-set in lockstep (a mismatch is a compile
+error).
+
+Isolation micro-benchmark (`bench/classify_bench.zig`, 10-wire-name set,
+ReleaseFast, 7 rounds x 1M, both paths agreeing on every name): FNV-hash
+path 13.6 ns/name vs DFA path 11.4 ns/name (**~16% faster per
+classification**). `zig build test` 158/158 (153 + 5 DFA tests),
+`bench/http-check.py` 15/15. Wire output byte-identical.
+
 ## Milestone 9: response transformation (gzip, cache headers, conditional GETs)
 
 Date: 2026-08-12 (machine rebooted overnight; post-boot load settled before

@@ -1,5 +1,6 @@
 const std = @import("std");
 const buffer_mod = @import("../net/buffer.zig");
+const header_dfa_mod = @import("header_dfa.zig");
 
 const ascii = std.ascii;
 const mem = std.mem;
@@ -84,6 +85,66 @@ pub const header_hasher = struct {
     }
 };
 
+/// Identity of a known header name, produced by the comptime header DFA
+/// (`header_dfa`). The wire name is classified once during parsing and the
+/// tag is stored in the slot, so special handling and lookups reduce to an
+/// integer compare — the state-machine form of the Milestone-8 hash lookup.
+pub const HeaderTag = enum(u16) {
+    unknown = 0,
+    host,
+    content_type,
+    content_length,
+    transfer_encoding,
+    connection,
+    accept_encoding,
+    if_none_match,
+    if_modified_since,
+    range,
+    accept,
+    user_agent,
+    cookie,
+    authorization,
+    referer,
+    upgrade,
+    expect,
+
+    /// Tag for a comptime-known header name (compile-time constant used in
+    /// `Request.header` lookups). Unknown names yield `.unknown`.
+    pub fn of(comptime name: []const u8) HeaderTag {
+        return @enumFromInt(header_dfa.classify(name));
+    }
+};
+
+/// The comptime-built classification DFA over the known header-name set.
+/// One transition-table lookup per byte; terminal state is the exact tag.
+pub const header_dfa = header_dfa_mod.build(&.{
+    .{ .name = "host", .tag = @intFromEnum(HeaderTag.host) },
+    .{ .name = "content-type", .tag = @intFromEnum(HeaderTag.content_type) },
+    .{ .name = "content-length", .tag = @intFromEnum(HeaderTag.content_length) },
+    .{ .name = "transfer-encoding", .tag = @intFromEnum(HeaderTag.transfer_encoding) },
+    .{ .name = "connection", .tag = @intFromEnum(HeaderTag.connection) },
+    .{ .name = "accept-encoding", .tag = @intFromEnum(HeaderTag.accept_encoding) },
+    .{ .name = "if-none-match", .tag = @intFromEnum(HeaderTag.if_none_match) },
+    .{ .name = "if-modified-since", .tag = @intFromEnum(HeaderTag.if_modified_since) },
+    .{ .name = "range", .tag = @intFromEnum(HeaderTag.range) },
+    .{ .name = "accept", .tag = @intFromEnum(HeaderTag.accept) },
+    .{ .name = "user-agent", .tag = @intFromEnum(HeaderTag.user_agent) },
+    .{ .name = "cookie", .tag = @intFromEnum(HeaderTag.cookie) },
+    .{ .name = "authorization", .tag = @intFromEnum(HeaderTag.authorization) },
+    .{ .name = "referer", .tag = @intFromEnum(HeaderTag.referer) },
+    .{ .name = "upgrade", .tag = @intFromEnum(HeaderTag.upgrade) },
+    .{ .name = "expect", .tag = @intFromEnum(HeaderTag.expect) },
+});
+
+comptime {
+    // The DFA and the hash-based known set must agree on every name.
+    for (header_hasher.known) |n| {
+        if (HeaderTag.of(n) == .unknown) {
+            @compileError("header name in hasher known-set is missing from the DFA: " ++ n);
+        }
+    }
+}
+
 pub const Version = struct {
     major: u8,
     minor: u8,
@@ -110,9 +171,10 @@ const Slot = struct {
     name_len: u32,
     value_off: u32,
     value_len: u32,
-    /// FNV-1a hash of the (lower-cased) name (Milestone 8): lookups compare
-    /// integers, with the string verified only on a hash hit.
-    name_hash: u32,
+    /// DFA-classified identity of the header name (comptime lookup
+    /// structure): lookups compare tags (integers) with no string
+    /// verification for known names.
+    tag: HeaderTag,
 };
 
 /// A parsed HTTP/1.x request. Header names/values are copied into private
@@ -184,17 +246,24 @@ pub const Request = struct {
     }
 
     /// Case-insensitive lookup of a header value (first occurrence wins).
-    /// `name` is a comptime literal (Milestone 8): its hash is a
-    /// compile-time constant, so the scan compares one integer per slot and
-    /// verifies the string only on a hash hit.
+    /// `name` is a comptime literal: for known names its DFA tag is a
+    /// compile-time constant, so the scan compares one tag per slot and is
+    /// exact (the DFA classified the wire name at parse time). Unknown names
+    /// fall back to a case-insensitive string scan.
     pub fn header(self: *const Request, comptime name: []const u8) ?[]const u8 {
-        const target_hash = comptime header_hasher.hash(name);
-        for (self.slots[0..self.header_count]) |s| {
-            if (s.name_hash == target_hash) {
-                const n = self.storage.items[s.name_off..][0..s.name_len];
-                if (ascii.eqlIgnoreCase(n, name)) {
+        const target_tag = comptime HeaderTag.of(name);
+        if (target_tag != .unknown) {
+            for (self.slots[0..self.header_count]) |s| {
+                if (s.tag == target_tag) {
                     return self.storage.items[s.value_off..][0..s.value_len];
                 }
+            }
+            return null;
+        }
+        for (self.slots[0..self.header_count]) |s| {
+            const n = self.storage.items[s.name_off..][0..s.name_len];
+            if (ascii.eqlIgnoreCase(n, name)) {
+                return self.storage.items[s.value_off..][0..s.value_len];
             }
         }
         return null;
@@ -216,13 +285,17 @@ pub const Request = struct {
         const v = mem.trim(u8, value, " \t");
         if (n.len == 0) return error.Malformed;
 
-        // Known-name detection is a hash compare (Milestone 8): the wire name
-        // is hashed once and matched against comptime constants.
-        const name_hash = header_hasher.hash(n);
-        if (name_hash == comptime header_hasher.hash("content-length")) {
-            self.content_length = std.fmt.parseInt(usize, v, 10) catch return error.Malformed;
-        } else if (name_hash == comptime header_hasher.hash("transfer-encoding")) {
-            if (valueHasChunked(v)) self.transfer_chunked = true;
+        // Known-name detection is a DFA walk (comptime lookup structure):
+        // one table lookup per byte, terminal state is the exact tag.
+        const tag: HeaderTag = @enumFromInt(header_dfa.classify(n));
+        switch (tag) {
+            .content_length => {
+                self.content_length = std.fmt.parseInt(usize, v, 10) catch return error.Malformed;
+            },
+            .transfer_encoding => {
+                if (valueHasChunked(v)) self.transfer_chunked = true;
+            },
+            else => {},
         }
 
         const name_off = self.storage.items.len;
@@ -235,7 +308,7 @@ pub const Request = struct {
             .name_len = @intCast(n.len),
             .value_off = @intCast(value_off),
             .value_len = @intCast(v.len),
-            .name_hash = name_hash,
+            .tag = tag,
         };
         self.header_count += 1;
     }
