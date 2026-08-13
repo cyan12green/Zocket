@@ -10,6 +10,7 @@ pub const connection = @import("net/connection.zig");
 pub const timer_wheel = @import("net/timer_wheel.zig");
 pub const epoll = @import("net/epoll.zig");
 pub const ct_pool = @import("ct_pool.zig");
+pub const iouring = @import("net/iouring.zig");
 
 pub const http = struct {
     pub const mime = @import("http/mime.zig");
@@ -64,6 +65,7 @@ comptime {
     _ = @import("http/arena.zig");
     _ = @import("dsl/static_cache.zig");
     _ = @import("ct_pool.zig");
+    _ = @import("net/iouring.zig");
     _ = @import("dsl/phase.zig");
     _ = @import("dsl/router.zig");
     _ = @import("dsl/registry.zig");

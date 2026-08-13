@@ -10,6 +10,13 @@ const http_parser = @import("../http/parser.zig");
 const http_response = @import("../http/response.zig");
 const dsl_pipeline = @import("../dsl/pipeline.zig");
 const static_cache_mod = @import("../dsl/static_cache.zig");
+const iouring_mod = @import("iouring.zig");
+
+/// I/O backend selection. Default: epoll (measured at parity with the ring
+/// on the keep-alive workloads and more robust at high connection counts).
+/// Set to false (--uring) to try the io_uring batch path at init and use
+/// it when available.
+pub var force_epoll: bool = true;
 const runtime_server = @import("../runtime/server.zig");
 
 const max_events = 1024;
@@ -65,6 +72,10 @@ const HttpSession = struct {
     /// Whether the response body is a slice that must be freed once fully
     /// sent (module-allocated).
     pending_body_owned: bool = false,
+    /// The iovec array of the in-flight ring write (io_uring references it
+    /// until the op is processed, so it must outlive flushHttp's stack).
+    write_iovs: [2]posix.iovec_const = undefined,
+    write_iov_count: usize = 0,
 };
 
 /// A single-reactor worker: its own thread, its own epoll instance and its own
@@ -115,6 +126,18 @@ pub const Reactor = struct {
     /// Connection pool (Milestone 14 follow-up): accepts recycle pooled
     /// connections, so steady-state connection churn costs zero allocations.
     conn_pool: connection.ConnectionPool = undefined,
+    /// I/O backend: io_uring (reads/writes batched on the ring, no EAGAIN
+    /// drain probe, no EPOLLOUT arming) or the classic epoll path. The ring
+    /// is tried at init and falls back to epoll when unavailable (sandboxes,
+    /// old kernels).
+    io_mode: enum { epoll, ring } = .epoll,
+    ring: iouring_mod.IoRing = .{},
+    /// Connections whose read must be (re)submitted to the ring: appended by
+    /// completions and new registrations, drained by ringSubmitReads every
+    /// loop iteration. Fds whose submit failed (SQ full) stay in the list
+    /// for the next iteration, so reads are never lost.
+    resubmit_reads: [8192]posix.fd_t = undefined,
+    resubmit_count: usize = 0,
     /// Per-reactor listener (Milestone 14, SO_REUSEPORT): when set, this
     /// reactor accepts connections directly from the kernel; -1 otherwise.
     listener: posix.fd_t = -1,
@@ -213,6 +236,20 @@ pub const Reactor = struct {
             self.http_sessions.deinit();
             self.pending.deinit(self.allocator);
         };
+        // Try io_uring; the epoll path remains when it is unavailable.
+        // The ring fd is epoll-registered (level-triggered): it is readable
+        // whenever completions are ready, so the loop structure is shared.
+        if (!force_epoll) {
+            self.ring = iouring_mod.IoRing.init() catch .{};
+            if (self.ring.inited) {
+                if (self.ep.add(self.ring.ringFd(), epoll.Events.In, self.ring.ringFd())) |_| {
+                    self.io_mode = .ring;
+                } else |_| {
+                    self.ring.deinit();
+                    self.ring = .{};
+                }
+            }
+        }
         if (self.listener >= 0) {
             self.ep.add(self.listener, epoll.Events.In | epoll.Events.EdgeTriggered, self.listener) catch {
                 self.ep.close();
@@ -377,6 +414,10 @@ pub const Reactor = struct {
         }
         if (fd == self.listener) {
             if (events & epoll.Events.In != 0) self.acceptConnections();
+            return;
+        }
+        if (self.io_mode == .ring and fd == self.ring.ringFd()) {
+            self.handleRingCompletions();
             return;
         }
 
@@ -624,12 +665,236 @@ pub const Reactor = struct {
         }
     }
 
+
+    /// Drain the ring's completions (called when the ring fd is epoll-ready)
+    /// and dispatch them; then resubmit reads for connections without one.
+    fn handleRingCompletions(self: *Reactor) void {
+        var comps: [iouring_mod.IoRing.completion_batch]iouring_mod.IoRing.Completion = undefined;
+        while (true) {
+            const n = self.ring.drain(&comps, false) catch return;
+            if (n == 0) break;
+            for (comps[0..n]) |c| self.handleCompletion(c);
+        }
+        // One submit per loop iteration: covers reads resubmitted by
+        // completions and writes queued by the flush path.
+        self.ring.submit() catch {};
+    }
+
+    fn handleCompletion(self: *Reactor, c: iouring_mod.IoRing.Completion) void {
+        const fd: posix.fd_t = @intCast(c.user_data & 0xFFFFFFFF);
+        if (c.user_data & iouring_mod.IoRing.cancel_tag != 0) {
+            // A connection close was deferred until its pending read was
+            // cancelled: close it for real now (ignore if already gone).
+            if (self.connections.get(fd)) |conn| {
+                if (conn.closing) self.closeConnection(conn);
+            }
+            return;
+        }
+        if (c.user_data & iouring_mod.IoRing.poll_tag != 0) {
+            if (c.result < 0) {
+                if (self.connections.get(fd)) |_| self.removeConnection(fd);
+                return;
+            }
+            // POLLOUT: the socket is writable again, resume the sendfile.
+            self.finalizeFlush(fd);
+            return;
+        }
+        if (c.result < 0) {
+            const err: i32 = -c.result;
+            // The fd was closed and the op cancelled: the connection is gone.
+            if (err == @intFromEnum(linux.E.CANCELED) or err == @intFromEnum(linux.E.BADF)) return;
+            if (self.connections.get(fd)) |_| self.removeConnection(fd);
+            return;
+        }
+        if (c.user_data & iouring_mod.IoRing.write_tag != 0) {
+            if (self.mode == .http) {
+                self.handleWriteData(fd, @intCast(c.result));
+            } else {
+                self.handleEchoWrite(fd, @intCast(c.result));
+            }
+        } else {
+            self.handleReadData(fd, @intCast(c.result));
+        }
+    }
+
+    /// A ring read completed: the data is in the connection's recv buffer.
+    /// There is no EAGAIN drain probe - the next request's data completes
+    /// the freshly submitted read instead.
+    fn handleReadData(self: *Reactor, fd: posix.fd_t, n: usize) void {
+        const conn = self.connections.get(fd) orelse return;
+        conn.read_pending = false;
+        if (conn.closing) return; // close deferred until the cancel lands
+        if (n == 0) {
+            self.removeConnection(fd);
+            return;
+        }
+        conn.recv_buf.write_pos += n;
+        // Make room for the next read before it is submitted (the old recv()
+        // grew the buffer here; the sweep must never resubmit into a full
+        // buffer, or a request larger than 16 KiB would hit the 431 path).
+        if (conn.recv_buf.availableWrite() == 0) {
+            conn.recv_buf.compact();
+            if (conn.recv_buf.availableWrite() == 0 and conn.recv_buf.data.len < connection.Connection.max_recv_buffer) {
+                conn.recv_buf.grow(conn.allocator, @min(connection.Connection.max_recv_buffer, conn.recv_buf.data.len * 2)) catch {};
+            }
+        }
+        self.rearmTimer(conn);
+        if (self.mode == .http) {
+            const session = self.http_sessions.getPtr(fd) orelse return;
+            if (self.stats) |s| {
+                if (session.stat_state == .waiting) {
+                    session.stat_state = .reading;
+                    _ = s.waiting.fetchSub(1, .monotonic);
+                    _ = s.reading.fetchAdd(1, .monotonic);
+                }
+            }
+            if (!session.writing) self.processHttp(fd);
+        } else {
+            const c = self.connections.get(fd) orelse return;
+            self.onMessage(c) catch {
+                self.removeConnection(fd);
+            };
+        }
+        // Resubmit the read for the next request: queue the fd on the
+        // resubmit list; ringSubmitReads sends the batch at the end of the
+        // completion drain (retrying any op the SQ could not hold).
+        if (self.connections.get(fd)) |c2| {
+            if (!c2.read_pending and !c2.closing and self.resubmit_count < self.resubmit_reads.len) {
+                self.resubmit_reads[self.resubmit_count] = fd;
+                self.resubmit_count += 1;
+            }
+        }
+    }
+
+    /// A ring write completed: advance the send state by n bytes and either
+    /// resubmit the remainder or finalize the flush.
+    fn handleWriteData(self: *Reactor, fd: posix.fd_t, n: usize) void {
+        const conn = self.connections.get(fd) orelse return;
+        const session = self.http_sessions.getPtr(fd) orelse return;
+        if (!session.writing) return;
+
+        const head_avail = conn.send_buf.availableRead();
+        if (n <= head_avail) {
+            conn.send_buf.consume(n);
+        } else {
+            conn.send_buf.consume(head_avail);
+            session.pending_body = session.pending_body[n - head_avail ..];
+        }
+        if (session.pending_body.len > 0) {
+            self.flushHttp(fd); // socket was full mid-write; resubmit
+            return;
+        }
+        self.freeResponseBody(session);
+        session.pending_body_owned = false;
+        session.pending_body = &.{};
+        if (conn.send_buf.availableRead() > 0) {
+            self.flushHttp(fd);
+            return;
+        }
+        self.finalizeFlush(fd);
+    }
+
+    /// Echo-mode ring write completion: advance the send buffer.
+    fn handleEchoWrite(self: *Reactor, fd: posix.fd_t, n: usize) void {
+        const conn = self.connections.get(fd) orelse return;
+        conn.write_pending = false;
+        conn.send_buf.consume(@min(n, conn.send_buf.availableRead()));
+        if (conn.send_buf.availableRead() > 0) {
+            conn.write_iovs[0] = .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() };
+            self.ring.submitWritev(fd, conn.write_iovs[0..1]) catch {
+                self.removeConnection(fd);
+            };
+        }
+    }
+
+    /// Submit ring reads for the connections on the resubmit list (also
+    /// grows the recv buffer when a body demands it). Ops the SQ cannot
+    /// hold stay on the list for the next iteration, so reads are never
+    /// lost.
+    fn ringSubmitReads(self: *Reactor) void {
+        var kept: usize = 0;
+        for (self.resubmit_reads[0..self.resubmit_count]) |fd| {
+            const conn = self.connections.get(fd) orelse continue;
+            if (conn.read_pending or conn.closing) continue;
+            if (conn.recv_buf.availableWrite() == 0) {
+                conn.recv_buf.compact();
+                if (conn.recv_buf.availableWrite() == 0) {
+                    if (conn.recv_buf.data.len < connection.Connection.max_recv_buffer) {
+                        conn.recv_buf.grow(conn.allocator, @min(connection.Connection.max_recv_buffer, conn.recv_buf.data.len * 2)) catch continue;
+                    } else continue;
+                }
+            }
+            const slice = conn.recv_buf.data[conn.recv_buf.write_pos..];
+            self.ring.submitRead(fd, slice) catch {
+                if (kept < self.resubmit_reads.len) {
+                    self.resubmit_reads[kept] = fd;
+                    kept += 1;
+                }
+                continue;
+            };
+            conn.read_pending = true;
+        }
+        self.resubmit_count = kept;
+        self.ring.submit() catch {};
+    }
+
+    /// Close a connection whose pending ring read has been cancelled.
+    fn closeConnection(self: *Reactor, conn: *connection.Connection) void {
+        // The fd must be captured before the connection is destroyed below.
+        const fd = conn.fd;
+        _ = self.connections.remove(fd);
+        self.wheel.remove(&conn.timer);
+        if (self.io_mode == .epoll) self.ep.remove(fd) catch {};
+        self.dropConnection(conn);
+        if (self.http_sessions.fetchRemove(fd)) |kv| {
+            var sess = kv.value;
+            if (sess.file_fd >= 0 and !sess.file_fd_cached) posix.close(sess.file_fd);
+            if (sess.resp.body_owned) self.allocator.free(sess.resp.body);
+            if (self.stats) |s| {
+                switch (sess.stat_state) {
+                    .waiting => _ = s.waiting.fetchSub(1, .monotonic),
+                    .reading => _ = s.reading.fetchSub(1, .monotonic),
+                    .writing => _ = s.writing.fetchSub(1, .monotonic),
+                }
+                _ = s.active.fetchSub(1, .monotonic);
+            }
+            sess.parser.deinit();
+            sess.req.deinit();
+        }
+    }
+
     /// Write queued response bytes until the socket would block. When the send
     /// buffer is drained: close if requested, otherwise reset the session and
     /// immediately process any pipelined data already buffered.
     fn flushHttp(self: *Reactor, fd: posix.fd_t) void {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
+
+        if (self.io_mode == .ring) {
+            // Submit whatever is pending as one ring writev; the completion
+            // advances the state and resubmits or finalizes. The ring waits
+            // for writability, so there is no EPOLLOUT dance.
+            if (session.pending_body.len > 0) {
+                session.write_iovs[0] = .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() };
+                session.write_iovs[1] = .{ .base = session.pending_body.ptr, .len = session.pending_body.len };
+                session.write_iov_count = 2;
+                self.ring.submitWritev(fd, session.write_iovs[0..session.write_iov_count]) catch {
+                    self.removeConnection(fd);
+                    return;
+                };
+                return; // one ring.submit() per loop iteration (the sweep)
+            }
+            if (conn.send_buf.availableRead() > 0) {
+                session.write_iovs[0] = .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() };
+                session.write_iov_count = 1;
+                self.ring.submitWritev(fd, session.write_iovs[0..session.write_iov_count]) catch {
+                    self.removeConnection(fd);
+                    return;
+                };
+                return;
+            }
+            return self.finalizeFlush(fd);
+        }
 
         // One writev for the remaining head + the body.
         if (session.pending_body.len > 0) {
@@ -703,6 +968,50 @@ pub const Reactor = struct {
             session.file_fd = -1;
         }
 
+        return self.finalizeFlush(fd);
+    }
+
+    /// Post-flush steps shared by both I/O paths: file body, close, session
+    /// reset, pipelined processing. In ring mode an EAGAIN on sendfile
+    /// submits a POLLOUT wait instead of relying on an epoll event.
+    fn finalizeFlush(self: *Reactor, fd: posix.fd_t) void {
+        const conn = self.connections.get(fd) orelse return;
+        const session = self.http_sessions.getPtr(fd) orelse return;
+
+        // Milestone 14: push any file body straight into the socket.
+        if (session.file_remaining > 0) {
+            var off: i64 = @intCast(session.file_offset);
+            while (session.file_remaining > 0) {
+                const rc = linux.sendfile(fd, session.file_fd, &off, @intCast(@min(session.file_remaining, 1 << 20)));
+                const err = posix.errno(rc);
+                if (err != .SUCCESS) {
+                    if (err == .AGAIN or err == .INTR) {
+                        if (self.io_mode == .ring) {
+                            self.ring.submitPollOut(fd) catch {};
+                            self.ring.submit() catch {};
+                        }
+                        return;
+                    }
+                    if (!session.file_fd_cached) posix.close(session.file_fd);
+                    session.file_fd = -1;
+                    self.removeConnection(fd);
+                    return;
+                }
+                const n = rc;
+                session.file_offset += n;
+                session.file_remaining -= n;
+                off = @intCast(session.file_offset);
+            }
+            if (session.file_remaining > 0) {
+                // Socket buffer full mid-sendfile: continue on the next
+                // EPOLLOUT edge (epoll) or POLLOUT completion (ring).
+                return;
+            }
+            if (!session.file_fd_cached) posix.close(session.file_fd);
+            session.file_fd_cached = false;
+            session.file_fd = -1;
+        }
+
         if (session.close_after_write) {
             // Discard unread receive data so close() sends FIN instead of RST
             // (the client may still be sending the request body).
@@ -727,10 +1036,8 @@ pub const Reactor = struct {
         // capacity is amortized. The allocation is bounded by
         // connection.Connection.max_recv_buffer and dies with the connection.
         // Nothing to send: wait for the next request without spurious
-        // EPOLLOUT edges. Only modify the epoll mask when EPOLLOUT was
-        // actually armed for this response (a fully synchronous flush never
-        // armed it), saving one epoll_ctl per request on the common path.
-        if (session.out_armed) {
+        // EPOLLOUT edges (epoll path only; the ring never arms EPOLLOUT).
+        if (session.out_armed and self.io_mode == .epoll) {
             self.ep.modify(fd, epoll.Events.In | epoll.Events.EdgeTriggered, fd) catch {};
             session.out_armed = false;
         }
@@ -835,10 +1142,15 @@ pub const Reactor = struct {
     /// Register a freshly created connection with this reactor's epoll and
     /// registries (shared by the pending queue and the accept path).
     fn registerConnection(self: *Reactor, conn: *connection.Connection) void {
-        self.ep.add(conn.fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, conn.fd) catch {
-            self.dropConnection(conn);
-            return;
-        };
+        if (self.io_mode == .ring) {
+            // Reads and writes go through the ring: the connection is never
+            // epoll-registered.
+        } else {
+            self.ep.add(conn.fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, conn.fd) catch {
+                self.dropConnection(conn);
+                return;
+            };
+        }
         if (self.connections.put(conn.fd, conn)) |_| {
             _ = self.registered.fetchAdd(1, .monotonic);
         } else |_| {
@@ -863,9 +1175,14 @@ pub const Reactor = struct {
                 session.parser.deinit();
                 session.req.deinit();
                 self.wheel.remove(&conn.timer);
-                self.ep.remove(conn.fd) catch {};
+                if (self.io_mode == .epoll) self.ep.remove(conn.fd) catch {};
                 self.dropConnection(conn);
             }
+        }
+        if (self.io_mode == .ring and self.resubmit_count < self.resubmit_reads.len) {
+            self.resubmit_reads[self.resubmit_count] = conn.fd;
+            self.resubmit_count += 1;
+            self.ringSubmitReads();
         }
     }
 
@@ -876,6 +1193,13 @@ pub const Reactor = struct {
         if (data.len > 0) {
             _ = conn.send_buf.writeSlice(data);
             conn.recv_buf.reset();
+            if (self.io_mode == .ring) {
+                if (conn.write_pending) return; // the in-flight write resubmits
+                conn.write_iovs[0] = .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() };
+                self.ring.submitWritev(conn.fd, conn.write_iovs[0..1]) catch return error.WriteFailed;
+                conn.write_pending = true;
+                return;
+            }
             try self.ep.modify(
                 conn.fd,
                 epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered,
@@ -912,11 +1236,28 @@ pub const Reactor = struct {
     }
 
     fn removeConnection(self: *Reactor, fd: posix.fd_t) void {
+        if (self.connections.get(fd)) |conn| {
+            if (self.io_mode == .ring and conn.read_pending) {
+                // A read is in flight for this fd: closing it now would
+                // let a stale completion corrupt a reused fd. Cancel the
+                // read and close when the cancel lands.
+                if (conn.closing) return;
+                conn.closing = true;
+                self.ring.submitCancel(fd) catch {
+                    self.closeConnection(conn);
+                    return;
+                };
+                self.ring.submit() catch {
+                    self.closeConnection(conn);
+                };
+                return;
+            }
+        }
         if (self.connections.fetchRemove(fd)) |kv| {
             const conn = kv.value;
             // Unlink the idle timer so the wheel never points at freed memory.
             self.wheel.remove(&conn.timer);
-            self.ep.remove(fd) catch {};
+            if (self.io_mode == .epoll) self.ep.remove(fd) catch {};
             self.dropConnection(conn);
         }
         if (self.http_sessions.fetchRemove(fd)) |kv| {

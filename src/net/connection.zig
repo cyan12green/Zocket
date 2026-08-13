@@ -38,6 +38,14 @@ pub const Connection = struct {
     /// link in `next`); external connections (tests, attach path) destroy
     /// themselves on close.
     from_pool: bool = false,
+    /// A ring read is in flight for this connection (io_uring backend).
+    read_pending: bool = false,
+    /// A ring write is in flight (echo mode; HTTP mode uses session.writing).
+    write_pending: bool = false,
+    /// The iovec array of the in-flight ring write (echo mode).
+    write_iovs: [1]posix.iovec_const = undefined,
+    /// Close deferred until the pending ring read is cancelled.
+    closing: bool = false,
     /// Free-list link used while the connection is pooled.
     next: ?*Connection = null,
 
@@ -69,6 +77,9 @@ pub const Connection = struct {
         self.timer = .{};
         self.timer_last_tick = 0;
         self.peer_ip = .{ 0, 0, 0, 0 };
+        self.read_pending = false;
+        self.write_pending = false;
+        self.closing = false;
         self.next = null;
     }
 

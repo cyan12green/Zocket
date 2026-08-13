@@ -30,6 +30,10 @@ pub fn main() !void {
             mode = .http;
         } else if (std.mem.eql(u8, arg, "--config")) {
             config_path = args.next() orelse return error.MissingConfigArgument;
+        } else if (std.mem.eql(u8, arg, "--uring")) {
+            // Experimental: use the io_uring batch I/O path when available
+            // (epoll is the default backend).
+            tcp_server.reactor.force_epoll = false;
         }
     }
 

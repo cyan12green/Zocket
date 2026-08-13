@@ -1338,3 +1338,36 @@ Remaining gap: GET / empty (nginx 1.14x) - our edge-triggered drain adds
 one EAGAIN probe read per request (3 syscalls vs nginx's 2 on the empty
 path) plus slightly heavier per-request user-space. Closing that is
 io_uring territory (batch read+write, no probe) - deferred as before.
+
+## io_uring experiment + why nginx does not need it
+
+Implemented an io_uring I/O path (src/net/iouring.zig + a ring backend in
+the reactor): connection reads/writes are submitted to the ring in
+batches, one in-flight read per connection, completions drained via the
+ring fd on epoll, writes queued and submitted once per loop iteration,
+sendfile resumed via poll_add, deferred connection close via async
+cancel. The edge-triggered EAGAIN drain probe disappears entirely (a ring
+read "blocks" until data arrives).
+
+Checked the nginx 1.28.0 source for comparison: **nginx contains zero
+io_uring code**. Its epoll module registers connections with EPOLLET but
+reads ONCE per event (`if (rev->ready) n = c->recv(...)` into the
+persistent header buffer; NGX_AGAIN -> arm timer), parsing pipelined
+requests from the buffer; it also uses a per-request memory pool
+(ngx_create_pool/destroy_pool) and a cached date string
+(ngx_cached_http_time, refreshed once per second). So nginx's probe-free
+read model is exactly what the ring gives us - and its remaining
+efficiency is user-space (pool bump, cached date, lean state machines).
+
+Measured on this box, the ring is at parity with the epoll path on
+keep-alive GET / (286.7k vs 290.9k, -1.4%, 8 interleaved reps) and
+regresses at scale (c=1000 -6%, c=5000 much worse - the per-completion
+read resubmission cannot match epoll's event delivery under connection
+floods). The EAGAIN probe was not the dominant cost on this workload, so
+the ring does not close the GET gap. It remains in the tree as an
+experimental opt-in (`--uring`; epoll is the default backend).
+
+The GET / empty gap vs nginx (~1.14x) is user-space: nginx's cached date
+string and tighter request path. Candidate follow-ups: cache the Date
+header per second like nginx, and trim the per-request pipeline/timer
+work.
