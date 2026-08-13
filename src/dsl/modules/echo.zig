@@ -19,7 +19,9 @@ pub const echo: registry.Module = .{
 };
 
 fn run(ctx: *registry.Context) !registry.Action {
-    if (ctx.req.body.len > max_echo_body) {
+    // Config `limits.max_body` overrides the compiled default.
+    const max_body = if (ctx.limits) |l| l.max_body else max_echo_body;
+    if (ctx.req.body.len > max_body) {
         // Mutate in place: earlier-phase modules (cache headers, conditional
         // GETs) may have set response state that must survive content.
         ctx.resp.status = .payload_too_large;

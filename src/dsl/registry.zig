@@ -4,6 +4,7 @@ const router = @import("router.zig");
 const http_parser = @import("../http/parser.zig");
 const http_response = @import("../http/response.zig");
 const static_cache = @import("static_cache.zig");
+const limits_mod = @import("limits.zig");
 
 pub const Phase = phase_mod.Phase;
 pub const ModuleBinding = router.ModuleBinding;
@@ -11,6 +12,7 @@ pub const Route = router.Route;
 pub const Request = http_parser.Request;
 pub const Response = http_response.Response;
 pub const Status = http_response.Status;
+pub const Limits = limits_mod.Limits;
 
 /// Result of a full pipeline walk for one request. Defined here (not in the
 /// pipeline) so the router's `DispatchFn` can reference it without an import
@@ -82,6 +84,10 @@ pub const Context = struct {
     /// equivalent). Owned by the reactor (per-reactor, no locks); null in
     /// tests and module-level invocation.
     static_cache: ?*static_cache.StaticCache = null,
+    /// Runtime-tunable server limits (config `limits` section). Set by the
+    /// reactor; null in tests and module-level invocation (modules fall
+    /// back to the compiled defaults).
+    limits: ?*const limits_mod.Limits = null,
 };
 
 /// Shared connection/request counters (Milestone 13): updated atomically by

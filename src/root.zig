@@ -22,6 +22,7 @@ pub const http = struct {
 
 pub const dsl = struct {
     pub const static_cache = @import("dsl/static_cache.zig");
+    pub const limits = @import("dsl/limits.zig");
     pub const phase = @import("dsl/phase.zig");
     pub const router = @import("dsl/router.zig");
     pub const registry = @import("dsl/registry.zig");
@@ -64,6 +65,7 @@ comptime {
     _ = @import("http/header_dfa.zig");
     _ = @import("http/arena.zig");
     _ = @import("dsl/static_cache.zig");
+    _ = @import("dsl/limits.zig");
     _ = @import("ct_pool.zig");
     _ = @import("net/iouring.zig");
     _ = @import("dsl/phase.zig");

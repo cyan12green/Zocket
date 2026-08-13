@@ -1,6 +1,7 @@
 const std = @import("std");
 const router = @import("../dsl/router.zig");
 const registry = @import("../dsl/registry.zig");
+const dsl_limits = @import("../dsl/limits.zig");
 
 pub const Route = router.Route;
 pub const ModuleBinding = router.ModuleBinding;
@@ -14,6 +15,9 @@ pub const Phase = router.Phase;
 ///   must be freed with `deinit`.
 pub const Config = struct {
     routes: []const Route = &.{},
+    /// Runtime-tunable server limits (the `limits` JSON section). The
+    /// reactor applies them to buffers, parsers, caches and pools.
+    limits: dsl_limits.Limits = .{},
 
     /// Comptime default: a single catch-all prefix route attaching the echo
     /// module to the content phase — the pre-pipeline M3 behavior, reproduced
@@ -78,6 +82,21 @@ pub const Config = struct {
     pub fn fromJson(allocator: std.mem.Allocator, json: []const u8) !Config {
         var parsed = try std.json.parseFromSlice(JsonConfig, allocator, json, .{});
         defer parsed.deinit();
+
+        // Merge the optional `limits` section over the compiled defaults.
+        var limits = dsl_limits.Limits{};
+        if (parsed.value.limits) |jl| {
+            if (jl.recv_buffer_size) |v| limits.recv_buffer_size = v;
+            if (jl.send_buffer_size) |v| limits.send_buffer_size = v;
+            if (jl.max_body) |v| limits.max_body = v;
+            if (jl.max_line_bytes) |v| limits.max_line_bytes = v;
+            if (jl.max_headers) |v| limits.max_headers = v;
+            if (jl.max_chunked_body) |v| limits.max_chunked_body = v;
+            if (jl.static_cache_entries) |v| limits.static_cache_entries = v;
+            if (jl.static_cache_valid_seconds) |v| limits.static_cache_valid_seconds = v;
+            if (jl.static_content_cache_max) |v| limits.static_content_cache_max = v;
+            if (jl.connection_pool_max) |v| limits.connection_pool_max = v;
+        }
 
         var routes = std.ArrayList(Route).empty;
         try routes.ensureTotalCapacity(allocator, parsed.value.routes.len);
@@ -194,7 +213,7 @@ pub const Config = struct {
             });
         }
 
-        return .{ .routes = try routes.toOwnedSlice(allocator) };
+        return .{ .routes = try routes.toOwnedSlice(allocator), .limits = limits };
     }
 };
 
@@ -241,11 +260,41 @@ const JsonRoute = struct {
     fail_timeout_seconds: u32 = 30,
 };
 
+const JsonLimits = struct {
+    recv_buffer_size: ?usize = null,
+    send_buffer_size: ?usize = null,
+    max_body: ?usize = null,
+    max_line_bytes: ?usize = null,
+    max_headers: ?usize = null,
+    max_chunked_body: ?usize = null,
+    static_cache_entries: ?usize = null,
+    static_cache_valid_seconds: ?u64 = null,
+    static_content_cache_max: ?usize = null,
+    connection_pool_max: ?usize = null,
+};
+
 const JsonConfig = struct {
     routes: []const JsonRoute = &.{},
+    limits: ?JsonLimits = null,
 };
 
 const testing = std.testing;
+
+
+test "fromJson parses the limits section with defaults for the rest" {
+    const json =
+        \\{ "limits": { "max_headers": 4, "max_body": 1024, "static_cache_valid_seconds": 5 },
+        \\  "routes": [] }
+    ;
+    var cfg = try Config.fromJson(testing.allocator, json);
+    defer cfg.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), cfg.limits.max_headers);
+    try testing.expectEqual(@as(usize, 1024), cfg.limits.max_body);
+    try testing.expectEqual(@as(u64, 5), cfg.limits.static_cache_valid_seconds);
+    // Unset fields keep the compiled defaults.
+    try testing.expectEqual(@as(usize, 8192), cfg.limits.max_line_bytes);
+    try testing.expectEqual(@as(usize, 16), cfg.limits.static_cache_entries);
+}
 
 test "default config declares echo on the catch-all prefix route" {
     const cfg = Config.default();

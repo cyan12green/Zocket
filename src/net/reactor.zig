@@ -12,6 +12,7 @@ const dsl_pipeline = @import("../dsl/pipeline.zig");
 const static_cache_mod = @import("../dsl/static_cache.zig");
 const cache_mod = @import("../dsl/modules/cache.zig");
 const iouring_mod = @import("iouring.zig");
+const limits_mod = @import("../dsl/limits.zig");
 
 /// I/O backend selection. Default: epoll (measured at parity with the ring
 /// on the keep-alive workloads and more robust at high connection counts).
@@ -143,6 +144,10 @@ pub const Reactor = struct {
     /// IMF-fixdate string is formatted once per wall-clock second and
     /// copied into every response, so per-request date formatting is zero.
     date_cache: [40]u8 = undefined,
+    /// Runtime-tunable limits from the config `limits` section (buffers,
+    /// parser caps, caches, pool). Applied at init; the compiled defaults
+    /// apply when no config sets them.
+    limits: limits_mod.Limits = .{},
     date_len: usize = 0,
     date_sec: u64 = 0,
     /// Per-reactor listener (Milestone 14, SO_REUSEPORT): when set, this
@@ -231,10 +236,26 @@ pub const Reactor = struct {
                 @constCast((http_handler orelse &default_http_handler).stats)
             else
                 null,
-            .static_cache = static_cache_mod.StaticCache.init(allocator),
-            .conn_pool = connection.ConnectionPool.init(allocator),
+            .static_cache = undefined,
+            .conn_pool = undefined,
             .drain_started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
         };
+        // Apply the config `limits` to the per-reactor caches and pool.
+        self.limits = (http_handler orelse &default_http_handler).cfg.limits;
+        self.static_cache = static_cache_mod.StaticCache.initWithConfig(
+            allocator,
+            self.limits.static_cache_entries,
+            self.limits.static_cache_valid_seconds,
+            self.limits.static_content_cache_max,
+        );
+        self.conn_pool = connection.ConnectionPool.initWithConfig(
+            allocator,
+            self.limits.connection_pool_max,
+            self.limits.recv_buffer_size,
+            self.limits.send_buffer_size,
+            self.limits.max_body,
+        );
+
         errdefer self.ep.close();
         self.ep.add(self.wakeup.fd, epoll.Events.In, self.wakeup.fd) catch {
             self.ep.close();
@@ -276,6 +297,9 @@ pub const Reactor = struct {
         // via epoll_ctl DEL, which would EBADF-panic on a closed epoll fd.
         self.closeAllConnections();
         if (self.listener >= 0) posix.close(self.listener);
+        self.static_cache.deinit();
+        self.conn_pool.deinit();
+        self.ring.deinit();
         self.ep.close();
         self.wakeup.close();
         self.connections.deinit();
@@ -583,6 +607,7 @@ pub const Reactor = struct {
                         .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0 },
                         .stats = self.stats,
                         .static_cache = &self.static_cache,
+                        .limits = &self.limits,
                     };
                     const handler = self.http_handler orelse &default_http_handler;
 
@@ -757,8 +782,8 @@ pub const Reactor = struct {
         // buffer, or a request larger than 16 KiB would hit the 431 path).
         if (conn.recv_buf.availableWrite() == 0) {
             conn.recv_buf.compact();
-            if (conn.recv_buf.availableWrite() == 0 and conn.recv_buf.data.len < connection.Connection.max_recv_buffer) {
-                conn.recv_buf.grow(conn.allocator, @min(connection.Connection.max_recv_buffer, conn.recv_buf.data.len * 2)) catch {};
+            if (conn.recv_buf.availableWrite() == 0 and conn.recv_buf.data.len < conn.max_recv_buf) {
+                conn.recv_buf.grow(conn.allocator, @min(conn.max_recv_buf, conn.recv_buf.data.len * 2)) catch {};
             }
         }
         self.rearmTimer(conn);
@@ -842,8 +867,8 @@ pub const Reactor = struct {
             if (conn.recv_buf.availableWrite() == 0) {
                 conn.recv_buf.compact();
                 if (conn.recv_buf.availableWrite() == 0) {
-                    if (conn.recv_buf.data.len < connection.Connection.max_recv_buffer) {
-                        conn.recv_buf.grow(conn.allocator, @min(connection.Connection.max_recv_buffer, conn.recv_buf.data.len * 2)) catch continue;
+                    if (conn.recv_buf.data.len < conn.max_recv_buf) {
+                        conn.recv_buf.grow(conn.allocator, @min(conn.max_recv_buf, conn.recv_buf.data.len * 2)) catch continue;
                     } else continue;
                 }
             }
@@ -1190,8 +1215,8 @@ pub const Reactor = struct {
         }
         if (self.mode == .http) {
             var session = HttpSession{
-                .parser = http_parser.Parser.init(self.allocator),
-                .req = http_parser.Request.init(self.allocator),
+                .parser = http_parser.Parser.initWithLimits(self.allocator, self.limits.max_line_bytes, self.limits.max_chunked_body),
+                .req = http_parser.Request.initWithLimits(self.allocator, self.limits.max_headers),
             };
             if (self.http_sessions.put(conn.fd, session)) |_| {
             } else |_| {

@@ -196,6 +196,8 @@ pub const Request = struct {
     body: []const u8,
 
     allocator: std.mem.Allocator,
+    /// Configured header-count cap (config `limits.max_headers`).
+    max_headers: usize = max_headers,
     /// Bump arena for header strings, the decoded target and the query
     /// string (request-scoped; reset() rewinds). Typical requests fit the
     /// embedded 16 KiB, so they cost zero heap allocations.
@@ -203,11 +205,18 @@ pub const Request = struct {
     /// Assembly buffer for chunked request bodies (Content-Length bodies are
     /// zero-copy views into the connection buffer instead).
     body_storage: std.ArrayList(u8),
-    slots: [max_headers]Slot = undefined,
+    /// Header slots, allocated at the configured limit (per-connection,
+    /// freed in deinit; resets keep them).
+    slots: []Slot = &.{},
     header_count: usize = 0,
     transfer_chunked: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Request {
+        return initWithLimits(allocator, max_headers);
+    }
+
+    /// Like `init`, with a configurable header-count cap (config `limits`).
+    pub fn initWithLimits(allocator: std.mem.Allocator, max_headers_limit: usize) Request {
         return .{
             .method = .unknown,
             .target = "",
@@ -220,12 +229,15 @@ pub const Request = struct {
             .allocator = allocator,
             .arena = arena_mod.Arena.init(allocator),
             .body_storage = .empty,
+            .slots = allocator.alloc(Slot, max_headers_limit) catch &.{},
+            .max_headers = max_headers_limit,
         };
     }
 
     pub fn deinit(self: *Request) void {
         self.arena.deinit();
         self.body_storage.deinit(self.allocator);
+        if (self.slots.len > 0) self.allocator.free(self.slots);
     }
 
     /// Prepare the struct for the next request on the same connection.
@@ -281,7 +293,7 @@ pub const Request = struct {
     }
 
     fn addHeader(self: *Request, name: []const u8, value: []const u8) error{ Malformed, HeaderCountExceeded, OutOfMemory }!void {
-        if (self.header_count >= max_headers) return error.HeaderCountExceeded;
+        if (self.header_count >= self.max_headers) return error.HeaderCountExceeded;
 
         const n = mem.trim(u8, name, " \t");
         const v = mem.trim(u8, value, " \t");
@@ -427,6 +439,9 @@ pub const Parser = struct {
     allocator: std.mem.Allocator,
     state: State = .request_line,
     line: std.ArrayList(u8),
+    /// Configured limits (config `limits`): line cap, chunked-body cap.
+    max_line_bytes: usize = max_line_bytes,
+    max_chunked_body: usize = max_chunked_body,
     body_remaining: usize = 0,
 
     const State = enum {
@@ -442,8 +457,15 @@ pub const Parser = struct {
     const LineError = error{ TooLong, OutOfMemory };
 
     pub fn init(allocator: std.mem.Allocator) Parser {
+        return initWithLimits(allocator, max_line_bytes, max_chunked_body);
+    }
+
+    /// Like `init`, with configurable limits (config `limits`).
+    pub fn initWithLimits(allocator: std.mem.Allocator, line_limit: usize, chunked_limit: usize) Parser {
         return .{
             .allocator = allocator,
+            .max_line_bytes = line_limit,
+            .max_chunked_body = chunked_limit,
             .line = .empty,
         };
     }
@@ -542,7 +564,7 @@ pub const Parser = struct {
                             self.state = .chunk_trailers;
                             continue;
                         }
-                        if (size > max_chunked_body or req.body_storage.items.len + size > max_chunked_body) {
+                        if (size > self.max_chunked_body or req.body_storage.items.len + size > self.max_chunked_body) {
                             return .payload_too_large;
                         }
                         self.body_remaining = size;
@@ -625,8 +647,11 @@ pub const Parser = struct {
         // scratch buffer first, then copied into the arena.
         var decoded: ?[]const u8 = null;
         if (mem.indexOfScalar(u8, target_tok[0..path_len], '%') != null) {
-            var decoded_buf: [max_line_bytes]u8 = undefined;
-            const decoded_bytes = percentDecode(target_tok[0..path_len], &decoded_buf) orelse return .bad_request;
+            // Decode into a separate arena allocation (the raw target must
+            // survive; the decoded output is never longer than the input, so
+            // path_len bytes suffice - no stack buffer sized by the line cap).
+            const scratch = req.arena.alloc(path_len) orelse return .out_of_memory;
+            const decoded_bytes = percentDecode(target_tok[0..path_len], scratch) orelse return .bad_request;
             const copy = req.arena.alloc(decoded_bytes.len) orelse return .out_of_memory;
             @memcpy(copy, decoded_bytes);
             decoded = copy;
@@ -653,7 +678,7 @@ pub const Parser = struct {
         if (mem.indexOfScalar(u8, avail, '\n')) |i| {
             var line = avail[0..i];
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            if (self.line.items.len + line.len > max_line_bytes) return error.TooLong;
+            if (self.line.items.len + line.len > self.max_line_bytes) return error.TooLong;
             try self.line.appendSlice(self.allocator, line);
             buf.consume(i + 1);
             // The '\r' may have arrived in a previous chunk (TCP split between
@@ -665,7 +690,7 @@ pub const Parser = struct {
             }
             return .{ .line_data = items };
         }
-        if (self.line.items.len + avail.len > max_line_bytes) return error.TooLong;
+        if (self.line.items.len + avail.len > self.max_line_bytes) return error.TooLong;
         try self.line.appendSlice(self.allocator, avail);
         buf.consume(avail.len);
         return null;

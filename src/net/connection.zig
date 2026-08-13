@@ -10,10 +10,12 @@ const timer_wheel = @import("timer_wheel.zig");
 /// heap storage only when a request body forces a recv-buffer grow (bounded
 /// by `max_recv_buffer`); that capacity is retained for reuse.
 pub const Connection = struct {
-    /// Upper bound for receive-buffer growth (per connection). Requests that
-    /// still do not fit are rejected by the reactor's buffer-full path.
+    /// Default upper bound for receive-buffer growth (per connection);
+    /// overridable per connection from the config `limits.max_body`.
     pub const max_recv_buffer = 16 * 1024 * 1024;
     pub const default_buf_size = buffer.Buffer.default_size;
+    /// Configured receive-buffer growth cap (config `limits.max_body`).
+    max_recv_buf: usize = max_recv_buffer,
 
     fd: posix.fd_t = -1,
     allocator: std.mem.Allocator,
@@ -49,15 +51,45 @@ pub const Connection = struct {
     /// Free-list link used while the connection is pooled.
     next: ?*Connection = null,
 
-    /// Cold path: one allocation for the whole connection.
+    /// Cold path: one allocation for the whole connection (default sizes;
+    /// the embedded 16 KiB buffers are used when the configured sizes match).
     pub fn create(allocator: std.mem.Allocator, fd: posix.fd_t) !*Connection {
+        return createWithLimits(allocator, fd, default_buf_size, default_buf_size, max_recv_buffer);
+    }
+
+    /// Like `create`, with configurable buffer sizes and growth cap
+    /// (config `limits`: recv_buffer_size / send_buffer_size / max_body).
+    /// When a configured size differs from the embedded default, the buffer
+    /// starts on a heap allocation (owns_data) of the configured size.
+    pub fn createWithLimits(
+        allocator: std.mem.Allocator,
+        fd: posix.fd_t,
+        recv_size: usize,
+        send_size: usize,
+        max_recv: usize,
+    ) !*Connection {
         const conn = try allocator.create(Connection);
-        conn.* = .{
-            .fd = fd,
-            .allocator = allocator,
-            .recv_buf = buffer.Buffer.fromSlice(&conn.read_storage),
-            .send_buf = buffer.Buffer.fromSlice(&conn.write_storage),
-        };
+        conn.* = .{ .fd = fd, .allocator = allocator, .max_recv_buf = max_recv, .recv_buf = buffer.Buffer.fromSlice(&.{}), .send_buf = buffer.Buffer.fromSlice(&.{}) };
+        if (recv_size == default_buf_size) {
+            conn.recv_buf = buffer.Buffer.fromSlice(&conn.read_storage);
+        } else {
+            conn.recv_buf = buffer.Buffer{
+                .data = try allocator.alloc(u8, recv_size),
+                .read_pos = 0,
+                .write_pos = 0,
+                .owns_data = true,
+            };
+        }
+        if (send_size == default_buf_size) {
+            conn.send_buf = buffer.Buffer.fromSlice(&conn.write_storage);
+        } else {
+            conn.send_buf = buffer.Buffer{
+                .data = try allocator.alloc(u8, send_size),
+                .read_pos = 0,
+                .write_pos = 0,
+                .owns_data = true,
+            };
+        }
         return conn;
     }
 
@@ -92,14 +124,14 @@ pub const Connection = struct {
         if (available == 0) {
             self.recv_buf.compact();
             if (self.recv_buf.availableWrite() == 0) {
-                if (self.recv_buf.data.len < max_recv_buffer) {
+                if (self.recv_buf.data.len < self.max_recv_buf) {
                     // Request larger than the default buffer (e.g. a big body):
                     // grow instead of rejecting, up to the per-connection cap.
                     // Doubling lands exactly on the cap (powers of two), so the
                     // buffer can never exceed it; at the cap recv returns
                     // BufferFull and the reactor rejects the request.
-                    try self.recv_buf.grow(self.allocator, @min(max_recv_buffer, self.recv_buf.data.len * 2));
-                    std.debug.assert(self.recv_buf.data.len <= max_recv_buffer);
+                    try self.recv_buf.grow(self.allocator, @min(self.max_recv_buf, self.recv_buf.data.len * 2));
+                    std.debug.assert(self.recv_buf.data.len <= self.max_recv_buf);
                 } else {
                     return error.BufferFull;
                 }
@@ -141,10 +173,34 @@ pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
     free: ?*Connection = null,
     count: usize = 0,
+    /// Configured pool cap (config `limits.connection_pool_max`).
     max_pooled: usize = 1024,
+    /// Configured per-connection buffer sizes and growth cap.
+    recv_size: usize = Connection.default_buf_size,
+    send_size: usize = Connection.default_buf_size,
+    max_recv: usize = Connection.max_recv_buffer,
 
     pub fn init(allocator: std.mem.Allocator) ConnectionPool {
-        return .{ .allocator = allocator };
+        return initWithConfig(allocator, 1024, Connection.default_buf_size, Connection.default_buf_size, Connection.max_recv_buffer);
+    }
+
+    /// Like `init`, with configurable pool cap and connection buffer sizes
+    /// (config `limits`: connection_pool_max / recv_buffer_size /
+    /// send_buffer_size / max_body).
+    pub fn initWithConfig(
+        allocator: std.mem.Allocator,
+        max_pooled: usize,
+        recv_size: usize,
+        send_size: usize,
+        max_recv: usize,
+    ) ConnectionPool {
+        return .{
+            .allocator = allocator,
+            .max_pooled = max_pooled,
+            .recv_size = recv_size,
+            .send_size = send_size,
+            .max_recv = max_recv,
+        };
     }
 
     pub fn deinit(self: *ConnectionPool) void {
@@ -163,7 +219,7 @@ pub const ConnectionPool = struct {
             c.fd = fd;
             return c;
         }
-        const c = try Connection.create(self.allocator, fd);
+        const c = try Connection.createWithLimits(self.allocator, fd, self.recv_size, self.send_size, self.max_recv);
         c.from_pool = true;
         return c;
     }

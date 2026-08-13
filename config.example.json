@@ -1,4 +1,16 @@
 {
+  "limits": {
+    "recv_buffer_size": 16384,
+    "send_buffer_size": 16384,
+    "max_body": 16777216,
+    "max_line_bytes": 8192,
+    "max_headers": 32,
+    "max_chunked_body": 65536,
+    "static_cache_entries": 16,
+    "static_cache_valid_seconds": 1,
+    "static_content_cache_max": 16384,
+    "connection_pool_max": 1024
+  },
   "routes": [
     {
       "path": "/echo",

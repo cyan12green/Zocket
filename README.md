@@ -27,7 +27,8 @@ nginx-feature comparison it leads on every measured workload (see
 | M14 | DONE | Kernel-level: SO_REUSEPORT per-reactor accept, sendfile for static bodies, writev for head+body. |
 | M15 | DONE | Benchmark-driven hardening: on-demand request-buffer growth (large bodies), nginx `open_file_cache`-style static fd cache (+ small-file content cache served as one writev), connection pooling with embedded buffers, request bump arena (zero hot-path allocations), cached Date header, experimental io_uring backend (opt-in `--uring`). Docs: `docs/ROADMAP.md`, `bench/BENCH.md`. |
 
-Roadmap: `docs/ROADMAP.md`.
+Roadmap: `docs/ROADMAP.md`. Configuration reference (routes + limits):
+`docs/config.md`; full sample: `config.example.json`.
 
 ## Source layout
 
@@ -72,7 +73,9 @@ src/
 zig build run                          HTTP mode (default), port 8080
 zig build run -- --threads N           N reactor threads (default: CPU count)
 zig build run -- --port P              change port
-zig build run -- --config <file>       HTTP with a JSON config (routes + module bindings)
+zig build run -- --config <file>       HTTP with a JSON config (routes + module bindings;
+                                       server limits like buffer/body/header caps live in
+                                       the `limits` section - see docs/config.md)
 zig build run -- --echo                raw byte-echo protocol (M1/M2 semantics)
 zig build run -- --single              M1 single-threaded echo server (A/B)
 zig build run -- --idle-timeout S      idle connection timeout in seconds (0 disables)

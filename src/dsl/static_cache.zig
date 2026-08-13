@@ -37,26 +37,46 @@ pub const Entry = struct {
 
 pub const StaticCache = struct {
     allocator: std.mem.Allocator,
-    entries: [max_entries]Entry = undefined,
+    /// Configured entry count (config `limits.static_cache_entries`);
+    /// heap-allocated at init.
+    entries: []Entry = &.{},
+    /// Configured revalidation window (config `limits.static_cache_valid_seconds`).
+    valid_ns: u64 = valid_ns,
+    /// Configured content-cache threshold (config `limits.static_content_cache_max`).
+    content_cache_max: usize = content_cache_max,
 
     pub fn init(allocator: std.mem.Allocator) StaticCache {
-        var c = StaticCache{ .allocator = allocator };
-        for (&c.entries) |*e| e.* = .{};
+        return initWithConfig(allocator, max_entries, valid_ns / std.time.ns_per_s, content_cache_max);
+    }
+
+    /// Like `init`, with configurable cache parameters (config `limits`).
+    pub fn initWithConfig(allocator: std.mem.Allocator, entry_count: usize, valid_seconds: u64, content_max: usize) StaticCache {
+        var c = StaticCache{
+            .allocator = allocator,
+            .valid_ns = valid_seconds * std.time.ns_per_s,
+            .content_cache_max = content_max,
+        };
+        if (entry_count > 0) {
+            c.entries = allocator.alloc(Entry, entry_count) catch &.{};
+        }
+        for (c.entries) |*e| e.* = .{};
         return c;
     }
 
     pub fn deinit(self: *StaticCache) void {
-        for (&self.entries) |*e| self.evict(e);
+        for (self.entries) |*e| self.evict(e);
+        if (self.entries.len > 0) self.allocator.free(self.entries);
+        self.entries = &.{};
     }
 
     /// Find (and if stale, revalidate) the entry for `path`. Returns null on
     /// miss or when the file changed on disk.
     pub fn lookup(self: *StaticCache, path: []const u8) ?*Entry {
         const now = std.time.Instant.now() catch return null;
-        for (&self.entries) |*e| {
+        for (self.entries) |*e| {
             if (!e.in_use) continue;
             if (!std.mem.eql(u8, e.path, path)) continue;
-            if (now.since(e.refreshed) > valid_ns) {
+            if (now.since(e.refreshed) > self.valid_ns) {
                 if (!self.revalidate(e, now)) return null;
             }
             return e;
@@ -75,7 +95,7 @@ pub const StaticCache = struct {
         mtime_secs: u64,
     ) ?*Entry {
         var victim: ?*Entry = null;
-        for (&self.entries) |*e| {
+        for (self.entries) |*e| {
             if (!e.in_use) {
                 victim = e;
                 break;
@@ -92,7 +112,7 @@ pub const StaticCache = struct {
         e.fd = fd;
         e.size = size;
         e.mtime_secs = mtime_secs;
-        if (size <= content_cache_max) {
+        if (size <= self.content_cache_max) {
             const content = self.allocator.alloc(u8, @intCast(size)) catch null;
             if (content) |buf| {
                 var got: usize = 0;
@@ -213,7 +233,7 @@ test "static cache evicts when full" {
         _ = cache.insert(buf, dup, 1, 1) orelse return error.SkipZigTest;
     }
     var used: usize = 0;
-    for (&cache.entries) |*e| {
+    for (cache.entries) |*e| {
         if (e.in_use) used += 1;
     }
     try testing.expectEqual(@as(usize, 16), used);

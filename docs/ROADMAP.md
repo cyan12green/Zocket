@@ -589,6 +589,13 @@ with comptime improvements.
   regressing at high connection counts, so it is opt-in and epoll stays
   the default. (A pure epoll read-once variant was tried and reverted:
   15k vs 304k on GET — the drain loop's probe is not the bottleneck.)
+- **Configurable limits** (nginx-style): the `limits` JSON section (and
+  comptime Config field) makes every hardcoded size/cap runtime-tunable -
+  recv/send buffer sizes, max_body (client_max_body_size), max_line_bytes,
+  max_headers, max_chunked_body, static_cache_entries/valid/content_max
+  (open_file_cache *), connection_pool_max. The reactor applies them at
+  init; modules read `ctx.limits` with compiled defaults as fallback.
+  Reference: docs/config.md.
 - **Lean state machines**: comptime DFA header classification
   (`header_dfa.zig`, 60-292 ns parse), single-pass response serialisation
   with a table itoa, two-iov flush (the zero-copy writev-parts variant
