@@ -16,6 +16,7 @@ pub const http = struct {
     pub const parser = @import("http/parser.zig");
     pub const response = @import("http/response.zig");
     pub const header_dfa = @import("http/header_dfa.zig");
+    pub const arena = @import("http/arena.zig");
 };
 
 pub const dsl = struct {
@@ -60,6 +61,7 @@ comptime {
     _ = @import("http/response.zig");
     _ = @import("http/mime.zig");
     _ = @import("http/header_dfa.zig");
+    _ = @import("http/arena.zig");
     _ = @import("dsl/static_cache.zig");
     _ = @import("ct_pool.zig");
     _ = @import("dsl/phase.zig");

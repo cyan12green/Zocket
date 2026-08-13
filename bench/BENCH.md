@@ -1275,3 +1275,20 @@ string. Two adoptions:
 
 All 170 tests pass (cache unit tests incl. revalidation + symlink escape,
 pool recycle tests).
+
+## Request storage as a bump arena
+
+Request data (header strings, decoded target, query) now lives in a bump
+arena (src/http/arena.zig): a 16 KiB embedded buffer + overflow heap
+blocks (doubling, kept warm across requests). Request-scoped allocations
+never move and are never freed individually; reset() rewinds between
+requests. Typical requests cost zero heap allocations (previously the
+Request.storage ArrayList grew via realloc on first use and on size
+changes); Slot stores slices instead of offsets (arena blocks are not
+contiguous).
+
+Measured under real connection churn (200k connections, Connection: close
+per request, strace): mmap+munmap pairs per connection 7.0 (original) ->
+3.0 (connection pool + embedded buffers) -> 2.0 (+ request arena). The
+remaining two are the session map node and the parser line buffer.
+Steady-state keep-alive requests are unchanged (micro parse ~parity).

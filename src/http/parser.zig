@@ -1,4 +1,5 @@
 const std = @import("std");
+const arena_mod = @import("arena.zig");
 const buffer_mod = @import("../net/buffer.zig");
 const header_dfa_mod = @import("header_dfa.zig");
 
@@ -167,10 +168,9 @@ pub const Outcome = union(enum) {
 };
 
 const Slot = struct {
-    name_off: u32,
-    name_len: u32,
-    value_off: u32,
-    value_len: u32,
+    /// Arena slices: stable until the request is reset.
+    name: []const u8,
+    value: []const u8,
     /// DFA-classified identity of the header name (comptime lookup
     /// structure): lookups compare tags (integers) with no string
     /// verification for known names.
@@ -196,7 +196,10 @@ pub const Request = struct {
     body: []const u8,
 
     allocator: std.mem.Allocator,
-    storage: std.ArrayList(u8),
+    /// Bump arena for header strings, the decoded target and the query
+    /// string (request-scoped; reset() rewinds). Typical requests fit the
+    /// embedded 16 KiB, so they cost zero heap allocations.
+    arena: arena_mod.Arena,
     /// Assembly buffer for chunked request bodies (Content-Length bodies are
     /// zero-copy views into the connection buffer instead).
     body_storage: std.ArrayList(u8),
@@ -215,13 +218,13 @@ pub const Request = struct {
             .content_length = 0,
             .body = &.{},
             .allocator = allocator,
-            .storage = .empty,
+            .arena = arena_mod.Arena.init(allocator),
             .body_storage = .empty,
         };
     }
 
     pub fn deinit(self: *Request) void {
-        self.storage.deinit(self.allocator);
+        self.arena.deinit();
         self.body_storage.deinit(self.allocator);
     }
 
@@ -235,7 +238,7 @@ pub const Request = struct {
         self.keep_alive = true;
         self.content_length = 0;
         self.body = &.{};
-        self.storage.clearRetainingCapacity();
+        self.arena.reset();
         self.body_storage.clearRetainingCapacity();
         self.header_count = 0;
         self.transfer_chunked = false;
@@ -255,15 +258,14 @@ pub const Request = struct {
         if (target_tag != .unknown) {
             for (self.slots[0..self.header_count]) |s| {
                 if (s.tag == target_tag) {
-                    return self.storage.items[s.value_off..][0..s.value_len];
+                    return s.value;
                 }
             }
             return null;
         }
         for (self.slots[0..self.header_count]) |s| {
-            const n = self.storage.items[s.name_off..][0..s.name_len];
-            if (ascii.eqlIgnoreCase(n, name)) {
-                return self.storage.items[s.value_off..][0..s.value_len];
+            if (ascii.eqlIgnoreCase(s.name, name)) {
+                return s.value;
             }
         }
         return null;
@@ -273,8 +275,8 @@ pub const Request = struct {
     pub fn headerAt(self: *const Request, i: usize) struct { name: []const u8, value: []const u8 } {
         const s = self.slots[i];
         return .{
-            .name = self.storage.items[s.name_off..][0..s.name_len],
-            .value = self.storage.items[s.value_off..][0..s.value_len],
+            .name = s.name,
+            .value = s.value,
         };
     }
 
@@ -298,16 +300,14 @@ pub const Request = struct {
             else => {},
         }
 
-        const name_off = self.storage.items.len;
-        try self.storage.appendSlice(self.allocator, n);
-        const value_off = self.storage.items.len;
-        try self.storage.appendSlice(self.allocator, v);
+        const name_copy = self.arena.alloc(n.len) orelse return error.OutOfMemory;
+        @memcpy(name_copy, n);
+        const value_copy = self.arena.alloc(v.len) orelse return error.OutOfMemory;
+        @memcpy(value_copy, v);
 
         self.slots[self.header_count] = .{
-            .name_off = @intCast(name_off),
-            .name_len = @intCast(n.len),
-            .value_off = @intCast(value_off),
-            .value_len = @intCast(v.len),
+            .name = name_copy,
+            .value = value_copy,
             .tag = tag,
         };
         self.header_count += 1;
@@ -595,7 +595,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parseRequestLine(self: *Parser, line: []const u8, req: *Request) ?Outcome {
+    fn parseRequestLine(_: *Parser, line: []const u8, req: *Request) ?Outcome {
         var it = mem.tokenizeAny(u8, line, " \t");
         const method_tok = it.next() orelse return .bad_request;
         const target_tok = it.next() orelse return .bad_request;
@@ -608,37 +608,34 @@ pub const Parser = struct {
         if (version.major != 1) return .unsupported;
         req.version = version;
 
-        const target_off = req.storage.items.len;
-        req.storage.appendSlice(self.allocator, target_tok) catch return .out_of_memory;
+        // The target is copied into the arena (bump allocations never
+        // move, so slices taken here stay valid for the rest of the
+        // request). Targets without escapes alias the arena copy.
+        const target = req.arena.alloc(target_tok.len) orelse return .out_of_memory;
+        @memcpy(target, target_tok);
 
         // Query string split: everything from `?` onwards (including it).
-        var query_off: ?usize = null;
         var path_len = target_tok.len;
         if (mem.indexOfScalar(u8, target_tok, '?')) |qi| {
-            query_off = target_off + qi;
             path_len = qi;
         }
 
-        // Percent-decoded target. Targets without escapes are zero-copy slices
-        // into `storage`; escaped ones are decoded into a stack scratch buffer
-        // first (appending reallocates `storage`, invalidating earlier
-        // slices), then copied into `storage`. All slices are taken only
-        // after every append, once the backing storage is stable.
-        var decoded_off: ?usize = null;
+        // Percent-decoded target. Targets without escapes are zero-copy
+        // slices of the arena copy; escaped ones are decoded into a stack
+        // scratch buffer first, then copied into the arena.
+        var decoded: ?[]const u8 = null;
         if (mem.indexOfScalar(u8, target_tok[0..path_len], '%') != null) {
             var decoded_buf: [max_line_bytes]u8 = undefined;
-            const decoded = percentDecode(target_tok[0..path_len], &decoded_buf) orelse return .bad_request;
-            decoded_off = req.storage.items.len;
-            req.storage.appendSlice(self.allocator, decoded) catch return .out_of_memory;
+            const decoded_bytes = percentDecode(target_tok[0..path_len], &decoded_buf) orelse return .bad_request;
+            const copy = req.arena.alloc(decoded_bytes.len) orelse return .out_of_memory;
+            @memcpy(copy, decoded_bytes);
+            decoded = copy;
         }
 
-        req.target = req.storage.items[target_off .. target_off + target_tok.len];
-        req.decoded_target = if (decoded_off) |off|
-            req.storage.items[off..]
-        else
-            req.storage.items[target_off .. target_off + path_len];
-        req.query_string = if (query_off) |off|
-            req.storage.items[off .. target_off + target_tok.len]
+        req.target = target;
+        req.decoded_target = decoded orelse target[0..path_len];
+        req.query_string = if (mem.indexOfScalar(u8, target, '?')) |off|
+            target[off..]
         else
             "";
         return null;
