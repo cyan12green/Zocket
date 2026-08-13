@@ -1,4 +1,5 @@
 const std = @import("std");
+const ct_pool = @import("../ct_pool.zig");
 
 /// Comptime-built DFA for classifying HTTP header names.
 ///
@@ -71,11 +72,12 @@ pub inline fn classOf(c: u8) u8 {
 }
 
 /// Trie build: names share prefix nodes; every distinct prefix gets one node;
-/// the node a full name ends at carries the name's tag.
+/// the node a full name ends at carries the name's tag. Nodes come from a
+/// typed comptime pool — the arena of this builder — and the finished array
+/// is copied by value into the DFA type's comptime constant.
 fn buildNodes(comptime pairs: anytype, comptime max_nodes: usize) [max_nodes]Node {
-    var nodes: [max_nodes]Node = undefined;
-    for (0..max_nodes) |i| nodes[i] = .{};
-    var count: usize = 1; // node 0 is the root
+    var pool = ct_pool.CtPool(Node, max_nodes){};
+    _ = pool.create(.{}); // node 0 is the root
 
     for (pairs) |p| {
         var state: u16 = 0;
@@ -84,23 +86,23 @@ fn buildNodes(comptime pairs: anytype, comptime max_nodes: usize) [max_nodes]Nod
             if (cls == invalid_class) {
                 @compileError("header DFA name contains a byte outside the alphabet: " ++ p.name);
             }
-            const idx = nodes[state].next[cls];
-            if (idx == no_state) {
-                if (count >= max_nodes) @compileError("header DFA node budget exceeded");
-                nodes[state].next[cls] = @intCast(count);
-                state = @intCast(count);
-                count += 1;
-            } else {
+            const node = &pool.items[state];
+            if (node.next[cls] == no_state) {
+                const idx: u16 = @intCast(pool.len); // the slot create will use
+                _ = pool.create(.{});
+                node.next[cls] = idx;
                 state = idx;
+            } else {
+                state = node.next[cls];
             }
         }
-        if (nodes[state].tag != 0) {
+        if (pool.items[state].tag != 0) {
             @compileError("duplicate header name in DFA set: " ++ p.name);
         }
-        nodes[state].tag = p.tag;
+        pool.items[state].tag = p.tag;
     }
 
-    return nodes;
+    return pool.items;
 }
 
 const testing = std.testing;

@@ -3,6 +3,7 @@ const posix = std.posix;
 const phase_mod = @import("phase.zig");
 const registry = @import("registry.zig");
 const response_mod = @import("../http/response.zig");
+const ct_pool = @import("../ct_pool.zig");
 
 pub const Phase = phase_mod.Phase;
 
@@ -370,16 +371,22 @@ pub fn buildTrie(comptime routes: []const Route) Trie {
 fn buildTrieImpl(comptime routes: []const Route) Trie {
     comptimeCheckAmbiguous(routes);
     const bounds = trieBounds(routes);
-    var nodes: [bounds.nodes]TrieNode = undefined;
-    var edges: [bounds.edges]TrieEdge = undefined;
-    const trie = buildCore(routes, &nodes, &edges) catch unreachable;
-    // Comptime *var* pointers cannot escape into runtime values: copy the
-    // built arrays into consts and re-slice from them.
-    const nodes_const: [bounds.nodes]TrieNode = nodes;
-    const edges_const: [bounds.edges]TrieEdge = edges;
+    // Typed comptime pools are the builder's arena: `buildCore` writes into
+    // their arrays, and once the pools are comptime constants their frozen
+    // slices are plain static data in .rodata (comptime *var* pointers
+    // cannot escape into runtime values, so the pools are broken out of a
+    // comptime block first).
+    const built = blk: {
+        var nodes = ct_pool.CtPool(TrieNode, bounds.nodes){};
+        var edges = ct_pool.CtPool(TrieEdge, bounds.edges){};
+        const trie = buildCore(routes, nodes.items[0..], edges.items[0..]) catch unreachable;
+        nodes.len = trie.nodes.len;
+        edges.len = trie.edges.len;
+        break :blk .{ .nodes = nodes, .edges = edges };
+    };
     return .{
-        .nodes = nodes_const[0..trie.nodes.len],
-        .edges = edges_const[0..trie.edges.len],
+        .nodes = built.nodes.freeze(),
+        .edges = built.edges.freeze(),
     };
 }
 
