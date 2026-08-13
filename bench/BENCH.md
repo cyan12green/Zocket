@@ -1211,3 +1211,37 @@ Final static matrix (six servers, co-resident, after the changes):
 tcp-server now takes the 1 MB cell outright (sendfile + zero-copy writev,
 2.1-2.3x nginx) and is within 1.2-1.5x of nginx on 1 KB static. Raw JSON
 in bench/results/servers/static/.
+
+## Response-path optimization review (2026-08-13): fast itoa/DFA/single-pass win; writev-parts regressed
+
+Four perf commits landed after the static-file work: single-pass response
+serialisation with a table itoa (c633b58), comptime DFA header-name
+classification (be1fc23), the CtPool comptime arena (6685def, plumbing),
+and zero-copy writev response parts (534b240). Micro-benchmark (compare.sh,
+5 rounds x 100k, avg ns/op):
+
+| operation | variant | before | after |
+|---|---:|---:|---:|
+| request_parse | get_min | 80 | 64 |
+| request_parse | get_4h | 436 | 328 |
+| request_parse | post_4h_64b | 407 | 350 |
+| request_parse | post_8h_1k | 602 | 541 |
+| response_build | empty | 41 | 18 |
+| response_build | small | 62 | 26 |
+| response_build | medium | 190 | 58 |
+| response_build | notfound | 66 | 27 |
+
+Real wins: build 2.2-3.3x faster, parse 1.1-1.3x faster. But the server
+level regressed ~8% (controlled isolated A/B, 8 interleaved reps each,
+POST /echo c=100: 288.5k -> 264.2k). Cause: 534b240 emits every response
+as up to 13 iovec segments (status line, per-header name/value, digits,
+body) instead of the two-iov head+body flush; the kernel's per-iov handling
+cost more than the saved serialisation. Fix (this tree): the fast
+single-pass writer stays (writeHeadToBuffer with the table itoa), but the
+head is serialised into the send buffer again and the body is a second iov
+- two iovs per writev. Re-measured: 294.6k vs 293.4k (parity, -0.4%).
+
+Focused tcp-vs-nginx re-check (isolated, interleaved, c=100, after the
+fix): GET / parity (~115k each), POST /echo 1 KB 3.4x ours (133k vs 40k;
+nginx's echo path copies the body twice), 1 KB static nginx 1.30x
+(169k vs 130k), 1 MB static 2.3x ours (10.7k vs 4.6k).

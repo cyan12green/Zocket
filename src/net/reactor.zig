@@ -51,19 +51,16 @@ const HttpSession = struct {
     file_fd: posix.fd_t = -1,
     file_offset: u64 = 0,
     file_remaining: u64 = 0,
-    /// The response currently being flushed (Milestone 15): its scratch and
-    /// header/body slices are what the send_parts iovs reference, so it must
-    /// outlive the flush (kept here instead of on the processHttp stack).
+    /// The response currently being flushed: its scratch and header/body
+    /// slices must outlive the flush (kept here instead of on the
+    /// processHttp stack).
     resp: http_response.Response = http_response.Response.init(.ok),
-    /// writev parts of the current response (Milestone 15): the whole
-    /// response — status line, every header, Content-Length and the body —
-    /// is emitted as zero-copy slices in one writev, so the head is never
-    /// concatenated into the send buffer. `part_index`/`part_offset` track a
-    /// partially flushed response across EPOLLOUT edges.
-    send_parts: [http_response.max_writev_parts]posix.iovec_const = undefined,
-    part_count: usize = 0,
-    part_index: usize = 0,
-    part_offset: usize = 0,
+    /// The response body waiting to be sent (writev body slice; the head
+    /// lives in the send buffer). Empty once fully flushed.
+    pending_body: []const u8 = &.{},
+    /// Whether the response body is a slice that must be freed once fully
+    /// sent (module-allocated).
+    pending_body_owned: bool = false,
 };
 
 /// A single-reactor worker: its own thread, its own epoll instance and its own
@@ -554,23 +551,32 @@ pub const Reactor = struct {
                     }
                     const close = ctx.close_after_write or !session.req.keep_alive;
                     session.resp.setHeader("Connection", if (close) "close" else "keep-alive");
-                    // Milestone 15 writev parts: the whole response — status
-                    // line, every header, Content-Length and the body — is
-                    // emitted as zero-copy slices in one writev, so the head
-                    // is never concatenated into the send buffer.
-                    session.part_count = 0;
-                    session.part_index = 0;
-                    session.part_offset = 0;
+                    conn.send_buf.compact();
+                    // The head (fast single-pass writer, fast itoa) goes into
+                    // the send buffer, the body stays put: one writev of two
+                    // iovs. (Sending the head as many iovec segments instead
+                    // cost more kernel iov handling than the serialisation
+                    // saved — measured -8% on the echo workload.)
                     if (session.resp.body_from_file) {
-                        session.part_count = session.resp.writevHeadParts(&session.send_parts, session.resp.file_len, &.{});
-                    } else if (session.req.method == .head) {
-                        session.part_count = session.resp.writevHeadParts(&session.send_parts, session.resp.body.len, &.{});
-                        if (session.resp.body_owned) {
-                            self.allocator.free(session.resp.body);
-                            session.resp.body_owned = false;
-                        }
+                        session.resp.writeHeadToBufferWithLength(conn.send_buf, session.resp.file_len) catch {
+                            self.freeResponseBody(session);
+                            self.removeConnection(fd);
+                            return;
+                        };
                     } else {
-                        session.part_count = session.resp.writevParts(&session.send_parts);
+                        session.resp.writeHeadToBuffer(conn.send_buf) catch {
+                            self.freeResponseBody(session);
+                            self.removeConnection(fd);
+                            return;
+                        };
+                    }
+                    if (session.req.method == .head or session.resp.body.len == 0) {
+                        session.pending_body = &.{};
+                        session.pending_body_owned = false;
+                        self.freeResponseBody(session);
+                    } else {
+                        session.pending_body = session.resp.body;
+                        session.pending_body_owned = session.resp.body_owned;
                     }
                     if (session.resp.body_from_file) {
                         // Take ownership of the module's fd; the body goes via
@@ -604,42 +610,34 @@ pub const Reactor = struct {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
 
-        // Milestone 15: pipeline responses are emitted as writev parts —
-        // status line, every header, Content-Length and the body as
-        // zero-copy slices, no head concatenation. `part_index`/`part_offset`
-        // resume a partially flushed response on the next EPOLLOUT edge.
-        if (session.part_count > 0) {
-            var iov = session.send_parts[session.part_index..session.part_count];
-            if (session.part_offset > 0 and iov.len > 0) {
-                iov[0].base += session.part_offset;
-                iov[0].len -= session.part_offset;
-            }
-            const n = posix.writev(fd, iov) catch |e| {
+        // One writev for the remaining head + the body.
+        if (session.pending_body.len > 0) {
+            var iov = [_]posix.iovec_const{
+                .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() },
+                .{ .base = session.pending_body.ptr, .len = session.pending_body.len },
+            };
+            const n = posix.writev(fd, &iov) catch |e| {
                 if (e == error.WouldBlock) return;
                 self.freeResponseBody(session);
+                session.pending_body = &.{};
                 self.removeConnection(fd);
                 return;
             };
-            var left = n;
-            while (left > 0 and session.part_index < session.part_count) {
-                const avail = session.send_parts[session.part_index].len - session.part_offset;
-                if (left < avail) {
-                    session.part_offset += left;
-                    left = 0;
-                } else {
-                    left -= avail;
-                    session.part_index += 1;
-                    session.part_offset = 0;
-                }
+            const head_avail = conn.send_buf.availableRead();
+            if (n <= head_avail) {
+                conn.send_buf.consume(n);
+            } else {
+                conn.send_buf.consume(head_avail);
+                session.pending_body = session.pending_body[n - head_avail ..];
             }
-            if (session.part_index < session.part_count) {
-                // Socket buffer full mid-response; continue on EPOLLOUT.
+            if (session.pending_body.len > 0) {
+                // Socket buffer full; continue on the next EPOLLOUT edge.
                 return;
             }
-            session.part_count = 0;
-            session.part_index = 0;
-            session.part_offset = 0;
             self.freeResponseBody(session);
+            session.pending_body_owned = false;
+            session.pending_body = &.{};
+            if (conn.send_buf.availableRead() > 0) return;
         } else {
             while (conn.send_buf.availableRead() > 0) {
                 const n = conn.send() catch |e| {
