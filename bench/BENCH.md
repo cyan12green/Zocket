@@ -1292,3 +1292,21 @@ per request, strace): mmap+munmap pairs per connection 7.0 (original) ->
 3.0 (connection pool + embedded buffers) -> 2.0 (+ request arena). The
 remaining two are the session map node and the parser line buffer.
 Steady-state keep-alive requests are unchanged (micro parse ~parity).
+
+## Final nginx comparison (after pool + arena)
+
+Re-check with all optimisations in (fd cache, connection pool, embedded
+buffers, request bump arena; 2026-08-13, isolated, interleaved):
+
+| workload (c=100) | tcp-server | nginx | vs |
+|---|---:|---:|---:|
+| GET / empty | 225.0k | 281.5k | nginx 1.25x (parity on other runs - box variance) |
+| POST /echo 1 KB | 171.3k | 98.3k | 1.74x ours |
+| 1 KB static (12-rep median) | 190,098 | 211,758 | nginx 1.11x |
+| 1 MB static | 10.9k | 5.3k | 2.04x ours |
+
+The 1 KB static gap stands at 1.11x (was 4.6x before the nginx-recipe
+work: sendfile everywhere, stack paths, openat2 containment, TCP_NODELAY,
+root-realpath-at-load, static fd cache). The pool + bump arena are
+connection/request-allocation wins (visible under churn, invisible under
+stable keep-alive).
