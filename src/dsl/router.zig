@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const phase_mod = @import("phase.zig");
 const registry = @import("registry.zig");
 const response_mod = @import("../http/response.zig");
@@ -37,6 +38,17 @@ pub const Route = struct {
     /// `index` file for directories; `autoindex` to list them. `embed` names
     /// a file baked into .rodata at compile time (`embed_bytes`).
     root: ?[]const u8 = null,
+    /// Resolved realpath of `root`, computed once at JSON config load
+    /// (nginx-style: it never realpaths per request either). Null for
+    /// comptime/struct-literal routes (immutable) and JSON routes without a
+    /// root; the static module falls back to a per-request realpath then.
+    root_real: ?[]const u8 = null,
+    /// O_PATH|O_DIRECTORY fd of `root`, opened once at JSON config load
+    /// (Milestone 14 follow-up): the static module resolves targets against
+    /// it with openat2(RESOLVE_BENEATH), one syscall with kernel-enforced
+    /// containment instead of a per-request open + realpath pair. -1 when
+    /// unset; the legacy per-request path is used then.
+    root_fd: posix.fd_t = -1,
     index: ?[]const u8 = null,
     autoindex: bool = false,
     embed: ?[]const u8 = null,

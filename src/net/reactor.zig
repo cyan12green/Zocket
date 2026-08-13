@@ -764,6 +764,11 @@ pub const Reactor = struct {
                 error.WouldBlock => return,
                 else => return,
             };
+            // TCP_NODELAY on accepted connections: nginx (default), Caddy
+            // and Bun all enable it; without it the Nagle/delayed-ACK
+            // interlock adds ~40 ms stalls to small two-part responses.
+            // One setsockopt per connection, amortized over keep-alive.
+            sockets.setTcpNoDelay(conn_fd);
             if (self.accepted_counter) |c| _ = c.fetchAdd(1, .monotonic);
             if (self.draining.load(.acquire)) {
                 posix.close(conn_fd);

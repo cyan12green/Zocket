@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const registry = @import("../registry.zig");
 const cache_mod = @import("cache.zig");
 const mime = @import("../../http/mime.zig");
@@ -31,8 +32,8 @@ const Stat = std.fs.File.Stat;
 fn run(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
     if (route.embed != null) return serveEmbedded(ctx, route);
-    const root = route.root orelse return .pass;
-    return serveDisk(ctx, route, root);
+    if (route.root == null) return .pass;
+    return serveDisk(ctx, route);
 }
 
 // ---- Comptime embedded path ----
@@ -73,7 +74,7 @@ const Meta = struct {
     is_dir: bool,
 };
 
-fn serveDisk(ctx: *Context, route: *const registry.Route, root: []const u8) !Action {
+fn serveDisk(ctx: *Context, route: *const registry.Route) !Action {
     // Strip the route prefix: "/static/hello.txt" on a "/static" route
     // resolves to root + "/hello.txt".
     var target = ctx.req.decoded_target;
@@ -84,48 +85,185 @@ fn serveDisk(ctx: *Context, route: *const registry.Route, root: []const u8) !Act
         return notFound(ctx);
     }
 
-    const allocator = ctx.allocator orelse return .pass;
-    var full = std.ArrayList(u8).empty;
-    defer full.deinit(allocator);
-    try full.appendSlice(allocator, root);
-    if (target.len > 0) {
-        if (full.items.len == 0 or full.items[full.items.len - 1] != '/') {
-            try full.append(allocator, '/');
-        }
-        try full.appendSlice(allocator, target);
+    // JSON configs carry a root fd: resolve against it with
+    // openat2(RESOLVE_BENEATH) — one syscall, kernel-enforced containment
+    // (no per-request open + realpath pair, no TOCTOU). Comptime routes and
+    // openat2-less environments fall back to the stack-path + realpath
+    // check (serveDiskLegacy).
+    if (route.root_fd >= 0) {
+        return serveDiskBeneath(ctx, route, target);
     }
 
-    // The resolved root realpath anchors the symlink-escape check.
-    var root_real_buf: [max_path]u8 = undefined;
-    const root_real = std.fs.cwd().realpath(root, &root_real_buf) catch return notFound(ctx);
+    return serveDiskLegacy(ctx, route, target);
+}
 
-    const meta = statPath(full.items) catch {
+fn serveDiskLegacy(ctx: *Context, route: *const registry.Route, target: []const u8) !Action {
+    const root = route.root orelse return .pass;
+    // Resolved path on the stack (no per-request allocation, nginx-style).
+    var full_buf: [max_path]u8 = undefined;
+    const used = buildFullPath(&full_buf, root, target) orelse return notFound(ctx);
+    const full = full_buf[0..used];
+
+    // The resolved root realpath anchors the symlink-escape check. JSON
+    // configs precompute it at load (route.root_real); comptime routes fall
+    // back to a per-request realpath.
+    var root_real_buf: [max_path]u8 = undefined;
+    const root_real = if (route.root_real) |rr|
+        rr
+    else
+        std.fs.cwd().realpath(root, &root_real_buf) catch return notFound(ctx);
+
+    const meta = statPath(full) catch {
         return notFound(ctx);
     };
 
     if (meta.is_dir) {
         // Directory: serve the configured index file, else autoindex.
         if (route.index) |index_file| {
-            const old_len = full.items.len;
-            if (full.items[full.items.len - 1] != '/') {
-                try full.append(allocator, '/');
-            }
-            try full.appendSlice(allocator, index_file);
-            const idx_meta = statPath(full.items) catch {
-                full.shrinkRetainingCapacity(old_len);
-                return if (route.autoindex) autoindex(ctx, full.items[0..old_len]) else notFound(ctx);
+            var idx_buf: [max_path]u8 = undefined;
+            const idx_used = buildFullPath(&idx_buf, full, index_file) orelse return notFound(ctx);
+            const idx_path = idx_buf[0..idx_used];
+            const idx_meta = statPath(idx_path) catch {
+                return if (route.autoindex) autoindexPath(ctx, full) else notFound(ctx);
             };
             if (idx_meta.is_dir) {
-                full.shrinkRetainingCapacity(old_len);
-                return if (route.autoindex) autoindex(ctx, full.items[0..old_len]) else notFound(ctx);
+                return if (route.autoindex) autoindexPath(ctx, full) else notFound(ctx);
             }
-            return serveFile(ctx, full.items, idx_meta, root_real);
+            return serveFile(ctx, idx_path, idx_meta, root_real);
         }
-        if (route.autoindex) return autoindex(ctx, full.items);
+        if (route.autoindex) return autoindexPath(ctx, full);
         return notFound(ctx);
     }
 
-    return serveFile(ctx, full.items, meta, root_real);
+    return serveFile(ctx, full, meta, root_real);
+}
+
+/// root + "/" + target into `buf`; null when it would not fit.
+fn buildFullPath(buf: []u8, root: []const u8, target: []const u8) ?usize {
+    if (root.len + 1 + target.len > buf.len) return null;
+    @memcpy(buf[0..root.len], root);
+    var used = root.len;
+    if (target.len > 0) {
+        if (used == 0 or buf[used - 1] != '/') {
+            buf[used] = '/';
+            used += 1;
+        }
+        @memcpy(buf[used .. used + target.len], target);
+        used += target.len;
+    }
+    return used;
+}
+
+// ---- openat2(RESOLVE_BENEATH) fast path (JSON configs) ----
+
+const linux = std.os.linux;
+const SYS_openat2 = linux.SYS.openat2;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_BENEATH: u64 = 0x08;
+const OpenHow = extern struct {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+};
+
+/// Open `path` (relative, no leading slash) against `dirfd`, refusing to
+/// follow anything that escapes it: ".." segments and symlink escapes are
+/// rejected by the kernel. `error.Unsupported` when openat2 is not
+/// available (pre-5.6 kernels, seccomp-filtered sandboxes) — callers fall
+/// back to the realpath check.
+fn openat2Beneath(dirfd: posix.fd_t, path: []const u8) error{ Unsupported, NotFound }!posix.fd_t {
+    const how = OpenHow{
+        .flags = 0, // O_RDONLY
+        .mode = 0,
+        .resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+    };
+    // openat2 has no length parameter: the path must be NUL-terminated, and
+    // request targets are slices into the request buffer (not terminated).
+    var path_buf: [max_path + 1]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NotFound;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const rc = linux.syscall4(SYS_openat2, @intCast(dirfd), @intFromPtr(&path_buf), @intFromPtr(&how), @sizeOf(OpenHow));
+    const err = posix.errno(rc);
+    return switch (err) {
+        .SUCCESS => @intCast(rc),
+        .NOSYS, .INVAL => error.Unsupported,
+        else => error.NotFound,
+    };
+}
+
+fn statFd(fd: posix.fd_t) error{ NotFound, AccessDenied, Unexpected }!Meta {
+    const st = (std.fs.File{ .handle = fd }).stat() catch |e| switch (e) {
+        error.AccessDenied => return error.AccessDenied,
+        else => return error.Unexpected,
+    };
+    return .{
+        .size = st.size,
+        .mtime_secs = @intCast(@max(0, @divTrunc(st.mtime.nanoseconds, std.time.ns_per_s))),
+        .is_dir = st.kind == .directory,
+    };
+}
+
+fn serveDiskBeneath(ctx: *Context, route: *const registry.Route, target: []const u8) !Action {
+    var rel = target;
+    while (rel.len > 0 and rel[0] == '/') rel = rel[1..];
+    if (rel.len == 0) rel = ".";
+
+    // openat2 unavailable (old kernel / sandbox): fall back to the legacy
+    // realpath path for this request.
+    const fd = openat2Beneath(route.root_fd, rel) catch |e| switch (e) {
+        error.Unsupported => return serveDiskLegacy(ctx, route, target),
+        error.NotFound => return notFound(ctx),
+    };
+    const meta = statFd(fd) catch |e| {
+        std.debug.print("beneath: statFd failed {}\n", .{e});
+        posix.close(fd);
+        return notFound(ctx);
+    };
+
+    if (meta.is_dir) {
+        // Directory: serve the configured index file, else autoindex.
+        if (route.index) |index_file| {
+            var idx_buf: [max_path]u8 = undefined;
+            const idx_rel = buildRelPath(&idx_buf, rel, index_file) orelse {
+                posix.close(fd);
+                return notFound(ctx);
+            };
+            const idx_fd = openat2Beneath(route.root_fd, idx_buf[0..idx_rel]) catch {
+                posix.close(fd);
+                return if (route.autoindex) autoindex(ctx, fd, rel) else notFound(ctx);
+            };
+            const idx_meta = statFd(idx_fd) catch {
+                posix.close(fd);
+                posix.close(idx_fd);
+                return notFound(ctx);
+            };
+            if (idx_meta.is_dir) {
+                posix.close(idx_fd);
+                return if (route.autoindex) autoindex(ctx, fd, rel) else notFound(ctx);
+            }
+            posix.close(fd);
+            return serveFd(ctx, idx_fd, idx_meta, idx_buf[0..idx_rel]);
+        }
+        if (route.autoindex) return autoindex(ctx, fd, rel);
+        posix.close(fd);
+        return notFound(ctx);
+    }
+
+    return serveFd(ctx, fd, meta, rel);
+}
+
+/// rel + "/" + sub into `buf`; null when it would not fit.
+fn buildRelPath(buf: []u8, rel: []const u8, sub: []const u8) ?usize {
+    if (rel.len + 1 + sub.len > buf.len) return null;
+    @memcpy(buf[0..rel.len], rel);
+    var used = rel.len;
+    if (used == 0 or buf[used - 1] != '/') {
+        buf[used] = '/';
+        used += 1;
+    }
+    @memcpy(buf[used .. used + sub.len], sub);
+    return used + sub.len;
 }
 
 /// Block `..` segments (run on the percent-decoded target) and NUL bytes.
@@ -166,8 +304,18 @@ fn realpathWithinRoot(path: []const u8, root_real: []const u8) bool {
 }
 
 fn serveFile(ctx: *Context, path: []const u8, meta: Meta, root_real: []const u8) !Action {
-    var resp = ctx.resp;
     if (!realpathWithinRoot(path, root_real)) return notFound(ctx);
+    const file = std.fs.cwd().openFile(path, .{}) catch return notFound(ctx);
+    return serveFd(ctx, file.handle, meta, path);
+}
+
+/// Shared file-response logic (conditional GETs, ranges, sendfile handoff).
+/// Takes ownership of `fd`: closes it on early returns, transfers it to the
+/// response on success.
+fn serveFd(ctx: *Context, fd: posix.fd_t, meta: Meta, mime_path: []const u8) !Action {
+    var resp = ctx.resp;
+    var transferred = false;
+    defer if (!transferred) posix.close(fd);
 
     // Entity metadata for the conditional-GET / cache machinery.
     var scratch: [160]u8 = undefined;
@@ -186,7 +334,7 @@ fn serveFile(ctx: *Context, path: []const u8, meta: Meta, root_real: []const u8)
     }
 
     resp.status = .ok;
-    resp.setHeader("Content-Type", mime.mimeForPath(path));
+    resp.setHeader("Content-Type", mime.mimeForPath(mime_path));
     resp.setHeaderFmt("ETag", "{s}", .{etag});
     resp.setHeaderFmt("Last-Modified", "{s}", .{lm});
     resp.setHeader("Accept-Ranges", "bytes");
@@ -213,39 +361,17 @@ fn serveFile(ctx: *Context, path: []const u8, meta: Meta, root_real: []const u8)
         }
     }
 
-    const allocator = ctx.allocator orelse return .pass;
-    const file = std.fs.cwd().openFile(path, .{}) catch return notFound(ctx);
-    errdefer file.close();
-
-    if (length >= sendfile_threshold) {
-        // Milestone 14: push the body from the file straight into the socket.
-        // The reactor takes ownership of the fd.
-        resp.body_from_file = true;
-        resp.file_fd = file.handle;
-        resp.file_offset = offset;
-        resp.file_len = length;
-        return .handled;
-    }
-
-    const body = allocator.alloc(u8, @intCast(length)) catch return error.OutOfMemory;
-    errdefer allocator.free(body);
-    if (offset > 0) {
-        file.seekTo(offset) catch return error.ReadFailed;
-    }
-    var got: usize = 0;
-    while (got < body.len) {
-        const n = file.read(body[got..]) catch return error.ReadFailed;
-        if (n == 0) break;
-        got += n;
-    }
-    resp.body = body[0..got];
-    resp.body_owned = true;
+    // Milestone 14: push the body from the file straight into the socket.
+    // sendfile for every size (like nginx): one kernel copy, no userspace
+    // buffer, no per-request allocation. The reactor takes ownership of
+    // the fd.
+    resp.body_from_file = true;
+    resp.file_fd = fd;
+    resp.file_offset = offset;
+    resp.file_len = length;
+    transferred = true;
     return .handled;
 }
-
-/// Files at least this large are served via sendfile (Milestone 14); smaller
-/// ones via the read loop (one write, no extra syscall state).
-pub const sendfile_threshold = 16 * 1024;
 
 fn notFound(ctx: *Context) Action {
     ctx.resp.status = .not_found;
@@ -259,16 +385,16 @@ fn notModified(ctx: *Context) Action {
     return .handled;
 }
 
-/// Minimal HTML directory listing (autoindex).
-fn autoindex(ctx: *Context, dir_path: []const u8) !Action {
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return notFound(ctx);
-    defer dir.close();
+/// Minimal HTML directory listing (autoindex). Takes the open directory fd
+/// (path-based callers open it first); the caller keeps ownership.
+fn autoindex(ctx: *Context, dir_fd: posix.fd_t, display_target: []const u8) !Action {
+    var dir = std.fs.Dir{ .fd = dir_fd };
 
     var out = std.ArrayList(u8).empty;
     const allocator = ctx.allocator orelse return .pass;
     defer out.deinit(allocator);
     try out.appendSlice(allocator, "<html><head><title>Index of ");
-    try out.appendSlice(allocator, ctx.req.decoded_target);
+    try out.appendSlice(allocator, display_target);
     try out.appendSlice(allocator, "</title></head><body><ul>");
 
     var it = dir.iterate();
@@ -276,8 +402,8 @@ fn autoindex(ctx: *Context, dir_path: []const u8) !Action {
         var name_buf: [512]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "{s}{s}", .{ entry.name, if (entry.kind == .directory) "/" else "" }) catch continue;
         try out.appendSlice(allocator, "<li><a href=\"");
-        try out.appendSlice(allocator, ctx.req.decoded_target);
-        if (ctx.req.decoded_target.len == 0 or ctx.req.decoded_target[ctx.req.decoded_target.len - 1] != '/') {
+        try out.appendSlice(allocator, display_target);
+        if (display_target.len == 0 or display_target[display_target.len - 1] != '/') {
             try out.append(allocator, '/');
         }
         try out.appendSlice(allocator, name);
@@ -292,6 +418,14 @@ fn autoindex(ctx: *Context, dir_path: []const u8) !Action {
     ctx.resp.body_owned = true;
     ctx.resp.setHeader("Content-Type", "text/html");
     return .handled;
+}
+
+/// Path-based autoindex (comptime-route fallback): open the dir, delegate,
+/// close.
+fn autoindexPath(ctx: *Context, dir_path: []const u8) !Action {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return notFound(ctx);
+    defer dir.close();
+    return autoindex(ctx, dir.fd, ctx.req.decoded_target);
 }
 
 // ---- Range parsing (RFC 9110 §14.2) ----
@@ -445,7 +579,10 @@ test "serves a disk file byte-identical with correct headers" {
     defer served.deinit();
 
     try testing.expectEqual(registry.Status.ok, served.resp.status);
-    try testing.expectEqualStrings("hello static world\n", served.resp.body);
+    // sendfile path: the body stays in the file; the reactor pushes it.
+    try testing.expectEqual(@as(usize, 19), served.resp.file_len);
+    try testing.expectEqual(@as(usize, 0), served.resp.file_offset);
+    try testing.expect(served.resp.body_from_file);
     try testing.expectEqualStrings("text/plain", headerValue(&served.resp, "Content-Type").?);
     try testing.expectEqualStrings("bytes", headerValue(&served.resp, "Accept-Ranges").?);
     try testing.expect(headerValue(&served.resp, "ETag") != null);
@@ -458,8 +595,10 @@ test "serves the index file for a directory" {
     var served = try serveWith(allocator, "GET /dir/ HTTP/1.1\r\nHost: x\r\n\r\n", &route);
     defer served.deinit();
     try testing.expectEqual(registry.Status.ok, served.resp.status);
-    try testing.expectEqualStrings("index content\n", served.resp.body);
+    try testing.expectEqual(@as(usize, 14), served.resp.file_len);
+    try testing.expect(served.resp.body_from_file);
     try testing.expectEqualStrings("text/html", headerValue(&served.resp, "Content-Type").?);
+    posix.close(served.resp.file_fd);
 }
 
 test "single range yields 206 with the right slice and Content-Range" {
@@ -468,13 +607,17 @@ test "single range yields 206 with the right slice and Content-Range" {
     var served = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n", &route);
     defer served.deinit();
     try testing.expectEqual(registry.Status.partial_content, served.resp.status);
-    try testing.expectEqualStrings("hello", served.resp.body);
+    try testing.expectEqual(@as(usize, 0), served.resp.file_offset);
+    try testing.expectEqual(@as(usize, 5), served.resp.file_len);
     try testing.expectEqualStrings("bytes 0-4/19", headerValue(&served.resp, "Content-Range").?);
+    posix.close(served.resp.file_fd);
 
     var suffix = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=-5\r\n\r\n", &route);
     defer suffix.deinit();
     try testing.expectEqual(registry.Status.partial_content, suffix.resp.status);
-    try testing.expectEqualStrings("orld\n", suffix.resp.body);
+    try testing.expectEqual(@as(usize, 14), suffix.resp.file_offset);
+    try testing.expectEqual(@as(usize, 5), suffix.resp.file_len);
+    posix.close(suffix.resp.file_fd);
 }
 
 test "unsatisfiable range yields 416 with Content-Range" {
@@ -492,7 +635,8 @@ test "conditional GET yields 304 on a matching If-None-Match" {
     // First: learn the ETag from a normal request.
     var first = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\n\r\n", &route);
     const etag = headerValue(&first.resp, "ETag").?;
-    try testing.expectEqualStrings("hello static world\n", first.resp.body);
+    try testing.expect(first.resp.body_from_file);
+    posix.close(first.resp.file_fd);
 
     var wire_buf: [256]u8 = undefined;
     const wire = std.fmt.bufPrint(&wire_buf, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nIf-None-Match: {s}\r\n\r\n", .{etag}) catch unreachable;
@@ -526,4 +670,49 @@ test "embedded asset serves byte-identical content with infinite cache" {
     try testing.expectEqualStrings(@import("embeds").embed("testdata/hello.txt"), served.resp.body);
     try testing.expectEqualStrings("public, max-age=31536000", headerValue(&served.resp, "Cache-Control").?);
     try testing.expect(!served.resp.body_owned);
+}
+
+test "openat2 fast path serves beneath the root fd and blocks symlink escapes" {
+    const allocator = testing.allocator;
+    var dir = std.fs.cwd().openDir("testdata", .{}) catch return error.SkipZigTest;
+    defer dir.close();
+    const route = registry.Route{
+        .path = "/",
+        .root = "testdata",
+        .root_real = "testdata",
+        .root_fd = dir.fd,
+    };
+
+    // The fast path needs openat2; skip in environments that block it
+    // (pre-5.6 kernels, seccomp-filtered test sandboxes).
+    const probe = openat2Beneath(dir.fd, "hello.txt") catch |e| switch (e) {
+        error.Unsupported => return error.SkipZigTest,
+        error.NotFound => return error.SkipZigTest,
+    };
+    posix.close(probe);
+
+    var served = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\n\r\n", &route);
+    defer served.deinit();
+    try testing.expectEqual(registry.Status.ok, served.resp.status);
+    try testing.expectEqual(@as(usize, 19), served.resp.file_len);
+    try testing.expect(served.resp.body_from_file);
+    try testing.expectEqualStrings("text/plain", headerValue(&served.resp, "Content-Type").?);
+    posix.close(served.resp.file_fd);
+
+    // A symlink inside the root pointing outside must be refused by the
+    // kernel (RESOLVE_BENEATH), same as the legacy realpath check.
+    const link_path = "testdata/link-escape-tmp";
+    std.fs.cwd().symLink("/etc/hostname", link_path, .{}) catch return error.SkipZigTest;
+    defer std.fs.cwd().deleteFile(link_path) catch {};
+    var escaped = try serveWith(allocator, "GET /link-escape-tmp HTTP/1.1\r\nHost: x\r\n\r\n", &route);
+    defer escaped.deinit();
+    try testing.expectEqual(registry.Status.not_found, escaped.resp.status);
+
+    // Range through the fast path still slices.
+    var ranged = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n", &route);
+    defer ranged.deinit();
+    try testing.expectEqual(registry.Status.partial_content, ranged.resp.status);
+    try testing.expectEqual(@as(usize, 0), ranged.resp.file_offset);
+    try testing.expectEqual(@as(usize, 5), ranged.resp.file_len);
+    posix.close(ranged.resp.file_fd);
 }

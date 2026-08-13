@@ -144,3 +144,10 @@ pub fn peerIp(fd: posix.fd_t) [4]u8 {
     } else |_| {}
     return .{ 0, 0, 0, 0 };
 }
+
+/// Enable TCP_NODELAY on a connected socket (accepted connections).
+/// nginx (default), Caddy and Bun all enable it; without it, small
+/// two-part responses can stall on the Nagle/delayed-ACK interlock.
+pub fn setTcpNoDelay(fd: posix.fd_t) void {
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+}

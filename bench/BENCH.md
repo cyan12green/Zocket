@@ -1053,3 +1053,73 @@ Config parity notes: nginx needs nothing extra (sendfile + nodelay are
 defaults); Caddy needs the file_server block and root; actix needs
 tcp_nodelay(true) and open_async (blocking open tanks the async workers);
 Bun needs BUN_STATIC; httpx needs --static with a startup preload.
+
+## How nginx wins small static — and what we adopted
+
+After the initial six-server static run, the 1 KB cell showed nginx at
+4.6x tcp-server (219.9k vs 47.9k co-resident; 233k vs 67k isolated).
+nginx's per-request recipe for that path, versus ours at the time:
+
+| step | nginx | tcp-server (before) |
+|---|---|---|
+| body | sendfile for every size (0 allocs, 1 syscall) | read into a heap buffer for files < 16 KB (1 mmap+munmap pair, 1 read, 1 user copy) |
+| path | pre-resolved in config | per-request path ArrayList (another alloc) |
+| containment | none (trusts its config) | 2 realpaths per request (root + file) |
+| TCP | NODELAY on by default | never set (later verified non-issue for us: no interlock on single-write responses) |
+
+What we changed (src/net/{sockets,reactor}.zig, src/dsl/{router,modules/static}.zig,
+src/runtime/config.zig):
+1. sendfile for all file sizes (the < 16 KB read path is gone).
+2. The resolved path builds on the stack — the per-request ArrayList was
+   the single biggest cost: removing it alone was +80% (67k -> 121k
+   isolated), because the reactor's allocator turned every path buffer
+   into an mmap+munmap pair per request.
+3. Root realpath computed once at JSON config load (route.root_real).
+4. openat2(RESOLVE_BENEATH|NO_MAGICLINKS) against a root dirfd opened at
+   load: the file containment check is now one kernel-enforced syscall
+   (no per-request open + realpath pair, and no TOCTOU window). Falls back
+   to the legacy realpath path on kernels/sandboxes without openat2.
+5. TCP_NODELAY on accepted connections (nginx/Caddy/Bun parity).
+
+Measured effect on the 1 KB static cell:
+
+| run | tcp-server | vs nginx |
+|---|---:|---:|
+| baseline (read path, per-request allocs/realpaths) | 47,870 co-resident / 67,449 isolated | 4.6x / 3.5x behind |
+| + sendfile everywhere + nodelay | 54,836 co-resident | 4.0x behind |
+| + root_realpath cache + stack path | 56,112 co-resident | 3.7x behind |
+| + openat2 fast path | **146,041 co-resident / 150,607 isolated** | **1.45x / 1.3x behind** |
+
+The remaining ~1.3x vs nginx is its 30-year-tuned per-request machinery
+(zero allocs, one-shot header building, no pipeline indirection) — the
+levers we had (syscalls, allocs, realpaths) are spent; the residual is
+instruction-level.
+
+Final static matrix (six servers, co-resident, after the changes):
+
+| cell | server | reqs/sec | vs tcp-server | p50 | p95 | p99 | throughput |
+|---|---|---:|---:|---:|---:|---:|---:|
+| GET /static 1 KB, c=100 | nginx | 211,638 | 1.45x | 0.43 ms | 1.00 ms | 1.47 ms | 266 MB/s |
+| | tcp-server | 146,041 | 1.00x | 0.58 ms | 1.50 ms | 2.91 ms | 179 MB/s |
+| | actix-web | 83,793 | 0.57x | 1.00 ms | 2.50 ms | 4.06 ms | 109 MB/s |
+| | Bun.serve | 57,995 | 0.40x | 1.65 ms | 2.39 ms | 2.75 ms | 68 MB/s |
+| | Caddy | 43,152 | 0.30x | 1.83 ms | 6.38 ms | 8.77 ms | 53 MB/s |
+| GET /static 1 KB, c=1000 | nginx | 174,029 | 1.23x | 5.25 ms | 10.75 ms | 15.62 ms | 218 MB/s |
+| | tcp-server | 141,586 | 1.00x | 6.47 ms | 12.02 ms | 16.67 ms | 172 MB/s |
+| | actix-web | 78,635 | 0.56x | 11.92 ms | 27.99 ms | 38.19 ms | 102 MB/s |
+| | Bun.serve | 51,013 | 0.36x | 19.22 ms | 24.54 ms | 26.37 ms | 60 MB/s |
+| | Caddy | 35,886 | 0.25x | 29.98 ms | 43.28 ms | 51.71 ms | 44 MB/s |
+| GET /static 1 MB, c=100 | tcp-server | 11,543 | 1.00x | 6.97 ms | 20.15 ms | 31.56 ms | 12083 MB/s |
+| | Caddy | 10,851 | 0.94x | 7.42 ms | 24.70 ms | 32.79 ms | 11362 MB/s |
+| | Bun.serve | 8,294 | 0.72x | 10.60 ms | 17.48 ms | 18.84 ms | 8689 MB/s |
+| | nginx | 4,960 | 0.43x | 17.30 ms | 40.08 ms | 58.84 ms | 5184 MB/s |
+| | actix-web | 2,393 | 0.21x | 40.48 ms | 59.58 ms | 76.31 ms | 2509 MB/s |
+| GET /static 1 MB, c=1000 | tcp-server | 10,196 | 1.00x | 86.08 ms | 194.13 ms | 345.51 ms | 10560 MB/s |
+| | Caddy | 9,907 | 0.97x | 93.29 ms | 177.03 ms | 295.62 ms | 10271 MB/s |
+| | Bun.serve | 8,183 | 0.80x | 119.34 ms | 150.37 ms | 177.06 ms | 8576 MB/s |
+| | nginx | 4,656 | 0.46x | 144.21 ms | 289.39 ms | 3875.98 ms | 4681 MB/s |
+| | actix-web | 2,170 | 0.21x | 450.74 ms | 558.84 ms | 732.74 ms | 2309 MB/s |
+
+tcp-server now takes the 1 MB cell outright (sendfile + zero-copy writev,
+2.1-2.3x nginx) and is within 1.2-1.5x of nginx on 1 KB static. Raw JSON
+in bench/results/servers/static/.

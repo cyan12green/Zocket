@@ -55,6 +55,8 @@ pub const Config = struct {
             allocator.free(r.modules);
             allocator.free(r.path);
             if (r.root) |root| allocator.free(root);
+            if (r.root_real) |rr| allocator.free(rr);
+            if (r.root_fd >= 0) std.posix.close(r.root_fd);
             if (r.index) |index| allocator.free(index);
             if (r.response) |*t| {
                 for (t.headers) |h| {
@@ -107,6 +109,24 @@ pub const Config = struct {
 
             const root = if (jr.root) |r| try allocator.dupe(u8, r) else null;
             errdefer if (root) |r| allocator.free(r);
+            // Resolve the root realpath once at load (nginx never realpaths
+            // per request either): the static module's symlink-escape anchor.
+            var root_real: ?[]const u8 = null;
+            var root_fd: std.posix.fd_t = -1;
+            if (root) |r| {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const resolved = std.fs.cwd().realpath(r, &buf) catch null;
+                if (resolved) |rp| {
+                    root_real = try allocator.dupe(u8, rp);
+                }
+                // O_PATH|O_DIRECTORY fd for the openat2(RESOLVE_BENEATH)
+                // fast path; best-effort (fallback is the realpath check).
+                root_fd = std.posix.open(r, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true, .CLOEXEC = true }, 0) catch -1;
+            }
+            errdefer {
+                if (root_real) |rr| allocator.free(rr);
+                if (root_fd >= 0) std.posix.close(root_fd);
+            }
             const index = if (jr.index) |ix| try allocator.dupe(u8, ix) else null;
             errdefer if (index) |ix| allocator.free(ix);
             // Response template (Milestone 11): status + headers + body are
@@ -161,6 +181,8 @@ pub const Config = struct {
                 .modules = try bindings.toOwnedSlice(allocator),
                 .max_age_seconds = jr.max_age,
                 .root = root,
+                .root_real = root_real,
+                .root_fd = root_fd,
                 .index = index,
                 .autoindex = jr.autoindex,
                 .embed = jr.embed,
