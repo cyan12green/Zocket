@@ -35,6 +35,7 @@ while [ $# -gt 0 ]; do
         --matrix) MATRIX=1; shift ;;
         --bodies) BODIES="$2"; shift 2 ;;
         --conns-list) CONNS_LIST="$2"; shift 2 ;;
+        --static) STATIC_MODE=1; STATIC_SIZES="$2"; shift 2 ;;
         *) echo "unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -69,22 +70,66 @@ pkill_servers() {
 }
 pkill_servers
 
+# Static-file mode: every server serves the same generated file at
+# GET /static (real disk path for tcp/nginx/caddy/actix/bun; preloaded
+# into memory for httpx, which has no sendfile path).
+STATIC_MODE=${STATIC_MODE:-0}
+STATIC_SIZES=${STATIC_SIZES:-""}
+STATIC_DIR="$ROOT/bench/.cache/static-1024"
+STATIC_FILE="$STATIC_DIR/static"
+STATIC_CONFIG="$ROOT/bench/.cache/static.json"
+
+gen_static_file() {
+    # $1 = size in bytes. Deterministic xorshift64 fill so the bytes are
+    # identical across runs (and incompressible-ish).
+    local size="$1"
+    STATIC_DIR="$ROOT/bench/.cache/static-$size"
+    STATIC_FILE="$STATIC_DIR/static"
+    mkdir -p "$STATIC_DIR"
+    python3 -c "
+import sys
+seed = 0x9E3779B97F4A7C15
+n = int(sys.argv[1])
+out = bytearray()
+while len(out) < n:
+    seed ^= seed >> 12
+    seed ^= (seed << 25) & 0xFFFFFFFFFFFFFFFF
+    seed ^= seed >> 27
+    out += (seed & 0xFFFF).to_bytes(2, 'big')
+open(sys.argv[2], 'wb').write(out[:n])
+" "$size" "$STATIC_FILE"
+    # tcp-server config: prefix route "/" rooted at the static dir; the
+    # static module resolves /static -> $DIR/static (sendfile >= 16 KB).
+    cat > "$STATIC_CONFIG" <<JSON
+{ "routes": [ { "path": "/", "match": "prefix", "root": "$STATIC_DIR", "modules": { "content": "static" } } ] }
+JSON
+}
+
 start_servers() {
     # $1 = tcp port, $2 = actix port, $3 = bun port, $4 = httpx port,
     # $5 = nginx port, $6 = caddy port
-    "$TCP_BIN" --port "$1" --threads 4 >/dev/null 2>&1 &
-    "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 &
-    "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 &
-    "$HX_BIN" --port "$4" >/dev/null 2>&1 &
+    if [ "$STATIC_MODE" = "1" ]; then
+        "$TCP_BIN" --port "$1" --threads 4 --config "$STATIC_CONFIG" >/dev/null 2>&1 &
+        ACTIX_STATIC="$STATIC_FILE" "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 &
+        BUN_STATIC="$STATIC_FILE" "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 &
+        "$HX_BIN" --port "$4" --static "$STATIC_FILE" >/dev/null 2>&1 &
+    else
+        "$TCP_BIN" --port "$1" --threads 4 >/dev/null 2>&1 &
+        "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 &
+        "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 &
+        "$HX_BIN" --port "$4" >/dev/null 2>&1 &
+    fi
     # nginx: per-port runtime prefix (pid file) and config.
     NGINX_PREFIX="$ROOT/bench/.cache/nginx-p$5"
     mkdir -p "$NGINX_PREFIX"
     sed -e "s/@@PORT@@/$5/" \
         -e "s|@@ERRLOG@@|$ROOT/bench/.cache/nginx-err-$5.log|" \
-        -e "s|@@PREFIX@@|$NGINX_PREFIX|" "$NGINX_TEMPLATE" > "$ROOT/bench/.cache/nginx-$5.conf"
+        -e "s|@@PREFIX@@|$NGINX_PREFIX|" \
+        -e "s|@@STATICDIR@@|$STATIC_DIR|" "$NGINX_TEMPLATE" > "$ROOT/bench/.cache/nginx-$5.conf"
     "$NGINX_BIN" -p "$NGINX_PREFIX" -c "$ROOT/bench/.cache/nginx-$5.conf" >/dev/null 2>&1 &
     # caddy: GOMAXPROCS=4 for parity with the other 4-worker servers.
-    sed -e "s/@@PORT@@/$6/" "$CADDY_TEMPLATE" > "$ROOT/bench/.cache/caddy-$6.caddyfile"
+    sed -e "s/@@PORT@@/$6/" \
+        -e "s|@@STATICDIR@@|$STATIC_DIR|" "$CADDY_TEMPLATE" > "$ROOT/bench/.cache/caddy-$6.caddyfile"
     GOMAXPROCS=4 "$CADDY_BIN" run --config "$ROOT/bench/.cache/caddy-$6.caddyfile" --adapter caddyfile >/dev/null 2>&1 &
     sleep 2
 }
@@ -101,7 +146,9 @@ run_cell() {
 
     local bombbase=(-c "$conns" -d "$DURATION" -l -o json)
     local args
-    if [ "$body" = "0" ]; then
+    if [ "$STATIC_MODE" = "1" ]; then
+        args=("${bombbase[@]}")
+    elif [ "$body" = "0" ]; then
         args=("${bombbase[@]}")
     else
         args=("${bombbase[@]}" -m POST -b "$(python3 -c "print('x' * $body)")")
@@ -114,7 +161,11 @@ run_cell() {
 
         for srv in "$tcp_port" "$actix_port" "$bun_port" "$hx_port" "$nginx_port" "$caddy_port"; do
             path="/"
-            [ "$body" != "0" ] && path="/echo"
+            if [ "$STATIC_MODE" = "1" ]; then
+                path="/static"
+            elif [ "$body" != "0" ]; then
+                path="/echo"
+            fi
             code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://127.0.0.1:${srv}${path}" || echo 000)
             echo "  health :${srv}${path} -> ${code}"
         done
@@ -130,7 +181,11 @@ run_cell() {
                     caddy) port="$caddy_port" ;;
                 esac
                 path="/"
-                [ "$body" != "0" ] && path="/echo"
+                if [ "$STATIC_MODE" = "1" ]; then
+                    path="/static"
+                elif [ "$body" != "0" ]; then
+                    path="/echo"
+                fi
                 ~/go/bin/bombardier "${args[@]}" "http://127.0.0.1:${port}${path}" > "$resdir/${pref}_${srv}_r${r}.json" 2>/dev/null
             done
         done
@@ -153,6 +208,18 @@ if [ "$MATRIX" = "1" ]; then
         for conns in $CONNS_LIST; do
             CELLS="$CELLS POST_/echo_body=${body}B_conns=${conns}|b${body}_c${conns}"
             run_cell "b${body}_c${conns}" "$conns" "$body"
+        done
+    done
+elif [ "$STATIC_MODE" = "1" ]; then
+    RESROOT="$ROOT/bench/results/servers/static"
+    rm -rf "$RESROOT"
+    mkdir -p "$RESROOT"
+    CELLS=""
+    for size in $STATIC_SIZES; do
+        gen_static_file "$size"
+        for conns in $CONNS_LIST; do
+            CELLS="$CELLS static_${size}B_conns=${conns}|s${size}_c${conns}"
+            run_cell "s${size}_c${conns}" "$conns" "0"
         done
     done
 else

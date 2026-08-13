@@ -992,3 +992,64 @@ bench/results/servers/matrix/.
   raised so bodies stay in memory (the spool-to-disk path empties
   $request_body). Caddy needs `admin off`, discarded logs, and the
   request_body max_size for the 64 KB cell. Both pinned in .gitmodules.
+
+## Static file serving (six servers)
+
+Date: 2026-08-13, same box/conditions as the matrices above. All six
+servers serve the same generated file (deterministic xorshift64 fill, named
+"static") at GET /static: tcp-server via its static module (read loop below
+16 KB, sendfile above), nginx via `location = /static { root ...; }`
+(sendfile on by default), Caddy via file_server, actix via actix-files
+NamedFile (open_async), Bun via Bun.file, httpx preloaded into memory at
+startup (it has no file path; noted). Raw JSON in
+bench/results/servers/static/.
+
+| cell | server | reqs/sec | vs tcp-server | p50 | p95 | p99 | throughput |
+|---|---|---:|---:|---:|---:|---:|---:|
+| GET /static 1 KB, c=100 | nginx | 219,881 | 4.59x | 0.40 ms | 0.88 ms | 1.47 ms | 276 MB/s |
+| | actix-web | 90,786 | 1.90x | 0.97 ms | 2.09 ms | 3.26 ms | 118 MB/s |
+| | Bun.serve | 56,081 | 1.17x | 1.68 ms | 2.44 ms | 2.81 ms | 66 MB/s |
+| | tcp-server | 47,870 | 1.00x | 2.02 ms | 2.92 ms | 3.85 ms | 59 MB/s |
+| | Caddy | 44,423 | 0.93x | 1.71 ms | 6.47 ms | 8.90 ms | 55 MB/s |
+| | httpx.zig | 5,136 | 0.11x | 0.74 ms | 1.36 ms | 1.78 ms | 3 MB/s |
+| GET /static 1 KB, c=1000 | nginx | 177,647 | 3.77x | 5.08 ms | 10.57 ms | 15.05 ms | 222 MB/s |
+| | actix-web | 82,519 | 1.75x | 14.68 ms | 25.28 ms | 34.04 ms | 107 MB/s |
+| | Bun.serve | 51,250 | 1.09x | 18.80 ms | 24.06 ms | 26.06 ms | 60 MB/s |
+| | tcp-server | 47,116 | 1.00x | 20.56 ms | 25.00 ms | 30.18 ms | 57 MB/s |
+| | Caddy | 35,783 | 0.76x | 29.64 ms | 43.19 ms | 50.56 ms | 44 MB/s |
+| | httpx.zig | 5,649 | 0.12x | 1.20 ms | 370.56 ms | 2253.97 ms | 5 MB/s |
+| GET /static 1 MB, c=100 | tcp-server | 11,082 | 1.00x | 8.61 ms | 13.95 ms | 17.93 ms | 11614 MB/s |
+| | Caddy | 10,790 | 0.97x | 7.23 ms | 24.04 ms | 32.81 ms | 11311 MB/s |
+| | Bun.serve | 8,255 | 0.74x | 10.54 ms | 17.51 ms | 18.70 ms | 8665 MB/s |
+| | nginx | 5,107 | 0.46x | 17.73 ms | 35.01 ms | 53.58 ms | 5330 MB/s |
+| | actix-web | 2,464 | 0.22x | 40.26 ms | 52.40 ms | 59.51 ms | 2584 MB/s |
+| | httpx.zig | 1,541 | 0.14x | 2.57 ms | 3.45 ms | 10003.14 ms | 812 MB/s |
+| GET /static 1 MB, c=1000 | tcp-server | 10,533 | 1.00x | 93.11 ms | 112.64 ms | 127.94 ms | 11001 MB/s |
+| | Caddy | 9,909 | 0.94x | 98.19 ms | 182.16 ms | 271.17 ms | 10336 MB/s |
+| | Bun.serve | 8,254 | 0.78x | 117.73 ms | 150.32 ms | 178.86 ms | 8613 MB/s |
+| | nginx | 4,525 | 0.43x | 128.61 ms | 326.48 ms | 5057.48 ms | 4499 MB/s |
+| | actix-web | 2,177 | 0.21x | 453.34 ms | 576.22 ms | 695.43 ms | 2288 MB/s |
+| | httpx.zig | 2,878 | 0.27x | 357.66 ms | 2242.44 ms | 2297.18 ms | 1385 MB/s |
+
+**Readings**:
+- Small static (1 KB) is nginx's home turf: 4.6x/3.8x - its cached fast path
+  (sendfile + pre-parsed metadata) with TCP_NODELAY on by default. actix
+  closes to 1.8-1.9x once nodelay is enabled (actix-http's default leaves
+  it off, which stalls its two-part head+body writes ~40 ms - a
+  Nagle/delayed-ACK interlock; with it on the same build goes 2.5k ->
+  90.8k req/s). We are mid-pack on small files (bun just ahead, caddy just
+  behind).
+- Large static (1 MB) flips the table: tcp-server wins on sendfile +
+  zero-copy writev, Caddy (userspace copy) is within 3-7%, Bun ~0.75x.
+  nginx drops to ~0.45x - surprising for sendfile, but it re-stats and
+  opens the file per request (no open_file_cache) and pays a two-phase
+  sendfile+write under co-resident load. actix collapses to 0.21x: its
+  NamedFile path has no sendfile and streams 64 KB chunks through
+  web::block thread-pool hops plus a fresh 64 KB allocation per chunk (the
+  same path actix-web's Files service uses).
+- httpx's in-memory static is allocation-bound as everywhere else.
+
+Config parity notes: nginx needs nothing extra (sendfile + nodelay are
+defaults); Caddy needs the file_server block and root; actix needs
+tcp_nodelay(true) and open_async (blocking open tanks the async workers);
+Bun needs BUN_STATIC; httpx needs --static with a startup preload.

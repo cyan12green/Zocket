@@ -1,7 +1,9 @@
-# Caddy benchmark config (template): one server, two endpoints.
-#   GET  /      -> 200, empty body
-#   POST /echo  -> 200, request body echoed ({http.request.body} placeholder)
-# Placeholder: @@PORT@@ (listen port).
+# Caddy benchmark config (template): one server, three endpoints.
+#   GET  /        -> 200, empty body
+#   POST /echo    -> 200, request body echoed ({http.request.body})
+#   GET  /static  -> the benchmark file (root @@STATICDIR@@, file_server)
+# Placeholders: @@PORT@@ (listen port), @@STATICDIR@@ (static file
+# directory; the file itself is named "static").
 {
     admin off
 }
@@ -9,6 +11,10 @@
 :@@PORT@@ {
     log {
         output discard
+    }
+    handle /static {
+        root * @@STATICDIR@@
+        file_server
     }
     handle /echo {
         request_body {

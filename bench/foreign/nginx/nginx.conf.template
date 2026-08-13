@@ -1,8 +1,10 @@
-# nginx benchmark config (template): one server, two endpoints.
-#   GET  /      -> 200, empty body
-#   POST /echo  -> 200, request body echoed (echo-nginx-module)
+# nginx benchmark config (template): one server, three endpoints.
+#   GET  /             -> 200, empty body
+#   POST /echo         -> 200, request body echoed (echo-nginx-module)
+#   GET  /static       -> the benchmark file (root @@STATICDIR@@, sendfile)
 # Placeholders: @@PORT@@ (listen port), @@ERRLOG@@ (error log path),
-# @@PREFIX@@ (runtime prefix: pid file location).
+# @@PREFIX@@ (runtime prefix: pid file location), @@STATICDIR@@ (static
+# file directory; the file itself is named "static").
 worker_processes 4;
 daemon off;
 error_log @@ERRLOG@@ crit;
@@ -34,5 +36,8 @@ http {
             echo_read_request_body;
             echo_request_body;
         }
+        # GET /static -> @@STATICDIR@@/static (root + exact-location uri).
+        # sendfile is on by default for static files.
+        location = /static { root @@STATICDIR@@; }
     }
 }
