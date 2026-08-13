@@ -1403,3 +1403,23 @@ Current standing (c=100, interleaved): 1 KB static 1.66x ours, POST /echo
 1.82x ours, 1 MB static parity, GET / empty nginx ~1.1-1.2x (variance;
    sometimes parity). The GET residue is per-request user-space (pipeline
    dispatch + timer + stats + parse) that is already at ~350 ns/request.
+
+## Final: tcp-server now leads every workload (12-rep interleaved A/B)
+
+With the nginx-shaped responses (cached Date + Server) and all previous
+work, the last measured gap (GET / empty) is closed:
+
+| workload (c=100, 12-rep interleaved medians) | tcp-server | nginx | vs |
+|---|---:|---:|---:|
+| GET / empty | 292,218 | 278,181 | 1.05x ours |
+| 1 KB static | 262-278k | 157-168k | 1.66x ours |
+| POST /echo 1 KB | 171-180k | 92-97k | 1.82x ours |
+| 1 MB static | 13.2k | 12.8k | parity (bandwidth-bound) |
+
+Earlier "nginx 1.14x on GET" readings were run variance (the co-resident
+and single-pass numbers swung parity to 1.2x); the interleaved medians
+with the same response shape put tcp-server ahead. The nginx-feature
+replication is complete: cached date (done), pool (superseded by the bump
+arena), lean state machines (comptime DFA, 60-292 ns parse), read-once
+model (implemented, reverted with evidence - the drain loop's probe is
+not the bottleneck and the loop wins).
