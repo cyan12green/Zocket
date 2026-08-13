@@ -10,6 +10,7 @@ const http_parser = @import("../http/parser.zig");
 const http_response = @import("../http/response.zig");
 const dsl_pipeline = @import("../dsl/pipeline.zig");
 const static_cache_mod = @import("../dsl/static_cache.zig");
+const cache_mod = @import("../dsl/modules/cache.zig");
 const iouring_mod = @import("iouring.zig");
 
 /// I/O backend selection. Default: epoll (measured at parity with the ring
@@ -138,6 +139,12 @@ pub const Reactor = struct {
     /// for the next iteration, so reads are never lost.
     resubmit_reads: [8192]posix.fd_t = undefined,
     resubmit_count: usize = 0,
+    /// Cached Date header (nginx ngx_cached_http_time equivalent): the
+    /// IMF-fixdate string is formatted once per wall-clock second and
+    /// copied into every response, so per-request date formatting is zero.
+    date_cache: [40]u8 = undefined,
+    date_len: usize = 0,
+    date_sec: u64 = 0,
     /// Per-reactor listener (Milestone 14, SO_REUSEPORT): when set, this
     /// reactor accepts connections directly from the kernel; -1 otherwise.
     listener: posix.fd_t = -1,
@@ -345,6 +352,7 @@ pub const Reactor = struct {
                 if (now.since(self.drain_started) > drain_timeout_ns) break;
             }
             self.advanceTimers();
+            self.refreshDate();
             const n = self.ep.wait(&events, 100) catch continue;
             for (events[0..n]) |ev| {
                 self.handleEvent(ev.events, @intCast(ev.data.ptr));
@@ -355,6 +363,16 @@ pub const Reactor = struct {
         self.wakeup.read();
         self.drainPending();
         self.drained.store(true, .release);
+    }
+
+    /// Refresh the cached Date string when the wall-clock second changes.
+    fn refreshDate(self: *Reactor) void {
+        const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch return;
+        const now: u64 = @intCast(ts.sec);
+        if (now == self.date_sec) return;
+        self.date_sec = now;
+        const date = cache_mod.formatHttpDate(now, &self.date_cache) orelse return;
+        self.date_len = date.len;
     }
 
     /// Advance the timer wheel to the current wall tick and close every
@@ -611,6 +629,11 @@ pub const Reactor = struct {
                     }
                     const close = ctx.close_after_write or !session.req.keep_alive;
                     session.resp.setHeader("Connection", if (close) "close" else "keep-alive");
+                    // nginx-parity headers, both effectively free: Date comes
+                    // from the once-per-second cache, Server is a comptime
+                    // literal.
+                    session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
+                    session.resp.setHeader("Server", "tcp-server");
                     conn.send_buf.compact();
                     // The head (fast single-pass writer, fast itoa) goes into
                     // the send buffer, the body stays put: one writev of two
@@ -1479,7 +1502,20 @@ test "reactor handles concurrent dispatch from many threads" {
     try testing.expectEqual(@as(usize, producers * per_producer), r.registered.load(.monotonic));
 }
 
-const http_ok_empty = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+
+/// Runtime-built 200-empty response including the cached Date/Server lines.
+fn httpOkEmpty(buf: []u8) []const u8 {
+    var dbuf: [96]u8 = undefined;
+    return std.fmt.bufPrint(buf, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 0" ++ "\r\n\r\n", .{testDateLine(&dbuf)}) catch unreachable;
+}
+
+/// Expected "Date: ...\r\nServer: tcp-server\r\n" for the current wall
+/// second (the reactor caches the date and refreshes it once per second).
+fn testDateLine(buf: []u8) []const u8 {
+    const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
+    const date = cache_mod.formatHttpDate(@intCast(ts.sec), buf) orelse unreachable;
+    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: tcp-server\r\n", .{date}) catch unreachable;
+}
 
 test "reactor serves HTTP with keep-alive and body echo" {
     const allocator = testing.allocator;
@@ -1500,18 +1536,20 @@ test "reactor serves HTTP with keep-alive and body echo" {
     // Request 1: simple GET, keep-alive default.
     try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var buf: [512]u8 = undefined;
-    const n1 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
-    try testing.expectEqualStrings(http_ok_empty, buf[0..n1]);
+    var ok_buf_0: [160]u8 = undefined;
+    const http_ok_empty_0 = httpOkEmpty(&ok_buf_0);
+    const n1 = try readUntil(pair[0], &buf, http_ok_empty_0.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty_0, buf[0..n1]);
 
     // Request 2 on the same connection: POST, body echoed.
     try writeAll(pair[0], "POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
-    const want2 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\nhello";
+    var date_buf_want2: [96]u8 = undefined; var want_buf_want2: [512]u8 = undefined; const want2 = std.fmt.bufPrint(&want_buf_want2, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 5" ++ "\r\n\r\n" ++ "hello", .{testDateLine(&date_buf_want2)}) catch unreachable;
     const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
     try testing.expectEqualStrings(want2, buf[0..n2]);
 
     // Request 3: Connection: close -> response then EOF.
     try writeAll(pair[0], "GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
-    const want3 = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    var date_buf_want3: [96]u8 = undefined; var want_buf_want3: [512]u8 = undefined; const want3 = std.fmt.bufPrint(&want_buf_want3, "HTTP/1.1 200 OK\r\n" ++ "Connection: close\r\n" ++ "{s}" ++ "Content-Length: 0" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_want3)}) catch unreachable;
     const n3 = try readUntil(pair[0], &buf, want3.len, 3000);
     try testing.expectEqualStrings(want3, buf[0..n3]);
     try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
@@ -1539,8 +1577,8 @@ test "reactor HTTP handles pipelined requests in one write" {
             "POST /b HTTP/1.1\r\nContent-Length: 1\r\n\r\nB",
     );
     var buf: [512]u8 = undefined;
-    const want_a = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\nA";
-    const want_b = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\nB";
+    var date_buf_want_a: [96]u8 = undefined; var want_buf_want_a: [512]u8 = undefined; const want_a = std.fmt.bufPrint(&want_buf_want_a, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 1" ++ "\r\n\r\n" ++ "A", .{testDateLine(&date_buf_want_a)}) catch unreachable;
+    var date_buf_want_b: [96]u8 = undefined; var want_buf_want_b: [512]u8 = undefined; const want_b = std.fmt.bufPrint(&want_buf_want_b, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 1" ++ "\r\n\r\n" ++ "B", .{testDateLine(&date_buf_want_b)}) catch unreachable;
     const n1 = try readUntil(pair[0], &buf, want_a.len, 3000);
     try testing.expectEqualStrings(want_a, buf[0..n1]);
     const n2 = try readUntil(pair[0], &buf, want_b.len, 3000);
@@ -1669,9 +1707,9 @@ test "reactor HTTP 64 KiB POST is echoed with 200 (regression: was 431) and keep
         std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
     }
 
-    const head = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 65536\r\n\r\n";
+    var date_buf_head: [96]u8 = undefined; var want_buf_head: [512]u8 = undefined; const head = std.fmt.bufPrint(&want_buf_head, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 65536" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_head)}) catch unreachable;
     const total = head.len + body_len;
-    var resp_buf: [head.len + body_len]u8 = undefined;
+    var resp_buf: [body_len + 128]u8 = undefined;
     const got = try readUntil(pair[0], &resp_buf, total, 5000);
     try testing.expectEqual(total, got);
     try testing.expectEqualStrings(head, resp_buf[0..head.len]);
@@ -1682,8 +1720,10 @@ test "reactor HTTP 64 KiB POST is echoed with 200 (regression: was 431) and keep
     // served normally.
     try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var small: [128]u8 = undefined;
-    const n2 = try readUntil(pair[0], &small, http_ok_empty.len, 3000);
-    try testing.expectEqualStrings(http_ok_empty, small[0..n2]);
+    var ok_buf_5: [160]u8 = undefined;
+    const http_ok_empty_5 = httpOkEmpty(&ok_buf_5);
+    const n2 = try readUntil(pair[0], &small, http_ok_empty_5.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty_5, small[0..n2]);
 }
 
 // A JSON config loaded at runtime, driving requests through the pipeline in a
@@ -1718,13 +1758,13 @@ test "reactor runs a JSON-config pipeline with default 404 fallback" {
     // Matched route: echo module answers with the request body.
     try writeAll(pair[0], "POST /only HTTP/1.1\r\nContent-Length: 4\r\n\r\necho");
     var buf: [512]u8 = undefined;
-    const want_echo = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 4\r\n\r\necho";
+    var date_buf_want_echo: [96]u8 = undefined; var want_buf_want_echo: [512]u8 = undefined; const want_echo = std.fmt.bufPrint(&want_buf_want_echo, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 4" ++ "\r\n\r\n" ++ "echo", .{testDateLine(&date_buf_want_echo)}) catch unreachable;
     const n1 = try readUntil(pair[0], &buf, want_echo.len, 3000);
     try testing.expectEqualStrings(want_echo, buf[0..n1]);
 
     // No route matches: default 404, connection stays alive.
     try writeAll(pair[0], "GET /elsewhere HTTP/1.1\r\n\r\n");
-    const want_404 = "HTTP/1.1 404 Not Found\r\nConnection: keep-alive\r\nContent-Length: 9\r\n\r\nNot Found";
+    var date_buf_want_404: [96]u8 = undefined; var want_buf_want_404: [512]u8 = undefined; const want_404 = std.fmt.bufPrint(&want_buf_want_404, "HTTP/1.1 404 Not Found\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 9" ++ "\r\n\r\n" ++ "Not Found", .{testDateLine(&date_buf_want_404)}) catch unreachable;
     const n2 = try readUntil(pair[0], &buf, want_404.len, 3000);
     try testing.expectEqualStrings(want_404, buf[0..n2]);
 
@@ -1751,7 +1791,7 @@ test "reactor HEAD responds with head only and correct Content-Length" {
 
     // HEAD on a path the echo module answers with an empty body.
     try writeAll(pair[0], "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
-    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    var date_buf_want: [96]u8 = undefined; var want_buf_want: [512]u8 = undefined; const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 0" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_want)}) catch unreachable;
     var buf: [512]u8 = undefined;
     const n = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n]);
@@ -1759,9 +1799,9 @@ test "reactor HEAD responds with head only and correct Content-Length" {
     // HEAD on a POST-shaped path: Content-Length must reflect the would-be
     // body, but no body bytes may follow the head.
     try writeAll(pair[0], "HEAD /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
-    const want2 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 5\r\n\r\n";
-    const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
-    try testing.expectEqualStrings(want2, buf[0..n2]);
+    var date_buf_want2b: [96]u8 = undefined; var want_buf_want2b: [512]u8 = undefined; const want2b = std.fmt.bufPrint(&want_buf_want2b, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 5" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_want2b)}) catch unreachable;
+    const n2 = try readUntil(pair[0], &buf, want2b.len, 3000);
+    try testing.expectEqualStrings(want2b, buf[0..n2]);
     // The echoed body must NOT be sent: a short read window yields nothing.
     try testing.expectError(error.Timeout, readUntil(pair[0], &buf, 1, 500));
 
@@ -1845,7 +1885,7 @@ test "reactor serves a chunked request end to end" {
         "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
             "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
     var buf: [512]u8 = undefined;
-    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 11\r\n\r\nhello world";
+    var date_buf_want: [96]u8 = undefined; var want_buf_want: [512]u8 = undefined; const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 11" ++ "\r\n\r\n" ++ "hello world", .{testDateLine(&date_buf_want)}) catch unreachable;
     const n = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n]);
 
@@ -1905,22 +1945,28 @@ test "reactor resets the idle timer on active traffic" {
     // Request 1: arms the timer with a ~1 s deadline.
     try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var buf: [512]u8 = undefined;
-    const n1 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
-    try testing.expectEqualStrings(http_ok_empty, buf[0..n1]);
+    var ok_buf_1: [160]u8 = undefined;
+    const http_ok_empty_1 = httpOkEmpty(&ok_buf_1);
+    const n1 = try readUntil(pair[0], &buf, http_ok_empty_1.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty_1, buf[0..n1]);
 
     // Request 2 just before the deadline: pushes the deadline to ~1.5 s.
     std.posix.nanosleep(0, 500 * std.time.ns_per_ms);
     try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-    const n2 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
-    try testing.expectEqualStrings(http_ok_empty, buf[0..n2]);
+    var ok_buf_2: [160]u8 = undefined;
+    const http_ok_empty_2 = httpOkEmpty(&ok_buf_2);
+    const n2 = try readUntil(pair[0], &buf, http_ok_empty_2.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty_2, buf[0..n2]);
 
     // Request 3 *after* the original ~1 s deadline: answered, which proves the
     // timer was re-armed (without rearming the connection would already be
     // closed and this write would fail).
     std.posix.nanosleep(0, 600 * std.time.ns_per_ms);
     try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-    const n3 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
-    try testing.expectEqualStrings(http_ok_empty, buf[0..n3]);
+    var ok_buf_3: [160]u8 = undefined;
+    const http_ok_empty_3 = httpOkEmpty(&ok_buf_3);
+    const n3 = try readUntil(pair[0], &buf, http_ok_empty_3.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty_3, buf[0..n3]);
 
     // Idle again past the re-armed deadline (~2.5 s): now it does expire.
     std.posix.nanosleep(2, 0);
@@ -1951,8 +1997,10 @@ test "idle timeout of zero disables reaping" {
     std.posix.nanosleep(2, 0);
     try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var buf: [512]u8 = undefined;
-    const n1 = try readUntil(pair[0], &buf, http_ok_empty.len, 3000);
-    try testing.expectEqualStrings(http_ok_empty, buf[0..n1]);
+    var ok_buf_4: [160]u8 = undefined;
+    const http_ok_empty_4 = httpOkEmpty(&ok_buf_4);
+    const n1 = try readUntil(pair[0], &buf, http_ok_empty_4.len, 3000);
+    try testing.expectEqualStrings(http_ok_empty_4, buf[0..n1]);
 
     r.stop();
     r.join();

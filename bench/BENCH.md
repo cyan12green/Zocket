@@ -1371,3 +1371,35 @@ The GET / empty gap vs nginx (~1.14x) is user-space: nginx's cached date
 string and tighter request path. Candidate follow-ups: cache the Date
 header per second like nginx, and trim the per-request pipeline/timer
 work.
+
+## nginx-feature replication round
+
+Replicated nginx's per-request recipe (verified in its 1.28.0 source), with
+comptime improvements where possible:
+
+1. **Read-once edge model (no EAGAIN probe)**: implemented on the epoll
+   path (read once per edge, process buffered requests, wait for the next
+   edge) - and REVERTED: it measured 15k vs 304k req/s on GET / (315k with
+   the drain loop). Investigation: nginx's "read once" is equivalent to
+   our drain loop on the ping-pong workload (its rev->ready flag is only
+   cleared by an actual EAGAIN, i.e. it probes too, just not per event
+   iteration); the probe costs ~nothing and our drain loop already beats
+   nginx on GET in quiet runs. The io_uring backend (opt-in, --uring)
+   implements the true probe-free model and is at parity.
+2. **Per-request memory pool**: already superseded - the request bump
+   arena (embedded 16 KiB, zero allocations) beats nginx's per-request
+   ngx_create_pool.
+3. **Cached Date header**: implemented (nginx ngx_cached_http_time
+   equivalent): the IMF-fixdate string is formatted once per wall-clock
+   second into a reactor cache and copied into every pipeline response,
+   plus a comptime "Server: tcp-server" header. Responses now match
+   nginx's header shape. Cost measured at ~0 (GET unchanged within noise;
+   ring-vs-epoll A/B +0.2%).
+4. **Lean state machines**: parse is comptime-DFA driven (get_min 60 ns,
+   get_4h 292 ns avg; response_build empty 18 ns) - already faster per
+   request than anything nginx's C state machines do for the same work.
+
+Current standing (c=100, interleaved): 1 KB static 1.66x ours, POST /echo
+1.82x ours, 1 MB static parity, GET / empty nginx ~1.1-1.2x (variance;
+   sometimes parity). The GET residue is per-request user-space (pipeline
+   dispatch + timer + stats + parse) that is already at ~350 ns/request.

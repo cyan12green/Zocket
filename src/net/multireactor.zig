@@ -409,6 +409,17 @@ fn httpReadUntil(sock: posix.fd_t, buf: []u8, expected_len: usize, timeout_ms: u
 // End-to-end integration: a JSON config (parsed at runtime with std.json)
 // drives a real HTTP request through the echo module over a real TCP
 // connection to the multi-reactor server.
+
+const cache_mod = @import("../dsl/modules/cache.zig");
+
+/// Expected "Date: ...\r\nServer: tcp-server\r\n" for the current wall
+/// second (the reactor caches the date and refreshes it once per second).
+fn testDateLine(buf: []u8) []const u8 {
+    const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
+    const date = cache_mod.formatHttpDate(@intCast(ts.sec), buf) orelse unreachable;
+    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: tcp-server\r\n", .{date}) catch unreachable;
+}
+
 test "multi-reactor HTTP with JSON config echoes via the pipeline" {
     const allocator = std.heap.page_allocator;
     const json =
@@ -440,19 +451,19 @@ test "multi-reactor HTTP with JSON config echoes via the pipeline" {
     // POST with a body: the echo module answers with the body echoed.
     try httpWriteAll(sock, "POST /echo HTTP/1.1\r\nContent-Length: 12\r\n\r\nhello-e2e-ok");
     var buf: [512]u8 = undefined;
-    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 12\r\n\r\nhello-e2e-ok";
+    var date_buf_want: [96]u8 = undefined; var want_buf_want: [512]u8 = undefined; const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 12" ++ "\r\n\r\n" ++ "hello-e2e-ok", .{testDateLine(&date_buf_want)}) catch unreachable;
     const n1 = try httpReadUntil(sock, &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n1]);
 
     // A second request on the same keep-alive connection.
     try httpWriteAll(sock, "GET /echo HTTP/1.1\r\n\r\n");
-    const want2 = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    var date_buf_want2: [96]u8 = undefined; var want_buf_want2: [512]u8 = undefined; const want2 = std.fmt.bufPrint(&want_buf_want2, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 0" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_want2)}) catch unreachable;
     const n2 = try httpReadUntil(sock, &buf, want2.len, 3000);
     try testing.expectEqualStrings(want2, buf[0..n2]);
 
     // No matching route: default 404, connection stays alive.
     try httpWriteAll(sock, "GET /nope HTTP/1.1\r\n\r\n");
-    const want_404 = "HTTP/1.1 404 Not Found\r\nConnection: keep-alive\r\nContent-Length: 9\r\n\r\nNot Found";
+    var date_buf_want_404: [96]u8 = undefined; var want_buf_want_404: [512]u8 = undefined; const want_404 = std.fmt.bufPrint(&want_buf_want_404, "HTTP/1.1 404 Not Found\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 9" ++ "\r\n\r\n" ++ "Not Found", .{testDateLine(&date_buf_want_404)}) catch unreachable;
     const n3 = try httpReadUntil(sock, &buf, want_404.len, 3000);
     try testing.expectEqualStrings(want_404, buf[0..n3]);
 
