@@ -1,5 +1,0 @@
-{
-  "routes": [
-    { "path": "/", "match": "prefix", "response": { "status": 200, "body": "reloaded" } }
-  ]
-}
