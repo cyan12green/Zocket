@@ -2,6 +2,7 @@ const std = @import("std");
 const router = @import("../dsl/router.zig");
 const registry = @import("../dsl/registry.zig");
 const dsl_limits = @import("../dsl/limits.zig");
+const json_config = @import("json_config.zig");
 
 pub const Route = router.Route;
 pub const ModuleBinding = router.ModuleBinding;
@@ -21,19 +22,25 @@ pub const Config = struct {
 
     /// Comptime default: a single catch-all prefix route attaching the echo
     /// module to the content phase — the pre-pipeline M3 behavior, reproduced
-    /// as config.
+    /// as config. Parsed at compile time by the DM1 validator (no std.json).
     pub fn default() Config {
-        return .{
-            .routes = &.{
-                .{
-                    .path = "/",
-                    .match = .prefix,
-                    .modules = &.{
-                        .{ .phase = .content, .module = "echo" },
-                    },
-                },
-            },
-        };
+        return fromJsonComptime(
+            \\{ "routes": [ { "path": "/", "match": "prefix", "modules": { "content": "echo" } } ] }
+        );
+    }
+
+    /// DM1: parse a JSON config at compile time with the schema validator in
+    /// `json_config.zig` (no std.json DOM, no allocator). Invalid configs are
+    /// compile errors; the built route table and strings live in .rodata.
+    pub fn fromJsonComptime(comptime json: []const u8) Config {
+        return json_config.parse(json);
+    }
+
+    /// DM2: embed a config file and parse it at compile time
+    /// (`@embedFile`), so the entire config — routes, trie-ready tables and
+    /// limits — is a compile-time input.
+    pub fn fromEmbedded(comptime path: []const u8) Config {
+        return json_config.parse(@embedFile(path));
     }
 
     /// Verify every route against the module registry: each binding must name

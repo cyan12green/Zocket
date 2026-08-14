@@ -43,6 +43,7 @@ pub const dsl = struct {
 pub const runtime = struct {
     pub const config = @import("runtime/config.zig");
     pub const server = @import("runtime/server.zig");
+    pub const json_config = @import("runtime/json_config.zig");
 };
 
 // This Zig snapshot only collects `test` blocks that are reachable through
@@ -84,4 +85,6 @@ comptime {
     _ = @import("dsl/modules/stub_status.zig");
     _ = @import("runtime/config.zig");
     _ = @import("runtime/server.zig");
+    _ = @import("runtime/json_config.zig");
+    _ = @import("runtime/json_config_tests.zig");
 }

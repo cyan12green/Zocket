@@ -19,5 +19,9 @@ The milestone history of Zocket. Current status: M1–M15 complete.
 | M13 | DONE | Observability: access log, error log, stub_status page, SIGHUP graceful reload. |
 | M14 | DONE | Kernel-level: SO_REUSEPORT per-reactor accept, sendfile for static bodies, writev for head+body. |
 | M15 | DONE | Benchmark-driven hardening: on-demand request-buffer growth (large bodies), nginx `open_file_cache`-style static fd cache (+ small-file content cache served as one writev), connection pooling with embedded buffers, request bump arena (zero hot-path allocations), cached Date header, configurable `limits`, experimental io_uring backend (opt-in `--uring`). |
+| M16 | PLANNED | HTTP/2: framing, HPACK, stream multiplexing, flow control, server push; ALPN `h2` after M17. |
+| M17 | PLANNED | TLS/HTTPS: OpenSSL bindings, SNI, ALPN, TLS 1.3, session resumption. |
+| M18 | PLANNED | WebSocket / `Connection: upgrade` protocol switching (RFC 6455 framing). |
+| M19 | PLANNED | HTTP/3 + QUIC (after M16+M17; feasibility revisited). |
 
 The future roadmap is in `docs/ROADMAP.md`.

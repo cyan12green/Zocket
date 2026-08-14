@@ -613,46 +613,168 @@ with comptime improvements.
 the registry are comptime-built; the request arena and connection pool
 eliminate runtime allocation entirely on the hot path.
 
+
+### M16 — HTTP/2
+
+**Status: PLANNED** (protocol completeness — the biggest gap vs nginx, which
+ships `ngx_http_v2`). HTTP/2 (RFC 9113) over the existing HTTP/1.1
+transport: framing, HPACK header compression (RFC 7541), stream
+multiplexing with per-stream and per-connection flow control
+(WINDOW_UPDATE), stream priorities, and optional server push.
+
+- **Framing**: 9-byte frame header decode/encode from the connection recv
+  buffer; SETTINGS exchange, PING, GOAWAY, RST_STREAM, DATA, HEADERS,
+  CONTINUATION, PRIORITY frames.
+- **HPACK**: static + dynamic table, Huffman decoding for header names;
+  the comptime DFA (`header_dfa.zig`) classifies names before table
+  lookups. The request arena (`http/arena.zig`) holds decoded headers.
+- **Streams**: per-connection session state (stream table keyed by id),
+  lifecycle (idle -> open -> half-closed -> closed), concurrency limits,
+  and the existing phase pipeline runs per stream. Responses reuse the
+  fast serializer, wrapped in HEADERS + DATA frames; the small-file
+  content cache and sendfile path adapt to frame-sized writes.
+- **Negotiation**: `h2c` prior-knowledge and the HTTP/1.1 `Upgrade: h2c`
+  path now, ALPN `h2` after M17 (TLS) for the internet path. The listener
+  must reject HTTP/1.x framing after the h2 preface (`PRI * HTTP/2.0`).
+- **Server push** (optional, after the core): PUSH_PROMISE for
+  module-tagged assets.
+
+**Verification**: `h2spec` conformance, curl --http2 / http2 clients,
+pipelining-equivalent multiplexed A/B vs HTTP/1.1, and the multi-client
+benchmark. The HTTP/2 stream model is also the base for gRPC proxying
+(later).
+
+**Comptime**: HPACK static table (61 entries, RFC 7541 appendix A) built
+at comptime; frame-type and flags decode tables.
+
+---
+
+### M17 — TLS/HTTPS
+
+**Status: PLANNED**. Server-side TLS (1.2/1.3) with SNI and ALPN.
+Prerequisite for HTTP/2 on the internet (ALPN `h2`) and for HTTP/3.
+
+- **Backend**: OpenSSL C bindings (the repo's raw-syscall style already
+  holds C deps via third-party submodules). `std.crypto.tls` is deferred
+  (immature in the pinned snapshot); the choice is documented in the
+  module. Per-listener cert/key from the config (`limits`-style section or
+  a `server` block: `ssl_certificate`, `ssl_certificate_key`,
+  `ssl_protocols`).
+- **Handshake**: accept-time async handshake on the reactor (the epoll
+  loop already drives fd readiness); session resumption (TLS 1.3 0-RTT
+  later), SNI to select the cert, ALPN to select h2/h1.
+- **Write path**: the response serializer feeds the OpenSSL BIO; sendfile
+  falls back to buffered writes under TLS (no file splicing through TLS).
+
+**Verification**: `openssl s_client -tls1_3 -alpn h2`, curl https, h2spec
+over TLS, and the standard A/B (the cipher path adds measurable
+per-request cost — document it separately from plaintext numbers).
+
+---
+
+### M18 — WebSocket and connection upgrade
+
+**Status: PLANNED**. The parser already classifies `upgrade`; implement
+protocol switching: on `Connection: upgrade` + `Upgrade: <proto>` return
+101 and hand the connection over (the reactor stops HTTP parsing and the
+session becomes a raw byte pipe, or a websocket content module owns the
+connection). RFC 6455 framing (FIN/opcode/mask/length) for a native
+websocket echo module; upstream passthrough for proxied `ws://`.
+
+**Verification**: ws clients (e.g. `websocat`), the existing socketpair
+reactor tests extended for the post-101 raw phase.
+
+---
+
+### M19 — HTTP/3 + QUIC
+
+**Status: PLANNED** (after M16 + M17; nginx `v3`, Caddy and h2o all ship
+it). RFC 9000 (QUIC) + RFC 9114 (HTTP/3): connection migration, 0-RTT,
+UDP transport. The largest single item — realistically via a QUIC C
+dependency (quiche / lsquic) or by waiting for Zig std support; scope and
+feasibility are revisited once M16/M17 land. Delivery is incremental: UDP
+receive path -> QUIC handshake -> HTTP/3 framing -> ALPN `h3`.
+
+---
+
+## Planned after protocol completeness
+
+Lower-priority backlog (nginx module parity, proxy, observability,
+robustness) tracked here; formal milestone numbers are assigned when each
+is picked up.
+
+- Rate limiting: `limit_req` (leaky bucket per key) + `limit_conn`
+  (per-IP concurrency cap).
+- Brotli + zstd compression, and serving precompressed `.gz`/`.br`
+  (comptime precompression — the deferred M9 Part B).
+- Request/response header manipulation module (`headers_filter`/`map`
+  equivalent): add/remove/rewrite headers per route.
+- `auth_basic` (htpasswd) and `auth_request` (subrequest auth).
+- Per-request timeouts: `client_header_timeout`, `client_body_timeout`
+  (slowloris defense beyond the existing idle timeout).
+- HTTP response caching (`proxy_cache`-style) with LRU +
+  stale-while-revalidate on the existing ETag/304 infrastructure.
+- Load balancing: `random`, consistent-hash (`upstream_hash`),
+  `least_time` (per-backend latency EWMA); active health checks.
+- Sticky sessions (cookie-based).
+- Traffic mirroring (nginx `mirror`).
+- Prometheus `/metrics` endpoint and structured JSON access logs.
+- OpenTelemetry trace spans.
+- Connection limits (`max_connections`) and accept-backlog tuning.
+- HTTP parser fuzzing + request-smuggling audit (TE/CL conflicts, RFC
+  9110 §6.3).
+- gRPC proxying (on top of M16).
+- IPv6 listeners (dual-stack).
+
+---
 ---
 
 ## Dependent milestones (blocked on Zig snapshot)
 
-### DM1 — Comptime JSON config validation
+### DM1 — Comptime JSON config validation ✅ DONE
 
-**Blocked on**: comptime allocator for `std.json.parseFromSlice` (currently
-fails at `@intFromPtr` in `std.mem.zig:4257`; documented in M4).
+**Status**: shipped. `std.json`'s DOM cannot run at comptime (no allocator,
+`@intFromPtr` in `std.mem`), so `src/runtime/json_config.zig` implements a
+DOM-free comptime JSON parser/validator for the config schema: objects,
+arrays, strings, integers, booleans, escapes (`\u` included). Malformed
+input, unknown keys, unknown phases, duplicate keys and out-of-range numbers
+are `@compileError` carrying the offending byte position. The parsed route
+table, decoded strings and precomputed upstream sockaddrs freeze into
+`.rodata` (multi-pass comptime-const table build — a slice of a comptime var
+cannot escape). Module-name registry checks deliberately happen at startup
+via `Config.validate` (comptime registry lookup costs ~50 eval branches per
+binding).
 
-When Zig supports a comptime allocator, `Config.fromJson` can validate at
-compile time: `@embedFile("config.json")` → parsed at comptime → validated
-against the registry → a compile error if a module name is misspelled or
-a phase binding is duplicated. All milestones from M7 onward that build
-comptime structures from the config (trie, dispatch table, embedded files,
-response templates, upstream sockaddr) then get their input at compile
-time, putting every decision in `.rodata`.
+Comptime budget notes (pinned 0.16.0-dev): the 1000-backward-branch quota is
+shared by every `parse()` in a compilation and is sensitive to analysis
+order (intermittent "evaluation exceeded 1000 backwards branches" without a
+bump). `parse` therefore sets `@setEvalBranchQuota(100000)`, which also
+allows large configs (a 100-route config parses fine). Keying on FNV-1a
+hashes instead of `std.mem.eql` chains keeps per-token dispatch O(1) — every
+comptime `eql` costs a branch per compared byte.
 
-**Today's workaround**: struct-literal configs (`Config{ .routes = &.{ ... }
-}`) already get comptime validation from Zig's type system — unknown
-module names are rejected by `Registry.isRegistered()` at compile time
-because the registry is a comptime value. The limitation is only for JSON.
+`Config.fromJsonComptime(json)` and `Config.fromEmbedded(path)` parse at
+compile time; `Config.default()` now goes through the validator too.
 
 ---
 
 ### DM2 — Comptime config as the primary path
 
-**Blocked on**: DM1.
-
-Once DM1 is unblocked, `@embedFile("config.json")` at comptime lets the
-full config live in `.rodata`. The `--config` CLI flag becomes a
-compile-time decision; the entire route table, trie, dispatch tables,
-embedded files, pre-compressed bodies, and upstream sockaddrs flow from
-comptime inputs in a single compilation unit. Runtime config (JSON parsing
-at startup) remains as a secondary path for development/dynamic uses.
+**Status**: partially shipped. `Config.fromEmbedded("@embedFile(config.json)")`
+parses the full config at compile time — routes, limits, response templates
+and upstream sockaddrs all live in `.rodata`. The remaining half is wiring
+the `--config` CLI flag and the reactor to prefer the comptime config when
+present (M7+ comptime-built structures: trie, dispatch table, embedded
+files, pre-compressed bodies). Runtime JSON parsing at startup stays as the
+secondary path for development/dynamic uses.
 
 ---
 
 ## Suggested starting milestone (next session)
 
-**M5 — Connection lifecycle** is the natural continuation. It was defined
-as the next milestone, is self-contained, closes a deferred M3 item, and
-needs no new module dependencies. After M5, proceed to M6 (chunked + URL
-decoding) which unblocks the content-module track.
+**M16 — HTTP/2** is the next milestone: the biggest remaining gap versus
+nginx, self-contained on the existing transport, and the prerequisite for
+the gRPC/observability track. It should start with framing + HPACK +
+single-stream correctness, then multiplexing and the A/B vs HTTP/1.1.
+M17 (TLS) can proceed in parallel once the OpenSSL binding pattern is
+established.
