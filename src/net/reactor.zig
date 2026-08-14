@@ -13,6 +13,7 @@ const static_cache_mod = @import("../dsl/static_cache.zig");
 const cache_mod = @import("../dsl/modules/cache.zig");
 const iouring_mod = @import("iouring.zig");
 const limits_mod = @import("../dsl/limits.zig");
+const version_mod = @import("../version.zig");
 
 /// I/O backend selection. Default: epoll (measured at parity with the ring
 /// on the keep-alive workloads and more robust at high connection counts).
@@ -658,7 +659,7 @@ pub const Reactor = struct {
                     // from the once-per-second cache, Server is a comptime
                     // literal.
                     session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
-                    session.resp.setHeader("Server", "Ziglet");
+                    session.resp.setHeader("Server", "Ziglet/" ++ version_mod.version);
                     conn.send_buf.compact();
                     // The head (fast single-pass writer, fast itoa) goes into
                     // the send buffer, the body stays put: one writev of two
@@ -1539,7 +1540,7 @@ fn httpOkEmpty(buf: []u8) []const u8 {
 fn testDateLine(buf: []u8) []const u8 {
     const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
     const date = cache_mod.formatHttpDate(@intCast(ts.sec), buf) orelse unreachable;
-    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Ziglet\r\n", .{date}) catch unreachable;
+    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Ziglet/" ++ version_mod.version ++ "\r\n", .{date}) catch unreachable;
 }
 
 test "reactor serves HTTP with keep-alive and body echo" {

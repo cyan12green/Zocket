@@ -9,6 +9,7 @@ pub fn main() !void {
     var single = false;
     var mode: ziglet.reactor.Mode = .http;
     var config_path: ?[]const u8 = null;
+    var show_version = false;
     var idle_timeout: u32 = ziglet.reactor.default_idle_timeout_seconds;
 
     var args = std.process.args();
@@ -30,11 +31,18 @@ pub fn main() !void {
             mode = .http;
         } else if (std.mem.eql(u8, arg, "--config")) {
             config_path = args.next() orelse return error.MissingConfigArgument;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            show_version = true;
         } else if (std.mem.eql(u8, arg, "--uring")) {
             // Experimental: use the io_uring batch I/O path when available
             // (epoll is the default backend).
             ziglet.reactor.force_epoll = false;
         }
+    }
+
+    if (show_version) {
+        std.debug.print("Ziglet {s}\n", .{ziglet.version.version});
+        return;
     }
 
     if (single) {

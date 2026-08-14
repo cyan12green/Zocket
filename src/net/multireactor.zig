@@ -417,7 +417,7 @@ const cache_mod = @import("../dsl/modules/cache.zig");
 fn testDateLine(buf: []u8) []const u8 {
     const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
     const date = cache_mod.formatHttpDate(@intCast(ts.sec), buf) orelse unreachable;
-    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Ziglet\r\n", .{date}) catch unreachable;
+    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Ziglet/" ++ @import("../version.zig").version ++ "\r\n", .{date}) catch unreachable;
 }
 
 test "multi-reactor HTTP with JSON config echoes via the pipeline" {
