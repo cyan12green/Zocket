@@ -16,11 +16,14 @@ const Balance = router.Balance;
 const Phase = phase_mod.Phase;
 const Limits = dsl_limits.Limits;
 
-const route_cap = 64;
-const module_cap = 256;
-const header_cap = 256;
-const upstream_cap = 256;
-const string_cap = 8192;
+// Parser pool capacities (compile-time only — the built route table is
+// frozen by actual count, so unused capacity costs nothing at runtime).
+// Generous for DM2 comptime configs; exhaustion is a compile error.
+const route_cap = 1024;
+const module_cap = 4096;
+const header_cap = 1024;
+const upstream_cap = 4096;
+const string_cap = 65536;
 
 /// A JSON string value: either a zero-copy slice into the config source (no
 /// escapes) or a reference into the comptime decode pool.

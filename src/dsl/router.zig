@@ -369,6 +369,10 @@ pub fn buildTrie(comptime routes: []const Route) Trie {
 }
 
 fn buildTrieImpl(comptime routes: []const Route) Trie {
+    // The trie build walks every route plus one node/edge pass per
+    // trie-node; large configs (DM2 embedded configs) exceed the default
+    // 1000-backward-branch comptime budget.
+    @setEvalBranchQuota(100000);
     comptimeCheckAmbiguous(routes);
     const bounds = trieBounds(routes);
     // Typed comptime pools are the builder's arena: `buildCore` writes into

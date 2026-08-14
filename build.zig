@@ -35,6 +35,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // DM2: comptime config as the primary path. `zig build -Dconfig=<file>`
+    // embeds a project-root-relative JSON config at compile time; the server
+    // then builds its trie, dispatch functions and pre-serialised response
+    // templates at compile time (all in .rodata). The runtime `--config` flag
+    // stays as the secondary path for development/dynamic uses.
+    const config_path = b.option([]const u8, "config", "JSON config file (project-root-relative) to embed at compile time (DM2)");
+    const build_options = b.addOptions();
+    build_options.addOption(?[]const u8, "config_path", config_path);
+    const build_options_mod = build_options.createModule();
+
     const mod = b.addModule("zocket", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -89,6 +99,8 @@ pub fn build(b: *std.Build) void {
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
                 .{ .name = "zocket", .module = mod },
+                .{ .name = "embeds", .module = embeds_mod },
+                .{ .name = "build_options", .module = build_options_mod },
             },
         }),
     });

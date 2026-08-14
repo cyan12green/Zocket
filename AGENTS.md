@@ -10,6 +10,7 @@ High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Throu
 - `zig build run -- --echo` — raw byte-echo protocol (Milestone 1/2 semantics) in the multi-reactor framework.
 - `zig build run -- --http` — HTTP/1.1 mode (default): `200 OK` echoing the request body, keep-alive, pipelining.
 - `zig build run -- --config <file>` — HTTP mode with a JSON config: `routes` (per-phase module bindings) + `limits` (runtime-tunable sizes/caps: recv/send buffer sizes, max_body, max_line_bytes, max_headers, max_chunked_body, static cache params, connection pool cap). Reference: `docs/config.md`; sample: `config.example.json`.
+- `zig build -Dconfig=<file>` — DM2: embed a project-root-relative JSON config at compile time (DM1-validated; invalid configs are compile errors). The server is built via `Server.comptimeInit` — trie, dispatch specialisation, pre-serialised response templates and upstream sockaddrs all in `.rodata`; no startup parse. This is the primary config path; runtime `--config` stays as the secondary/development path. Example: `zig build -Dconfig=config.example.json run`.
 - `zig build run -- --threads N` — N reactor threads (default: CPU count; use physical-core count, e.g. 4, for best throughput).
 - `zig build run -- --port P` — change port.
 - `zig build run -- --uring` — experimental io_uring batch I/O backend (epoll is the default; the ring regressed at high connection counts and is kept opt-in for further work).

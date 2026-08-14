@@ -758,15 +758,32 @@ compile time; `Config.default()` now goes through the validator too.
 
 ---
 
-### DM2 — Comptime config as the primary path
+### DM2 — Comptime config as the primary path ✅ DONE
 
-**Status**: partially shipped. `Config.fromEmbedded("@embedFile(config.json)")`
-parses the full config at compile time — routes, limits, response templates
-and upstream sockaddrs all live in `.rodata`. The remaining half is wiring
-the `--config` CLI flag and the reactor to prefer the comptime config when
-present (M7+ comptime-built structures: trie, dispatch table, embedded
-files, pre-compressed bodies). Runtime JSON parsing at startup stays as the
-secondary path for development/dynamic uses.
+**Status**: shipped. Build with `zig build -Dconfig=<file>` to embed a
+project-root-relative JSON config at compile time (resolved through the
+`embeds` module, same convention as M10 route `embed` paths). The config is
+parsed by the DM1 validator at compile time (invalid configs are compile
+errors), then `Server.comptimeInit` builds the route trie, per-route dispatch
+functions, pre-serialised response templates (`response_bytes`, M11) and
+upstream sockaddrs — everything in `.rodata`, no startup parsing, no
+allocator, no trie build at boot. The runtime `--config` flag remains the
+secondary path for development/dynamic uses (startup std.json parse +
+startup trie + SIGHUP reload). Config source priority: `-Dconfig` (embedded)
+> `--config` (runtime) > default.
+
+Details:
+- `Config.fromEmbedded(path)` is now root-relative via `embeds.embed`.
+- Parser pool capacities are compile-time only (frozen slices use actual
+  counts) and generous: 1024 routes, 4096 module/upstream bindings.
+- Large embedded configs need comptime quota bumps: `json_config.parse`
+  sets `@setEvalBranchQuota(100000)` (DM1), and `router.buildTrieImpl` now
+  does too — a 100-route embedded config compiles and runs.
+- Module names are validated at startup (`Config.validate`), consistent with
+  the runtime path; structure/phase/key errors are compile errors.
+- Tests: embedded server routes byte-identically to the JSON server across
+  every route in `config.example.json`, and module-less template routes take
+  the pre-serialised fast path (`matchFast`).
 
 ---
 

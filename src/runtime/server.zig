@@ -81,6 +81,53 @@ pub const Server = struct {
         return comptimeInit(comptime Config.default());
     }
 
+    /// DM2: build a server from a comptime/embedded config, then resolve
+    /// static roots at startup — exactly what `fromJson` does at load, but
+    /// the comptime route table is immutable .rodata, so the rooted routes
+    /// are copied into `allocator` with `root_real` (symlink-escape anchor)
+    /// and `root_fd` (O_PATH|O_DIRECTORY for the openat2 fast path) filled
+    /// in. The dispatch functions, trie and everything else stay comptime;
+    /// the trie's positional route indices apply to the copy unchanged.
+    /// Free the allocator-owned copy with `deinitPrepared`.
+    pub fn embeddedInit(allocator: std.mem.Allocator, comptime cfg: Config) !Server {
+        const base = comptimeInit(cfg);
+        const routes = try allocator.alloc(router_mod.Route, base.cfg.routes.len);
+        errdefer allocator.free(routes);
+        var prepared_len: usize = 0;
+        errdefer for (routes[0..prepared_len]) |r| {
+            if (r.root_real) |rr| allocator.free(rr);
+            if (r.root_fd >= 0) std.posix.close(r.root_fd);
+        };
+        for (base.cfg.routes, 0..) |r, i| {
+            var copy = r;
+            if (r.root) |root| {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const resolved = std.fs.cwd().realpath(root, &buf) catch null;
+                if (resolved) |rp| {
+                    copy.root_real = try allocator.dupe(u8, rp);
+                }
+                copy.root_fd = std.posix.open(root, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true, .CLOEXEC = true }, 0) catch -1;
+            }
+            routes[i] = copy;
+            prepared_len += 1;
+        }
+        var s = base;
+        s.cfg = .{ .routes = routes, .limits = base.cfg.limits };
+        s.router.routes = routes;
+        return s;
+    }
+
+    /// Free the allocator-owned route copy created by `embeddedInit` (only
+    /// the resolved root fields and the array itself; the comptime strings
+    /// still live in .rodata).
+    pub fn deinitPrepared(self: *Server, allocator: std.mem.Allocator) void {
+        for (self.cfg.routes) |r| {
+            if (r.root_real) |rr| allocator.free(rr);
+            if (r.root_fd >= 0) std.posix.close(r.root_fd);
+        }
+        allocator.free(self.cfg.routes);
+    }
+
     /// Run one fully-parsed request through the phase pipeline. On
     /// `.not_handled` the caller sends the default (404) response. Module
     /// errors propagate to the caller, which turns them into a 500.
@@ -346,6 +393,98 @@ test "matchFast returns pre-serialised bytes only for module-less template route
     var resp3 = registry.Response.init(.ok);
     var ctx3 = pipeline.Context{ .req = &req3, .resp = &resp3 };
     try testing.expectEqual(@as(?router_mod.FastResponse, null), srv.matchFast(&ctx3));
+}
+
+// ---- DM2: comptime-embedded config as the primary path ----
+
+test "embedded comptime config parses via fromEmbedded (root-relative path)" {
+    const cfg = comptime Config.fromEmbedded("src/testdata/config.example.json");
+    try testing.expectEqual(@as(usize, 6), cfg.routes.len);
+    try testing.expectEqualStrings("/echo", cfg.routes[0].path);
+    try testing.expectEqualStrings("/", cfg.routes[5].path);
+}
+
+test "server from an embedded comptime config routes identically to the JSON server" {
+    const embedded = Server.comptimeInit(comptime Config.fromEmbedded("src/testdata/config.example.json"));
+
+    const json = @embedFile("../testdata/config.example.json");
+    var cfg = try Config.fromJson(testing.allocator, json);
+    defer cfg.deinit(testing.allocator);
+    try cfg.validate(registry.default_registry);
+    var json_srv = try Server.initWithTrie(testing.allocator, cfg);
+    defer json_srv.deinit(testing.allocator);
+
+    const targets = [_][]const u8{ "/echo", "/gzip", "/static/", "/health", "/old", "/", "/anything" };
+    for (targets) |t| {
+        var req_a = registry.Request.init(testing.allocator);
+        defer req_a.deinit();
+        req_a.target = t;
+        req_a.body = "payload";
+        var resp_a = registry.Response.init(.ok);
+        var ctx_a = pipeline.Context{ .req = &req_a, .resp = &resp_a };
+
+        var req_b = registry.Request.init(testing.allocator);
+        defer req_b.deinit();
+        req_b.target = t;
+        req_b.body = "payload";
+        var resp_b = registry.Response.init(.ok);
+        var ctx_b = pipeline.Context{ .req = &req_b, .resp = &resp_b };
+
+        const out_a = try embedded.handleRequest(&ctx_a);
+        const out_b = try json_srv.handleRequest(&ctx_b);
+        try testing.expectEqual(out_a, out_b);
+        try testing.expectEqual(resp_a.status, resp_b.status);
+        try testing.expectEqualStrings(resp_a.body, resp_b.body);
+    }
+}
+
+test "embedded comptime config gets pre-serialised fast responses (M11 path)" {
+    const srv = Server.comptimeInit(comptime Config.fromEmbedded("src/testdata/config.example.json"));
+
+    // /health and /old are module-less template routes: served from
+    // pre-serialised bytes, no pipeline.
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/health";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    const fb = srv.matchFast(&ctx).?;
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", fb.head);
+    try testing.expectEqualStrings("ok", fb.body);
+
+    var req2 = registry.Request.init(testing.allocator);
+    defer req2.deinit();
+    req2.target = "/old";
+    var resp2 = registry.Response.init(.ok);
+    var ctx2 = pipeline.Context{ .req = &req2, .resp = &resp2 };
+    const fb2 = srv.matchFast(&ctx2).?;
+    try testing.expectEqualStrings("HTTP/1.1 301 Moved Permanently\r\nLocation: /health\r\n", fb2.head);
+    try testing.expectEqualStrings("", fb2.body);
+
+    // /echo is module-backed: no fast path.
+    var req3 = registry.Request.init(testing.allocator);
+    defer req3.deinit();
+    req3.target = "/echo";
+    var resp3 = registry.Response.init(.ok);
+    var ctx3 = pipeline.Context{ .req = &req3, .resp = &resp3 };
+    try testing.expectEqual(@as(?router_mod.FastResponse, null), srv.matchFast(&ctx3));
+}
+
+test "embeddedInit resolves static roots at startup (root_real + root_fd)" {
+    const cfg = comptime Config.fromJsonComptime(
+        \\{ "routes": [ { "path": "/static", "root": "testdata", "modules": { "content": "static" } } ] }
+    );
+    var srv = try Server.embeddedInit(testing.allocator, cfg);
+    defer srv.deinitPrepared(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), srv.cfg.routes.len);
+    // "testdata" exists at the project root and resolves to an absolute path.
+    const rr = srv.cfg.routes[0].root_real orelse return error.SkipZigTest;
+    try testing.expect(rr.len > 0 and rr[0] == '/');
+    try testing.expect(srv.cfg.routes[0].root_fd >= 0);
+
+    // The copy carries the comptime dispatch fn.
+    try testing.expect(srv.cfg.routes[0].dispatch != null);
 }
 
 test "JSON template route applies through the pipeline" {

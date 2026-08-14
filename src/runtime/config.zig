@@ -36,11 +36,15 @@ pub const Config = struct {
         return json_config.parse(json);
     }
 
-    /// DM2: embed a config file and parse it at compile time
-    /// (`@embedFile`), so the entire config — routes, trie-ready tables and
-    /// limits — is a compile-time input.
+    /// DM2: embed a config file and parse it at compile time, so the entire
+    /// config — routes, trie-ready tables and limits — is a compile-time
+    /// input. The path is project-root-relative and resolved through the
+    /// `embeds` module (same convention as Milestone 10 route `embed`
+    /// paths). Use `Server.comptimeInit` to turn the result into a server
+    /// with a comptime-built trie, dispatch specialisation and pre-serialised
+    /// response templates.
     pub fn fromEmbedded(comptime path: []const u8) Config {
-        return json_config.parse(@embedFile(path));
+        return json_config.parse(@import("embeds").embed(path));
     }
 
     /// Verify every route against the module registry: each binding must name

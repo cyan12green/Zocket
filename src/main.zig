@@ -1,5 +1,18 @@
 const std = @import("std");
 const zocket = @import("zocket");
+const build_options = @import("build_options");
+
+/// DM2: comptime config as the primary path. When built with
+/// `zig build -Dconfig=<file>`, the JSON config is embedded at compile time
+/// and parsed by the DM1 validator; the server below is built with
+/// `Server.comptimeInit`, so the route trie, dispatch functions,
+/// pre-serialised response templates and upstream sockaddrs all live in
+/// .rodata. Invalid configs are compile errors. Null when no build-time
+/// config was given — the runtime `--config` path (secondary) or the default
+/// config is used then.
+const embedded_cfg: ?zocket.runtime.config.Config = if (build_options.config_path) |p|
+    zocket.runtime.config.Config.fromEmbedded(p)
+else null;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -55,22 +68,39 @@ pub fn main() !void {
     }
 
     // HTTP mode runs through the config-driven pipeline (Milestone 4). The
-    // default config (echo on every path) is a comptime struct literal: its
-    // route trie and per-route dispatch functions are built at compile time
-    // (Milestone 7). An explicit JSON config is parsed at startup with
-    // std.json; its trie is built at startup and freed with the server.
+    // config source is, in priority order:
+    //   1. DM2: the config embedded at build time (`-Dconfig=<file>`); the
+    //      server is built at compile time (trie + dispatch specialisation),
+    //      everything in .rodata;
+    //   2. the `--config` file, parsed at startup with std.json; its trie is
+    //      built at startup and freed with the server (secondary path);
+    //   3. the comptime default (echo on every path), as `Server.default()`.
     var json_buf: ?[]u8 = null;
     var loaded_cfg: ?zocket.runtime.config.Config = null;
-    if (config_path) |p| {
-        json_buf = try std.fs.cwd().readFileAlloc(p, allocator, .limited(1 << 20));
-        loaded_cfg = try zocket.runtime.config.Config.fromJson(allocator, json_buf.?);
-        try loaded_cfg.?.validate(zocket.dsl.registry.default_registry);
+    if (embedded_cfg == null) {
+        if (config_path) |p| {
+            json_buf = try std.fs.cwd().readFileAlloc(p, allocator, .limited(1 << 20));
+            loaded_cfg = try zocket.runtime.config.Config.fromJson(allocator, json_buf.?);
+            try loaded_cfg.?.validate(zocket.dsl.registry.default_registry);
+        }
     }
     if (json_buf) |b| allocator.free(b);
     defer if (loaded_cfg) |*cfg| cfg.deinit(allocator);
 
-    var http_srv: zocket.runtime.server.Server = zocket.runtime.server.Server.default();
+    var http_srv: zocket.runtime.server.Server = if (embedded_cfg) |cfg| blk: {
+        // DM2: module names are validated at startup (the DM1 comptime
+        // parser checks structure/phases; registry membership is a runtime
+        // check, consistent with the runtime `--config` path). Static roots
+        // are resolved at startup too (realpath + O_PATH fd per rooted
+        // route), mirroring the JSON load path.
+        try cfg.validate(zocket.dsl.registry.default_registry);
+        break :blk try zocket.runtime.server.Server.embeddedInit(allocator, cfg);
+    } else
+        zocket.runtime.server.Server.default();
     var http_srv_owns_trie = false;
+    defer if (embedded_cfg != null) {
+        http_srv.deinitPrepared(allocator);
+    };
     if (loaded_cfg) |cfg| {
         http_srv = try zocket.runtime.server.Server.initWithTrie(allocator, cfg);
         http_srv_owns_trie = true;
@@ -83,11 +113,13 @@ pub fn main() !void {
 
     // Graceful reload (Milestone 13): SIGHUP re-parses the config and swaps
     // in a fresh reactor set; old connections drain on the old set. Only
-    // meaningful with --config; old handlers stay alive until process exit.
+    // meaningful with a runtime `--config` file (a build-time embedded config
+    // is immutable); old handlers stay alive until process exit.
     zocket.multireactor.installSignalHandlers();
     var reload_handlers = std.ArrayList(*zocket.runtime.server.Server).empty;
     defer reload_handlers.deinit(allocator);
-    if (config_path) |path| {
+    if (embedded_cfg == null) {
+        if (config_path) |path| {
         const ReloadState = struct {
             allocator: std.mem.Allocator,
             config_path: []const u8,
@@ -122,11 +154,20 @@ pub fn main() !void {
         };
         s.reload_fn = ReloadState.reload;
         s.reload_userdata = &reload_state;
+        }
     }
 
     switch (mode) {
         .echo => std.debug.print("Starting multi-reactor TCP echo server on port {} with {} threads\n", .{ port, n }),
-        .http => std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads\n", .{ port, n }),
+        .http => {
+            if (embedded_cfg) |cfg| {
+                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (comptime-embedded config: {d} routes)\n", .{ port, n, cfg.routes.len });
+            } else if (config_path) |p| {
+                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (JSON config: {s})\n", .{ port, n, p });
+            } else {
+                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (default config)\n", .{ port, n });
+            }
+        },
     }
     if (idle_timeout > 0) {
         std.debug.print("Idle timeout: {}s\n", .{idle_timeout});

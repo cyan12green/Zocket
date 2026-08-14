@@ -1,10 +1,21 @@
 # Zocket configuration
 
-Zocket is configured at startup with `--config <file.json>`. The config has
-two sections: `routes` (the nginx-style location/phase mapping) and
-`limits` (runtime-tunable sizes and caps — nginx's `http{}`/`server{}`
-directive equivalents). Any `limits` field may be omitted; the compiled
-defaults apply. See `config.example.json` for a complete sample.
+The config has two sections: `routes` (the nginx-style location/phase
+mapping) and `limits` (runtime-tunable sizes and caps — nginx's
+`http{}`/`server{}` directive equivalents). Any `limits` field may be
+omitted; the compiled defaults apply. See `config.example.json` for a
+complete sample.
+
+There are two load paths:
+
+- **Comptime (primary, DM2)**: `zig build -Dconfig=<file>` embeds a
+  project-root-relative JSON config at compile time. The DM1 validator
+  parses it (invalid configs are compile errors) and `Server.comptimeInit`
+  builds the route trie, dispatch specialisation, pre-serialised response
+  templates and upstream sockaddrs — all in `.rodata`, no startup parsing.
+- **Runtime (secondary/development)**: `--config <file.json>` parses the
+  config at startup with std.json (startup trie build, SIGHUP reload
+  support). Used when no `-Dconfig` was given.
 
 ## routes
 
@@ -65,5 +76,8 @@ descriptions). All fields optional.
 }
 ```
 
-Startup: `zig build run -- --config config.json`. For the other run modes
-see the README.
+Startup:
+- Comptime: `zig build -Dconfig=config.json run` (primary path, DM2).
+- Runtime: `zig build run -- --config config.json` (secondary path).
+
+For the other run modes see the README.
