@@ -2,15 +2,15 @@
 //! (pre-DFA) vs comptime DFA path, for the header sets of the standard
 //! request variants. Alternates rounds so machine noise cancels.
 //!
-//! Usage:  zig build-exe -OReleaseFast --dep ziglet \
-//!           -Mroot=bench/classify_bench.zig -Mziglet=src/root.zig \
+//! Usage:  zig build-exe -OReleaseFast --dep zocket \
+//!           -Mroot=bench/classify_bench.zig -Mzocket=src/root.zig \
 //!           -femit-bin=zig-out/bin/classify_bench
 //!         zig-out/bin/classify_bench
 
 const std = @import("std");
-const ziglet = @import("ziglet");
-const parser = ziglet.http.parser;
-const header_dfa = ziglet.http.header_dfa;
+const zocket = @import("zocket");
+const parser = zocket.http.parser;
+const header_dfa = zocket.http.header_dfa;
 
 const wire_names = [_][]const u8{
     "Host",

@@ -1,4 +1,4 @@
-//! Parameterized request-parse / response-build micro-benchmark (Ziglet
+//! Parameterized request-parse / response-build micro-benchmark (Zocket
 //! side), paired with bench/reqresp_bench_httpx.zig (httpx.zig side).
 //!
 //! Runs the full request x response variant matrix, or a subset via CLI:
@@ -11,11 +11,11 @@
 //! one-for-one.
 
 const std = @import("std");
-const ziglet = @import("ziglet");
+const zocket = @import("zocket");
 
-const http_parser = ziglet.http.parser;
-const http_response = ziglet.http.response;
-const buffer_mod = ziglet.buffer;
+const http_parser = zocket.http.parser;
+const http_response = zocket.http.response;
+const buffer_mod = zocket.buffer;
 
 const RequestVariant = struct { name: []const u8, wire: []const u8 };
 
@@ -182,7 +182,7 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("=== Ziglet request/response micro-benchmark (ReleaseFast) ===\n\n", .{});
+    std.debug.print("=== Zocket request/response micro-benchmark (ReleaseFast) ===\n\n", .{});
 
     parse_buf = try buffer_mod.Buffer.init(allocator);
     parse_parser = http_parser.Parser.init(allocator);

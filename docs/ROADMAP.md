@@ -541,7 +541,7 @@ userspace before the syscall boundary).
 ### M15 — Benchmark-driven hardening (nginx comparison)
 
 **Status: DONE** (2026-08-13). Motivated by cross-framework comparison
-(Ziglet vs actix-web, Bun.serve, httpx.zig, nginx, Caddy — all pinned
+(Zocket vs actix-web, Bun.serve, httpx.zig, nginx, Caddy — all pinned
 as `third_party/` submodules, driven by `bench/compare-servers.sh`): fix
 what the benchmarks exposed, then replicate nginx's per-request recipe
 with comptime improvements.
@@ -578,7 +578,7 @@ with comptime improvements.
 - **Cached Date header** (nginx `ngx_cached_http_time` equivalent): the
   IMF-fixdate string is formatted once per wall-clock second into a
   reactor cache and copied into every pipeline response, plus a comptime
-  `Server: Ziglet` header; per-request date formatting is zero.
+  `Server: Zocket` header; per-request date formatting is zero.
 - **io_uring backend** (`net/iouring.zig`, opt-in `--uring`): batch
   connection reads/writes on a ring (one in-flight read per connection,
   no EAGAIN drain probe; completions drained via the ring fd on epoll;
@@ -606,7 +606,7 @@ with comptime improvements.
   47.9k -> 268k co-resident, gap to nginx 4.6x -> 1.66x ours; 64 KiB
   POST error path -> real echo; churn mmap pairs 7 -> 2 per connection;
   GET / empty 12-rep interleaved 292k vs nginx 278k). Final interleaved
-  comparison: Ziglet leads every workload (GET / 1.05x, 1 KB static
+  comparison: Zocket leads every workload (GET / 1.05x, 1 KB static
   1.66x, POST /echo 1.82x, 1 MB static parity). 175 tests.
 
 **Comptime**: DFA transition table, MIME/date tables, header templates and

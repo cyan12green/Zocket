@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the paired request/response micro-benchmark matrix (Ziglet vs
+# Run the paired request/response micro-benchmark matrix (Zocket vs
 # httpx.zig submodule) and print a comparison table.
 #
 #   bench/compare.sh [--iters N] [--rounds N] [--req NAME] [--resp NAME]
@@ -25,12 +25,12 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-echo "== building Ziglet bench =="
+echo "== building Zocket bench =="
 mkdir -p "$ROOT/zig-out/bin"
 (cd "$ROOT" && zig build-exe -OReleaseFast \
     -femit-bin="$ROOT/zig-out/bin/reqresp_bench" \
-    --dep ziglet --dep embeds \
-    -Mroot=bench/reqresp_bench.zig -Mziglet=src/root.zig -Membeds=embeds.zig)
+    --dep zocket --dep embeds \
+    -Mroot=bench/reqresp_bench.zig -Mzocket=src/root.zig -Membeds=embeds.zig)
 
 echo "== building httpx.zig bench (submodule) =="
 bash "$ROOT/bench/build-httpx.sh" >/dev/null
@@ -67,7 +67,7 @@ def parse(out):
 t = parse(tcp)
 h = parse(hx)
 
-print("| op | variant | Ziglet ns/op | httpx.zig ns/op | ratio (tcp faster) |")
+print("| op | variant | Zocket ns/op | httpx.zig ns/op | ratio (tcp faster) |")
 print("|---|---:|---:|---:|---:|")
 for key in sorted(t.keys()):
     if key not in h:

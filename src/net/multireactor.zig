@@ -412,12 +412,12 @@ fn httpReadUntil(sock: posix.fd_t, buf: []u8, expected_len: usize, timeout_ms: u
 
 const cache_mod = @import("../dsl/modules/cache.zig");
 
-/// Expected "Date: ...\r\nServer: Ziglet\r\n" for the current wall
+/// Expected "Date: ...\r\nServer: Zocket\r\n" for the current wall
 /// second (the reactor caches the date and refreshes it once per second).
 fn testDateLine(buf: []u8) []const u8 {
     const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
     const date = cache_mod.formatHttpDate(@intCast(ts.sec), buf) orelse unreachable;
-    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Ziglet/" ++ @import("../version.zig").version ++ "\r\n", .{date}) catch unreachable;
+    return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Zocket/" ++ @import("../version.zig").version ++ "\r\n", .{date}) catch unreachable;
 }
 
 test "multi-reactor HTTP with JSON config echoes via the pipeline" {

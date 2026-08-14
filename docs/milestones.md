@@ -1,6 +1,6 @@
 # Milestones
 
-The milestone history of Ziglet. Current status: M1–M15 complete.
+The milestone history of Zocket. Current status: M1–M15 complete.
 
 | Milestone | Status | Description |
 |---|---:|---|

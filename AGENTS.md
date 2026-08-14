@@ -1,6 +1,6 @@
 ## Project
 
-High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Through M14: multi-reactor epoll transport, HTTP/1.1, config-driven phase pipeline (`src/dsl/`, `src/runtime/`), static files, reverse proxy, observability, kernel-level optimizations. M15 (benchmark-driven hardening): on-demand request-buffer growth, nginx `open_file_cache`-style static fd + content cache, connection pooling with embedded buffers, request bump arena, cached Date header, experimental io_uring backend. In the nginx/actix/Bun/Caddy/httpx comparison (bench/compare-servers.sh) Ziglet leads every measured workload. Future base for a hot-reloadable, nginx-style config-driven HTTP server.
+High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Through M14: multi-reactor epoll transport, HTTP/1.1, config-driven phase pipeline (`src/dsl/`, `src/runtime/`), static files, reverse proxy, observability, kernel-level optimizations. M15 (benchmark-driven hardening): on-demand request-buffer growth, nginx `open_file_cache`-style static fd + content cache, connection pooling with embedded buffers, request bump arena, cached Date header, experimental io_uring backend. In the nginx/actix/Bun/Caddy/httpx comparison (bench/compare-servers.sh) Zocket leads every measured workload. Future base for a hot-reloadable, nginx-style config-driven HTTP server.
 
 ## Commands
 
@@ -19,13 +19,13 @@ High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Throu
 - Graphs: `python3 bench/graphs.py` is the single entry point — it runs the
   full comparison suite (matrix + static) with `--run` and/or generates all
   PNGs in `bench/graphs/` (matrix req/s + latency per body size, static
-  bars, Ziglet-vs-nginx head-to-head with per-request cost) from
+  bars, Zocket-vs-nginx head-to-head with per-request cost) from
   `bench/results/servers/`; the README embeds them. For CI:
   `python3 bench/graphs.py --run`.
 
 ## Layout & conventions
 
-- `src/root.zig` is the library module root; every new submodule MUST be re-exported there (consumer imports `@import("ziglet")`).
+- `src/root.zig` is the library module root; every new submodule MUST be re-exported there (consumer imports `@import("zocket")`).
 - `src/root.zig` also comptime-imports every submodule: this Zig snapshot only collects `test` blocks reachable via comptime imports from the test root, so new submodules must be added to that block or their tests silently never run.
 - `src/main.zig` is the exe entrypoint (CLI flags only; all server logic lives in `src/net/`, `src/http/`, `src/dsl/`, `src/runtime/`).
 - Module map: `net/` (M1/M2 transport), `http/` (M3 parser/response), `dsl/` (M4 phase pipeline: `phase.zig`, `router.zig`, `registry.zig`, `pipeline.zig`, `modules/`), `runtime/` (M4 config + server wiring: `config.zig`, `server.zig`), `ct_pool.zig` (comptime typed pool — the arena for comptime builders: fixed array + len, `create`/`freeze`, no allocator). Organization in submodules is a hard requirement — never dump code into main.zig.

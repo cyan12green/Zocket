@@ -31,7 +31,7 @@ RESULTS = os.path.join(ROOT, "bench", "results", "servers")
 OUT = os.path.join(ROOT, "bench", "graphs")
 
 SERVERS = [
-    ("tcp", "Ziglet", "#111111", 2.5),
+    ("tcp", "Zocket", "#111111", 2.5),
     ("actix", "actix-web", "#e63946", 1.6),
     ("nginx", "nginx", "#457b9d", 1.6),
     ("bun", "Bun.serve", "#f4a261", 1.6),
@@ -142,7 +142,7 @@ def plot_static():
 
 
 def plot_nginx_compare():
-    """One-to-one Ziglet vs nginx across every cell: req/s bars and the
+    """One-to-one Zocket vs nginx across every cell: req/s bars and the
     derived per-request cost (1e9 / rps, ns/request)."""
     cells = matrix_cells() + static_cells()
     labels = [c[0] for c in cells]
@@ -156,25 +156,25 @@ def plot_nginx_compare():
     x = range(len(labels))
     width = 0.38
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    axes[0].bar([p - width / 2 for p in x], zig_rps, width, label="Ziglet",
+    axes[0].bar([p - width / 2 for p in x], zig_rps, width, label="Zocket",
                 color="#111111")
     axes[0].bar([p + width / 2 for p in x], ngx_rps, width, label="nginx",
                 color="#457b9d")
     axes[0].set_xticks(list(x))
     axes[0].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
     axes[0].set_ylabel("requests/sec (higher is better)")
-    axes[0].set_title("Ziglet vs nginx — req/s (higher is better)")
+    axes[0].set_title("Zocket vs nginx — req/s (higher is better)")
     axes[0].legend(fontsize=8)
     axes[0].grid(True, axis="y", alpha=0.3)
 
     axes[1].bar([p - width / 2 for p in x], [v / 1000 for v in zig_ns], width,
-                label="Ziglet", color="#111111")
+                label="Zocket", color="#111111")
     axes[1].bar([p + width / 2 for p in x], [v / 1000 for v in ngx_ns], width,
                 label="nginx", color="#457b9d")
     axes[1].set_xticks(list(x))
     axes[1].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
     axes[1].set_ylabel("per-request cost (us, lower is better)")
-    axes[1].set_title("Ziglet vs nginx — effective cost per request (lower is better)")
+    axes[1].set_title("Zocket vs nginx — effective cost per request (lower is better)")
     axes[1].legend(fontsize=8)
     axes[1].grid(True, axis="y", alpha=0.3)
 

@@ -1,6 +1,6 @@
-# Ziglet configuration
+# Zocket configuration
 
-Ziglet is configured at startup with `--config <file.json>`. The config has
+Zocket is configured at startup with `--config <file.json>`. The config has
 two sections: `routes` (the nginx-style location/phase mapping) and
 `limits` (runtime-tunable sizes and caps — nginx's `http{}`/`server{}`
 directive equivalents). Any `limits` field may be omitted; the compiled

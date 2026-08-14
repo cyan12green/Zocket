@@ -1,5 +1,5 @@
 //! Temporary benchmark server: GET / -> 200 with an empty body (mirrors
-//! Ziglet's default catch-all behavior), POST /echo -> body echo, and
+//! Zocket's default catch-all behavior), POST /echo -> body echo, and
 //! GET /static -> a file loaded into memory at startup (--static <path>;
 //! httpx.zig has no sendfile path, so the file is preloaded, documented in
 //! BENCH.md).
