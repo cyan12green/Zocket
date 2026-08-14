@@ -7,13 +7,12 @@ kernel-level optimizations (SO_REUSEPORT, sendfile, writev). In the
 nginx-feature comparison it leads on every measured workload (see
 `bench/BENCH.md`).
 
-## Status
+## Motivation
+- Heavily influenced by nginx in terms of config / custom modules / http phases.
+- A high performance TCP/HTTP server that can compete with nginx (the fastest web server that I have worked with).
+- Comptime, Comptime and Comptime!!! Use compile time (Zig's one of the strongest feature IMO) wherever.
 
-All milestones M1-M15 are complete (see `docs/milestones.md` for the
-history). In the nginx/actix/Bun/Caddy/httpx comparison
-(`bench/compare-servers.sh`) Ziglet leads every measured workload.
-Roadmap: `docs/ROADMAP.md`. Configuration reference (routes + limits):
-`docs/config.md`; full sample: `config.example.json`.
+
 
 ## Source layout
 
@@ -96,3 +95,8 @@ just run `python3 bench/graphs.py --run` (full suite + graphs):
   Ziglet leads every measured workload (nginx comparison in
   `bench/BENCH.md`).
 - `bench/http-check.py`, `bench/echo-check.py` — end-to-end correctness checks.
+
+## AI Disclosure
+
+- This project is also a learning opportunity for me for using agentic development, so there is heavy AI/LLM usage in this repo.
+- Mainly the model used is *DeepSeek V4 Flash* with *OpenCode* as the harness.
