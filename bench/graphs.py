@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Generate benchmark graphs from the stored results.
+"""Single entry point for the benchmark suite and graph generation.
 
-Reads:
+Usage:
+  python3 bench/graphs.py            generate graphs from stored results
+  python3 bench/graphs.py --run      run the full comparison suite first
+                                     (matrix + static), then generate graphs
+
+The whole flow is one program so CI can do: python3 bench/graphs.py --run.
+
+Reads/writes:
   bench/results/servers/matrix/<cell>/A|B_<srv>_r*.json   (payload x conns)
   bench/results/servers/static/<cell>/A|B_<srv>_r*.json   (file serving)
-  bench/compare.sh output (micro-benchmarks, run on demand)
-
-Writes PNGs into bench/graphs/ (referenced from the README):
-  matrix_reqs_<size>.png   req/s vs connections, one line per server
-  matrix_p50_<size>.png    median latency vs connections
-  static.png               req/s grouped bars per file size
-  micro_parse.png, micro_build.png   ns/op per variant (Ziglet vs httpx.zig)
+  bench/graphs/*.png                                       (output)
 """
+import argparse
 import glob
 import json
 import os
-import re
 import statistics
 import subprocess
 import sys
@@ -54,45 +55,49 @@ def med(d, name):
     return statistics.median(v[0] for v in vals), statistics.median(v[1] for v in vals)
 
 
-def cells():
-    out = []
+def cell_value(d, tag, idx):
+    a = med(d, f"A_{tag}")
+    b = med(d, f"B_{tag}")
+    if not a or not b:
+        return None
+    return statistics.median([a[idx], b[idx]])
+
+
+def matrix_cells():
+    cells = []
+    sizes = {"1024": "1K", "8192": "8K", "65536": "64K"}
     for body in ("1024", "8192", "65536"):
-        row = []
         for c in ("10", "100", "1000"):
-            row.append(os.path.join(RESULTS, "matrix", f"b{body}_c{c}"))
-        out.append((body, row))
-    return out
+            cells.append((f"echo {sizes[body]} c={c}",
+                          os.path.join(RESULTS, "matrix", f"b{body}_c{c}")))
+    return cells
 
 
 def static_cells():
-    out = []
+    cells = []
     for size in ("1024", "1048576"):
-        row = []
         for c in ("100", "1000"):
-            row.append(os.path.join(RESULTS, "static", f"s{size}_c{c}"))
-        out.append((size, row))
-    return out
+            label = "1K" if size == "1024" else "1M"
+            cells.append((f"static {label} c={c}",
+                          os.path.join(RESULTS, "static", f"s{size}_c{c}")))
+    return cells
 
 
 def plot_matrix():
     sizes = {"1024": "1 KB", "8192": "8 KB", "65536": "64 KB"}
-    for body, dirs in cells():
+    for body, dirs in (("1024", []), ("8192", []), ("65536", [])):
+        dirs = [os.path.join(RESULTS, "matrix", f"b{body}_c{c}") for c in ("10", "100", "1000")]
         xs = ("10", "100", "1000")
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
         for tag, name, color, lw in SERVERS:
             rps, p50 = [], []
             for d in dirs:
-                m = med(d, f"A_{tag}")
-                b = med(d, f"B_{tag}")
-                if m and b:
-                    rps.append(statistics.median([m[0], b[0]]))
-                    p50.append(statistics.median([m[1], b[1]]))
-                else:
-                    rps.append(None)
-                    p50.append(None)
+                r = cell_value(d, tag, 0)
+                p = cell_value(d, tag, 1)
+                rps.append(r)
+                p50.append(p / 1000.0 if p else None)
             axes[0].plot(xs, rps, label=name, color=color, linewidth=lw, marker="o")
-            axes[1].plot(xs, [p / 1000.0 if p else None for p in p50],
-                         label=name, color=color, linewidth=lw, marker="o")
+            axes[1].plot(xs, p50, label=name, color=color, linewidth=lw, marker="o")
         axes[0].set_title(f"POST /echo body={sizes[body]} — req/s")
         axes[0].set_xlabel("connections")
         axes[0].set_ylabel("requests/sec")
@@ -110,25 +115,20 @@ def plot_matrix():
 
 
 def plot_static():
-    labels = []
-    zig = []
-    others = {srv: [] for srv, _, _, _ in SERVERS}
-    for size, dirs in static_cells():
+    labels, zig, others = [], [], {s: [] for s, _, _, _ in SERVERS}
+    for size, dirs in (("1024", []), ("1048576", [])):
+        dirs = [os.path.join(RESULTS, "static", f"s{size}_c{c}") for c in ("100", "1000")]
         for d in dirs:
             conns = os.path.basename(d).split("_")[-1]
-            labels.append(f"{size} B / c={conns}")
+            labels.append(f"{'1K' if size == '1024' else '1M'} / c={conns}")
             for tag, _, _, _ in SERVERS:
-                m = med(d, f"A_{tag}")
-                b = med(d, f"B_{tag}")
-                val = statistics.median([m[0], b[0]]) if m and b else 0
-                others[tag].append(val)
+                others[tag].append(cell_value(d, tag, 0) or 0)
     x = range(len(labels))
     width = 0.13
     fig, ax = plt.subplots(figsize=(11, 4.5))
     for i, (tag, name, color, lw) in enumerate(SERVERS):
-        vals = others[tag]
-        ax.bar([p + i * width for p in x], vals, width, label=name, color=color,
-               edgecolor="black", linewidth=0.3)
+        ax.bar([p + i * width for p in x], others[tag], width, label=name,
+               color=color, edgecolor="black", linewidth=0.3)
     ax.set_xticks([p + width * (len(SERVERS) - 1) / 2 for p in x])
     ax.set_xticklabels(labels, fontsize=8)
     ax.set_ylabel("requests/sec")
@@ -141,53 +141,72 @@ def plot_static():
     print("static.png")
 
 
-def parse_micro(out):
-    """compare.sh output -> dict variant -> (ziglet_ns, httpx_ns)."""
-    data = {}
-    current = None
-    ziglet = True
-    for line in out.splitlines():
-        m = re.search(r"(request_parse|response_build)\[(\w+)\].*avg=([\d.]+)ns/op", line)
-        if m:
-            key = (m.group(1), m.group(2))
-            data.setdefault(key, {})["ziglet" if "httpx" not in line else "httpx"] = float(m.group(3))
-    return data
+def plot_nginx_compare():
+    """One-to-one Ziglet vs nginx across every cell: req/s bars and the
+    derived per-request cost (1e9 / rps, ns/request)."""
+    cells = matrix_cells() + static_cells()
+    labels = [c[0] for c in cells]
+    zig_rps, ngx_rps = [], []
+    for _, d in cells:
+        zig_rps.append(cell_value(d, "tcp", 0) or 0)
+        ngx_rps.append(cell_value(d, "nginx", 0) or 0)
+    zig_ns = [1e9 / r if r else 0 for r in zig_rps]
+    ngx_ns = [1e9 / r if r else 0 for r in ngx_rps]
+
+    x = range(len(labels))
+    width = 0.38
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].bar([p - width / 2 for p in x], zig_rps, width, label="Ziglet",
+                color="#111111")
+    axes[0].bar([p + width / 2 for p in x], ngx_rps, width, label="nginx",
+                color="#457b9d")
+    axes[0].set_xticks(list(x))
+    axes[0].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    axes[0].set_ylabel("requests/sec")
+    axes[0].set_title("Ziglet vs nginx — req/s (all cells)")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, axis="y", alpha=0.3)
+
+    axes[1].bar([p - width / 2 for p in x], [v / 1000 for v in zig_ns], width,
+                label="Ziglet", color="#111111")
+    axes[1].bar([p + width / 2 for p in x], [v / 1000 for v in ngx_ns], width,
+                label="nginx", color="#457b9d")
+    axes[1].set_xticks(list(x))
+    axes[1].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    axes[1].set_ylabel("per-request cost (us, 1e9/rps)")
+    axes[1].set_title("Ziglet vs nginx — effective cost per request")
+    axes[1].legend(fontsize=8)
+    axes[1].grid(True, axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "nginx_compare.png"), dpi=120)
+    plt.close(fig)
+    print("nginx_compare.png")
 
 
-def plot_micro():
-    res = subprocess.run(["bash", "bench/compare.sh"], cwd=ROOT, capture_output=True, text=True)
-    if res.returncode != 0:
-        print("micro bench failed; skipping micro graphs")
-        return
-    data = parse_micro(res.stdout)
-    for op, title, fname in (
-        ("request_parse", "Request parsing — avg ns/op", "micro_parse.png"),
-        ("response_build", "Response building — avg ns/op", "micro_build.png"),
-    ):
-        items = sorted((k[1] for k in data if k[0] == op))
-        zig = [data[(op, v)]["ziglet"] for v in items]
-        hx = [data[(op, v)].get("httpx", 0) for v in items]
-        fig, ax = plt.subplots(figsize=(9, 4))
-        x = range(len(items))
-        ax.bar([p - 0.2 for p in x], zig, 0.4, label="Ziglet", color="#111111")
-        ax.bar([p + 0.2 for p in x], hx, 0.4, label="httpx.zig", color="#8d99ae")
-        ax.set_xticks(list(x))
-        ax.set_xticklabels(items, fontsize=9)
-        ax.set_ylabel("ns/op (lower is better)")
-        ax.set_title(title)
-        ax.legend()
-        ax.grid(True, axis="y", alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(os.path.join(OUT, fname), dpi=120)
-        plt.close(fig)
-        print(fname)
+def run_suite():
+    print("== running the comparison suite ==")
+    subprocess.run(["bash", "bench/compare-servers.sh",
+                    "--matrix", "--bodies", "1024 8192 65536",
+                    "--conns-list", "10 100 1000",
+                    "--reps", "3", "--duration", "5s"], cwd=ROOT, check=True)
+    subprocess.run(["bash", "bench/compare-servers.sh",
+                    "--static", "1024 1048576",
+                    "--conns-list", "100 1000",
+                    "--reps", "3", "--duration", "5s"], cwd=ROOT, check=True)
 
 
 def main():
+    ap = argparse.ArgumentParser(description="Run the suite and/or generate graphs")
+    ap.add_argument("--run", action="store_true",
+                    help="run the full comparison suite first, then generate graphs")
+    args = ap.parse_args()
+    if args.run:
+        run_suite()
     os.makedirs(OUT, exist_ok=True)
     plot_matrix()
     plot_static()
-    plot_micro()
+    plot_nginx_compare()
     print("done")
 
 

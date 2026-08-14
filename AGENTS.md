@@ -16,10 +16,12 @@ High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Throu
 - `zig build -Doptimize=ReleaseFast` — for benchmarking.
 - Benchmark: `bash bench/bench.sh <binary> <tag> [--extra server args]` (bombardier sweeps; set `CHECK=http-check.py` for the HTTP server, default `echo-check.py` for raw echo), `bash bench/bench2.sh <binary> <tag> [--extra server args]` (true-capacity echo-client sweeps); summarize with `bench/summarize.py` / `bench/summarize2.py`; e2e HTTP checks: `bench/http-check.py <port>`; cross-language comparison (actix-web, Bun.serve, httpx.zig, nginx, Caddy as pinned submodules): `bash bench/compare-servers.sh` (single-cell), `--matrix` (payload x conns), `--static "1024 1048576"` (file serving), `--bodies`, `--conns-list`; see `bench/BENCH.md`.
 - Verify compilation with `zig build` or `zig build-exe` after any change.
-- Graphs: `python3 bench/graphs.py` regenerates the PNGs in `bench/graphs/`
-  (matrix req/s + latency per body size, static bars, parse/build micro)
-  from the stored results in `bench/results/servers/`; the README embeds
-  them.
+- Graphs: `python3 bench/graphs.py` is the single entry point — it runs the
+  full comparison suite (matrix + static) with `--run` and/or generates all
+  PNGs in `bench/graphs/` (matrix req/s + latency per body size, static
+  bars, Ziglet-vs-nginx head-to-head with per-request cost) from
+  `bench/results/servers/`; the README embeds them. For CI:
+  `python3 bench/graphs.py --run`.
 
 ## Layout & conventions
 
