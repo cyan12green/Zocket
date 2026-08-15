@@ -37,6 +37,7 @@ nginx-style phases for matching requests.
 | `balance` | `"round_robin"` \| `"least_connections"` \| `"ip_hash"` | `"round_robin"` | Proxy load-balance strategy. |
 | `max_fails` | number | 3 | Proxy passive health-check failures before the backend is marked down. |
 | `fail_timeout_seconds` | number | 30 | Proxy backend recheck window after failures. |
+| `chunked` | bool | false | Route opt-in for HTTP/1.1 chunked responses: the body is framed as a single chunk (`Transfer-Encoding: chunked`) instead of Content-Length — head+size, body and terminator flush as one writev, so it costs nothing extra. Enables streaming when the body size is unknown up front. Ignored over HTTP/2 (frame-based). |
 
 ## limits
 
@@ -79,5 +80,66 @@ descriptions). All fields optional.
 Startup:
 - Comptime: `zig build -Dconfig=config.json run` (primary path, DM2).
 - Runtime: `zig build run -- --config config.json` (secondary path).
+
+## Daemon control and reloads
+
+`--start`/`--stop`/`--status`/`--reload-*` turn the server into a daemon
+with config reloads. The daemon records everything needed to reproduce its
+build+start in a state file written next to the pidfile: `<pidfile>.state`
+(JSON: `config_path`, `optimize`, `port`, `threads`, `mode`, `idle_timeout`,
+`uring`, `single`, `embedded`, `project_root`). `--pidfile` defaults to
+`/tmp/zocket.pid`.
+
+Example lifecycle:
+
+```sh
+zocket --start --config config.example.json --port 8080 --threads 4 \
+        --pidfile /tmp/zocket.pid     # daemonize; exit 0 once listening
+zocket --status --pidfile /tmp/zocket.pid
+# ...edit the config...
+zocket --reload-soft --pidfile /tmp/zocket.pid   # fast in-process reparse
+# ...or for a full compile-time reload...
+zocket --reload-hard --pidfile /tmp/zocket.pid   # rebuild + zero-downtime swap
+zocket --stop --pidfile /tmp/zocket.pid          # graceful drain + exit
+```
+
+- `zocket --start [options]` — daemonize (fork + detach, stdio to
+  /dev/null), bind, write pidfile + state, then exit 0 only after the
+  listeners are ready.
+- `zocket --stop` — SIGTERM with a graceful drain: the daemon stops
+  accepting, closes its SO_REUSEPORT listeners and finishes existing
+  connections (30 s cap) before exiting.
+- `zocket --status` — running / not running (stale pidfile detection).
+- `zocket --reload-soft` — **runtime reload**: sends SIGHUP; the daemon
+  re-parses its `--config` in-process (no rebuild, no restart). Only
+  applies when the daemon runs a runtime config — an embedded config is
+  immutable at runtime (use `--reload-hard`).
+- `zocket --reload-hard [--config <file>]` — **comptime reload**: rebuilds
+  the binary with the config embedded at compile time, then swaps:
+  1. `zig build -Doptimize=<recorded> -Dconfig=<config>` in the recorded
+     project root (`zig` from PATH). The DM1 validator runs at compile time:
+     **an invalid config is a compile error and aborts the reload — the old
+     daemon keeps serving untouched** (module names are checked when the new
+     daemon starts; the old daemon is still untouched either way).
+  2. The freshly built `zig-out/bin/zocket --start` is exec'd with the
+     recorded options — both daemons bind the port via SO_REUSEPORT, so
+     there is no acceptance gap (verified: 2M requests across a swap, 0
+     errors).
+  3. The old daemon gets SIGTERM and drains: it stops accepting, closes its
+     listeners (so every new connection goes to the new daemon), serves any
+     connections already in its accept backlog, and finishes its in-flight
+     requests before exiting. The only loss window is the µs between the
+     drain request and the listener close (a connection whose SYN lands
+     exactly there is reset — the same instant nginx's reload has).
+  4. The pid/state files are only removed by a daemon that still owns them:
+     the old daemon checks the pidfile before cleaning up, so it cannot
+     delete the new daemon's files (the reload-hard cleanup race, covered
+     by a test).
+  `--config` overrides the recorded path. Config paths must resolve inside
+  the project tree — the comptime embed (`@embedFile`) cannot reach outside
+  it (dot-directories like `.zig-cache` are excluded too).
+
+SIGHUP alone (e.g. `kill -HUP <pid>`) still performs the fast runtime
+reparse, identical to `--reload-soft`.
 
 For the other run modes see the README.

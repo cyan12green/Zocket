@@ -175,6 +175,9 @@ pub const Reactor = struct {
     draining: std.atomic.Value(bool) = .init(false),
     drained: std.atomic.Value(bool) = .init(false),
     drain_started: std.time.Instant = undefined,
+    /// Set by `drain`: the listener should be closed as soon as the current
+    /// epoll batch finishes (see `closeListenerIfRequested`).
+    listener_close_requested: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: std.mem.Allocator, id: usize, mode: Mode) !Reactor {
         return initWithTimeout(allocator, id, mode, default_idle_timeout_seconds);
@@ -348,7 +351,24 @@ pub const Reactor = struct {
     pub fn drain(self: *Reactor) void {
         self.draining.store(true, .release);
         self.drain_started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+        // Graceful handoff (daemon swap, reload): stop routing new
+        // connections to this reactor by closing its SO_REUSEPORT listener,
+        // so the kernel delivers them to sibling listeners (the new
+        // process). Deferred to after the current epoll batch: the listener
+        // may be mid-event, and closing it inside the batch could let a
+        // later stale event accept from a closed fd.
+        self.listener_close_requested.store(true, .release);
         self.wakeup.write();
+    }
+
+    /// Close the listener if drain requested it. Called once per loop
+    /// iteration and after the loop exits (drain may have been requested
+    /// while the loop was in epoll_wait).
+    fn closeListenerIfRequested(self: *Reactor) void {
+        if (self.listener >= 0 and self.listener_close_requested.swap(false, .release)) {
+            posix.close(self.listener);
+            self.listener = -1;
+        }
     }
 
     /// True once the reactor loop has exited after a drain (polled by the
@@ -385,14 +405,20 @@ pub const Reactor = struct {
         sockets.pinToCpu(self.id);
         var events: [max_events]linux.epoll_event = undefined;
         while (self.running.load(.acquire)) {
+            self.closeListenerIfRequested();
             if (self.draining.load(.acquire)) {
                 if (self.connections.count() == 0) break;
                 const now = std.time.Instant.now() catch break;
                 if (now.since(self.drain_started) > drain_timeout_ns) break;
             }
             self.advanceTimers();
-            self.refreshDate();
             const n = self.ep.wait(&events, 100) catch continue;
+            // Refresh the cached Date after the wait: a request that just
+            // woke the loop is handled with a fresh second (stale by the µs
+            // of batch processing), instead of up to a second + the wait
+            // timeout if the refresh ran before the wait. (nginx refreshes
+            // its cached time once per event cycle too; ours is per batch.)
+            self.refreshDate();
             for (events[0..n]) |ev| {
                 self.handleEvent(ev.events, @intCast(ev.data.ptr));
             }
@@ -401,6 +427,7 @@ pub const Reactor = struct {
         // even if a connection arrived between the last wakeup and stop.
         self.wakeup.read();
         self.drainPending();
+        self.closeListenerIfRequested();
         self.drained.store(true, .release);
     }
 
@@ -1306,7 +1333,11 @@ pub const Reactor = struct {
 
     /// Accept from the per-reactor listener (SO_REUSEPORT, Milestone 14) and
     /// register each connection directly — no accept loop, no dispatcher, no
-    /// eventfd wakeup. Connections are rejected while draining.
+    /// eventfd wakeup. While draining (reload-hard handoff) connections
+    /// already queued in the accept backlog are still served: dropping them
+    /// would reset clients mid-handshake. The listener is closed right after
+    /// this batch, so this is bounded to the backlog; connections arriving
+    /// after the close go to the sibling listeners (the new daemon).
     fn acceptConnections(self: *Reactor) void {
         while (true) {
             const conn_fd = sockets.acceptNonBlock(self.listener) catch |e| switch (e) {
@@ -1319,10 +1350,6 @@ pub const Reactor = struct {
             // One setsockopt per connection, amortized over keep-alive.
             sockets.setTcpNoDelay(conn_fd);
             if (self.accepted_counter) |c| _ = c.fetchAdd(1, .monotonic);
-            if (self.draining.load(.acquire)) {
-                posix.close(conn_fd);
-                continue;
-            }
             const conn = self.conn_pool.acquire(conn_fd) catch {
                 posix.close(conn_fd);
                 return;

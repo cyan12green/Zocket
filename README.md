@@ -1,19 +1,53 @@
 # Zocket
 
-High-performance TCP/HTTP server in Zig (0.16.0-dev, pinned in
-`build.zig.zon`): multi-reactor epoll transport, HTTP/1.1, an nginx-style
-config-driven phase pipeline, static file serving, reverse proxying, and
-kernel-level optimizations (SO_REUSEPORT, sendfile, writev). In the
-nginx-feature comparison it leads on every measured workload (see
-`bench/BENCH.md`).
+High-performance TCP/HTTP server in Zig.
 
 ## Motivation
+- A compiled routing/configurable web server.
 - Heavily influenced by nginx in terms of config / custom modules / http phases.
 - A high performance TCP/HTTP server that can compete with nginx (the fastest web server that I have worked with).
 - Comptime, Comptime and Comptime!!! Use compile time (Zig's one of the strongest feature IMO) wherever.
 
+## Major features
 
+**Transport & protocols**
+- Multi-reactor epoll transport: one SO_REUSEPORT listener + event loop per
+  physical core, lock-free dispatch, connection pooling, io_uring backend
+  (opt-in)
+- HTTP/1.1: incremental parser (DFA header classification), keep-alive,
+  pipelining, chunked request bodies, HEAD, 400/413/431/501 handling
+- HTTP/2 (h2c prior-knowledge): HPACK (comptime Huffman + static tables),
+  flow control, CONTINUATION, trailers, RST/GOAWAY
+- Chunked transfer responses, per-route opt-in (`"chunked": true`)
+- Automatic protocol detection per connection (h2 preface vs HTTP/1.1)
 
+**Config & modules (nginx-style)**
+- Config-driven phase pipeline: 10 nginx phases (post_read … log), prefix/
+  exact routing, comptime route trie + per-route dispatch specialisation
+- Comptime config as the primary path (DM2): the JSON config is embedded and
+  DM1-validated at compile time — trie, dispatch and pre-serialised response
+  templates live in `.rodata`; invalid configs are compile errors
+- Module registry (echo, gzip, static + sendfile, proxy + load balancing +
+  health checks, cache/Conditional-GET, response templates, stub_status,
+  access/error logs) — identical behaviour over HTTP/1.1 and HTTP/2
+
+**Operations**
+- Daemon control: `--start` / `--stop` / `--status` (pidfile)
+- `--reload-soft`: in-process runtime config reparse (SIGHUP)
+- `--reload-hard`: compile-time config reload — rebuild with the config
+  embedded, zero-downtime daemon swap (SO_REUSEPORT handoff, old daemon
+  drains its connections)
+- Graceful shutdown: SIGTERM/SIGINT drain connections (30 s cap)
+- `--validate`: parse + validate a config and print the route table
+- `--single` (M1 baseline), `--echo` (raw protocol), `--uring` (experimental)
+
+**Engineering**
+- Performance: beats nginx on every measured workload — HTTP/2 echo 3.0x
+  (100 streams/conn) and 1.2x (serialized), chunked transfer 1.4-2.0x,
+  static 1.7x, h1 echo/matrix 1.1-1.8x (see Benchmarks below)
+- Comptime-first: route trie, header DFA, MIME table, HPACK tables, JSON
+  config parser and protocol decode tables are all compile-time built
+- Fuzz harness + h2spec conformance gate (`zig build fuzz`, `zig build h2test`)
 
 ## Run modes
 
@@ -31,7 +65,11 @@ zig build run -- --uring               experimental io_uring batch I/O backend
                                        (epoll is the default)
 zig build run -- --help                all flags, including daemon control:
                                        --start/--stop/--status (pidfile),
-                                       --validate (config check)
+                                       --validate (config check),
+                                       --reload-soft (in-process runtime
+                                       reparse) / --reload-hard (rebuild with
+                                       the config compiled in + zero-downtime
+                                       daemon swap)
 ```
 
 ## Benchmark graphs
