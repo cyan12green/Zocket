@@ -45,6 +45,11 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
     // No route matched: no module can act on this request.
     const r = route orelse return .not_handled;
 
+    // Route opt-in for chunked transfer encoding (config `chunked: true`):
+    // the serializer frames this route's response as chunks instead of
+    // Content-Length. The flag travels on the response; h2 ignores it.
+    if (r.chunked) ctx.resp.chunked = true;
+
     // Milestone 7: comptime-specialised dispatch (struct-literal configs).
     // Zero loops, zero moduleFor scans, zero Registry.resolve at runtime.
     if (r.dispatch) |f| {

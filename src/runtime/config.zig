@@ -221,6 +221,7 @@ pub const Config = struct {
                 .balance = balance,
                 .max_fails = jr.max_fails,
                 .fail_timeout_seconds = jr.fail_timeout_seconds,
+                .chunked = jr.chunked,
             });
         }
 
@@ -269,6 +270,7 @@ const JsonRoute = struct {
     balance: ?[]const u8 = null,
     max_fails: u32 = 3,
     fail_timeout_seconds: u32 = 30,
+    chunked: bool = false,
 };
 
 const JsonLimits = struct {
@@ -340,6 +342,22 @@ test "JSON config parses into the same route table" {
     try testing.expectEqualStrings("/", cfg.routes[1].path);
     try testing.expectEqual(router.Match.prefix, cfg.routes[1].match);
     try testing.expectEqualStrings("echo", cfg.routes[1].moduleFor(.content).?);
+}
+
+test "JSON config route opt-in for chunked responses" {
+    const json =
+        \\{ "routes": [
+        \\    { "path": "/chunked", "match": "exact", "chunked": true,
+        \\      "modules": { "content": "echo" } },
+        \\    { "path": "/plain", "match": "exact", "modules": { "content": "echo" } }
+        \\  ] }
+    ;
+    var cfg = try Config.fromJson(testing.allocator, json);
+    defer cfg.deinit(testing.allocator);
+    try cfg.validate(registry.default_registry);
+
+    try testing.expect(cfg.routes[0].chunked);
+    try testing.expect(!cfg.routes[1].chunked);
 }
 
 test "JSON config rejects an unknown module at validate time" {

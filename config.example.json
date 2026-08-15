@@ -50,6 +50,12 @@
       "path": "/",
       "match": "prefix",
       "modules": { "content": "echo" }
+    },
+    {
+      "path": "/chunked",
+      "match": "exact",
+      "chunked": true,
+      "modules": { "content": "echo" }
     }
   ]
 }

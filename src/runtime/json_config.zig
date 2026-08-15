@@ -70,6 +70,7 @@ const RouteSpec = struct {
     balance: Balance = .round_robin,
     max_fails: u32 = 3,
     fail_timeout_seconds: u32 = 30,
+    chunked: bool = false,
 };
 
 /// Comptime builder: append-only pools for every piece of the route table.
@@ -146,6 +147,7 @@ const H_upstreams = keyHash("upstreams");
 const H_balance = keyHash("balance");
 const H_max_fails = keyHash("max_fails");
 const H_fail_timeout_seconds = keyHash("fail_timeout_seconds");
+const H_chunked = keyHash("chunked");
 const H_exact = keyHash("exact");
 const H_prefix = keyHash("prefix");
 const H_round_robin = keyHash("round_robin");
@@ -451,6 +453,7 @@ const Cursor = struct {
                 },
                 H_max_fails => spec.max_fails = self.parseUInt(k.key, u32),
                 H_fail_timeout_seconds => spec.fail_timeout_seconds = self.parseUInt(k.key, u32),
+                H_chunked => spec.chunked = self.parseBool(k.key),
                 else => self.fail("unknown route key '" ++ k.key ++ "'"),
             }
             switch (self.peek()) {
@@ -745,6 +748,7 @@ fn build(b: *const Builder) Config {
                 .balance = spec.balance,
                 .max_fails = spec.max_fails,
                 .fail_timeout_seconds = spec.fail_timeout_seconds,
+                .chunked = spec.chunked,
             };
             len += 1;
         }

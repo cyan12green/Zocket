@@ -112,6 +112,35 @@ pub fn formatUInt(buf: []u8, pos: usize, v: u64) usize {
     return pos + n;
 }
 
+/// Lowercase hex of `v` (RFC 9112 chunk sizes are hexadecimal), written at
+/// `buf[pos]`. Returns the new position; `buf` needs `hexDigitCount(v)`
+/// bytes (at least 1).
+pub fn formatHexUInt(buf: []u8, pos: usize, v: u64) usize {
+    var i = pos;
+    const digits = hexDigitCount(v);
+    if (digits == 0) {
+        buf[i] = '0';
+        return i + 1;
+    }
+    const shift: u6 = @intCast((digits - 1) * 4);
+    var x = v;
+    while (i < pos + digits) {
+        const nibble: u4 = @intCast((x >> shift) & 0xf);
+        buf[i] = "0123456789abcdef"[nibble];
+        i += 1;
+        x <<= 4;
+    }
+    return i;
+}
+
+/// Number of hex digits in `v` (0 for 0).
+pub fn hexDigitCount(v: u64) usize {
+    var n: usize = 0;
+    var x = v;
+    while (x > 0) : (x >>= 4) n += 1;
+    return n;
+}
+
 /// Reason phrase for an arbitrary status code (comptime templates): known
 /// codes map to their phrases, unknown ones to the generic fallback.
 pub fn reasonPhraseForCode(comptime code: u16) []const u8 {
@@ -162,6 +191,12 @@ pub const Response = struct {
     file_fd_cached: bool = false,
     file_offset: u64 = 0,
     file_len: u64 = 0,
+    /// Optional chunked transfer encoding (route config `chunked: true`).
+    /// When set, the head carries `Transfer-Encoding: chunked` instead of
+    /// Content-Length and the body is framed as a single chunk. Serialized
+    /// with `writeChunkedHeadToBuffer`; ignored by the h2 path (h2 is
+    /// frame-based and never uses Transfer-Encoding).
+    chunked: bool = false,
 
     pub const Header = struct { name: []const u8, value: []const u8 };
 
@@ -211,6 +246,18 @@ pub const Response = struct {
         return size;
     }
 
+    /// Chunked head, without the size line: status line + headers +
+    /// `Transfer-Encoding: chunked` + blank line.
+    fn chunkedHeadWireSize(self: *const Response) usize {
+        var size: usize = 9 + // "HTTP/1.1 "
+            digitCount(@intFromEnum(self.status)) + 1 + self.status.reasonPhrase().len + 2;
+        for (self.headers[0..self.header_count]) |h| {
+            size += h.name.len + 2 + h.value.len + 2;
+        }
+        size += 26 + 4; // "Transfer-Encoding: chunked\r\n" + "\r\n"
+        return size;
+    }
+
     /// Single-pass head serialisation over any sink exposing
     /// `writeAll([]const u8) !void`. Integers go through `formatUInt` (no
     /// format-string machinery, no separate sizing pass).
@@ -230,6 +277,32 @@ pub const Response = struct {
         try sink.writeAll("Content-Length: ");
         try sink.writeAll(num[0..formatUInt(&num, 0, content_length)]);
         try sink.writeAll("\r\n\r\n");
+    }
+
+    /// Chunked variant of `writeHeadTo`: `Transfer-Encoding: chunked`
+    /// instead of Content-Length, plus the chunk-size line when
+    /// `content_length > 0` (the size of the single body chunk; pass 0 for
+    /// HEAD, which mirrors the GET response's head without the framing).
+    fn writeChunkedHeadTo(self: *const Response, sink: anytype, content_length: usize) !void {
+        var num: [24]u8 = undefined;
+        try sink.writeAll("HTTP/1.1 ");
+        try sink.writeAll(num[0..formatUInt(&num, 0, @intFromEnum(self.status))]);
+        try sink.writeAll(" ");
+        try sink.writeAll(self.status.reasonPhrase());
+        try sink.writeAll("\r\n");
+        for (self.headers[0..self.header_count]) |h| {
+            try sink.writeAll(h.name);
+            try sink.writeAll(": ");
+            try sink.writeAll(h.value);
+            try sink.writeAll("\r\n");
+        }
+        try sink.writeAll("Transfer-Encoding: chunked\r\n");
+        try sink.writeAll("\r\n");
+        if (content_length > 0) {
+            // RFC 9112: chunk sizes are hexadecimal (lowercase).
+            try sink.writeAll(num[0..formatHexUInt(&num, 0, content_length)]);
+            try sink.writeAll("\r\n");
+        }
     }
 
     /// Serialize the response into any sink exposing
@@ -263,6 +336,45 @@ pub const Response = struct {
         const needed = self.headWireSize(content_length);
         if (needed > buf.availableWrite()) return error.BufferFull;
         try self.writeHeadTo(RawSink{ .buf = buf }, content_length);
+    }
+
+    pub const ChunkedFraming = struct {
+        /// Bytes consumed in `buf`: status line + headers +
+        /// Transfer-Encoding + blank line (+ the chunk-size line when
+        /// `content_length > 0`). The body is sent separately.
+        head_len: usize,
+        /// Chunk terminator written into the caller's `tail` scratch:
+        /// `\r\n0\r\n\r\n` after a body chunk, `0\r\n\r\n` for an empty one.
+        tail: []const u8,
+    };
+
+    /// Chunked head serialisation (route config `chunked: true`). The head
+    /// goes into `buf`, the chunk terminator into `tail`; the caller sends
+    /// head, then the body chunk, then the terminator. `content_length` is
+    /// the wire body length (`body.len`, or `file_len` for sendfile bodies);
+    /// pass 0 for HEAD requests, which claim no body.
+    pub fn writeChunkedHeadToBuffer(
+        self: *const Response,
+        buf: *buffer_mod.Buffer,
+        content_length: usize,
+        tail: []u8,
+    ) !ChunkedFraming {
+        const size_digits: usize = if (content_length > 0) hexDigitCount(content_length) else 0;
+        const needed = self.chunkedHeadWireSize() + size_digits + (if (content_length > 0) @as(usize, 2) else 0);
+        if (needed > buf.availableWrite()) return error.BufferFull;
+        try self.writeChunkedHeadTo(RawSink{ .buf = buf }, content_length);
+        var tail_len: usize = 0;
+        if (content_length > 0) {
+            tail[0] = '\r';
+            tail[1] = '\n';
+            tail_len = 2;
+        }
+        tail[tail_len + 0] = '0';
+        tail[tail_len + 1] = '\r';
+        tail[tail_len + 2] = '\n';
+        tail[tail_len + 3] = '\r';
+        tail[tail_len + 4] = '\n';
+        return .{ .head_len = needed, .tail = tail[0 .. tail_len + 5] };
     }
 
     /// Fill `parts` with the response's pieces as zero-copy slices — status
@@ -464,6 +576,63 @@ test "writeHeadToBuffer writes head only with full Content-Length" {
     );
     // Head-only serialization is exactly the full wire size minus the body.
     try testing.expectEqual(resp.wireSize() - resp.body.len, buf.availableRead());
+}
+
+test "chunked head: body is framed as a single chunk with terminator split" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.ok);
+    resp.setHeader("Connection", "keep-alive");
+    resp.setBody("hello");
+
+    const buf = try buffer_mod.Buffer.init(allocator);
+    defer buf.deinit(allocator);
+    var tail: [8]u8 = undefined;
+    const framing = try resp.writeChunkedHeadToBuffer(buf, resp.body.len, &tail);
+    // Head carries Transfer-Encoding, no Content-Length, plus the size line.
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n",
+        buf.peek()[0..framing.head_len],
+    );
+    try testing.expectEqualStrings("\r\n0\r\n\r\n", framing.tail);
+    // The whole wire is head+size, then the body, then the terminator.
+    const wire = buf.peek().len + resp.body.len + framing.tail.len;
+    try testing.expectEqual(
+        wire,
+        framing.head_len + resp.body.len + framing.tail.len,
+    );
+}
+
+test "chunked head: empty body emits only the empty-chunk terminator" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.ok);
+    resp.setHeader("Connection", "keep-alive");
+
+    const buf = try buffer_mod.Buffer.init(allocator);
+    defer buf.deinit(allocator);
+    var tail: [8]u8 = undefined;
+    const framing = try resp.writeChunkedHeadToBuffer(buf, 0, &tail);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n",
+        buf.peek()[0..framing.head_len],
+    );
+    try testing.expectEqualStrings("0\r\n\r\n", framing.tail);
+    try testing.expectEqual(framing.head_len, buf.peek().len);
+}
+
+test "chunked head: explicit content length for sendfile bodies" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.ok);
+    resp.setHeader("Content-Type", "text/plain");
+
+    const buf = try buffer_mod.Buffer.init(allocator);
+    defer buf.deinit(allocator);
+    var tail: [8]u8 = undefined;
+    const framing = try resp.writeChunkedHeadToBuffer(buf, 4096, &tail);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n1000\r\n",
+        buf.peek()[0..framing.head_len],
+    );
+    try testing.expectEqualStrings("\r\n0\r\n\r\n", framing.tail);
 }
 
 /// Copy writev parts into a contiguous buffer (they are scattered by

@@ -66,6 +66,13 @@ pub const Route = struct {
     balance: Balance = .round_robin,
     max_fails: u32 = 3,
     fail_timeout_seconds: u32 = 30,
+    /// Route opt-in for chunked transfer encoding (HTTP/1.1 only): responses
+    /// on this route are framed as a single chunk with
+    /// `Transfer-Encoding: chunked` instead of Content-Length. Off by
+    /// default — Content-Length is unambiguous and lets the response flush
+    /// as one writev; enable for routes whose body size is not known in
+    /// advance or when streaming semantics are wanted. Ignored by h2.
+    chunked: bool = false,
 
     /// The module name bound to `phase` on this route, if any.
     pub fn moduleFor(self: *const Route, phase: Phase) ?[]const u8 {

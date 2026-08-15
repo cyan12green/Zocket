@@ -84,9 +84,14 @@ const HttpSession = struct {
     /// Whether the response body is a slice that must be freed once fully
     /// sent (module-allocated).
     pending_body_owned: bool = false,
+    /// Chunked framing (route config `chunked: true`): the chunk terminator
+    /// written by the head serializer into `tail_scratch`, sent after the
+    /// body (or after the sendfile body, or alone for an empty body).
+    pending_tail: []const u8 = &.{},
+    tail_scratch: [8]u8 = undefined,
     /// The iovec array of the in-flight ring write (io_uring references it
     /// until the op is processed, so it must outlive flushHttp's stack).
-    write_iovs: [2]posix.iovec_const = undefined,
+    write_iovs: [3]posix.iovec_const = undefined,
     write_iov_count: usize = 0,
 };
 
@@ -693,13 +698,33 @@ pub const Reactor = struct {
                     // iovs. (Sending the head as many iovec segments instead
                     // cost more kernel iov handling than the serialisation
                     // saved — measured -8% on the echo workload.)
-                    if (session.resp.body_from_file) {
+                    // Chunked routes (config `chunked: true`) use three iovs:
+                    // head+size line, body, terminator.
+                    const is_head = session.req.method == .head;
+                    const chunked = session.resp.chunked and
+                        session.resp.status != .not_modified;
+                    if (chunked) {
+                        // HEAD claims no body: size line omitted, only the
+                        // empty-chunk terminator is sent. Sendfile bodies
+                        // frame `file_len` bytes (the size line is known at
+                        // head time; the terminator flushes after sendfile).
+                        const cl: usize = if (is_head) 0 else if (session.resp.body_from_file) session.resp.file_len else session.resp.body.len;
+                        const framing = session.resp.writeChunkedHeadToBuffer(&conn.send_buf, cl, &session.tail_scratch) catch {
+                            self.freeResponseBody(session);
+                            self.removeConnection(fd);
+                            return;
+                        };
+                        _ = framing.head_len; // head+size in send_buf, body is its own iov
+                        session.pending_tail = framing.tail;
+                    } else if (session.resp.body_from_file) {
+                        session.pending_tail = &.{};
                         session.resp.writeHeadToBufferWithLength(&conn.send_buf, session.resp.file_len) catch {
                             self.freeResponseBody(session);
                             self.removeConnection(fd);
                             return;
                         };
                     } else {
+                        session.pending_tail = &.{};
                         session.resp.writeHeadToBuffer(&conn.send_buf) catch {
                             self.freeResponseBody(session);
                             self.removeConnection(fd);
@@ -842,6 +867,30 @@ pub const Reactor = struct {
         }
     }
 
+    /// Advance the http send state by `n` bytes: head (send buffer), then
+    /// the body iov, then the chunked terminator iov. Shared by the ring
+    /// write completion and the epoll-mode direct writev.
+    fn advanceHttpWrite(self: *Reactor, conn: *connection.Connection, session: *HttpSession, n: usize) void {
+        _ = self;
+        var remaining = n;
+        const head_avail = conn.send_buf.availableRead();
+        if (head_avail > 0) {
+            const c = @min(remaining, head_avail);
+            conn.send_buf.consume(c);
+            remaining -= c;
+        }
+        if (remaining > 0 and session.pending_body.len > 0) {
+            const c = @min(remaining, session.pending_body.len);
+            session.pending_body = session.pending_body[c..];
+            remaining -= c;
+        }
+        if (remaining > 0 and session.pending_tail.len > 0) {
+            const c = @min(remaining, session.pending_tail.len);
+            session.pending_tail = session.pending_tail[c..];
+            remaining -= c;
+        }
+    }
+
     /// A ring write completed: advance the send state by n bytes and either
     /// resubmit the remainder or finalize the flush.
     fn handleWriteData(self: *Reactor, fd: posix.fd_t, n: usize) void {
@@ -849,20 +898,15 @@ pub const Reactor = struct {
         const session = self.http_sessions.getPtr(fd) orelse return;
         if (!session.writing) return;
 
-        const head_avail = conn.send_buf.availableRead();
-        if (n <= head_avail) {
-            conn.send_buf.consume(n);
-        } else {
-            conn.send_buf.consume(head_avail);
-            session.pending_body = session.pending_body[n - head_avail ..];
-        }
-        if (session.pending_body.len > 0) {
+        self.advanceHttpWrite(conn, session, n);
+        if (session.pending_body.len > 0 or session.pending_tail.len > 0) {
             self.flushHttp(fd); // socket was full mid-write; resubmit
             return;
         }
         self.freeResponseBody(session);
         session.pending_body_owned = false;
         session.pending_body = &.{};
+        session.pending_tail = &.{};
         if (conn.send_buf.availableRead() > 0) {
             self.flushHttp(fd);
             return;
@@ -946,104 +990,109 @@ pub const Reactor = struct {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
 
+        // Iov order mirrors the wire: head (send buffer; chunked routes put
+        // the chunk-size line there), then the body, then the chunked
+        // terminator. The head flushes before any sendfile body (sendfile
+        // runs from finalizeFlush), so a file route never has a body iov.
+        const build_iovs = struct {
+            fn call(
+                sess: *HttpSession,
+                c: *connection.Connection,
+                iovs: *[3]posix.iovec_const,
+                count: *usize,
+            ) void {
+                var n: usize = 0;
+                const head_len = c.send_buf.availableRead();
+                if (head_len > 0) {
+                    iovs.*[n] = .{ .base = c.send_buf.peek().ptr, .len = head_len };
+                    n += 1;
+                }
+                if (sess.pending_body.len > 0) {
+                    iovs.*[n] = .{ .base = sess.pending_body.ptr, .len = sess.pending_body.len };
+                    n += 1;
+                }
+                if (sess.pending_tail.len > 0) {
+                    iovs.*[n] = .{ .base = sess.pending_tail.ptr, .len = sess.pending_tail.len };
+                    n += 1;
+                }
+                count.* = n;
+            }
+        }.call;
+
         if (self.io_mode == .ring) {
             // Submit whatever is pending as one ring writev; the completion
             // advances the state and resubmits or finalizes. The ring waits
             // for writability, so there is no EPOLLOUT dance.
-            if (session.pending_body.len > 0) {
-                session.write_iovs[0] = .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() };
-                session.write_iovs[1] = .{ .base = session.pending_body.ptr, .len = session.pending_body.len };
-                session.write_iov_count = 2;
-                self.ring.submitWritev(fd, session.write_iovs[0..session.write_iov_count]) catch {
-                    self.removeConnection(fd);
+            var count: usize = 0;
+            build_iovs(session, conn, &session.write_iovs, &count);
+            if (count == 0) return self.finalizeFlush(fd);
+            session.write_iov_count = count;
+            self.ring.submitWritev(fd, session.write_iovs[0..count]) catch {
+                self.removeConnection(fd);
+                return;
+            };
+            return; // one ring.submit() per loop iteration (the sweep)
+        }
+
+        // One writev for whatever is pending: the remaining head, the body
+        // and the chunked terminator.
+        var iov: [3]posix.iovec_const = undefined;
+        var count: usize = 0;
+        build_iovs(session, conn, &iov, &count);
+        if (count == 0) {
+            // Milestone 14: push any file body straight into the socket.
+            if (session.file_remaining > 0) {
+                var off: i64 = @intCast(session.file_offset);
+                while (session.file_remaining > 0) {
+                    const rc = linux.sendfile(fd, session.file_fd, &off, @intCast(@min(session.file_remaining, 1 << 20)));
+                    const err = posix.errno(rc);
+                    if (err != .SUCCESS) {
+                        if (err == .AGAIN or err == .INTR) break; // wait for EPOLLOUT
+                        if (!session.file_fd_cached) posix.close(session.file_fd);
+                        session.file_fd = -1;
+                        self.removeConnection(fd);
+                        return;
+                    }
+                    const n = rc;
+                    session.file_offset += n;
+                    session.file_remaining -= n;
+                    off = @intCast(session.file_offset);
+                }
+                if (session.file_remaining > 0) {
+                    // Socket buffer full mid-sendfile: continue on the next
+                    // EPOLLOUT edge.
                     return;
-                };
-                return; // one ring.submit() per loop iteration (the sweep)
+                }
+                if (!session.file_fd_cached) posix.close(session.file_fd);
+                session.file_fd_cached = false;
+                session.file_fd = -1;
             }
-            if (conn.send_buf.availableRead() > 0) {
-                session.write_iovs[0] = .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() };
-                session.write_iov_count = 1;
-                self.ring.submitWritev(fd, session.write_iovs[0..session.write_iov_count]) catch {
-                    self.removeConnection(fd);
-                    return;
-                };
+            if (session.pending_tail.len > 0) {
+                // Chunked sendfile route: the terminator flushes now, after
+                // the file bytes.
+                self.flushHttp(fd);
                 return;
             }
             return self.finalizeFlush(fd);
         }
-
-        // One writev for the remaining head + the body.
-        if (session.pending_body.len > 0) {
-            var iov = [_]posix.iovec_const{
-                .{ .base = conn.send_buf.peek().ptr, .len = conn.send_buf.availableRead() },
-                .{ .base = session.pending_body.ptr, .len = session.pending_body.len },
-            };
-            const n = posix.writev(fd, &iov) catch |e| {
-                if (e == error.WouldBlock) return;
-                self.freeResponseBody(session);
-                session.pending_body = &.{};
-                self.removeConnection(fd);
-                return;
-            };
-            const head_avail = conn.send_buf.availableRead();
-            if (n <= head_avail) {
-                conn.send_buf.consume(n);
-            } else {
-                conn.send_buf.consume(head_avail);
-                session.pending_body = session.pending_body[n - head_avail ..];
-            }
-            if (session.pending_body.len > 0) {
-                // Socket buffer full; continue on the next EPOLLOUT edge.
-                return;
-            }
+        const n = posix.writev(fd, iov[0..count]) catch |e| {
+            if (e == error.WouldBlock) return;
             self.freeResponseBody(session);
-            session.pending_body_owned = false;
             session.pending_body = &.{};
-            if (conn.send_buf.availableRead() > 0) return;
-        } else {
-            while (conn.send_buf.availableRead() > 0) {
-                const n = conn.send() catch |e| {
-                    if (e == error.WouldBlock) break;
-                    self.removeConnection(fd);
-                    return;
-                };
-                if (n == 0) break;
-            }
-            if (conn.send_buf.availableRead() > 0) {
-                // Socket buffer full; the next EPOLLOUT edge (socket became
-                // writable again) will continue the flush.
-                return;
-            }
+            session.pending_tail = &.{};
+            self.removeConnection(fd);
+            return;
+        };
+        self.advanceHttpWrite(conn, session, n);
+        if (session.pending_body.len > 0 or session.pending_tail.len > 0) {
+            // Socket buffer full; continue on the next EPOLLOUT edge.
+            return;
         }
-
-        // Milestone 14: push any file body straight into the socket.
-        if (session.file_remaining > 0) {
-            var off: i64 = @intCast(session.file_offset);
-            while (session.file_remaining > 0) {
-                const rc = linux.sendfile(fd, session.file_fd, &off, @intCast(@min(session.file_remaining, 1 << 20)));
-                const err = posix.errno(rc);
-                if (err != .SUCCESS) {
-                    if (err == .AGAIN or err == .INTR) break; // wait for EPOLLOUT
-                    if (!session.file_fd_cached) posix.close(session.file_fd);
-                    session.file_fd = -1;
-                    self.removeConnection(fd);
-                    return;
-                }
-                const n = rc;
-                session.file_offset += n;
-                session.file_remaining -= n;
-                off = @intCast(session.file_offset);
-            }
-            if (session.file_remaining > 0) {
-                // Socket buffer full mid-sendfile: continue on the next
-                // EPOLLOUT edge.
-                return;
-            }
-            if (!session.file_fd_cached) posix.close(session.file_fd);
-            session.file_fd_cached = false;
-            session.file_fd = -1;
-        }
-
+        self.freeResponseBody(session);
+        session.pending_body_owned = false;
+        session.pending_body = &.{};
+        session.pending_tail = &.{};
+        if (conn.send_buf.availableRead() > 0) return;
         return self.finalizeFlush(fd);
     }
 
@@ -1086,6 +1135,13 @@ pub const Reactor = struct {
             if (!session.file_fd_cached) posix.close(session.file_fd);
             session.file_fd_cached = false;
             session.file_fd = -1;
+        }
+
+        if (session.pending_tail.len > 0) {
+            // Chunked sendfile route (ring path): the terminator flushes
+            // after the file bytes; handleWriteData → flushHttp → finalize.
+            self.flushHttp(fd);
+            return;
         }
 
         if (session.close_after_write) {
@@ -2022,6 +2078,67 @@ test "reactor serves a chunked request end to end" {
     r.join();
 }
 
+test "reactor serves a chunked response when the route opts in" {
+    const allocator = testing.allocator;
+    const json =
+        \\{ "routes": [
+        \\    { "path": "/chunked", "match": "exact", "chunked": true,
+        \\      "modules": { "content": "echo" } }
+        \\  ] }
+    ;
+    var cfg = try runtime_server.Config.fromJson(allocator, json);
+    defer cfg.deinit(allocator);
+    try cfg.validate(runtime_server.default_registry);
+    const srv = runtime_server.Server.init(cfg);
+
+    var r = try Reactor.initWithHandler(allocator, 0, .http, &srv);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // POST /chunked: echo body framed as a single chunk.
+    try writeAll(pair[0], "POST /chunked HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
+    var buf: [512]u8 = undefined;
+    var date_buf_want: [96]u8 = undefined; var want_buf_want: [512]u8 = undefined; const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "5\r\nhello\r\n0\r\n\r\n", .{testDateLine(&date_buf_want)}) catch unreachable;
+    const n1 = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n1]);
+
+    // GET with an empty body: empty-chunk framing only.
+    try writeAll(pair[0], "GET /chunked HTTP/1.1\r\n\r\n");
+    var date_buf_want2: [96]u8 = undefined; var want_buf_want2: [512]u8 = undefined; const want2 = std.fmt.bufPrint(&want_buf_want2, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "0\r\n\r\n", .{testDateLine(&date_buf_want2)}) catch unreachable;
+    const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
+    try testing.expectEqualStrings(want2, buf[0..n2]);
+
+    // HEAD: same head as GET, no framing bytes.
+    try writeAll(pair[0], "HEAD /chunked HTTP/1.1\r\n\r\n");
+    var date_buf_want3: [96]u8 = undefined; var want_buf_want3: [512]u8 = undefined; const want3 = std.fmt.bufPrint(&want_buf_want3, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "0\r\n\r\n", .{testDateLine(&date_buf_want3)}) catch unreachable;
+    const n3 = try readUntil(pair[0], &buf, want3.len, 3000);
+    try testing.expectEqualStrings(want3, buf[0..n3]);
+
+    // Chunked request into the chunked route: assembled then re-framed.
+    try writeAll(pair[0],
+        "POST /chunked HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n");
+    var date_buf_want4: [96]u8 = undefined; var want_buf_want4: [512]u8 = undefined; const want4 = std.fmt.bufPrint(&want_buf_want4, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "6\r\nabcdef\r\n0\r\n\r\n", .{testDateLine(&date_buf_want4)}) catch unreachable;
+    const n4 = try readUntil(pair[0], &buf, want4.len, 3000);
+    try testing.expectEqualStrings(want4, buf[0..n4]);
+
+    r.stop();
+    r.join();
+}
+// wheel's tick granularity is 100 ms, so deadlines land within ~100 ms of the
+// nominal second (the loop re-advances the wheel before every epoll_wait,
+// timeout 100 ms). Sleeps below leave generous margins on both sides of every
+// deadline.
 // M5: idle timeout. A 1 s timeout is used so the tests finish quickly; the
 // wheel's tick granularity is 100 ms, so deadlines land within ~100 ms of the
 // nominal second (the loop re-advances the wheel before every epoll_wait,
