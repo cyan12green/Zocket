@@ -24,6 +24,17 @@ pub const Method = enum {
     options,
     patch,
     unknown,
+
+    pub fn fromString(s: []const u8) ?Method {
+        if (ascii.eqlIgnoreCase(s, "GET")) return .get;
+        if (ascii.eqlIgnoreCase(s, "HEAD")) return .head;
+        if (ascii.eqlIgnoreCase(s, "POST")) return .post;
+        if (ascii.eqlIgnoreCase(s, "PUT")) return .put;
+        if (ascii.eqlIgnoreCase(s, "DELETE")) return .delete;
+        if (ascii.eqlIgnoreCase(s, "OPTIONS")) return .options;
+        if (ascii.eqlIgnoreCase(s, "PATCH")) return .patch;
+        return null;
+    }
 };
 
 /// FNV-1a (32-bit) over lower-cased bytes (Milestone 8). Header names and
@@ -290,6 +301,14 @@ pub const Request = struct {
             .name = s.name,
             .value = s.value,
         };
+    }
+
+    /// Public entry point for non-HTTP/1 callers (the HTTP/2 session):
+    /// add a decoded header (name/value already validated, typically
+    /// HPACK-decompressed). Behaves identically to the wire parser's header
+    /// handling (DFA tag, Content-Length side effects).
+    pub fn addHeaderParsed(self: *Request, name: []const u8, value: []const u8) error{ Malformed, HeaderCountExceeded, OutOfMemory }!void {
+        return self.addHeader(name, value);
     }
 
     fn addHeader(self: *Request, name: []const u8, value: []const u8) error{ Malformed, HeaderCountExceeded, OutOfMemory }!void {

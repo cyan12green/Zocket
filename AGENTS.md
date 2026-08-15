@@ -5,6 +5,7 @@ High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Throu
 ## Commands
 
 - `zig build test` — run all tests (two parallel execs: library module + exe tests). Always run before finishing work.
+- `zig build h2test` — HTTP/2 end-to-end integration tests (M16): builds the server and verifies it with `curl --http2-prior-knowledge` (GET/POST/HEAD, byte-exact 200 KB round-trip, static, redirect, 10-request multiplexing, HTTP/1.1 regression) plus `h2spec` RFC conformance (must pass ≥130/145). Requires curl with nghttp2 and `h2spec` (go install github.com/summerwind/h2spec/cmd/h2spec@latest). Run after any HTTP/2 or reactor change.
 - `zig build run` — run server (`src/main.zig`, default multi-reactor HTTP mode, port 8080).
 - `zig build run -- --single` — run the Milestone 1 single-threaded echo server (A/B comparison).
 - `zig build run -- --echo` — raw byte-echo protocol (Milestone 1/2 semantics) in the multi-reactor framework.
@@ -26,6 +27,7 @@ High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Throu
 
 ## Layout & conventions
 
+- Prefer comptime wherever possible, especially for protocol parsing: build decode/lookup tables, tries, hashes and dispatch structures at compile time (M7 trie, M8 header-hash/DFA, DM1 hash-dispatch, and M16's HPACK static table + Huffman trie + frame-type table + settings table + hash-sorted name index are the reference patterns). Runtime loops over comptime-known data should be replaced with comptime-built structures (integer-compare hash prefiltering, binary-searchable indices). Remember comptime values freeze into `.rodata` (a slice of a comptime var cannot escape; build by value then slice).
 - `src/root.zig` is the library module root; every new submodule MUST be re-exported there (consumer imports `@import("zocket")`).
 - `src/root.zig` also comptime-imports every submodule: this Zig snapshot only collects `test` blocks reachable via comptime imports from the test root, so new submodules must be added to that block or their tests silently never run.
 - `src/main.zig` is the exe entrypoint (CLI flags only; all server logic lives in `src/net/`, `src/http/`, `src/dsl/`, `src/runtime/`).

@@ -164,6 +164,33 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Milestone 16: HTTP/2 end-to-end integration tests against a live
+    // server — curl --http2-prior-knowledge and the h2spec RFC-conformance
+    // suite. Requires curl with nghttp2 and h2spec on PATH; see bench/h2test.sh.
+    const h2test_step = b.step("h2test", "Run HTTP/2 integration tests (curl + h2spec)");
+    const run_h2test = b.addSystemCommand(&.{ "bash", "bench/h2test.sh" });
+    run_h2test.setCwd(b.path("."));
+    h2test_step.dependOn(&run_h2test.step);
+
+    // Deterministic fuzz campaign: pounds the HTTP/1 parser, HPACK decoder,
+    // HTTP/2 session and reactor HTTP path with pseudo-random inputs under
+    // the DebugAllocator (any crash / invalid free panics). `zig build test`
+    // runs a fast smoke fuzz (src/fuzz.zig test blocks); this step runs a
+    // long campaign for a real robustness pass.
+    const fuzz_exe = b.addExecutable(.{
+        .name = "zocket-fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "zocket", .module = mod } },
+        }),
+    });
+    b.installArtifact(fuzz_exe);
+    const fuzz_step = b.step("fuzz", "Run the deterministic fuzz campaign (HTTP/1 + HPACK + HTTP/2 + reactor)");
+    const run_fuzz = b.addRunArtifact(fuzz_exe);
+    fuzz_step.dependOn(&run_fuzz.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

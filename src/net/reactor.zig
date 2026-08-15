@@ -14,6 +14,8 @@ const cache_mod = @import("../dsl/modules/cache.zig");
 const iouring_mod = @import("iouring.zig");
 const limits_mod = @import("../dsl/limits.zig");
 const version_mod = @import("../version.zig");
+const http2_session = @import("../http2/session.zig");
+const http2_frames = @import("../http2/frames.zig");
 
 /// I/O backend selection. Default: epoll (measured at parity with the ring
 /// on the keep-alive workloads and more robust at high connection counts).
@@ -43,6 +45,10 @@ pub const Mode = enum {
 const HttpSession = struct {
     parser: http_parser.Parser,
     req: http_parser.Request,
+    /// HTTP/2 session (Milestone 16), created lazily when the connection
+    /// preface is detected. When non-null the connection is in HTTP/2 mode
+    /// and `parser`/`req` are unused.
+    h2: ?http2_session.Session = null,
     /// A response is queued in the send buffer and the fd is armed for
     /// EPOLLOUT until it has been fully flushed.
     writing: bool = false,
@@ -548,7 +554,7 @@ pub const Reactor = struct {
                 }
             }
             const session = self.http_sessions.getPtr(fd) orelse return;
-            if (!session.writing) self.processHttp(fd);
+            if (!session.writing or session.h2 != null) self.processHttp(fd);
         }
 
         if (events & epoll.Events.Out != 0) {
@@ -566,7 +572,25 @@ pub const Reactor = struct {
         while (true) {
             const session = self.http_sessions.getPtr(fd) orelse return;
             const conn = self.connections.get(fd) orelse return;
-            if (session.writing) return;
+            // HTTP/1 stops parsing while a response is being flushed (the
+            // pipelined request bytes stay buffered); HTTP/2 must keep
+            // reading (WINDOW_UPDATE, PING, RST_STREAM) while writing.
+            if (session.writing and session.h2 == null) return;
+
+            // HTTP/2 detection (h2c prior knowledge, RFC 9113 §3.4): a
+            // connection whose first bytes are the client preface switches to
+            // the HTTP/2 session permanently.
+            if (session.h2 == null) {
+                const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
+                if (recv_slice.len >= 24 and http2_session.Session.looksLikeHttp2Preface(recv_slice[0..24])) {
+                    session.h2 = http2_session.Session.init(self.allocator);
+                    if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+                }
+            }
+            if (session.h2) |*h2s| {
+                self.processHttp2(fd, h2s);
+                return;
+            }
 
             const outcome = session.parser.parse(&conn.recv_buf, &session.req);
             switch (outcome) {
@@ -797,7 +821,7 @@ pub const Reactor = struct {
                     _ = s.reading.fetchAdd(1, .monotonic);
                 }
             }
-            if (!session.writing) self.processHttp(fd);
+            if (!session.writing or session.h2 != null) self.processHttp(fd);
         } else {
             const c = self.connections.get(fd) orelse return;
             self.onMessage(c) catch {
@@ -1102,6 +1126,77 @@ pub const Reactor = struct {
         }
     }
 
+    /// Drive the HTTP/2 session for `fd`: feed all buffered receive bytes,
+    /// append the produced frames to the send buffer and flush. On a
+    /// connection-level error send GOAWAY then close.
+    fn processHttp2(self: *Reactor, fd: posix.fd_t, h2s: *http2_session.Session) void {
+        const conn = self.connections.get(fd) orelse return;
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+
+        var handler = http2_session.Session.Handler{
+            .server = self.http_handler orelse &default_http_handler,
+            .allocator = self.allocator,
+            .client_ip = conn.peer_ip,
+            .stats = self.stats,
+            .static_cache = &self.static_cache,
+            .limits = &self.limits,
+            .date_header = self.date_cache[0..self.date_len],
+            .version_string = "Zocket/" ++ version_mod.version,
+        };
+
+        const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
+        const consumed = h2s.process(recv_slice, &out, &handler) catch |e| blk: {
+            // Connection-level protocol violation: GOAWAY then close.
+            var gbuf = std.ArrayList(u8).empty;
+            defer gbuf.deinit(self.allocator);
+            const code: u32 = switch (e) {
+                error.FrameSizeError => 0x6, // FRAME_SIZE_ERROR
+                error.FlowControlError => 0x3, // FLOW_CONTROL_ERROR
+                error.OutOfMemory => 0x2, // INTERNAL_ERROR
+                else => 0x1, // PROTOCOL_ERROR
+            };
+            http2_frames.writeGoaway(&gbuf, self.allocator, h2s.max_stream_id, code, @errorName(e)) catch {};
+            self.appendH2Output(fd, &gbuf);
+            self.markWriting(fd);
+            const sess = self.http_sessions.getPtr(fd) orelse return;
+            sess.writing = true;
+            sess.close_after_write = true;
+            self.flushHttp(fd);
+            break :blk 0;
+        };
+        conn.recv_buf.read_pos += consumed;
+
+        if (out.items.len > 0) {
+            self.appendH2Output(fd, &out);
+            const sess = self.http_sessions.getPtr(fd) orelse return;
+            if (!sess.writing) {
+                self.markWriting(fd);
+                sess.writing = true;
+            }
+            self.flushHttp(fd);
+        }
+        // If the session asked to close (GOAWAY received), finish draining
+        // and close.
+        if (h2s.closing) {
+            const sess = self.http_sessions.getPtr(fd) orelse return;
+            if (!sess.writing) self.removeConnection(fd);
+        }
+    }
+
+    fn appendH2Output(self: *Reactor, fd: posix.fd_t, out: *const std.ArrayList(u8)) void {
+        const conn = self.connections.get(fd) orelse return;
+        if (out.items.len == 0) return;
+        conn.send_buf.compact();
+        // writeSlice silently truncates at the buffer's capacity; grow to
+        // fit the whole frame batch (HTTP/1 keeps send_buf small because the
+        // body goes out via writev, but HTTP/2 frames all live in send_buf).
+        if (conn.send_buf.availableWrite() < out.items.len) {
+            conn.send_buf.grow(self.allocator, conn.send_buf.data.len + out.items.len) catch return;
+        }
+        _ = conn.send_buf.writeSlice(out.items);
+    }
+
     /// Read and discard up to `max` bytes from the socket.
     fn drainRecv(conn: *connection.Connection, max: usize) void {
         var buf: [4096]u8 = undefined;
@@ -1321,6 +1416,7 @@ pub const Reactor = struct {
                 }
                 _ = s.active.fetchSub(1, .monotonic);
             }
+            if (sess.h2) |*h2s| h2s.deinit();
             sess.parser.deinit();
             sess.req.deinit();
         }
@@ -1341,6 +1437,7 @@ pub const Reactor = struct {
         while (sit.next()) |s| {
             if (s.file_fd >= 0 and !s.file_fd_cached) posix.close(s.file_fd);
             if (s.resp.body_owned) self.allocator.free(s.resp.body);
+            if (s.h2) |*h2s| h2s.deinit();
             s.parser.deinit();
             s.req.deinit();
         }

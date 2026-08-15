@@ -616,36 +616,49 @@ eliminate runtime allocation entirely on the hot path.
 
 ### M16 — HTTP/2
 
-**Status: PLANNED** (protocol completeness — the biggest gap vs nginx, which
-ships `ngx_http_v2`). HTTP/2 (RFC 9113) over the existing HTTP/1.1
-transport: framing, HPACK header compression (RFC 7541), stream
-multiplexing with per-stream and per-connection flow control
-(WINDOW_UPDATE), stream priorities, and optional server push.
+**Status: CORE DONE** (2026-08-15). HTTP/2 (RFC 9113) over the existing
+HTTP/1.1 transport. A new self-contained `src/http2/` module (hpack, frames,
+session) is integrated with the reactor: the connection preface (h2c
+prior-knowledge, RFC 9113 §3.4) is detected on first contact and the
+connection switches to the HTTP/2 session permanently; HTTP/1.1 keeps
+working on the same listener. Verified with `curl --http2-prior-knowledge`
+(all methods, byte-exact 204 KB round-trips through flow control, HEAD,
+custom headers, 10-request stream multiplexing on one connection) and
+`h2spec` (134/145 pass, 4 skipped, 0 crashes — remaining failures are
+closed/half-closed stream-state edge cases).
 
-- **Framing**: 9-byte frame header decode/encode from the connection recv
-  buffer; SETTINGS exchange, PING, GOAWAY, RST_STREAM, DATA, HEADERS,
-  CONTINUATION, PRIORITY frames.
-- **HPACK**: static + dynamic table, Huffman decoding for header names;
-  the comptime DFA (`header_dfa.zig`) classifies names before table
-  lookups. The request arena (`http/arena.zig`) holds decoded headers.
-- **Streams**: per-connection session state (stream table keyed by id),
-  lifecycle (idle -> open -> half-closed -> closed), concurrency limits,
-  and the existing phase pipeline runs per stream. Responses reuse the
-  fast serializer, wrapped in HEADERS + DATA frames; the small-file
-  content cache and sendfile path adapt to frame-sized writes.
-- **Negotiation**: `h2c` prior-knowledge and the HTTP/1.1 `Upgrade: h2c`
-  path now, ALPN `h2` after M17 (TLS) for the internet path. The listener
-  must reject HTTP/1.x framing after the h2 preface (`PRI * HTTP/2.0`).
-- **Server push** (optional, after the core): PUSH_PROMISE for
-  module-tagged assets.
+- **Framing** (`frames.zig`): 9-byte frame header encode/decode, all frame
+  types (DATA, HEADERS, PRIORITY, RST_STREAM, SETTINGS, PING, GOAWAY,
+  WINDOW_UPDATE, CONTINUATION), server-side encoders (SETTINGS, PING ACK,
+  GOAWAY, RST_STREAM, WINDOW_UPDATE, HEADERS+CONTINUATION, DATA).
+- **HPACK** (`hpack.zig`): decoder with static (61 entries, RFC 7541
+  Appendix A) + dynamic table, RFC 7541 Appendix B Huffman decoding via a
+  comptime-built trie, integer/string primitives; minimal encoder
+  (static-table indexed/name-indexed literals, lower-cased names). The
+  Huffman table was regenerated from the RFC text after a transcription bug
+  (the RFC C.3.1 "custom-value" 0x0d/12-byte errata is noted in tests).
+- **Session** (`session.zig`): stream table, lifecycle, concurrency limit
+  (RST_STREAM REFUSED_STREAM), per-stream + connection flow control in both
+  directions (WINDOW_UPDATE resume, overflow = FLOW_CONTROL_ERROR),
+  CONTINUATION assembly, trailers, GOAWAY/RST_STREAM/PING, and the existing
+  phase pipeline runs per stream (requests map to `http.parser.Request`).
+  Stream-level violations send RST_STREAM (connection stays up); connection
+  violations send GOAWAY with the correct error code (PROTOCOL_ERROR /
+  FRAME_SIZE_ERROR / FLOW_CONTROL_ERROR).
+- **Reactor**: preface detection, HTTP/2 read/write plumbing (send buffer
+  grows for frame batches; reads keep flowing while a response is being
+  flushed so WINDOW_UPDATE is always processed).
+- **Negotiation**: h2c prior-knowledge done; HTTP/1.1 `Upgrade: h2c` and
+  ALPN `h2` (TLS) deferred to M17.
 
-**Verification**: `h2spec` conformance, curl --http2 / http2 clients,
-pipelining-equivalent multiplexed A/B vs HTTP/1.1, and the multi-client
-benchmark. The HTTP/2 stream model is also the base for gRPC proxying
-(later).
+**Verification**: `h2spec` conformance (134/145), `curl --http2-prior-
+knowledge` end to end, byte-exact large-body round-trips, HTTP/1.1
+regression on the same listener. Multiplexed A/B vs HTTP/1.1 and the
+multi-client benchmark are the next benchmarking step. The stream model is
+the base for gRPC proxying (later).
 
-**Comptime**: HPACK static table (61 entries, RFC 7541 appendix A) built
-at comptime; frame-type and flags decode tables.
+**Comptime**: HPACK static table (61 entries) and the Huffman decode trie
+(257 symbols) built at comptime.
 
 ---
 

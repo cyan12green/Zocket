@@ -21,6 +21,14 @@ pub const http = struct {
     pub const arena = @import("http/arena.zig");
 };
 
+pub const http2 = struct {
+    pub const hpack = @import("http2/hpack.zig");
+    pub const frames = @import("http2/frames.zig");
+    pub const session = @import("http2/session.zig");
+};
+
+pub const fuzz = @import("fuzz.zig");
+
 pub const dsl = struct {
     pub const static_cache = @import("dsl/static_cache.zig");
     pub const limits = @import("dsl/limits.zig");
@@ -66,6 +74,10 @@ comptime {
     _ = @import("http/mime.zig");
     _ = @import("http/header_dfa.zig");
     _ = @import("http/arena.zig");
+    _ = @import("http2/hpack.zig");
+    _ = @import("http2/frames.zig");
+    _ = @import("http2/session.zig");
+    _ = @import("fuzz.zig");
     _ = @import("dsl/static_cache.zig");
     _ = @import("dsl/limits.zig");
     _ = @import("ct_pool.zig");
