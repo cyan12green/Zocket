@@ -1,0 +1,1 @@
+{ "routes": [ { "path": "/proxy", "match": "prefix", "modules": { "content": "proxy" }, "upstreams": [ { "host": "127.0.0.1", "port": 18090 } ] }, { "path": "/", "match": "prefix", "modules": { "content": "echo" } } ] }

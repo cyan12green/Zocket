@@ -16,3 +16,6 @@
 [submodule "third_party/caddy"]
 	path = third_party/caddy
 	url = https://github.com/caddyserver/caddy.git
+[submodule "third_party/nghttp2"]
+	path = third_party/nghttp2
+	url = https://github.com/nghttp2/nghttp2.git

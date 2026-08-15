@@ -84,9 +84,11 @@ just run `python3 bench/graphs.py --run` (full suite + graphs):
 
 ![Zocket vs nginx — req/s and per-request cost](bench/graphs/nginx_compare.png)
 
+![HTTP/2 (h2c) — Zocket vs nginx, h2load](bench/graphs/h2_compare.png)
+
 ## Tests and benchmarks
 
-- `zig build test` — unit + concurrency tests (175 passing).
+- `zig build test` — unit + concurrency + fuzz-smoke tests (201 passing).
 - `bench/bench.sh`, `bench/bench2.sh`, `bench/summarize.py` — reproducible
   benchmark harness; results and methodology in `bench/BENCH.md`.
 - `bench/compare-servers.sh` — cross-language comparison against actix-web,
@@ -94,6 +96,10 @@ just run `python3 bench/graphs.py --run` (full suite + graphs):
   single-cell, payload-size matrix, and `--static` file-serving modes.
   Zocket leads every measured workload (nginx comparison in
   `bench/BENCH.md`).
+- `bench/h2bench.sh` — HTTP/2 (h2c) comparison against nginx with `h2load`
+  (built from `third_party/nghttp2`); renders `bench/graphs/h2_compare.png`
+  via `python3 bench/graphs.py`. Zocket beats nginx on h2 echo (3.0x at
+  100 streams/conn, 1.2x serialized) and static (1.7x).
 - `bench/http-check.py`, `bench/echo-check.py` — end-to-end correctness checks.
 
 ## AI Disclosure

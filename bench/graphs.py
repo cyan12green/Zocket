@@ -184,6 +184,74 @@ def plot_nginx_compare():
     print("nginx_compare.png")
 
 
+
+def plot_h2_compare():
+    """HTTP/2 echo/static, Zocket vs nginx (h2load results from bench/results/h2)."""
+    h2dir = os.path.join(ROOT, "bench", "results", "h2")
+    workloads = [
+        ("echo100", "GET /echo\nm=100 streams"),
+        ("echo1", "GET /echo\nm=1 stream"),
+        ("static100", "GET /static\nm=100 streams"),
+    ]
+    if not os.path.isdir(h2dir):
+        print("h2_compare.png: no bench/results/h2 data (run bench/h2bench.sh first)")
+        return
+    labels = []
+    z_meds, n_meds = [], []
+    for wl, label in workloads:
+        zv = _h2_med(h2dir, f"{wl}_z.txt")
+        nv = _h2_med(h2dir, f"{wl}_n.txt")
+        if zv is None or nv is None:
+            print(f"h2_compare.png: missing {wl} data, skipping")
+            return
+        labels.append(label)
+        z_meds.append(zv)
+        n_meds.append(nv)
+
+    x = list(range(len(labels)))
+    width = 0.35
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+    for ax, values, color, name in (
+        (axes[0], z_meds, "#111111", "Zocket"),
+        (axes[1], n_meds, "#b22222", "nginx"),
+    ):
+        bars = ax.bar(x, values, width, color=color)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=9)
+        ax.set_title(f"{name} — req/s (higher is better)", fontsize=10)
+        ax.set_ylabel("req/s")
+        for bar, v in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width() / 2, v, f"{v:,.0f}",
+                    ha="center", va="bottom", fontsize=8)
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(4, 4))
+    fig.suptitle("HTTP/2 (h2c) — Zocket vs nginx, h2load, 4 connections", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "h2_compare.png"), dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print("h2_compare.png")
+
+
+def _h2_med(h2dir, name):
+    """Median of the per-rep req/s values; None when no valid data."""
+    path = os.path.join(h2dir, name)
+    if not os.path.isfile(path):
+        return None
+    vals = []
+    for line in open(path):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            v = float(line)
+        except ValueError:
+            continue
+        if v > 1000:
+            vals.append(v)
+    if not vals:
+        return None
+    return statistics.median(vals)
+
+
 def run_suite():
     print("== running the comparison suite ==")
     subprocess.run(["bash", "bench/compare-servers.sh",
@@ -207,6 +275,7 @@ def main():
     plot_matrix()
     plot_static()
     plot_nginx_compare()
+    plot_h2_compare()
     print("done")
 
 

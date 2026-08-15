@@ -18,6 +18,8 @@ High-performance TCP server in Zig 0.16.0-dev (pinned in `build.zig.zon`). Throu
 - `zig build -Doptimize=ReleaseFast` — for benchmarking.
 - Benchmark: `bash bench/bench.sh <binary> <tag> [--extra server args]` (bombardier sweeps; set `CHECK=http-check.py` for the HTTP server, default `echo-check.py` for raw echo), `bash bench/bench2.sh <binary> <tag> [--extra server args]` (true-capacity echo-client sweeps); summarize with `bench/summarize.py` / `bench/summarize2.py`; e2e HTTP checks: `bench/http-check.py <port>`; cross-language comparison (actix-web, Bun.serve, httpx.zig, nginx, Caddy as pinned submodules): `bash bench/compare-servers.sh` (single-cell), `--matrix` (payload x conns), `--static "1024 1048576"` (file serving), `--bodies`, `--conns-list`; see `bench/BENCH.md`.
 - Verify compilation with `zig build` or `zig build-exe` after any change.
+- HTTP/2 benchmarking needs `h2load` from nghttp2, built from `third_party/nghttp2` (clone + `autoreconf -i` + `./configure --enable-app --with-libev --with-libcares` + `make`; the binary lands in `third_party/nghttp2/src/h2load`). System deps for that build: **libev-dev** and **libc-ares-dev** (plus libssl-dev/zlib1g-dev, already present). `h2spec` for conformance: `go install github.com/summerwind/h2spec/cmd/h2spec@latest`.
+- `zig build fuzz` (long deterministic fuzz campaign), `zig build h2test` (curl + h2spec end-to-end).
 - Graphs: `python3 bench/graphs.py` is the single entry point — it runs the
   full comparison suite (matrix + static) with `--run` and/or generates all
   PNGs in `bench/graphs/` (matrix req/s + latency per body size, static

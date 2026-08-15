@@ -1423,3 +1423,27 @@ replication is complete: cached date (done), pool (superseded by the bump
 arena), lean state machines (comptime DFA, 60-292 ns parse), read-once
 model (implemented, reverted with evidence - the drain loop's probe is
 not the bottleneck and the loop wins).
+
+## HTTP/2 (Milestone 16) — Zocket vs nginx (h2load, h2c)
+
+Date: 2026-08-15. Load generator: `h2load` (nghttp2/1.59.0, built from
+`third_party/nghttp2`). Both servers serve h2c prior-knowledge on loopback,
+4 reactor/worker threads. nginx built with `--with-http_v2_module`
+(echo-nginx-module for `/echo`, sendfile on). Interleaved, warm-up rep
+discarded, 8 reps; medians (req/s).
+
+| workload (4 conns) | Zocket | nginx | vs |
+|---|---:|---:|---:|
+| GET /echo, m=100 streams | 460,567 | 152,211 | **Zocket 3.03x** |
+| GET /echo, m=1 | 100,071 | 83,321 | **Zocket 1.20x** |
+| GET /static (1 KB), m=100 | 118,435 | 68,210 | **Zocket 1.74x** |
+
+The journey from ~19k to ~460k req/s (24x): `strace` showed 4 mmap+munmap
+per request — per-stream `st.headers`/`st.body` ArrayLists and the per-call
+response `out` buffer all allocated via `page_allocator` (a syscall per
+alloc). Fixed by (1) pooling Requests per session (reused across streams,
+arena reset on reuse), (2) decoding HPACK fields AND the st.headers/st.body
+containers into the Request's bump arena (`Arena.asAllocator`), (3) a
+reusable session scratch for the response HPACK block and a per-connection
+`h2_out` response-frame buffer. Frame-type, settings and HPACK-name tables
+are comptime-built.

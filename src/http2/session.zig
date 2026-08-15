@@ -22,9 +22,19 @@ const limits_mod = @import("../dsl/limits.zig");
 /// is deferred).
 pub const Session = struct {
     allocator: std.mem.Allocator,
-    hpack_dec: hpack.Decoder = .{},
+    hpack_dec: hpack.Decoder,
     /// Stream table. Deleted once a stream is fully closed.
     streams: std.AutoHashMap(u31, Stream),
+    /// Reusable request structs returned by completed streams (their header
+    /// slots and arena are reused, avoiding per-request allocation).
+    request_pool: std.ArrayList(parser.Request) = .empty,
+    /// Reusable HPACK response-block scratch (keeps its capacity across
+    /// requests; reset per frameResponse so no per-request allocation).
+    block_scratch: std.ArrayList(u8) = .empty,
+    /// Header-count limit captured from the handler (used for pooled
+    /// Request creation in decodeAndDispatch, where no handler is in scope).
+    max_headers: usize = 32,
+    // (prof) per-request timing accumulators.
     /// Connection-level flow control (RFC 9113 §5.2).
     conn_recv_window: u32 = default_window,
     conn_send_window: u32 = default_window,
@@ -42,6 +52,7 @@ pub const Session = struct {
     pending_hpack_block: std.ArrayList(u8) = .empty,
     /// Set when the connection should be torn down (GOAWAY sent/received).
     closing: bool = false,
+
 
     pub const default_window: u32 = 65535;
     pub const max_concurrent_streams: u32 = 100;
@@ -123,28 +134,43 @@ pub const Session = struct {
     pub fn init(allocator: std.mem.Allocator) Session {
         return .{
             .allocator = allocator,
+            .hpack_dec = hpack.Decoder.init(allocator),
             .streams = std.AutoHashMap(u31, Stream).init(allocator),
             .pending_hpack_block = std.ArrayList(u8).empty,
+            .request_pool = std.ArrayList(parser.Request).empty,
+            .block_scratch = std.ArrayList(u8).empty,
         };
     }
 
     pub fn deinit(self: *Session) void {
-        self.hpack_dec.deinit(self.allocator);
+        self.hpack_dec.deinit();
         self.pending_hpack_block.deinit(self.allocator);
         var it = self.streams.iterator();
         while (it.next()) |e| self.destroyStream(e.value_ptr);
         self.streams.deinit();
+        for (self.request_pool.items) |*r| r.deinit();
+        self.request_pool.deinit(self.allocator);
+        self.block_scratch.deinit(self.allocator);
     }
 
     fn destroyStream(self: *Session, st: *Stream) void {
-        for (st.headers.items) |f| {
-            self.allocator.free(f.name);
-            self.allocator.free(f.value);
-        }
-        st.headers.deinit(self.allocator);
-        st.body.deinit(self.allocator);
+        // The HPACK-decoded fields and Request headers live in the Request's
+        // arena (bump-owned); the arena is reclaimed when the Request is
+        // reset on pool reuse. Only the containers themselves are freed.
+        const arena = if (st.request) |*r| r.arena.asAllocator() else self.allocator;
+        st.headers.deinit(arena);
+        st.body.deinit(arena);
         st.pending_response.deinit(self.allocator);
-        if (st.request) |*r| r.deinit();
+        // Return the request to the per-session pool (its header slots and
+        // arena are reused by the next stream — the HTTP/1 connection-reuse
+        // model applied across streams, since each h2 stream is one-shot).
+        if (st.request) |r| {
+            self.request_pool.append(self.allocator, r) catch {
+                var r2 = r;
+                r2.deinit();
+            };
+            st.request = null;
+        }
     }
 
     /// Caller context for running a completed request through the pipeline.
@@ -275,9 +301,12 @@ pub const Session = struct {
             const id: u16 = (@as(u16, payload[i]) << 8) | payload[i + 1];
             const value: u32 = (@as(u32, payload[i + 2]) << 24) | (@as(u32, payload[i + 3]) << 16) | (@as(u32, payload[i + 4]) << 8) | payload[i + 5];
             // Unknown settings are ignored; known ones validated by their
-            // comptime-defined ranges.
+            // comptime-defined ranges (before any narrowing cast).
+            if (settingRange(id)) |s| {
+                if (value < s.min or value > s.max) return error.ProtocolError;
+            }
             switch (id) {
-                1 => self.hpack_dec.setHeaderTableSize(self.allocator, value), // HEADER_TABLE_SIZE
+                1 => self.hpack_dec.setHeaderTableSize(value), // HEADER_TABLE_SIZE
                 2 => {}, // ENABLE_PUSH: validated by settingRange below
                 3 => {}, // MAX_CONCURRENT_STREAMS: we open no streams
                 4 => {
@@ -293,9 +322,6 @@ pub const Session = struct {
                 },
                 5 => self.peer_max_frame_size = @intCast(value),
                 else => {}, // unknown settings ignored
-            }
-            if (settingRange(id)) |s| {
-                if (value < s.min or value > s.max) return error.ProtocolError;
             }
         }
         // ACK the settings.
@@ -391,7 +417,7 @@ pub const Session = struct {
         // Enforce the advertised concurrent-stream limit (RFC 9113 §5.1.2):
         // new streams beyond it are refused (RST_STREAM REFUSED_STREAM).
         if (self.streams.count() >= max_concurrent_streams) {
-            self.streamError(hdr.stream_id, send);
+                self.streamError(hdr.stream_id, send);
             return;
         }
         self.max_stream_id = hdr.stream_id;
@@ -468,17 +494,26 @@ pub const Session = struct {
         block: []const u8,
     ) !void {
         const st = self.streams.getPtr(stream_id) orelse return error.ProtocolError;
+        // The stream's Request (arena) is the per-request scratch: HPACK
+        // fields allocate bump-style, no per-field syscalls. Freed when the
+        // Request is pooled and its arena reset on reuse.
+        if (st.request == null) {
+            var r = self.request_pool.pop() orelse parser.Request.initWithLimits(self.allocator, self.max_headers);
+            r.reset(); // clear the previous stream's arena before reuse
+            st.request = r;
+        }
+        const arena_alloc = st.request.?.arena.asAllocator();
         var fields = std.ArrayList(hpack.Field).empty;
-        defer fields.deinit(self.allocator);
-        self.hpack_dec.decode(self.allocator, block, &fields) catch |e| {
+        defer fields.deinit(arena_alloc);
+        self.hpack_dec.decode(arena_alloc, block, &fields) catch |e| {
             return switch (e) {
                 error.ProtocolError, error.CompressionError, error.Truncated, error.InvalidHuffman => error.StreamError,
                 error.OutOfMemory => error.OutOfMemory,
             };
         };
-        // Take ownership of the decoded fields.
+        // Fields live in the Request arena (bump-owned); just record them.
         for (fields.items) |f| {
-            try st.headers.append(self.allocator, .{ .name = f.name, .value = f.value, .value_len = f.value.len });
+            try st.headers.append(arena_alloc, .{ .name = f.name, .value = f.value, .value_len = f.value.len });
         }
     }
 
@@ -512,7 +547,7 @@ pub const Session = struct {
         if (data.len > st.recv_window or data.len > self.conn_recv_window) return error.StreamError;
         st.recv_window -= @intCast(data.len);
         self.conn_recv_window -= @intCast(data.len);
-        try st.body.appendSlice(self.allocator, data);
+        try st.body.appendSlice(st.request.?.arena.asAllocator(), data);
 
         if (st.recv_window < (default_window / 2)) {
             const inc = default_window - st.recv_window;
@@ -542,13 +577,12 @@ pub const Session = struct {
     ) !void {
         const st = self.streams.getPtr(stream_id) orelse return;
         if (!st.end_stream_received) return;
-        if (st.request != null) return;
-        if (st.headers.items.len == 0) return;
 
-        // Build the Request.
-        var req = parser.Request.initWithLimits(handler.allocator, handler.limits.max_headers);
-        errdefer req.deinit();
-
+        // The stream's request was created (and its arena reset) in
+        // decodeAndDispatch; the decoded fields still live in that arena, so
+        // it must not be reset again here.
+        const req = &st.request.?;
+        self.max_headers = handler.limits.max_headers;
         var method_set = false;
         var path_set = false;
         var scheme_set = false;
@@ -672,7 +706,7 @@ pub const Session = struct {
 
         var resp = response_mod.Response.init(.ok);
         var ctx = pipeline.Context{
-            .req = &req,
+            .req = req,
             .resp = &resp,
             .allocator = handler.allocator,
             .client_ip = handler.client_ip,
@@ -689,11 +723,8 @@ pub const Session = struct {
             resp = response_mod.Response.init(.internal_error);
             resp.setBody(response_mod.Status.internal_error.reasonPhrase());
         }
-        st.request = req;
         st.responded = true;
-        try self.frameResponse(stream_id, &resp, send, handler);
-        st.end_stream_sent = true;
-        st.state = .half_closed_remote;
+        try self.frameResponse(stream_id, &resp, req.method == .head, send, handler);
     }
 
     /// A stream-level protocol violation (RFC 9113 §5.4.2): send RST_STREAM
@@ -719,26 +750,27 @@ pub const Session = struct {
     ) !void {
         var resp = response_mod.Response.init(status);
         resp.setBody(status.reasonPhrase());
-        try self.frameResponse(stream_id, &resp, send, handler);
+        try self.frameResponse(stream_id, &resp, false, send, handler);
     }
 
     /// Serialize a pipeline response into HEADERS + DATA frames.
     fn frameResponse(
         self: *Session,
         stream_id: u31,
-        resp: *const response_mod.Response,
+        resp: *response_mod.Response,
+        is_head: bool,
         send: *std.ArrayList(u8),
         handler: *const Handler,
     ) !void {
-        var block = std.ArrayList(u8).empty;
-        defer block.deinit(self.allocator);
+        self.block_scratch.clearRetainingCapacity();
+        const block = &self.block_scratch;
         // :status
         var status_buf: [8]u8 = undefined;
         const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{@intFromEnum(resp.status)}) catch "500";
-        try hpack.encodeField(&block, self.allocator, ":status", status_str);
+        try hpack.encodeField(block, self.allocator, ":status", status_str);
         // Date + Server (nginx-parity, both free).
-        try hpack.encodeField(&block, self.allocator, "date", handler.date_header);
-        try hpack.encodeField(&block, self.allocator, "server", handler.version_string);
+        try hpack.encodeField(block, self.allocator, "date", handler.date_header);
+        try hpack.encodeField(block, self.allocator, "server", handler.version_string);
         // Response headers (skip connection-specific ones, and content-length
         // is implicit in the DATA framing).
         for (resp.headers[0..resp.header_count]) |h| {
@@ -747,9 +779,10 @@ pub const Session = struct {
                 std.mem.eql(u8, h.name, "transfer-encoding"))
                 continue;
             if (std.mem.eql(u8, h.name, "content-length")) continue;
-            try hpack.encodeField(&block, self.allocator, h.name, h.value);
+            try hpack.encodeField(block, self.allocator, h.name, h.value);
         }
-        // Body: buffered or read from the file.
+        // Body: buffered or read from the file (sendfile under h2 is
+        // deferred; the file is read into a buffer and framed).
         var file_buf: ?[]u8 = null;
         defer if (file_buf) |b| handler.allocator.free(b);
         var body: []const u8 = resp.body;
@@ -765,17 +798,31 @@ pub const Session = struct {
             }
             body = buf[0..read_total];
         }
+        // HEAD: no body (RFC 9113 §8.1 — a HEAD response carries only the
+        // headers). Matches the HTTP/1 serializer.
+        if (is_head) body = &.{};
 
         // Send HEADERS. body_len 0 -> END_STREAM on the HEADERS frame.
         const end_stream = body.len == 0;
         try frames.writeHeaders(send, self.allocator, stream_id, block.items, end_stream, self.peer_max_frame_size);
-        if (body.len == 0) {
-            self.markStreamClosed(stream_id);
-            return;
+        if (body.len > 0) {
+            // DATA frames, flow-control limited. writeData copies into `send`
+            // and any flow-control overflow into the stream's pending buffer,
+            // so resp.body can be freed as soon as we return.
+            try self.writeBodyFrames(stream_id, body, send);
         }
 
-        // DATA frames, flow-control limited.
-        try self.writeBodyFrames(stream_id, body, send);
+        // Free an allocator-owned module body (gzip, stub_status, autoindex,
+        // proxy, error pages...) exactly like the HTTP/1 path's
+        // freeResponseBody.
+        if (resp.body_owned and !resp.body_from_file) {
+            handler.allocator.free(resp.body);
+            resp.body_owned = false;
+        }
+        // The response stream is done on our side (writeData already sets
+        // end_stream_sent for the buffered path; the empty/HEAD path needs
+        // it explicitly so the stream can be cleaned up).
+        self.markStreamClosed(stream_id);
         self.maybeCloseStream(stream_id);
     }
 
@@ -832,7 +879,7 @@ pub const Session = struct {
     fn maybeCloseStream(self: *Session, stream_id: u31) void {
         const st = self.streams.getPtr(stream_id) orelse return;
         if (st.end_stream_sent and st.end_stream_received and st.pending_response.items.len == 0) {
-            self.destroyStream(st);
+                self.destroyStream(st);
             _ = self.streams.remove(stream_id);
         }
     }
@@ -896,4 +943,109 @@ test "session processes a GET request end to end" {
 
 test "session rejects HTTP/1 after preface expectation" {
     try testing.expect(!Session.looksLikeHttp2Preface("GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+}
+
+test "session: HEAD request over h2 produces a HEADERS-only response (no DATA)" {
+    var s = Session.init(testing.allocator);
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try hpack.encodeField(&hb, testing.allocator, ":method", "HEAD");
+    try hpack.encodeField(&hb, testing.allocator, ":scheme", "http");
+    try hpack.encodeField(&hb, testing.allocator, ":path", "/");
+    var fh = frames.FrameHeader{
+        .length = @intCast(hb.items.len),
+        .type = .headers,
+        .flag_bits = frames.flags.end_headers | frames.flags.end_stream,
+        .stream_id = 1,
+    };
+    var req_bytes = std.ArrayList(u8).empty;
+    defer req_bytes.deinit(testing.allocator);
+    try req_bytes.appendSlice(testing.allocator, Session.preface);
+    var hdr: [9]u8 = undefined;
+    fh.encode(&hdr);
+    try req_bytes.appendSlice(testing.allocator, &hdr);
+    try req_bytes.appendSlice(testing.allocator, hb.items);
+
+    var handler = Session.Handler{
+        .server = &server_mod.Server.default(),
+        .allocator = testing.allocator,
+        .limits = &limits_mod.Limits{},
+        .date_header = "Sat, 15 Aug 2026 00:00:00 GMT",
+        .version_string = "Zocket/1.0.0",
+    };
+    _ = try s.process(req_bytes.items, &send, &handler);
+
+    // Assert: a HEADERS frame with END_STREAM, and no DATA frame.
+    var off: usize = 0;
+    var headers_found = false;
+    var data_found = false;
+    while (off + 9 <= send.items.len) {
+        const f = frames.parseHeader(send.items[off..]).?;
+        if (off + 9 + f.length > send.items.len) break;
+        if (f.type == .headers and f.stream_id == 1 and f.flag_bits & frames.flags.end_stream != 0) headers_found = true;
+        if (f.type == .data) data_found = true;
+        off += 9 + f.length;
+    }
+    try testing.expect(headers_found);
+    try testing.expect(!data_found);
+}
+
+test "session: an allocator-owned module body is freed (gzip path, no leak)" {
+    // Server with a gzip route (content=echo, log=gzip), like the example
+    // config. Run a gzip-compressible POST through the session; if the
+    // compressed body is not freed, the testing allocator reports a leak.
+    const srv = server_mod.Server.comptimeInit(comptime server_mod.Config.fromJsonComptime(
+        \\{ "routes": [ { "path": "/", "modules": { "content": "echo", "log": "gzip" } } ] }
+    ));
+
+    var s = Session.init(testing.allocator);
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try hpack.encodeField(&hb, testing.allocator, ":method", "POST");
+    try hpack.encodeField(&hb, testing.allocator, ":scheme", "http");
+    try hpack.encodeField(&hb, testing.allocator, ":path", "/");
+    try hpack.encodeField(&hb, testing.allocator, "accept-encoding", "gzip");
+    var fh = frames.FrameHeader{
+        .length = @intCast(hb.items.len),
+        .type = .headers,
+        .flag_bits = frames.flags.end_headers,
+        .stream_id = 1,
+    };
+    var req_bytes = std.ArrayList(u8).empty;
+    defer req_bytes.deinit(testing.allocator);
+    try req_bytes.appendSlice(testing.allocator, Session.preface);
+    var hdr: [9]u8 = undefined;
+    fh.encode(&hdr);
+    try req_bytes.appendSlice(testing.allocator, &hdr);
+    try req_bytes.appendSlice(testing.allocator, hb.items);
+    // Compressible body (>= min_compress_bytes) as a DATA frame with END_STREAM.
+    const body = "compressible-body-" ** 20;
+    var dfh = frames.FrameHeader{
+        .length = @intCast(body.len),
+        .type = .data,
+        .flag_bits = frames.flags.end_stream,
+        .stream_id = 1,
+    };
+    dfh.encode(&hdr);
+    try req_bytes.appendSlice(testing.allocator, &hdr);
+    try req_bytes.appendSlice(testing.allocator, body);
+
+    var handler = Session.Handler{
+        .server = &srv,
+        .allocator = testing.allocator,
+        .limits = &limits_mod.Limits{},
+        .date_header = "Sat, 15 Aug 2026 00:00:00 GMT",
+        .version_string = "Zocket/1.0.0",
+    };
+    _ = try s.process(req_bytes.items, &send, &handler);
+    // Deinits release everything; the testing allocator fails the test if the
+    // gzip body leaked.
 }

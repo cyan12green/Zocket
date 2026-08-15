@@ -49,6 +49,9 @@ const HttpSession = struct {
     /// preface is detected. When non-null the connection is in HTTP/2 mode
     /// and `parser`/`req` are unused.
     h2: ?http2_session.Session = null,
+    /// Reusable h2 output-buffer scratch (kept across processHttp2 calls so
+    /// response frames never reallocate per request).
+    h2_out: std.ArrayList(u8) = .empty,
     /// A response is queued in the send buffer and the fd is armed for
     /// EPOLLOUT until it has been fully flushed.
     writing: bool = false,
@@ -1131,8 +1134,9 @@ pub const Reactor = struct {
     /// connection-level error send GOAWAY then close.
     fn processHttp2(self: *Reactor, fd: posix.fd_t, h2s: *http2_session.Session) void {
         const conn = self.connections.get(fd) orelse return;
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.allocator);
+        const session_p = self.http_sessions.getPtr(fd) orelse return;
+        const out = &session_p.h2_out;
+        out.clearRetainingCapacity();
 
         var handler = http2_session.Session.Handler{
             .server = self.http_handler orelse &default_http_handler,
@@ -1146,7 +1150,7 @@ pub const Reactor = struct {
         };
 
         const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
-        const consumed = h2s.process(recv_slice, &out, &handler) catch |e| blk: {
+        const consumed = h2s.process(recv_slice, out, &handler) catch |e| blk: {
             // Connection-level protocol violation: GOAWAY then close.
             var gbuf = std.ArrayList(u8).empty;
             defer gbuf.deinit(self.allocator);
@@ -1168,7 +1172,7 @@ pub const Reactor = struct {
         conn.recv_buf.read_pos += consumed;
 
         if (out.items.len > 0) {
-            self.appendH2Output(fd, &out);
+            self.appendH2Output(fd, out);
             const sess = self.http_sessions.getPtr(fd) orelse return;
             if (!sess.writing) {
                 self.markWriting(fd);
@@ -1417,6 +1421,7 @@ pub const Reactor = struct {
                 _ = s.active.fetchSub(1, .monotonic);
             }
             if (sess.h2) |*h2s| h2s.deinit();
+            sess.h2_out.deinit(self.allocator);
             sess.parser.deinit();
             sess.req.deinit();
         }
@@ -1438,6 +1443,7 @@ pub const Reactor = struct {
             if (s.file_fd >= 0 and !s.file_fd_cached) posix.close(s.file_fd);
             if (s.resp.body_owned) self.allocator.free(s.resp.body);
             if (s.h2) |*h2s| h2s.deinit();
+            s.h2_out.deinit(self.allocator);
             s.parser.deinit();
             s.req.deinit();
         }

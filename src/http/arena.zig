@@ -29,8 +29,7 @@ pub const Arena = struct {
         return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *Arena) void {
-        var b = self.blocks;
+    pub fn deinit(self: *Arena) void {        var b = self.blocks;
         while (b) |blk| {
             const next = blk.next;
             self.allocator.free(blk.data);
@@ -66,6 +65,60 @@ pub const Arena = struct {
             return s;
         }
         return self.allocHeap(n);
+    }
+
+    /// Expose the arena as a `std.mem.Allocator` (bump-only: `free` is a
+    /// no-op and `resize` never shrinks in place). Lets request-scoped work
+    /// (e.g. HTTP/2 HPACK field decoding) allocate without per-allocation
+    /// syscalls; the whole region is reclaimed by `reset`.
+    pub fn asAllocator(self: *Arena) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = allocImpl,
+        .resize = resizeImpl,
+        .remap = remapImpl,
+        .free = freeImpl,
+    };
+
+    fn allocImpl(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        _ = ret_addr;
+        const self: *Arena = @ptrCast(@alignCast(ctx));
+        const n = std.mem.alignForward(usize, len, alignment.toByteUnits()) + (alignment.toByteUnits() - 1);
+        const s = self.alloc(n) orelse return null;
+        // The bump allocator hands back 8-byte-aligned memory; the caller
+        // requested `alignment` which is <= the extra we padded for.
+        return s.ptr;
+    }
+
+    fn resizeImpl(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return false; // never resize in place; the caller reallocates
+    }
+
+    fn remapImpl(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = ret_addr;
+        _ = new_len;
+        return null; // fall back to alloc+copy
+    }
+
+    fn freeImpl(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = ret_addr;
+        // no-op: the whole arena is reclaimed by reset
     }
 
     fn allocHeap(self: *Arena, n: usize) ?[]u8 {

@@ -111,8 +111,8 @@ pub fn fuzzHpack(prng: *Prng, iterations: usize) void {
     var alloc = std.heap.DebugAllocator(.{}){};
     defer _ = alloc.deinitWithoutLeakChecks();
     const allocator = alloc.allocator();
-    var dec = hpack.Decoder.init();
-    defer dec.deinit(allocator);
+    var dec = hpack.Decoder.init(allocator);
+    defer dec.deinit();
 
     var i: usize = 0;
     while (i < iterations) : (i += 1) {

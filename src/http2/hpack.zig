@@ -22,21 +22,26 @@ pub const Field = struct {
 };
 
 pub const Decoder = struct {
+    /// Connection-scoped allocator for the dynamic table (entries persist
+    /// across requests on the connection).
+    allocator: std.mem.Allocator,
     /// Dynamic table: most-recently-inserted at the front.
     dyn: DynamicTable = .{},
 
-    pub fn init() Decoder {
-        return .{};
+    pub fn init(allocator: std.mem.Allocator) Decoder {
+        return .{ .allocator = allocator };
     }
 
     /// Apply a SETTINGS_HEADER_TABLE_SIZE change (RFC 7541 §4.2).
-    pub fn setHeaderTableSize(self: *Decoder, allocator: std.mem.Allocator, size: usize) void {
-        self.dyn.resize(allocator, size);
+    pub fn setHeaderTableSize(self: *Decoder, size: usize) void {
+        self.dyn.resize(self.allocator, size);
     }
 
     /// Decode one header block fragment into `fields` (appending). `fields`
-    /// memory is owned by the caller (typically the request arena).
-    pub fn decode(self: *Decoder, allocator: std.mem.Allocator, block: []const u8, fields: *std.ArrayList(Field)) !void {
+    /// memory is owned by the caller (typically the request arena) — passed
+    /// as `scratch` — while the dynamic table allocates from the
+    /// connection-scoped `self.allocator`.
+    pub fn decode(self: *Decoder, scratch: std.mem.Allocator, block: []const u8, fields: *std.ArrayList(Field)) !void {
         var it = BitReader{ .bytes = block };
         var saw_field = false;
         while (true) {
@@ -59,34 +64,34 @@ pub const Decoder = struct {
                 // Static-table fields reference .rodata; the caller owns the
                 // returned field slices, so dupe.
                 saw_field = true;
-                try fields.append(allocator, .{
-                    .name = try allocator.dupe(u8, f.name),
-                    .value = try allocator.dupe(u8, f.value),
+                try fields.append(scratch, .{
+                    .name = try scratch.dupe(u8, f.name),
+                    .value = try scratch.dupe(u8, f.value),
                     .value_len = f.value.len,
                 });
             } else if (first & 0xC0 == 0x40) {
                 // 6.2.1 Literal Header Field with Incremental Indexing: 01xxxxxx
                 const index = try readInt(&it, 6, first & 0x3f);
-                const name = try self.readName(&it, index, allocator);
-                const value = try readString(&it, allocator);
+                const name = try self.readName(&it, index, scratch);
+                const value = try readString(&it, scratch);
                 saw_field = true;
-                try self.dyn.insert(allocator, name, value);
-                try fields.append(allocator, .{ .name = name, .value = value, .value_len = value.len });
+                try self.dyn.insert(self.allocator, name, value);
+                try fields.append(scratch, .{ .name = name, .value = value, .value_len = value.len });
             } else if (first & 0xE0 == 0x20) {
                 // 6.3 Dynamic Table Size Update: 001xxxxx
                 const new_size = try readInt(&it, 5, first & 0x1f);
                 // RFC 7541 §6.3: the new size must be <= the limit set by the
                 // protocol (we do not advertise HEADER_TABLE_SIZE, so 4096).
                 if (new_size > 4096) return error.CompressionError;
-                self.dyn.resize(allocator, new_size);
+                self.dyn.resize(self.allocator, new_size);
             } else {
                 // 6.2.2 Literal without Indexing: 0000xxxx
                 // 6.2.3 Literal Never Indexed: 0001xxxx
                 const index = try readInt(&it, 4, first & 0x0f);
-                const name = try self.readName(&it, index, allocator);
-                const value = try readString(&it, allocator);
+                const name = try self.readName(&it, index, scratch);
+                const value = try readString(&it, scratch);
                 saw_field = true;
-                try fields.append(allocator, .{ .name = name, .value = value, .value_len = value.len });
+                try fields.append(scratch, .{ .name = name, .value = value, .value_len = value.len });
             }
         }
     }
@@ -111,8 +116,8 @@ pub const Decoder = struct {
     }
 
     /// Free the dynamic table's heap (call once per connection at teardown).
-    pub fn deinit(self: *Decoder, allocator: std.mem.Allocator) void {
-        self.dyn.deinit(allocator);
+    pub fn deinit(self: *Decoder) void {
+        self.dyn.deinit(self.allocator);
     }
 };
 
@@ -691,11 +696,17 @@ fn huffmanDecode(src: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     var node: usize = 0; // root
     var partial_len: u8 = 0;
     var partial_bits: u32 = 0;
+    // Bit accumulator: process bytes MSB-first, walking the trie one bit at
+    // a time but without per-bit array indexing / shifts against the input.
+    var acc: u32 = 0;
+    var acc_bits: u8 = 0;
 
     for (src) |byte| {
-        for (0..8) |b| {
-            const shift: u3 = @intCast(7 - b);
-            const bit = (byte >> shift) & 1;
+        acc = (acc << 8) | byte;
+        acc_bits += 8;
+        while (acc_bits > 0) {
+            const bit: u8 = @intCast((acc >> @as(u5, @intCast(acc_bits - 1))) & 1);
+            acc_bits -= 1;
             const next = trie[node].child[bit];
             if (next == no_node) return error.InvalidHuffman;
             node = next;
@@ -855,8 +866,8 @@ test "HPACK: RFC 7541 C.4.1 integer decoding (1337 with 5-bit prefix)" {
 }
 
 test "HPACK: static table index 2 is :method GET" {
-    var d = Decoder.init();
-    defer d.deinit(testing.allocator);
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
     var fields = std.ArrayList(Field).empty;
     defer fields.deinit(testing.allocator);
     // 0x82 = indexed header field, index 2.
@@ -868,8 +879,8 @@ test "HPACK: static table index 2 is :method GET" {
 }
 
 test "HPACK: literal with incremental indexing (C.3.1 sample)" {
-    var d = Decoder.init();
-    defer d.deinit(testing.allocator);
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
     var fields = std.ArrayList(Field).empty;
     defer fields.deinit(testing.allocator);
     // custom-key: 40 0a 637573746f6d2d6b6579, custom-value: 0d 637573746f6d2d76616c7565
@@ -885,8 +896,8 @@ test "HPACK: literal with incremental indexing (C.3.1 sample)" {
 }
 
 test "HPACK: huffman-encoded string decodes (curl sample)" {
-    var d = Decoder.init();
-    defer d.deinit(testing.allocator);
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
     var fields = std.ArrayList(Field).empty;
     defer fields.deinit(testing.allocator);
     // ":path /" Huffman-coded: index 4 is ":path /", so 0x84 alone.
@@ -897,8 +908,8 @@ test "HPACK: huffman-encoded string decodes (curl sample)" {
 }
 
 test "HPACK: RFC 7541 C.4.1 huffman-encoded string decodes correctly" {
-    var d = Decoder.init();
-    defer d.deinit(testing.allocator);
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
     var fields = std.ArrayList(Field).empty;
     defer fields.deinit(testing.allocator);
     // C.4.1: :method GET (indexed), :scheme http (indexed 6), :path /

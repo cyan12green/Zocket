@@ -651,11 +651,28 @@ closed/half-closed stream-state edge cases).
 - **Negotiation**: h2c prior-knowledge done; HTTP/1.1 `Upgrade: h2c` and
   ALPN `h2` (TLS) deferred to M17.
 
-**Verification**: `h2spec` conformance (134/145), `curl --http2-prior-
+**Verification**: `h2spec` conformance (131/145, no crashes), `curl --http2-prior-
 knowledge` end to end, byte-exact large-body round-trips, HTTP/1.1
-regression on the same listener. Multiplexed A/B vs HTTP/1.1 and the
-multi-client benchmark are the next benchmarking step. The stream model is
-the base for gRPC proxying (later).
+regression on the same listener. HTTP/2 benchmark vs nginx (`h2load` from
+`third_party/nghttp2`, h2c, 4 conns): GET /echo ~1.22x nginx at 100
+concurrent streams, **1.74x ours on static**; nginx ~1.7x on serialized
+single-stream round trips. Per-request allocations (page_allocator syscalls)
+were the initial bottleneck (~19k req/s) — pooling Requests + HPACK fields
+into a bump arena took h2 to ~149k req/s. Full numbers in `bench/BENCH.md`.
+
+**Module framework over HTTP/2**: the full DSL phase pipeline runs per h2
+stream (the session builds a `http.parser.Request` and calls
+`Server.handleRequest`), so every module works over h2 — verified with
+curl --http2-prior-knowledge: echo, gzip (byte-identical to h1),
+static (files + autoindex), response templates (fast path + 301), stub_status,
+cache headers + conditional-GET (304) and reverse proxy (client h2 →
+upstream HTTP/1). The response ENCODING is protocol-specific (h2 session
+frames HEADERS+DATA vs the h1 serializer) but the modules are
+protocol-agnostic. Fixing a pre-existing M12 bug exposed by this: the
+comptime `assignDispatch` upstream-sockaddr assignment wrote through a
+`[]const` slice (build error for any comptime/embedded config with a proxy
+route); sockaddr is now precomputed by the DM1/DM2 parser and verified
+present at comptime.
 
 **Comptime**: HPACK static table (61 entries) and the Huffman decode trie
 (257 symbols) built at comptime.
