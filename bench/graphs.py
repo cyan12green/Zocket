@@ -210,21 +210,20 @@ def plot_h2_compare():
 
     x = list(range(len(labels)))
     width = 0.35
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
-    for ax, values, color, name in (
-        (axes[0], z_meds, "#111111", "Zocket"),
-        (axes[1], n_meds, "#b22222", "nginx"),
-    ):
-        bars = ax.bar(x, values, width, color=color)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=9)
-        ax.set_title(f"{name} — req/s (higher is better)", fontsize=10)
-        ax.set_ylabel("req/s")
-        for bar, v in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width() / 2, v, f"{v:,.0f}",
-                    ha="center", va="bottom", fontsize=8)
-        ax.ticklabel_format(axis="y", style="sci", scilimits=(4, 4))
-    fig.suptitle("HTTP/2 (h2c) — Zocket vs nginx, h2load, 4 connections", fontsize=12)
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    bars = []
+    bars += ax.bar([p - width / 2 for p in x], z_meds, width, label="Zocket", color="#111111")
+    bars += ax.bar([p + width / 2 for p in x], n_meds, width, label="nginx", color="#b22222")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_title("HTTP/2 (h2c) — Zocket vs nginx, h2load, 4 connections (req/s, higher is better)", fontsize=11)
+    ax.set_ylabel("req/s")
+    for bar, v in zip(bars, z_meds + n_meds):
+        ax.text(bar.get_x() + bar.get_width() / 2, v, f"{v:,.0f}",
+                ha="center", va="bottom", fontsize=7)
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.ticklabel_format(axis="y", style="sci", scilimits=(4, 4))
     fig.tight_layout()
     fig.savefig(os.path.join(OUT, "h2_compare.png"), dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -252,6 +251,48 @@ def _h2_med(h2dir, name):
     return statistics.median(vals)
 
 
+
+def plot_chunked_compare():
+    """HTTP/1.1 chunked transfer (POST echo), Zocket vs nginx (bombardier
+    results from bench/results/chunked)."""
+    cdir = os.path.join(ROOT, "bench", "results", "chunked")
+    if not os.path.isdir(cdir):
+        print("chunked_compare.png: no bench/results/chunked data (run bench/chunked-bench.sh first)")
+        return
+    labels, z_meds, n_meds = [], [], []
+    for body in (128, 8192):
+        for conns in (10, 100, 1000):
+            zv = _h2_med(cdir, f"b{body}_c{conns}_z.txt")
+            nv = _h2_med(cdir, f"b{body}_c{conns}_n.txt")
+            if zv is None or nv is None:
+                print(f"chunked_compare.png: missing b{body}_c{conns} data, skipping")
+                return
+            labels.append(f"{body} B\nc={conns}")
+            z_meds.append(zv)
+            n_meds.append(nv)
+
+    x = list(range(len(labels)))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    bars = []
+    bars += ax.bar([p - width / 2 for p in x], z_meds, width, label="Zocket", color="#111111")
+    bars += ax.bar([p + width / 2 for p in x], n_meds, width, label="nginx", color="#b22222")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_title("HTTP/1.1 chunked transfer — Zocket vs nginx, POST echo (req/s, higher is better)", fontsize=11)
+    ax.set_ylabel("req/s")
+    for bar, v in zip(bars, z_meds + n_meds):
+        ax.text(bar.get_x() + bar.get_width() / 2, v, f"{v:,.0f}",
+                ha="center", va="bottom", fontsize=7)
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.ticklabel_format(axis="y", style="sci", scilimits=(4, 4))
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "chunked_compare.png"), dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print("chunked_compare.png")
+
+
 def run_suite():
     print("== running the comparison suite ==")
     subprocess.run(["bash", "bench/compare-servers.sh",
@@ -276,6 +317,7 @@ def main():
     plot_static()
     plot_nginx_compare()
     plot_h2_compare()
+    plot_chunked_compare()
     print("done")
 
 

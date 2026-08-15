@@ -176,6 +176,8 @@ pub const Server = struct {
         // With SO_REUSEPORT the reactors accept directly; the main thread
         // only polls for stop/reload/drain completion.
         while (self.running.load(.acquire)) {
+            // SIGTERM/SIGINT (daemon --stop / Ctrl-C): graceful shutdown.
+            if (stop_requested.load(.acquire)) self.stop();
             self.maybeReload();
             self.reapDrained();
             self.stop_ev.read();
@@ -474,12 +476,20 @@ test "multi-reactor HTTP with JSON config echoes via the pipeline" {
 
 /// Set by the SIGHUP handler (async-signal-safe: an atomic store).
 var reload_requested = std.atomic.Value(bool).init(false);
+/// Set by the SIGTERM/SIGINT handler: the run loop calls `stop()` for a
+/// graceful shutdown (daemon `--stop`, Ctrl-C).
+var stop_requested = std.atomic.Value(bool).init(false);
 
 fn handleHup(_: posix.SIG) callconv(.c) void {
     reload_requested.store(true, .release);
 }
 
-/// Install the SIGHUP handler (called by the embedder, e.g. main).
+fn handleTerm(_: posix.SIG) callconv(.c) void {
+    stop_requested.store(true, .release);
+}
+
+/// Install the SIGHUP reload and SIGTERM/SIGINT graceful-stop handlers
+/// (called by the embedder, e.g. main).
 pub fn installSignalHandlers() void {
     var act = posix.Sigaction{
         .handler = .{ .handler = handleHup },
@@ -487,4 +497,7 @@ pub fn installSignalHandlers() void {
         .flags = 0,
     };
     posix.sigaction(posix.SIG.HUP, &act, null);
+    act.handler = .{ .handler = handleTerm };
+    posix.sigaction(posix.SIG.INT, &act, null);
+    posix.sigaction(posix.SIG.TERM, &act, null);
 }
