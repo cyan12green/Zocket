@@ -18,6 +18,7 @@ const ResponseTemplate = router.ResponseTemplate;
 const ResponseTemplateCV = router.ResponseTemplateCV;
 const CVHeader = router.CVHeader;
 const SetVar = router.SetVar;
+const ProxyHeader = router.ProxyHeader;
 const Regex = router.Regex;
 const Upstream = router.Upstream;
 const Balance = router.Balance;
@@ -150,6 +151,10 @@ const LocationSpec = struct {
     return_body: ?Str = null,
     return_headers_start: usize = 0,
     return_headers_len: usize = 0,
+    /// `proxy_set_header <name> "<cv>";` overrides (M-E): range into the
+    /// builder's proxy-header pool.
+    proxy_headers_start: usize = 0,
+    proxy_headers_len: usize = 0,
     /// `set $name "<cv>";` declarations: range into the builder's set pool
     /// (M-C). Slots are assigned in declaration order (0..max_user_vars-1).
     set_start: usize = 0,
@@ -158,6 +163,12 @@ const LocationSpec = struct {
 
 /// A `set` declaration as parsed (value unresolved until build).
 const SetSpec = struct {
+    name: Str = .{ .src = "" },
+    value: Str = .{ .src = "" },
+};
+
+/// A `proxy_set_header` declaration as parsed (value unresolved until build).
+const ProxySpec = struct {
     name: Str = .{ .src = "" },
     value: Str = .{ .src = "" },
 };
@@ -185,6 +196,7 @@ const Builder = struct {
     strings: ct_pool.CtPool(u8, string_cap) = .{},
     log_formats: ct_pool.CtPool(LogFormatSpec, 16) = .{},
     set_vars: ct_pool.CtPool(SetSpec, 1024) = .{},
+    proxy_headers: ct_pool.CtPool(ProxySpec, 1024) = .{},
     limits: Limits = .{},
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
@@ -657,7 +669,17 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             lx.expectTerminator("fail_timeout");
         },
         H_proxy_set_header => {
-            lx.fail("proxy_set_header lands in M-E (this plan milestone is not implemented yet)");
+            // `proxy_set_header <name> "<cv>";` (M-E): an upstream request
+            // header override; the value is a complex value.
+            const hname = lx.value(b, "proxy_set_header");
+            const hvalue = lx.value(b, "proxy_set_header");
+            lx.expectTerminator("proxy_set_header");
+            const n = resolve(hname, b.strings.items[0..]);
+            const v = resolve(hvalue, b.strings.items[0..]);
+            if (spec.proxy_headers_len == 0) spec.proxy_headers_start = b.proxy_headers.len;
+            _ = b.proxy_headers.create(.{ .name = .{ .src = n }, .value = .{ .src = v } });
+            spec.proxy_headers_len += 1;
+            b.cost += 8;
         },
         H_access_log => {
             const t = lx.token() orelse lx.fail("access_log: expected a format name or off");
@@ -774,6 +796,7 @@ fn build(b: *const Builder) Config {
     const upstreams = b.upstreams.freeze();
     const log_specs = b.log_formats.freeze();
     const set_specs = b.set_vars.freeze();
+    const proxy_specs = b.proxy_headers.freeze();
 
     const Range = struct { start: usize, len: usize };
 
@@ -863,6 +886,28 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .ranges = ranges };
     };
 
+    // `proxy_set_header` overrides per route (M-E): values resolve as
+    // complex values against the location's set scope.
+    const ProxyTable = struct { items: [1024]ProxyHeader, ranges: [route_cap]Range };
+    const proxy_table: ProxyTable = comptime blk: {
+        var items: [1024]ProxyHeader = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.proxy_headers_len };
+            const sr = set_table.ranges[ri];
+            const route_sets = set_table.items[sr.start..][0..sr.len];
+            for (proxy_specs[spec.proxy_headers_start..][0..spec.proxy_headers_len]) |ph| {
+                items[pos] = .{
+                    .name = resolve(ph.name, strings),
+                    .value = vars.parseComplexValue(resolve(ph.value, strings), route_sets),
+                };
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
     const Routes = struct { items: [route_cap]Route, len: usize };
     const routes_built: Routes = comptime blk: {
         var items: [route_cap]Route = undefined;
@@ -920,6 +965,7 @@ fn build(b: *const Builder) Config {
                 }
             }
             const ur = up_table.ranges[ri];
+            const pr = proxy_table.ranges[ri];
             items[len] = .{
                 .path = resolve(spec.path, strings),
                 .match = spec.match,
@@ -934,6 +980,7 @@ fn build(b: *const Builder) Config {
                 .response = resp,
                 .response_cv = resp_cv,
                 .set_vars = route_sets,
+                .proxy_headers = proxy_table.items[pr.start..][0..pr.len],
                 .upstreams = up_table.items[ur.start..][0..ur.len],
                 .balance = spec.balance,
                 .max_fails = spec.max_fails,
@@ -1274,4 +1321,26 @@ test "conf: set variables resolve to user slots and render" {
     try testing.expectEqual(@as(usize, 2), r.set_vars[0].value.len);
     // The return body references $greeting → a user fragment.
     try testing.expectEqual(@as(u8, 0), r.response_cv.?.body[1].user);
+}
+
+test "conf: proxy_set_header parses into the route" {
+    const cfg = parse(
+        \\server {
+        \\    location /p {
+        \\        content proxy;
+        \\        proxy_pass 127.0.0.1:9000;
+        \\        proxy_set_header X-Forwarded-Host "$host";
+        \\        proxy_set_header X-Custom "v-$arg_x";
+        \\    }
+        \\}
+    );
+    const r = cfg.routes[0];
+    try testing.expectEqual(@as(usize, 2), r.proxy_headers.len);
+    try testing.expectEqualStrings("X-Forwarded-Host", r.proxy_headers[0].name);
+    try testing.expectEqual(@as(usize, 1), r.proxy_headers[0].value.len);
+    try testing.expectEqual(vars.VarId.host, r.proxy_headers[0].value[0].builtin);
+    try testing.expectEqualStrings("X-Custom", r.proxy_headers[1].name);
+    try testing.expectEqual(@as(usize, 2), r.proxy_headers[1].value.len);
+    try testing.expectEqualStrings("v-", r.proxy_headers[1].value[0].literal);
+    try testing.expectEqual(comptime vars.hashFn("x"), r.proxy_headers[1].value[1].arg);
 }

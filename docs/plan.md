@@ -2,7 +2,8 @@
 
 Status: **M-A done (conf language core), M-B done (complex values & variables),
 M-C done (set user variables), M-D done (regex engine + router precedence),
-M-E pending**. This is the implementation blueprint for replacing the JSON
+M-E done (proxy_set_header + audit + bench)**. This is the implementation
+blueprint for replacing the JSON
 config with a custom nginx-conf-flavored language, compiled entirely at comptime,
 with an nginx-style variable ("complex value") system and regex `location`
 matching. A future agent session should be able to implement this end-to-end from
@@ -1060,12 +1061,21 @@ one is fully green.
   404), captures correctness, `~*` case folding.
 
 ### M-E — proxy_set_header + audit + bench
-- `proxy_set_header` rendering (§8.4).
+- `proxy_set_header` rendering (§8.4). **DONE**: conf.zig parses
+  `proxy_set_header <name> "<cv>";` into a per-route `ProxyHeader` pool
+  (`ProxySpec` deferred to `build()`, values compiled to fragment lists with
+  the location's set scope); `proxy.zig` `sendUpstreamRequest` replaces any
+  client header whose name is overridden (hash-compared) and appends the
+  override with the value rendered via `renderComplex` into the upstream
+  request.
 - Full `zig build test`, `zig build h2test` (variables render off `Request`; verify
   h2 requests work — they populate `Request` via `addHeaderParsed`),
-  `-Doptimize=ReleaseFast` build.
+  `-Doptimize=ReleaseFast` build. **DONE**: 264 tests, h2test 131/145, fuzz OK,
+  ReleaseFast builds with `config.example.conf` and `bench/.cache/tls-bench.conf`.
 - Bench A/B against the pre-change tree (the AGENTS.md M4 constraint: pipeline
-  overhead <5%). Conf path removes startup parse (strictly faster at startup);
+  overhead <5%). **DONE**: proxy path with 2 variable `proxy_set_header`s vs the
+  `a2fb7d9` baseline measured 23.6–25.1k rps vs 24.2k rps — parity, no measurable
+  regression. Conf path removes startup parse (strictly faster at startup);
   ensure the fragment render loop stays allocation-free on the log/proxy hot
   paths, and that literal-only templates still hit `matchFast`.
 

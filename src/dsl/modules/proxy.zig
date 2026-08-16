@@ -2,6 +2,7 @@ const std = @import("std");
 const registry = @import("../registry.zig");
 const router = @import("../router.zig");
 const http_parser = @import("../../http/parser.zig");
+const vars = @import("../vars.zig");
 
 pub const Context = registry.Context;
 pub const Action = registry.Action;
@@ -251,10 +252,26 @@ fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) 
     try out.appendSlice(allocator, ip);
     try out.appendSlice(allocator, "\r\n");
 
-    // Forward the client's headers except hop-by-hop ones we manage.
+    // M-E: proxy_set_header overrides — a header whose name appears here is
+    // replaced (the client's value is skipped); others are appended after
+    // the forwarded headers. Values are complex values (rendered per
+    // request).
+    const overrides = if (ctx.route) |route| route.proxy_headers else &.{};
+    var override_hashes: [8]u32 = undefined;
+    var override_count: usize = 0;
+    for (overrides) |ph| {
+        if (override_count < 8) {
+            override_hashes[override_count] = http_parser.header_hasher.hash(ph.name);
+            override_count += 1;
+        }
+    }
+
+    // Forward the client's headers except hop-by-hop ones we manage and
+    // any name overridden by proxy_set_header.
     for (0..ctx.req.headerCount()) |i| {
         const h = ctx.req.headerAt(i);
-        const skip = switch (http_parser.header_hasher.hash(h.name)) {
+        const hh = http_parser.header_hasher.hash(h.name);
+        const skip = switch (hh) {
             http_parser.header_hasher.hash("host") => true,
             http_parser.header_hasher.hash("connection") => true,
             http_parser.header_hasher.hash("content-length") => true,
@@ -262,9 +279,25 @@ fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) 
             else => false,
         };
         if (skip) continue;
+        var overridden = false;
+        for (override_hashes[0..override_count]) |oh| {
+            if (oh == hh) {
+                overridden = true;
+                break;
+            }
+        }
+        if (overridden) continue;
         try out.appendSlice(allocator, h.name);
         try out.appendSlice(allocator, ": ");
         try out.appendSlice(allocator, h.value);
+        try out.appendSlice(allocator, "\r\n");
+    }
+    // The proxy_set_header overrides.
+    var sink = vars.ArrayListSink{ .list = &out, .allocator = allocator };
+    for (overrides) |ph| {
+        try out.appendSlice(allocator, ph.name);
+        try out.appendSlice(allocator, ": ");
+        try vars.renderComplex(ctx, ph.value, &sink);
         try out.appendSlice(allocator, "\r\n");
     }
     try out.appendSlice(allocator, "Content-Length: ");

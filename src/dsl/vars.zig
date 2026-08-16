@@ -267,7 +267,7 @@ fn resolveName(comptime name: []const u8, comptime set_vars: []const SetVar, com
 }
 
 /// FNV-1a (32-bit) verbatim (query args are case-sensitive).
-fn hashFn(name: []const u8) u32 {
+pub fn hashFn(name: []const u8) u32 {
     var h: u32 = 2166136261;
     for (name) |c| {
         h ^= c;
@@ -277,7 +277,7 @@ fn hashFn(name: []const u8) u32 {
 }
 
 /// FNV-1a (32-bit) over lower-cased bytes (cookies).
-fn hashLower(name: []const u8) u32 {
+pub fn hashLower(name: []const u8) u32 {
     var h: u32 = 2166136261;
     for (name) |c| {
         h ^= std.ascii.toLower(c);
