@@ -16,6 +16,7 @@ const TemplateHeader = router.TemplateHeader;
 const ResponseTemplate = router.ResponseTemplate;
 const ResponseTemplateCV = router.ResponseTemplateCV;
 const CVHeader = router.CVHeader;
+const SetVar = router.SetVar;
 const Upstream = router.Upstream;
 const Balance = router.Balance;
 const Phase = phase_mod.Phase;
@@ -145,6 +146,16 @@ const LocationSpec = struct {
     return_body: ?Str = null,
     return_headers_start: usize = 0,
     return_headers_len: usize = 0,
+    /// `set $name "<cv>";` declarations: range into the builder's set pool
+    /// (M-C). Slots are assigned in declaration order (0..max_user_vars-1).
+    set_start: usize = 0,
+    set_len: usize = 0,
+};
+
+/// A `set` declaration as parsed (value unresolved until build).
+const SetSpec = struct {
+    name: Str = .{ .src = "" },
+    value: Str = .{ .src = "" },
 };
 
 /// A response-template section as parsed.
@@ -169,6 +180,7 @@ const Builder = struct {
     upstreams: ct_pool.CtPool(Upstream, upstream_cap) = .{},
     strings: ct_pool.CtPool(u8, string_cap) = .{},
     log_formats: ct_pool.CtPool(LogFormatSpec, 16) = .{},
+    set_vars: ct_pool.CtPool(SetSpec, 1024) = .{},
     limits: Limits = .{},
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
@@ -548,7 +560,39 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             b.cost += 8;
         },
         H_set => {
-            lx.fail("set: user variables land in M-C (this plan milestone is not implemented yet)");
+            // `set $name "<cv>";` — the name must be a valid identifier
+            // `[A-Za-z_][A-Za-z0-9_]*`; `$1..$9`/`$$` are reserved (M-C).
+            const name_t = lx.token() orelse lx.fail("set: expected a variable name");
+            const ns = name_t.srcOf("set: name cannot contain escapes");
+            if (ns.len < 2 or ns[0] != '$') lx.fail("set: expected $name");
+            const bare = ns[1..];
+            if (bare.len == 0 or !(std.ascii.isAlphabetic(bare[0]) or bare[0] == '_')) {
+                lx.fail("set: name must start with a letter or underscore");
+            }
+            for (bare) |c| {
+                if (!(std.ascii.isAlphanumeric(c) or c == '_')) {
+                    lx.fail("set: name must be [A-Za-z0-9_]*");
+                }
+            }
+            if (std.mem.eql(u8, bare, "$$") or (bare.len == 1 and bare[0] >= '1' and bare[0] <= '9')) {
+                lx.fail("set: '$$' and '$1..$9' are reserved");
+            }
+            // Duplicate name in the same location → compile error.
+            for (b.set_vars.items[spec.set_start..][0..spec.set_len]) |existing| {
+                if (std.mem.eql(u8, resolve(existing.name, b.strings.items[0..]), bare)) {
+                    lx.fail("set: duplicate variable '$" ++ bare ++ "' in this location");
+                }
+            }
+            if (spec.set_len >= vars.max_user_vars) {
+                lx.fail("set: too many user variables in one location (max " ++
+                    std.fmt.comptimePrint("{d}", .{vars.max_user_vars}) ++ ")");
+            }
+            if (spec.set_len == 0) spec.set_start = b.set_vars.len;
+            const value = lx.value(b, "set");
+            lx.expectTerminator("set");
+            _ = b.set_vars.create(.{ .name = .{ .src = bare }, .value = value });
+            spec.set_len += 1;
+            b.cost += 8;
         },
         H_proxy_pass => {
             const t = lx.value(b, "proxy_pass");
@@ -726,6 +770,7 @@ fn build(b: *const Builder) Config {
     const headers = b.headers.freeze();
     const upstreams = b.upstreams.freeze();
     const log_specs = b.log_formats.freeze();
+    const set_specs = b.set_vars.freeze();
 
     const Range = struct { start: usize, len: usize };
 
@@ -789,12 +834,40 @@ fn build(b: *const Builder) Config {
     };
 
     // Resolve an `access_log <name>` directive to its log_format index.
+    const SetTable = struct { items: [1024]SetVar, ranges: [route_cap]Range };
+    const set_table: SetTable = comptime blk: {
+        var items: [1024]SetVar = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.set_len };
+            // Resolve set values in declaration order with a growing scope:
+            // a set may reference sets declared before it (forward references
+            // are compile errors, plan §5.3).
+            const scope_start = pos;
+            for (set_specs[spec.set_start..][0..spec.set_len], 0..) |ss, si| {
+                const name = resolve(ss.name, strings);
+                const value_text = resolve(ss.value, strings);
+                const scope = items[scope_start .. scope_start + si];
+                items[pos] = .{
+                    .name = name,
+                    .slot = @intCast(si),
+                    .value = vars.parseComplexValue(value_text, scope),
+                };
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
     const Routes = struct { items: [route_cap]Route, len: usize };
     const routes_built: Routes = comptime blk: {
         var items: [route_cap]Route = undefined;
         var len: usize = 0;
         for (route_specs, 0..) |spec, ri| {
             const mr = mod_table.ranges[ri];
+            const sr = set_table.ranges[ri];
+            const route_sets = set_table.items[sr.start..][0..sr.len];
             var resp: ?ResponseTemplate = null;
             var resp_cv: ?ResponseTemplateCV = null;
             if (spec.return_status != 0) {
@@ -804,7 +877,7 @@ fn build(b: *const Builder) Config {
                 // as complex values; if any fragment is non-literal the route
                 // uses the dynamic template (response_cv), else the literal
                 // fast path (response + pre-serialised bytes) is kept.
-                const body_frags = vars.parseComplexValue(body_text, &.{});
+                const body_frags = vars.parseComplexValue(body_text, route_sets);
                 var dynamic = hasVariables(body_frags);
                 const hcount = hr.len;
                 const CVArray = struct { items: [header_cap]CVHeader };
@@ -812,7 +885,7 @@ fn build(b: *const Builder) Config {
                     var a: [header_cap]CVHeader = undefined;
                     var n: usize = 0;
                     for (head_table.items[hr.start..][0..hcount]) |h| {
-                        const hf = vars.parseComplexValue(h.value, &.{});
+                        const hf = vars.parseComplexValue(h.value, route_sets);
                         if (hasVariables(hf)) dynamic = true;
                         a[n] = .{ .name = h.name, .value = hf };
                         n += 1;
@@ -856,6 +929,7 @@ fn build(b: *const Builder) Config {
                 .embed = if (spec.embed) |e| resolve(e, strings) else null,
                 .response = resp,
                 .response_cv = resp_cv,
+                .set_vars = route_sets,
                 .upstreams = up_table.items[ur.start..][0..ur.len],
                 .balance = spec.balance,
                 .max_fails = spec.max_fails,
@@ -1175,4 +1249,23 @@ test "conf: exact and prefix routes match via the trie" {
     try testing.expectEqualStrings("/who", m.path);
     try testing.expectEqual(Match.exact, m.match);
     try testing.expectEqualStrings("/", rtr.match("/anything").?.path);
+}
+
+test "conf: set variables resolve to user slots and render" {
+    const cfg = parse(
+        \\server {
+        \\    location = /user {
+        \\        set $greeting "hi-$host";
+        \\        return 200 "g=$greeting";
+        \\    }
+        \\}
+    );
+    const r = cfg.routes[0];
+    try testing.expectEqual(@as(usize, 1), r.set_vars.len);
+    try testing.expectEqualStrings("greeting", r.set_vars[0].name);
+    try testing.expectEqual(@as(u8, 0), r.set_vars[0].slot);
+    // The set value references $host (builtin) → 2 fragments.
+    try testing.expectEqual(@as(usize, 2), r.set_vars[0].value.len);
+    // The return body references $greeting → a user fragment.
+    try testing.expectEqual(@as(u8, 0), r.response_cv.?.body[1].user);
 }

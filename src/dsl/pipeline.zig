@@ -538,3 +538,25 @@ test "dispatched routes route identically through a trie-backed router" {
     const res2 = try runWithRouter(PassThroughRegistry, &dispatched, &rtr, &ctx2);
     try testing.expectEqual(Outcome.not_handled, res2);
 }
+
+test "response_cv renders set user variables lazily with caching" {
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.addHeaderParsed("host", "example.com") catch unreachable;
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+
+    const set_frags = comptime vars.parseComplexValue("hi-$host", &.{});
+    const route_set = router.SetVar{ .name = "greeting", .slot = 0, .value = set_frags };
+    const body_frags = comptime vars.parseComplexValue("g=$greeting again=$greeting", &.{.{ .name = "greeting", .slot = 0, .value = set_frags }});
+    var route = router.Route{
+        .path = "/",
+        .response_cv = .{ .status = 200, .body = body_frags },
+        .set_vars = &.{route_set},
+    };
+    ctx.route = &route;
+    applyTemplateCV(&ctx, route.response_cv.?);
+    try testing.expectEqualStrings("g=hi-example.com again=hi-example.com", resp.body);
+    // Cached after first render.
+    try testing.expectEqualStrings("hi-example.com", ctx.user_slots[0].?);
+}
