@@ -11,6 +11,7 @@ pub const DispatchFn = registry.DispatchFn;
 pub const Request = registry.Request;
 pub const Response = registry.Response;
 pub const Status = registry.Status;
+const vars = @import("vars.zig");
 
 /// Walk the phase chain for one fully-parsed request.
 ///
@@ -40,7 +41,7 @@ pub fn run(comptime Registry: type, routes: []const router.Route, ctx: *Context)
 /// the final response. The walk loop skips the log phase; this function runs
 /// it once at the end.
 pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr: ?*const router.Router, ctx: *Context) !Outcome {
-    const route = if (rtr) |r| r.match(ctx.req.target) else router.matchRoutes(routes, ctx.req.target);
+    const route = if (rtr) |r| r.match(ctx.req.decoded_target) else router.matchRoutes(routes, ctx.req.decoded_target);
     ctx.route = route;
     // No route matched: no module can act on this request.
     const r = route orelse return .not_handled;
@@ -58,6 +59,11 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
         if (out == .not_handled) {
             if (r.response) |t| {
                 applyTemplate(ctx, t);
+                return .handled;
+            }
+            // M-B: dynamic (variable-capable) templates render into the arena.
+            if (r.response_cv) |t| {
+                applyTemplateCV(ctx, t);
                 return .handled;
             }
         }
@@ -89,6 +95,11 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
             applyTemplate(ctx, t);
             return .handled;
         }
+        // M-B: dynamic templates render per request (variables/captures).
+        if (r.response_cv) |t| {
+            applyTemplateCV(ctx, t);
+            return .handled;
+        }
     }
     return outcome;
 }
@@ -103,6 +114,18 @@ fn applyTemplate(ctx: *Context, t: router.ResponseTemplate) void {
         ctx.resp.setHeader(h.name, h.value);
     }
     ctx.resp.body = t.body;
+}
+
+/// Apply a dynamic (variable-capable) response template: every header value
+/// and the body render into the request arena (M-B), then apply like the
+/// literal template.
+fn applyTemplateCV(ctx: *Context, t: router.ResponseTemplateCV) void {
+    ctx.resp.status = @enumFromInt(t.status);
+    for (t.headers) |h| {
+        const value = vars.renderComplexArena(ctx, h.value, &ctx.req.arena) orelse "";
+        ctx.resp.setHeader(h.name, value);
+    }
+    ctx.resp.body = vars.renderComplexArena(ctx, t.body, &ctx.req.arena) orelse "";
 }
 
 /// Comptime-specialised dispatch function for one route (Milestone 7 Part B).
@@ -143,6 +166,16 @@ pub fn dispatchForRoute(comptime Registry: type, comptime route: router.Route) D
             if (route.moduleFor(.log)) |name| {
                 const run_fn = Registry.resolve(name).?;
                 _ = try run_fn(ctx);
+            }
+            if (outcome == .not_handled) {
+                if (route.response) |t| {
+                    applyTemplate(ctx, t);
+                    return .handled;
+                }
+                if (route.response_cv) |t| {
+                    applyTemplateCV(ctx, t);
+                    return .handled;
+                }
             }
             return outcome;
         }
@@ -291,6 +324,7 @@ test "pipeline walks phases in order" {
     var req = Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/anything";
+    req.decoded_target = "/anything";
 
     const res = try runWith(OrderRegistry, routes, &req);
     // Nothing claimed the request: the walk covered every phase.
@@ -308,6 +342,7 @@ test "find_config runs the router: non-matching request is not handled" {
     var req = Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/unmatched";
+    req.decoded_target = "/unmatched";
 
     const rs = [_]router.Route{.{ .path = "/api", .match = .exact, .modules = &.{
         .{ .phase = .content, .module = "content_mod" },
@@ -324,6 +359,7 @@ test "absence of module attachment yields a default (not_handled) response" {
     var req = Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/";
+    req.decoded_target = "/";
 
     const res = try runWith(OrderRegistry, &rs, &req);
     try testing.expectEqual(Outcome.not_handled, res.outcome);
@@ -338,6 +374,7 @@ test "module short-circuit skips later phases" {
     var req = Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/";
+    req.decoded_target = "/";
 
     const res = try runWith(ShortCircuitRegistry, &routes, &req);
     try testing.expectEqual(Outcome.not_handled, res.outcome);
@@ -355,6 +392,7 @@ test "handled module stops the chain and its context mutation is visible" {
     var req = Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/";
+    req.decoded_target = "/";
 
     const res = try runWith(HandlerRegistry, &routes, &req);
     try testing.expectEqual(Outcome.handled, res.outcome);
@@ -374,6 +412,7 @@ test "passing module lets later phases run" {
     var req = Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/";
+    req.decoded_target = "/";
 
     const res = try runWith(PassThroughRegistry, &routes, &req);
     try testing.expectEqual(Outcome.handled, res.outcome);
@@ -391,6 +430,7 @@ test "unknown module binding is a config error" {
     var req = Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/";
+    req.decoded_target = "/";
 
     var resp = Response.init(.ok);
     var ctx = Context{ .req = &req, .resp = &resp };
@@ -405,6 +445,7 @@ test "dispatch specialisation matches the loop walk outcome and state" {
     var req_a = Request.init(testing.allocator);
     defer req_a.deinit();
     req_a.target = "/anything";
+    req_a.decoded_target = "/anything";
     const res_a = try runWith(OrderRegistry, routes, &req_a);
 
     // The same route table with comptime dispatch functions assigned.
@@ -412,6 +453,7 @@ test "dispatch specialisation matches the loop walk outcome and state" {
     var req_b = Request.init(testing.allocator);
     defer req_b.deinit();
     req_b.target = "/anything";
+    req_b.decoded_target = "/anything";
     const res_b = try runWith(OrderRegistry, &dispatched, &req_b);
 
     try testing.expectEqual(res_a.outcome, res_b.outcome);
@@ -434,11 +476,13 @@ test "dispatch specialisation handles short-circuit and handled modules" {
     var req_a = Request.init(testing.allocator);
     defer req_a.deinit();
     req_a.target = "/";
+    req_a.decoded_target = "/";
     const res_a = try runWith(ShortCircuitRegistry, short_routes, &req_a);
 
     var req_b = Request.init(testing.allocator);
     defer req_b.deinit();
     req_b.target = "/";
+    req_b.decoded_target = "/";
     const res_b = try runWith(ShortCircuitRegistry, &short_dispatched, &req_b);
 
     try testing.expectEqual(res_a.outcome, res_b.outcome);
@@ -456,6 +500,7 @@ test "dispatch specialisation handles short-circuit and handled modules" {
     var req_c = Request.init(testing.allocator);
     defer req_c.deinit();
     req_c.target = "/";
+    req_c.decoded_target = "/";
     const res_c = try runWith(HandlerRegistry, &claim_dispatched, &req_c);
     try testing.expectEqual(Outcome.handled, res_c.outcome);
     try testing.expectEqual(Status.bad_request, res_c.resp.status);
@@ -477,6 +522,7 @@ test "dispatched routes route identically through a trie-backed router" {
     var req = Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/somewhere";
+    req.decoded_target = "/somewhere";
     var resp = Response.init(.ok);
     var ctx = Context{ .req = &req, .resp = &resp };
     const res = try runWithRouter(PassThroughRegistry, &dispatched, &rtr, &ctx);
@@ -486,6 +532,7 @@ test "dispatched routes route identically through a trie-backed router" {
     var req2 = Request.init(testing.allocator);
     defer req2.deinit();
     req2.target = "/skip";
+    req2.decoded_target = "/skip";
     var resp2 = Response.init(.ok);
     var ctx2 = Context{ .req = &req2, .resp = &resp2 };
     const res2 = try runWithRouter(PassThroughRegistry, &dispatched, &rtr, &ctx2);

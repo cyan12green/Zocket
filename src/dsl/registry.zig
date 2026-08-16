@@ -13,6 +13,10 @@ pub const Request = http_parser.Request;
 pub const Response = http_response.Response;
 pub const Status = http_response.Status;
 pub const Limits = limits_mod.Limits;
+pub const CaptureRange = router.CaptureRange;
+pub const LogFormat = router.LogFormat;
+const vars_mod = @import("vars.zig");
+pub const max_user_vars = vars_mod.max_user_vars;
 
 /// Result of a full pipeline walk for one request. Defined here (not in the
 /// pipeline) so the router's `DispatchFn` can reference it without an import
@@ -88,6 +92,19 @@ pub const Context = struct {
     /// reactor; null in tests and module-level invocation (modules fall
     /// back to the compiled defaults).
     limits: ?*const limits_mod.Limits = null,
+    /// Regex capture ranges into `capture_subject` (decoded target,
+    /// arena-stable) — M-D. Index 0 = whole match; 1..9 = groups.
+    captures: [9]CaptureRange = [_]CaptureRange{.{ .start = 0, .end = 0 }} ** 9,
+    capture_count: u8 = 0,
+    capture_subject: []const u8 = "",
+    /// Lazy-rendered user-variable slots (set $var), slices into req.arena.
+    user_slots: [max_user_vars]?[]const u8 = .{null} ** max_user_vars,
+    /// Named log formats (config `log_format`); the access_log module reads
+    /// the route's `log_format` index into this table. Null in tests and
+    /// module-level invocation (the module falls back to `combined`).
+    formats: ?[]const LogFormat = null,
+    /// Per-request start instant for `$request_time`.
+    started: std.time.Instant = undefined,
 };
 
 /// Shared connection/request counters (Milestone 13): updated atomically by

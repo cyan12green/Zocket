@@ -1,6 +1,7 @@
 # Plan: nginx-style conf language + complex variables (comptime-only)
 
-Status: **M-A done (conf language core), M-B..M-E pending**. This is the implementation blueprint for replacing the JSON
+Status: **M-A done (conf language core), M-B done (complex values & variables),
+M-C..M-E pending**. This is the implementation blueprint for replacing the JSON
 config with a custom nginx-conf-flavored language, compiled entirely at comptime,
 with an nginx-style variable ("complex value") system and regex `location`
 matching. A future agent session should be able to implement this end-to-end from

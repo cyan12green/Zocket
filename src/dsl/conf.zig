@@ -4,6 +4,7 @@ const dsl_limits = @import("limits.zig");
 const router = @import("router.zig");
 const phase_mod = @import("phase.zig");
 const ct_pool = @import("../ct_pool.zig");
+const vars = @import("vars.zig");
 
 const Config = config_mod.Config;
 const TlsConfig = config_mod.TlsConfig;
@@ -13,10 +14,24 @@ const Match = router.Match;
 const ModuleBinding = router.ModuleBinding;
 const TemplateHeader = router.TemplateHeader;
 const ResponseTemplate = router.ResponseTemplate;
+const ResponseTemplateCV = router.ResponseTemplateCV;
+const CVHeader = router.CVHeader;
 const Upstream = router.Upstream;
 const Balance = router.Balance;
 const Phase = phase_mod.Phase;
 const Limits = dsl_limits.Limits;
+
+/// True when a compiled complex value contains any non-literal fragment
+/// (a variable/capture/user slot): such values need the dynamic renderer.
+fn hasVariables(frags: []const vars.Frag) bool {
+    for (frags) |f| {
+        switch (f) {
+            .literal => {},
+            else => return true,
+        }
+    }
+    return false;
+}
 
 // Parser pool capacities (compile-time only — the built route table is
 // frozen by actual count, so unused capacity costs nothing at runtime).
@@ -766,7 +781,7 @@ fn build(b: *const Builder) Config {
         for (log_specs) |ls| {
             items[len] = .{
                 .name = resolve(ls.name, strings),
-                .value = resolve(ls.value, strings),
+                .value = vars.parseComplexValue(resolve(ls.value, strings), &.{}),
             };
             len += 1;
         }
@@ -781,13 +796,52 @@ fn build(b: *const Builder) Config {
         for (route_specs, 0..) |spec, ri| {
             const mr = mod_table.ranges[ri];
             var resp: ?ResponseTemplate = null;
+            var resp_cv: ?ResponseTemplateCV = null;
             if (spec.return_status != 0) {
                 const hr = head_table.ranges[ri];
-                resp = .{
-                    .status = spec.return_status,
-                    .headers = head_table.items[hr.start..][0..hr.len],
-                    .body = if (spec.return_body) |bd| resolve(bd, strings) else "",
+                const body_text = if (spec.return_body) |bd| resolve(bd, strings) else "";
+                // M-B: variable-capable? Parse the body and every header value
+                // as complex values; if any fragment is non-literal the route
+                // uses the dynamic template (response_cv), else the literal
+                // fast path (response + pre-serialised bytes) is kept.
+                const body_frags = vars.parseComplexValue(body_text, &.{});
+                var dynamic = hasVariables(body_frags);
+                const hcount = hr.len;
+                const CVArray = struct { items: [header_cap]CVHeader };
+                const cv_arr: CVArray = cv_blk: {
+                    var a: [header_cap]CVHeader = undefined;
+                    var n: usize = 0;
+                    for (head_table.items[hr.start..][0..hcount]) |h| {
+                        const hf = vars.parseComplexValue(h.value, &.{});
+                        if (hasVariables(hf)) dynamic = true;
+                        a[n] = .{ .name = h.name, .value = hf };
+                        n += 1;
+                    }
+                    break :cv_blk .{ .items = a };
                 };
+                const LitArray = struct { items: [header_cap]TemplateHeader };
+                const lit_arr: LitArray = lit_blk: {
+                    var a: [header_cap]TemplateHeader = undefined;
+                    var n: usize = 0;
+                    for (head_table.items[hr.start..][0..hcount]) |h| {
+                        a[n] = h;
+                        n += 1;
+                    }
+                    break :lit_blk .{ .items = a };
+                };
+                if (dynamic) {
+                    resp_cv = .{
+                        .status = spec.return_status,
+                        .headers = cv_arr.items[0..hcount],
+                        .body = body_frags,
+                    };
+                } else {
+                    resp = .{
+                        .status = spec.return_status,
+                        .headers = lit_arr.items[0..hcount],
+                        .body = body_text,
+                    };
+                }
             }
             const ur = up_table.ranges[ri];
             items[len] = .{
@@ -801,6 +855,7 @@ fn build(b: *const Builder) Config {
                 .autoindex = spec.autoindex,
                 .embed = if (spec.embed) |e| resolve(e, strings) else null,
                 .response = resp,
+                .response_cv = resp_cv,
                 .upstreams = up_table.items[ur.start..][0..ur.len],
                 .balance = spec.balance,
                 .max_fails = spec.max_fails,
@@ -1090,4 +1145,34 @@ test "conf: gzip route binds 4 distinct phases" {
         \\}
     );
     try testing.expectEqual(@as(usize, 4), cfg.routes[0].modules.len);
+}
+
+test "conf: variable return body produces response_cv" {
+    const cfg = parse(
+        \\server {
+        \\    location = /who {
+        \\        return 200 "host=$host";
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.routes[0].response == null);
+    try testing.expect(cfg.routes[0].response_cv != null);
+    try testing.expectEqual(@as(usize, 2), cfg.routes[0].response_cv.?.body.len);
+    try testing.expectEqualStrings("host=", cfg.routes[0].response_cv.?.body[0].literal);
+    try testing.expectEqual(vars.VarId.host, cfg.routes[0].response_cv.?.body[1].builtin);
+}
+
+test "conf: exact and prefix routes match via the trie" {
+    const cfg = comptime parse(
+        \\server {
+        \\    location = /who { return 200 "host=$host"; }
+        \\    location / { content echo; }
+        \\}
+    );
+    const trie = router.buildTrie(cfg.routes);
+    const rtr = router.Router{ .routes = cfg.routes, .trie = trie };
+    const m = rtr.match("/who").?;
+    try testing.expectEqualStrings("/who", m.path);
+    try testing.expectEqual(Match.exact, m.match);
+    try testing.expectEqualStrings("/", rtr.match("/anything").?.path);
 }

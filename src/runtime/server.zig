@@ -148,11 +148,17 @@ pub const Server = struct {
     /// no function call through the phase chain. Returns null when any
     /// module could still act on the request.
     pub fn matchFast(self: *const Server, ctx: *pipeline.Context) ?router_mod.FastResponse {
-        const route = self.router.match(ctx.req.target) orelse return null;
+        const route = self.router.match(ctx.req.decoded_target) orelse return null;
         if (route.modules.len != 0) return null;
         const fb = route.response_bytes orelse return null;
         ctx.route = route;
         return fb;
+    }
+
+    /// The configured named log formats (M-B): the access_log module reads
+    /// the route's `log_format` index into this table.
+    pub fn formats(self: *const Server) ?[]const config_mod.LogFormat {
+        return if (self.cfg.log_formats.len > 0) self.cfg.log_formats else null;
     }
 };
 
@@ -164,6 +170,7 @@ test "runtime server dispatches an echo request through the pipeline" {
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/";
+    req.decoded_target = "/";
     req.body = "body via config";
 
     var resp = registry.Response.init(.ok);
@@ -184,6 +191,7 @@ test "runtime server with a conf config drives an HTTP request to 200 echo" {
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/submit";
+    req.decoded_target = "/submit";
     req.body = "conf-driven";
 
     var resp = registry.Response.init(.ok);
@@ -203,6 +211,7 @@ test "runtime server yields not_handled when no module claims the request" {
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/static/file.txt";
+    req.decoded_target = "/static/file.txt";
 
     var resp = registry.Response.init(.ok);
     var ctx = pipeline.Context{ .req = &req, .resp = &resp };
@@ -221,6 +230,7 @@ test "comptime server routes identically to the plain server" {
         var req_a = registry.Request.init(testing.allocator);
         defer req_a.deinit();
         req_a.target = t;
+        req_a.decoded_target = t;
         req_a.body = "payload";
         var resp_a = registry.Response.init(.ok);
         var ctx_a = pipeline.Context{ .req = &req_a, .resp = &resp_a };
@@ -228,6 +238,7 @@ test "comptime server routes identically to the plain server" {
         var req_b = registry.Request.init(testing.allocator);
         defer req_b.deinit();
         req_b.target = t;
+        req_b.decoded_target = t;
         req_b.body = "payload";
         var resp_b = registry.Response.init(.ok);
         var ctx_b = pipeline.Context{ .req = &req_b, .resp = &resp_b };
@@ -259,6 +270,7 @@ test "comptime server dispatches a route with multiple phases via the dispatch f
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/only";
+    req.decoded_target = "/only";
     req.body = "via dispatch";
     var resp = registry.Response.init(.ok);
     var ctx = pipeline.Context{ .req = &req, .resp = &resp };
@@ -272,6 +284,7 @@ test "comptime server dispatches a route with multiple phases via the dispatch f
     var req2 = registry.Request.init(testing.allocator);
     defer req2.deinit();
     req2.target = "/elsewhere";
+    req2.decoded_target = "/elsewhere";
     var resp2 = registry.Response.init(.ok);
     var ctx2 = pipeline.Context{ .req = &req2, .resp = &resp2 };
     try testing.expectEqual(pipeline.Outcome.not_handled, try srv.handleRequest(&ctx2));
@@ -292,6 +305,7 @@ test "conf-config server with a comptime trie routes identically to the plain se
         var req_a = registry.Request.init(testing.allocator);
         defer req_a.deinit();
         req_a.target = t;
+        req_a.decoded_target = t;
         req_a.body = "b";
         var resp_a = registry.Response.init(.ok);
         var ctx_a = pipeline.Context{ .req = &req_a, .resp = &resp_a };
@@ -299,6 +313,7 @@ test "conf-config server with a comptime trie routes identically to the plain se
         var req_b = registry.Request.init(testing.allocator);
         defer req_b.deinit();
         req_b.target = t;
+        req_b.decoded_target = t;
         req_b.body = "b";
         var resp_b = registry.Response.init(.ok);
         var ctx_b = pipeline.Context{ .req = &req_b, .resp = &resp_b };
@@ -337,6 +352,7 @@ test "comptime template route serves through the dispatch fallback" {
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/health";
+    req.decoded_target = "/health";
     var resp = registry.Response.init(.ok);
     var ctx = pipeline.Context{ .req = &req, .resp = &resp };
     try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
@@ -346,6 +362,7 @@ test "comptime template route serves through the dispatch fallback" {
     var req2 = registry.Request.init(testing.allocator);
     defer req2.deinit();
     req2.target = "/old";
+    req2.decoded_target = "/old";
     var resp2 = registry.Response.init(.ok);
     var ctx2 = pipeline.Context{ .req = &req2, .resp = &resp2 };
     try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx2));
@@ -371,6 +388,7 @@ test "matchFast returns pre-serialised bytes only for module-less template route
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/health";
+    req.decoded_target = "/health";
     var resp = registry.Response.init(.ok);
     var ctx = pipeline.Context{ .req = &req, .resp = &resp };
     const fb = srv.matchFast(&ctx).?;
@@ -381,6 +399,7 @@ test "matchFast returns pre-serialised bytes only for module-less template route
     var req2 = registry.Request.init(testing.allocator);
     defer req2.deinit();
     req2.target = "/withmods";
+    req2.decoded_target = "/withmods";
     var resp2 = registry.Response.init(.ok);
     var ctx2 = pipeline.Context{ .req = &req2, .resp = &resp2 };
     try testing.expectEqual(@as(?router_mod.FastResponse, null), srv.matchFast(&ctx2));
@@ -389,6 +408,7 @@ test "matchFast returns pre-serialised bytes only for module-less template route
     var req3 = registry.Request.init(testing.allocator);
     defer req3.deinit();
     req3.target = "/anything";
+    req3.decoded_target = "/anything";
     var resp3 = registry.Response.init(.ok);
     var ctx3 = pipeline.Context{ .req = &req3, .resp = &resp3 };
     try testing.expectEqual(@as(?router_mod.FastResponse, null), srv.matchFast(&ctx3));
@@ -430,6 +450,7 @@ test "server from an embedded comptime config routes identically to the struct-l
         var req_a = registry.Request.init(testing.allocator);
         defer req_a.deinit();
         req_a.target = t;
+        req_a.decoded_target = t;
         req_a.body = "payload";
         var resp_a = registry.Response.init(.ok);
         var ctx_a = pipeline.Context{ .req = &req_a, .resp = &resp_a };
@@ -437,6 +458,7 @@ test "server from an embedded comptime config routes identically to the struct-l
         var req_b = registry.Request.init(testing.allocator);
         defer req_b.deinit();
         req_b.target = t;
+        req_b.decoded_target = t;
         req_b.body = "payload";
         var resp_b = registry.Response.init(.ok);
         var ctx_b = pipeline.Context{ .req = &req_b, .resp = &resp_b };
@@ -457,6 +479,7 @@ test "embedded comptime config gets pre-serialised fast responses (M11 path)" {
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/health";
+    req.decoded_target = "/health";
     var resp = registry.Response.init(.ok);
     var ctx = pipeline.Context{ .req = &req, .resp = &resp };
     const fb = srv.matchFast(&ctx).?;
@@ -466,6 +489,7 @@ test "embedded comptime config gets pre-serialised fast responses (M11 path)" {
     var req2 = registry.Request.init(testing.allocator);
     defer req2.deinit();
     req2.target = "/old";
+    req2.decoded_target = "/old";
     var resp2 = registry.Response.init(.ok);
     var ctx2 = pipeline.Context{ .req = &req2, .resp = &resp2 };
     const fb2 = srv.matchFast(&ctx2).?;
@@ -476,6 +500,7 @@ test "embedded comptime config gets pre-serialised fast responses (M11 path)" {
     var req3 = registry.Request.init(testing.allocator);
     defer req3.deinit();
     req3.target = "/echo";
+    req3.decoded_target = "/echo";
     var resp3 = registry.Response.init(.ok);
     var ctx3 = pipeline.Context{ .req = &req3, .resp = &resp3 };
     try testing.expectEqual(@as(?router_mod.FastResponse, null), srv.matchFast(&ctx3));
@@ -511,9 +536,57 @@ test "conf template route applies through the pipeline" {
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/health";
+    req.decoded_target = "/health";
     var resp = registry.Response.init(.ok);
     var ctx = pipeline.Context{ .req = &req, .resp = &resp };
     try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
     try testing.expectEqual(registry.Status.ok, resp.status);
     try testing.expectEqualStrings("ok-conf", resp.body);
+}
+
+test "comptime server trie matches exact conf routes" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location = /who { return 200 "host=$host"; }
+        \\    location / { content echo; }
+        \\}
+    );
+    const srv = Server.comptimeInit(cfg);
+    const m = srv.router.match("/who").?;
+    try testing.expectEqualStrings("/who", m.path);
+    try testing.expectEqual(router_mod.Match.exact, m.match);
+}
+
+test "embedded server trie matches exact conf routes" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location = /who { return 200 "host=$host"; }
+        \\    location / { content echo; }
+        \\}
+    );
+    var srv = try Server.embeddedInit(testing.allocator, cfg);
+    defer srv.deinitPrepared(testing.allocator);
+    const m = srv.router.match("/who").?;
+    try testing.expectEqualStrings("/who", m.path);
+    try testing.expectEqual(router_mod.Match.exact, m.match);
+}
+
+test "access_log runs through the pipeline with a custom format" {
+    const cfg = comptime Config.fromConfComptime(
+        \\log_format short "$request $status";
+        \\server {
+        \\    location / { content echo; log access_log; access_log short; }
+        \\}
+    );
+    const srv = Server.comptimeInit(cfg);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/x";
+    req.decoded_target = "/x";
+    req.body = "b";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp, .allocator = testing.allocator, .formats = srv.formats() };
+    const out = try srv.handleRequest(&ctx);
+    try testing.expectEqual(pipeline.Outcome.handled, out);
 }

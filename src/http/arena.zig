@@ -54,6 +54,37 @@ pub const Arena = struct {
         self.cur_block = self.blocks;
     }
 
+    /// A marker of the bump cursor: the bytes allocated after `mark()`
+    /// (and before the next reset) are `since(marker)` — the contiguous
+    /// tail of the arena. Used by the complex-value renderer to return a
+    /// single slice of the fragments it just copied.
+    pub const Mark = struct { embedded_used: usize, block_used: usize };
+
+    pub fn mark(self: *const Arena) Mark {
+        return .{
+            .embedded_used = self.embedded_used,
+            .block_used = if (self.cur_block) |b| b.used else 0,
+        };
+    }
+
+    /// The slice of arena memory allocated since `m` (contiguous: the
+    /// renderer's fragments are back-to-back bumps).
+    pub fn since(self: *const Arena, m: Mark) []u8 {
+        if (self.cur_block) |b| {
+            if (m.block_used != 0 or b.used > m.block_used) {
+                // Current allocation lives in the heap block.
+                if (b.used >= m.block_used) {
+                    return b.data[m.block_used..b.used];
+                }
+            }
+        }
+        // Both sides in the embedded region.
+        if (self.embedded_used >= m.embedded_used) {
+            return self.embedded[m.embedded_used..self.embedded_used];
+        }
+        return &.{};
+    }
+
     /// Bump-allocate `n` bytes (8-byte aligned). Null when out of memory.
     pub fn alloc(self: *Arena, n: usize) ?[]u8 {
         if (self.embedded_used + n <= self.embedded.len) {

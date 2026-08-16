@@ -1148,6 +1148,7 @@ pub const Reactor = struct {
         const session = self.http_sessions.getPtr(fd) orelse return false;
         const close0 = !session.req.keep_alive;
         session.resp = http_response.Response.init(.ok);
+        const handler = self.http_handler orelse &default_http_handler;
         var ctx = dsl_pipeline.Context{
             .req = &session.req,
             .resp = &session.resp,
@@ -1156,8 +1157,9 @@ pub const Reactor = struct {
             .stats = self.stats,
             .static_cache = &self.static_cache,
             .limits = &self.limits,
+            .formats = handler.formats(),
+            .started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
         };
-        const handler = self.http_handler orelse &default_http_handler;
 
         if (!tls_mode) {
             // Milestone 11 fast path: module-less response-template routes are

@@ -10,6 +10,7 @@ pub const Phase = phase_mod.Phase;
 pub const Frag = vars.Frag;
 pub const VarId = vars.VarId;
 pub const SetVar = vars.SetVar;
+pub const LogFormat = vars.LogFormat;
 pub const ProxyHeader = vars.ProxyHeader;
 pub const CVHeader = vars.CVHeader;
 pub const ResponseTemplateCV = vars.ResponseTemplateCV;
