@@ -48,6 +48,7 @@ pub const dsl = struct {
     pub const pipeline = @import("dsl/pipeline.zig");
     pub const conf = @import("dsl/conf.zig");
     pub const vars = @import("dsl/vars.zig");
+    pub const regex = @import("dsl/regex.zig");
     pub const modules = struct {
         pub const echo = @import("dsl/modules/echo.zig");
         pub const gzip = @import("dsl/modules/gzip.zig");
@@ -99,6 +100,8 @@ comptime {
     _ = @import("dsl/registry.zig");
     _ = @import("dsl/pipeline.zig");
     _ = @import("dsl/conf.zig");
+    _ = @import("dsl/vars.zig");
+    _ = @import("dsl/regex.zig");
     _ = @import("dsl/modules/echo.zig");
     _ = @import("dsl/modules/gzip.zig");
     _ = @import("dsl/modules/cache.zig");

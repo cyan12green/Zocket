@@ -88,6 +88,9 @@ pub const CaptureRange = struct { start: u16, end: u16 };
 pub const Regex = struct {
     states: []const RegexState = &.{},
     group_count: u8 = 0,
+    /// Character-class bitmaps referenced by kind_class/kind_class_ci
+    /// states (`byte` = index into this table).
+    class_bitmaps: []const [32]u32 = &.{},
 };
 
 /// One NFA state (M-D; shape from the plan §6.2).
