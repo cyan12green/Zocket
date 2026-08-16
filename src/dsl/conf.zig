@@ -5,6 +5,7 @@ const router = @import("router.zig");
 const phase_mod = @import("phase.zig");
 const ct_pool = @import("../ct_pool.zig");
 const vars = @import("vars.zig");
+const regex_mod = @import("regex.zig");
 
 const Config = config_mod.Config;
 const TlsConfig = config_mod.TlsConfig;
@@ -17,6 +18,7 @@ const ResponseTemplate = router.ResponseTemplate;
 const ResponseTemplateCV = router.ResponseTemplateCV;
 const CVHeader = router.CVHeader;
 const SetVar = router.SetVar;
+const Regex = router.Regex;
 const Upstream = router.Upstream;
 const Balance = router.Balance;
 const Phase = phase_mod.Phase;
@@ -124,6 +126,8 @@ const LocationSpec = struct {
     path: Str = .{ .src = "" },
     match: Match = .prefix,
     no_regex: bool = false,
+    /// Comptime-compiled NFA for .regex / .regex_ci locations (M-D).
+    pattern_regex: ?Regex = null,
     modules_start: usize = 0,
     modules_len: usize = 0,
     max_age: u32 = 0,
@@ -695,11 +699,10 @@ fn parseLocation(lx: *Lexer, b: *Builder) void {
         spec.path = first;
     }
 
-    // M-D: regex targets compile here. For now they are stored verbatim and
-    // the router treats them as prefix routes (regex lands in M-D).
+    // M-D: compile the regex pattern into a Thompson NFA at comptime.
     if (spec.match == .regex or spec.match == .regex_ci) {
-        // Leave a marker so the router can reject them before M-D lands.
-        spec.match = .prefix;
+        const pat = resolve(spec.path, b.strings.items[0..]);
+        spec.pattern_regex = regex_mod.compileRegex(pat);
     }
 
     lx.expectOpen("location");
@@ -921,6 +924,7 @@ fn build(b: *const Builder) Config {
                 .path = resolve(spec.path, strings),
                 .match = spec.match,
                 .no_regex = spec.no_regex,
+                .pattern_regex = spec.pattern_regex,
                 .modules = mod_table.items[mr.start..][0..mr.len],
                 .max_age_seconds = spec.max_age,
                 .root = if (spec.root) |r| resolve(r, strings) else null,
@@ -1202,9 +1206,11 @@ test "conf: exact and regex location modifiers parse" {
     );
     try testing.expectEqual(Match.exact, cfg.routes[0].match);
     try testing.expectEqualStrings("/health", cfg.routes[0].path);
-    try testing.expectEqual(Match.prefix, cfg.routes[1].match); // regex folds to prefix until M-D
+    try testing.expectEqual(Match.regex, cfg.routes[1].match);
     try testing.expectEqualStrings("^/api/([0-9]+)/", cfg.routes[1].path);
-    try testing.expectEqual(Match.prefix, cfg.routes[2].match);
+    try testing.expect(cfg.routes[1].pattern_regex != null);
+    try testing.expectEqual(Match.regex_ci, cfg.routes[2].match);
+    try testing.expect(cfg.routes[2].pattern_regex != null);
 }
 
 test "conf: gzip route binds 4 distinct phases" {
@@ -1245,10 +1251,10 @@ test "conf: exact and prefix routes match via the trie" {
     );
     const trie = router.buildTrie(cfg.routes);
     const rtr = router.Router{ .routes = cfg.routes, .trie = trie };
-    const m = rtr.match("/who").?;
+    const m = rtr.match("/who", null).?;
     try testing.expectEqualStrings("/who", m.path);
     try testing.expectEqual(Match.exact, m.match);
-    try testing.expectEqualStrings("/", rtr.match("/anything").?.path);
+    try testing.expectEqualStrings("/", rtr.match("/anything", null).?.path);
 }
 
 test "conf: set variables resolve to user slots and render" {

@@ -5,6 +5,7 @@ const registry = @import("registry.zig");
 const response_mod = @import("../http/response.zig");
 const ct_pool = @import("../ct_pool.zig");
 const vars = @import("vars.zig");
+const regex_mod = @import("regex.zig");
 
 pub const Phase = phase_mod.Phase;
 pub const Frag = vars.Frag;
@@ -115,8 +116,9 @@ pub const Route = struct {
 };
 
 /// Prefix/exact route matching. An exact match beats every prefix; otherwise
-/// the longest matching prefix wins. `matchRoutes` is called from the
-/// `find_config` phase of the pipeline.
+/// the longest matching prefix wins. Regex routes are excluded (they are
+/// walked separately by the router's precedence). `matchRoutes` is called
+/// from the `find_config` phase of the pipeline.
 pub fn matchRoutes(route_list: []const Route, target: []const u8) ?*const Route {
     var best: ?*const Route = null;
     for (route_list) |*r| {
@@ -134,6 +136,30 @@ pub fn matchRoutes(route_list: []const Route, target: []const u8) ?*const Route 
         }
     }
     return best;
+}
+
+/// Build the declaration-order regex route table for a comptime route list
+/// (M-D §7): one entry per .regex/.regex_ci route, with the pattern compiled
+/// at comptime into its NFA.
+pub fn buildRegexTable(comptime routes: []const Route) []const RegexRoute {
+    return comptime blk: {
+        var table: [128]RegexRoute = undefined;
+        var n: usize = 0;
+        for (routes, 0..) |*r, i| {
+            if (r.match == .regex or r.match == .regex_ci) {
+                const re = r.pattern_regex orelse
+                    @compileError("regex route '" ++ r.path ++ "' has no compiled pattern (M-D)");
+                table[n] = .{
+                    .re = &re,
+                    .route = @intCast(i),
+                    .ci = r.match == .regex_ci,
+                };
+                n += 1;
+            }
+        }
+        const out: [n]RegexRoute = table[0..n].*;
+        break :blk &out;
+    };
 }
 
 /// Sentinel: no route is bound at a trie node.
@@ -470,17 +496,72 @@ pub fn trieMatch(trie: *const Trie, target: []const u8) ?u32 {
     return if (best != no_route) best else null;
 }
 
+/// Capture ranges + subject for a regex match (M-D). `ranges[0]` is the
+/// whole match; `count` = number of populated ranges.
+pub const MatchCaps = struct {
+    subject: []const u8,
+    ranges: [9]CaptureRange = [_]CaptureRange{.{ .start = 0, .end = 0 }} ** 9,
+    count: u8 = 0,
+};
+
+/// One regex route in the declaration-order table (M-D).
+pub const RegexRoute = struct {
+    re: *const Regex,
+    route: u32,
+    ci: bool,
+};
+
 /// A built route table: the routes plus their trie. `match` is the lookup the
 /// pipeline's find_config phase uses. With an empty trie it falls back to the
 /// linear `matchRoutes` (plain `Server.init` / direct test usage).
 pub const Router = struct {
     routes: []const Route = &.{},
     trie: Trie = .{},
+    /// Regex routes in declaration order (M-D), walked only after exact and
+    /// `^~` prefixes have been ruled out (nginx precedence).
+    regex_routes: []const RegexRoute = &.{},
+    /// Regex table building must be comptime-only for struct-literal configs;
+    /// `Server.comptimeInitImpl` fills it via `buildRegexTable`.
+    regex_table_built: bool = false,
 
-    pub fn match(self: *const Router, target: []const u8) ?*const Route {
+    /// Match a target with nginx location precedence (plan §7):
+    /// 1. exact trie match wins immediately (no captures);
+    /// 2. longest `^~`-flagged prefix wins (regex skipped);
+    /// 3. first regex (~ / ~*) match in declaration order wins (captures
+    ///    recorded into `caps`);
+    /// 4. longest plain prefix wins; else null.
+    pub fn match(self: *const Router, target: []const u8, caps: ?*MatchCaps) ?*const Route {
         if (self.trie.nodes.len == 0) return matchRoutes(self.routes, target);
         const idx = trieMatch(&self.trie, target) orelse return null;
-        return &self.routes[idx];
+        const trie_route = &self.routes[idx];
+
+        // 1. exact match wins immediately.
+        if (trie_route.match == .exact) return trie_route;
+
+        // 2. `^~` prefix wins (regex skipped).
+        if (trie_route.no_regex) return trie_route;
+
+        // 3. regex routes in declaration order; first match wins, captures
+        // recorded into `caps`.
+        const best_prefix: ?*const Route = if (trie_route.match == .prefix) trie_route else null;
+        for (self.regex_routes) |rr| {
+            const r = &self.routes[rr.route];
+            if (r.pattern_regex) |*re| {
+                var mcaps: MatchCaps = .{ .subject = target };
+                if (regex_mod.match(re, target, &mcaps.ranges, 0, rr.ci)) {
+                    mcaps.count = re.group_count + 1;
+                    if (caps) |c| c.* = mcaps;
+                    return r;
+                }
+            }
+        }
+        // 4. longest plain prefix.
+        return best_prefix;
+    }
+
+    pub fn deinit(self: *const Router, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
     }
 };
 
@@ -633,12 +714,12 @@ test "trie: single-segment paths" {
 test "Router.match falls back to the linear matcher without a trie" {
     var rtr = Router{ .routes = &trie_routes };
     // "/nothing/here" matches the catch-all "/" prefix route.
-    try testing.expectEqualStrings("/", rtr.match("/nothing/here").?.path);
-    try testing.expectEqual(@as(?*const Route, null), rtr.match(""));
+    try testing.expectEqualStrings("/", rtr.match("/nothing/here", null).?.path);
+    try testing.expectEqual(@as(?*const Route, null), rtr.match("", null));
 
     var with_trie = Router{ .routes = &trie_routes, .trie = buildTrie(&trie_routes) };
-    try testing.expectEqualStrings("/api", with_trie.match("/api/users").?.path);
-    try testing.expectEqual(@as(?*const Route, null), with_trie.match(""));
+    try testing.expectEqualStrings("/api", with_trie.match("/api/users", null).?.path);
+    try testing.expectEqual(@as(?*const Route, null), with_trie.match("", null));
 }
 
 // ---- Milestone 11: comptime response templates ----
@@ -672,4 +753,51 @@ test "template serialisation is byte-identical to the response builder" {
     try testing.expectEqualStrings(fb.head, expected[0..fb.head.len]);
     try testing.expectEqualStrings(suffix, expected[fb.head.len .. fb.head.len + suffix.len]);
     try testing.expectEqualStrings(fb.body, expected[expected.len - fb.body.len ..]);
+}
+
+// ---- M-D: nginx location precedence ----
+
+test "nginx precedence: exact beats regex beats longest prefix" {
+    const routes = comptime [_]Route{
+        .{ .path = "/static", .match = .exact },
+        .{ .path = "^/static/.*", .match = .regex, .pattern_regex = regex_mod.compileRegex("^/static/.*") },
+        .{ .path = "/", .match = .prefix },
+    };
+    const trie = buildTrie(&routes);
+    const regex_tbl = buildRegexTable(&routes);
+    var rtr = Router{ .routes = &routes, .trie = trie, .regex_routes = regex_tbl };
+    // Exact /static wins.
+    try testing.expectEqualStrings("/static", rtr.match("/static", null).?.path);
+    // Regex ^/static/.* wins over the / prefix for /static/x.
+    try testing.expectEqualStrings("^/static/.*", rtr.match("/static/x", null).?.path);
+    // Longest plain prefix for /other.
+    try testing.expectEqualStrings("/", rtr.match("/other", null).?.path);
+}
+
+test "nginx precedence: caret-prefix (^~) skips regex" {
+    const routes = comptime [_]Route{
+        .{ .path = "/static/", .match = .prefix, .no_regex = true },
+        .{ .path = "^/static/.*", .match = .regex, .pattern_regex = regex_mod.compileRegex("^/static/.*") },
+        .{ .path = "/", .match = .prefix },
+    };
+    const trie = buildTrie(&routes);
+    const regex_tbl = buildRegexTable(&routes);
+    var rtr = Router{ .routes = &routes, .trie = trie, .regex_routes = regex_tbl };
+    // ^~ prefix wins immediately (regex skipped).
+    try testing.expectEqualStrings("/static/", rtr.match("/static/x", null).?.path);
+    // Plain prefix falls to regex.
+    try testing.expectEqualStrings("/", rtr.match("/other", null).?.path);
+}
+
+test "nginx precedence: first regex in declaration order wins" {
+    const routes = comptime [_]Route{
+        .{ .path = "^/a/", .match = .regex, .pattern_regex = regex_mod.compileRegex("^/a/") },
+        .{ .path = "^/a/b", .match = .regex, .pattern_regex = regex_mod.compileRegex("^/a/b") },
+        .{ .path = "/", .match = .prefix },
+    };
+    const trie = buildTrie(&routes);
+    const regex_tbl = buildRegexTable(&routes);
+    var rtr = Router{ .routes = &routes, .trie = trie, .regex_routes = regex_tbl };
+    // Both match /a/b/c; declaration order picks ^/a/.
+    try testing.expectEqualStrings("^/a/", rtr.match("/a/b/c", null).?.path);
 }

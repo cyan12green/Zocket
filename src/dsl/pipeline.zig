@@ -41,7 +41,18 @@ pub fn run(comptime Registry: type, routes: []const router.Route, ctx: *Context)
 /// the final response. The walk loop skips the log phase; this function runs
 /// it once at the end.
 pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr: ?*const router.Router, ctx: *Context) !Outcome {
-    const route = if (rtr) |r| r.match(ctx.req.decoded_target) else router.matchRoutes(routes, ctx.req.decoded_target);
+    const route = if (rtr) |r| blk: {
+        // M-D: the router records regex captures; copy them into the context
+        // (the winning route may be a regex route).
+        var caps = router.MatchCaps{ .subject = ctx.req.decoded_target };
+        const matched = r.match(ctx.req.decoded_target, &caps);
+        if (caps.count > 0) {
+            ctx.capture_subject = caps.subject;
+            ctx.captures = caps.ranges;
+            ctx.capture_count = caps.count;
+        }
+        break :blk matched;
+    } else router.matchRoutes(routes, ctx.req.decoded_target);
     ctx.route = route;
     // No route matched: no module can act on this request.
     const r = route orelse return .not_handled;

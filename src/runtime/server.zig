@@ -66,9 +66,10 @@ pub const Server = struct {
     fn comptimeInitImpl(comptime cfg: Config) Server {
         const routes = pipeline.assignDispatch(registry.default_registry, cfg.routes);
         const trie = router_mod.buildTrie(&routes);
+        const regex_routes = router_mod.buildRegexTable(&routes);
         return .{
             .cfg = .{ .routes = &routes, .limits = cfg.limits, .tls = cfg.tls, .listen_port = cfg.listen_port, .log_formats = cfg.log_formats },
-            .router = .{ .routes = &routes, .trie = trie },
+            .router = .{ .routes = &routes, .trie = trie, .regex_routes = regex_routes },
         };
     }
     /// The default server: echo module on the catch-all route, the pre-pipeline
@@ -148,7 +149,13 @@ pub const Server = struct {
     /// no function call through the phase chain. Returns null when any
     /// module could still act on the request.
     pub fn matchFast(self: *const Server, ctx: *pipeline.Context) ?router_mod.FastResponse {
-        const route = self.router.match(ctx.req.decoded_target) orelse return null;
+        var caps = router_mod.MatchCaps{ .subject = ctx.req.decoded_target };
+        const route = self.router.match(ctx.req.decoded_target, &caps) orelse return null;
+        if (caps.count > 0) {
+            ctx.capture_subject = caps.subject;
+            ctx.captures = caps.ranges;
+            ctx.capture_count = caps.count;
+        }
         if (route.modules.len != 0) return null;
         const fb = route.response_bytes orelse return null;
         ctx.route = route;
@@ -552,7 +559,7 @@ test "comptime server trie matches exact conf routes" {
         \\}
     );
     const srv = Server.comptimeInit(cfg);
-    const m = srv.router.match("/who").?;
+    const m = srv.router.match("/who", null).?;
     try testing.expectEqualStrings("/who", m.path);
     try testing.expectEqual(router_mod.Match.exact, m.match);
 }
@@ -566,7 +573,7 @@ test "embedded server trie matches exact conf routes" {
     );
     var srv = try Server.embeddedInit(testing.allocator, cfg);
     defer srv.deinitPrepared(testing.allocator);
-    const m = srv.router.match("/who").?;
+    const m = srv.router.match("/who", null).?;
     try testing.expectEqualStrings("/who", m.path);
     try testing.expectEqual(router_mod.Match.exact, m.match);
 }

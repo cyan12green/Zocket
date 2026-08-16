@@ -316,7 +316,9 @@ fn getBuiltin(ctx: *Context, id: VarId, scratch: *GetterScratch) []const u8 {
     switch (id) {
         .method => return methodName(req.method),
         .request_uri => return req.target,
-        .uri => return req.decoded_target,
+        .uri => {
+            return req.decoded_target;
+        },
         .args, .query_string => return req.query_string,
         .host => return req.header("host") orelse "",
         .status => return scratch.fmt("{d}", .{@intFromEnum(ctx.resp.status)}),
