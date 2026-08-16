@@ -64,7 +64,7 @@ pub const Buffer = struct {
     pub fn writeSlice(self: *Buffer, slice: []const u8) usize {
         const available = self.availableWrite();
         const to_write = @min(slice.len, available);
-        @memcpy(self.data[self.write_pos..self.write_pos + to_write], slice[0..to_write]);
+        @memcpy(self.data[self.write_pos .. self.write_pos + to_write], slice[0..to_write]);
         self.write_pos += to_write;
         return to_write;
     }
@@ -72,7 +72,7 @@ pub const Buffer = struct {
     pub fn readSlice(self: *Buffer, slice: []u8) usize {
         const available = self.availableRead();
         const to_read = @min(slice.len, available);
-        @memcpy(slice[0..to_read], self.data[self.read_pos..self.read_pos + to_read]);
+        @memcpy(slice[0..to_read], self.data[self.read_pos .. self.read_pos + to_read]);
         self.read_pos += to_read;
         return to_read;
     }

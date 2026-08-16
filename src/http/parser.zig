@@ -986,11 +986,10 @@ test "chunked request: empty body" {
 
 test "chunked request: size extensions and uppercase hex tolerated" {
     const allocator = testing.allocator;
-    const buf = try fill(allocator,
-        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
-            "A;foo=bar;baz\r\nabcdefghij\r\n" ++
-            "3\r\nxyz\r\n" ++
-            "0\r\n\r\n");
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "A;foo=bar;baz\r\nabcdefghij\r\n" ++
+        "3\r\nxyz\r\n" ++
+        "0\r\n\r\n");
     defer buf.deinit(allocator);
 
     var req = Request.init(allocator);
@@ -1062,9 +1061,8 @@ test "chunked request: incremental feeding at every byte boundary" {
 
 test "chunked request pipelined with a content-length request" {
     const allocator = testing.allocator;
-    const buf = try fill(allocator,
-        "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n" ++
-            "POST /b HTTP/1.1\r\nContent-Length: 2\r\n\r\ncd");
+    const buf = try fill(allocator, "POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n" ++
+        "POST /b HTTP/1.1\r\nContent-Length: 2\r\n\r\ncd");
     defer buf.deinit(allocator);
 
     var req = Request.init(allocator);
@@ -1130,12 +1128,11 @@ test "known header-name set is collision-free" {
 
 test "hash-matched lookup finds known and unknown headers with any case" {
     const allocator = testing.allocator;
-    const buf = try fill(allocator,
-        "GET / HTTP/1.1\r\n" ++
-            "HoSt: example.com\r\n" ++
-            "Content-Type: text/plain\r\n" ++
-            "ACCEPT-ENCODING: gzip, deflate\r\n" ++
-            "X-Custom-Header: custom-value\r\n\r\n");
+    const buf = try fill(allocator, "GET / HTTP/1.1\r\n" ++
+        "HoSt: example.com\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "ACCEPT-ENCODING: gzip, deflate\r\n" ++
+        "X-Custom-Header: custom-value\r\n\r\n");
     defer buf.deinit(allocator);
 
     var req = Request.init(allocator);

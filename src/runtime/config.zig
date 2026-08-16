@@ -320,7 +320,6 @@ const JsonConfig = struct {
 
 const testing = std.testing;
 
-
 test "fromJson parses the limits section with defaults for the rest" {
     const json =
         \\{ "limits": { "max_headers": 4, "max_body": 1024, "static_cache_valid_seconds": 5 },

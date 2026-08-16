@@ -46,8 +46,7 @@ pub fn decodeFirst(
                 }
                 for (pem[pos..end_line_end]) |c| {
                     switch (c) {
-                        'a'...'z', 'A'...'Z', '0'...'9', '+', '/', '=' =>
-                            b64_stream.append(std.heap.page_allocator, c) catch return error.OutOfMemory,
+                        'a'...'z', 'A'...'Z', '0'...'9', '+', '/', '=' => b64_stream.append(std.heap.page_allocator, c) catch return error.OutOfMemory,
                         ' ', '\t', '\r' => {},
                         else => return error.InvalidBase64,
                     }

@@ -183,7 +183,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fuzz_main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "zocket", .module = mod } },
+            .imports = &.{.{ .name = "zocket", .module = mod }},
         }),
     });
     b.installArtifact(fuzz_exe);

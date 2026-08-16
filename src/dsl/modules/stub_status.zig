@@ -27,19 +27,18 @@ fn run(ctx: *Context) anyerror!Action {
 
     // The skeleton is a comptime literal (M11-style); only the numbers are
     // formatted at runtime.
-    const body = std.fmt.allocPrint(allocator,
-        "Active connections: {d}\n" ++
-            "server accepts handled requests\n" ++
-            " {d} {d} {d}\n" ++
-            "Reading: {d} Writing: {d} Waiting: {d}\n", .{
-            active,
-            accepted,
-            requests,
-            accepted,
-            reading,
-            writing,
-            waiting,
-        }) catch return error.OutOfMemory;
+    const body = std.fmt.allocPrint(allocator, "Active connections: {d}\n" ++
+        "server accepts handled requests\n" ++
+        " {d} {d} {d}\n" ++
+        "Reading: {d} Writing: {d} Waiting: {d}\n", .{
+        active,
+        accepted,
+        requests,
+        accepted,
+        reading,
+        writing,
+        waiting,
+    }) catch return error.OutOfMemory;
 
     ctx.resp.status = .ok;
     ctx.resp.body = body;

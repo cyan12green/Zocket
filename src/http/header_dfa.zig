@@ -14,7 +14,6 @@ const ct_pool = @import("../ct_pool.zig");
 /// This is the Milestone-8 lookup structure in state-machine form: the same
 /// role as `parser.header_hasher` (which remains for the response-side
 /// modules), but classification is exact and one pass.
-
 /// Alphabet classes: 'a'-'z' (0-25, lower-cased), '0'-'9' (26-35), '-' (36),
 /// and everything else (37, can never match a known name).
 pub const alphabet_width = 38;

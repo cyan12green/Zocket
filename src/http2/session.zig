@@ -53,7 +53,6 @@ pub const Session = struct {
     /// Set when the connection should be torn down (GOAWAY sent/received).
     closing: bool = false,
 
-
     pub const default_window: u32 = 65535;
     pub const max_concurrent_streams: u32 = 100;
 
@@ -417,7 +416,7 @@ pub const Session = struct {
         // Enforce the advertised concurrent-stream limit (RFC 9113 §5.1.2):
         // new streams beyond it are refused (RST_STREAM REFUSED_STREAM).
         if (self.streams.count() >= max_concurrent_streams) {
-                self.streamError(hdr.stream_id, send);
+            self.streamError(hdr.stream_id, send);
             return;
         }
         self.max_stream_id = hdr.stream_id;
@@ -599,7 +598,10 @@ pub const Session = struct {
                 return;
             }
             if (std.mem.eql(u8, f.name, ":method")) {
-                if (pseudo_seen[0]) { self.streamError(stream_id, send); return; }
+                if (pseudo_seen[0]) {
+                    self.streamError(stream_id, send);
+                    return;
+                }
                 pseudo_seen[0] = true;
                 const m = parser.Method.fromString(f.value) orelse {
                     // Unknown method: answer 501.
@@ -610,7 +612,10 @@ pub const Session = struct {
                 req.method = m;
                 method_set = true;
             } else if (std.mem.eql(u8, f.name, ":path")) {
-                if (pseudo_seen[3]) { self.streamError(stream_id, send); return; }
+                if (pseudo_seen[3]) {
+                    self.streamError(stream_id, send);
+                    return;
+                }
                 pseudo_seen[3] = true;
                 // RFC 9113 §8.1.2.3: an empty :path is a malformed request
                 // (except OPTIONS *, handled below by the pipeline).
@@ -628,11 +633,17 @@ pub const Session = struct {
                 }
                 path_set = true;
             } else if (std.mem.eql(u8, f.name, ":scheme")) {
-                if (pseudo_seen[1]) { self.streamError(stream_id, send); return; }
+                if (pseudo_seen[1]) {
+                    self.streamError(stream_id, send);
+                    return;
+                }
                 pseudo_seen[1] = true;
                 scheme_set = true;
             } else if (std.mem.eql(u8, f.name, ":authority")) {
-                if (pseudo_seen[2]) { self.streamError(stream_id, send); return; }
+                if (pseudo_seen[2]) {
+                    self.streamError(stream_id, send);
+                    return;
+                }
                 pseudo_seen[2] = true;
                 authority = f.value;
             } else if (std.mem.eql(u8, f.name, "content-length")) {
@@ -879,7 +890,7 @@ pub const Session = struct {
     fn maybeCloseStream(self: *Session, stream_id: u31) void {
         const st = self.streams.getPtr(stream_id) orelse return;
         if (st.end_stream_sent and st.end_stream_received and st.pending_response.items.len == 0) {
-                self.destroyStream(st);
+            self.destroyStream(st);
             _ = self.streams.remove(stream_id);
         }
     }

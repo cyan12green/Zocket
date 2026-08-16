@@ -189,9 +189,8 @@ fn cache_date(secs: u64, buf: []u8) ?[]const u8 {
     const names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
     const mnames = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     return std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
-        names[weekday],     day,  mnames[m],     y,
-        @divTrunc(rem, 3600),      @divTrunc(rem % 3600, 60),
-        rem % 60,
+        names[weekday],       day,                       mnames[m], y,
+        @divTrunc(rem, 3600), @divTrunc(rem % 3600, 60), rem % 60,
     }) catch null;
 }
 

@@ -818,8 +818,6 @@ pub fn parse(comptime json: []const u8) Config {
     };
 }
 
-
-
 const testing = std.testing;
 
 test "comptime parse of the default-style config" {

@@ -29,7 +29,8 @@ pub const Arena = struct {
         return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *Arena) void {        var b = self.blocks;
+    pub fn deinit(self: *Arena) void {
+        var b = self.blocks;
         while (b) |blk| {
             const next = blk.next;
             self.allocator.free(blk.data);

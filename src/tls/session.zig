@@ -496,42 +496,42 @@ pub fn Session(
             try self.emitEncryptedHandshake(msg[0..n_ee]);
 
             if (!resumed) {
-            const n_cert = handshake_mod.buildCertificate(&msg, self.creds.cert_der) catch
-                return error.OutOfMemory;
-            self.hashMessage(msg[0..n_cert]);
-            try self.emitEncryptedHandshake(msg[0..n_cert]);
+                const n_cert = handshake_mod.buildCertificate(&msg, self.creds.cert_der) catch
+                    return error.OutOfMemory;
+                self.hashMessage(msg[0..n_cert]);
+                try self.emitEncryptedHandshake(msg[0..n_cert]);
 
-            // CertificateVerify: ECDSA over the signature transcript (up to
-            // and including Certificate).
-            // RFC 8446 §4.4.3: the signature is over the transcript hash
-            // prefixed with the signature context string.
-            const sig_transcript_hash = self.sig_transcript.peek();
-            const sig_msg_len = 64 + "TLS 1.3, server CertificateVerify".len + 1 + SigHash.digest_length;
-            var sig_msg: [64 + "TLS 1.3, server CertificateVerify".len + 1 + 64]u8 = undefined;
-            @memset(sig_msg[0..64], ' ');
-            @memcpy(sig_msg[64 .. 64 + "TLS 1.3, server CertificateVerify".len], "TLS 1.3, server CertificateVerify");
-            sig_msg[64 + "TLS 1.3, server CertificateVerify".len] = 0;
-            @memcpy(sig_msg[64 + "TLS 1.3, server CertificateVerify".len + 1 ..][0..SigHash.digest_length], &sig_transcript_hash);
-            var sig_digest: [SigHash.digest_length]u8 = undefined;
-            SigHash.hash(sig_msg[0..sig_msg_len], &sig_digest, .{});
-            var sig_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
-            const sig_len = self.signEcdsa(&sig_buf, &sig_digest) catch
-                return self.fail(error.TlsIllegalParameter, .internal_error);
-            // Self-check: the signature must verify against the public key
-            // derived from the certificate's secret (catches key/cert
-            // mismatches and transcript bugs before the client does).
-            {
-                const sk = Ecdsa.SecretKey.fromBytes(self.creds.key.secret_key[0..Ecdsa.SecretKey.encoded_length].*) catch unreachable;
-                const kp = Ecdsa.KeyPair.fromSecretKey(sk) catch unreachable;
-                const sig2 = Ecdsa.Signature.fromDer(sig_buf[0..sig_len]) catch unreachable;
-                sig2.verifyPrehashed(sig_digest, kp.public_key) catch {
+                // CertificateVerify: ECDSA over the signature transcript (up to
+                // and including Certificate).
+                // RFC 8446 §4.4.3: the signature is over the transcript hash
+                // prefixed with the signature context string.
+                const sig_transcript_hash = self.sig_transcript.peek();
+                const sig_msg_len = 64 + "TLS 1.3, server CertificateVerify".len + 1 + SigHash.digest_length;
+                var sig_msg: [64 + "TLS 1.3, server CertificateVerify".len + 1 + 64]u8 = undefined;
+                @memset(sig_msg[0..64], ' ');
+                @memcpy(sig_msg[64 .. 64 + "TLS 1.3, server CertificateVerify".len], "TLS 1.3, server CertificateVerify");
+                sig_msg[64 + "TLS 1.3, server CertificateVerify".len] = 0;
+                @memcpy(sig_msg[64 + "TLS 1.3, server CertificateVerify".len + 1 ..][0..SigHash.digest_length], &sig_transcript_hash);
+                var sig_digest: [SigHash.digest_length]u8 = undefined;
+                SigHash.hash(sig_msg[0..sig_msg_len], &sig_digest, .{});
+                var sig_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
+                const sig_len = self.signEcdsa(&sig_buf, &sig_digest) catch
                     return self.fail(error.TlsIllegalParameter, .internal_error);
-                };
-            }
-            const n_cv = handshake_mod.buildCertificateVerify(&msg, signature_scheme, sig_buf[0..sig_len]) catch
-                return error.OutOfMemory;
-            self.hashMessage(msg[0..n_cv]);
-            try self.emitEncryptedHandshake(msg[0..n_cv]);
+                // Self-check: the signature must verify against the public key
+                // derived from the certificate's secret (catches key/cert
+                // mismatches and transcript bugs before the client does).
+                {
+                    const sk = Ecdsa.SecretKey.fromBytes(self.creds.key.secret_key[0..Ecdsa.SecretKey.encoded_length].*) catch unreachable;
+                    const kp = Ecdsa.KeyPair.fromSecretKey(sk) catch unreachable;
+                    const sig2 = Ecdsa.Signature.fromDer(sig_buf[0..sig_len]) catch unreachable;
+                    sig2.verifyPrehashed(sig_digest, kp.public_key) catch {
+                        return self.fail(error.TlsIllegalParameter, .internal_error);
+                    };
+                }
+                const n_cv = handshake_mod.buildCertificateVerify(&msg, signature_scheme, sig_buf[0..sig_len]) catch
+                    return error.OutOfMemory;
+                self.hashMessage(msg[0..n_cv]);
+                try self.emitEncryptedHandshake(msg[0..n_cv]);
             }
 
             // Finished: HMAC over the full transcript (up to and including

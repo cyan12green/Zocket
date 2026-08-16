@@ -29,7 +29,6 @@ const Worker = struct {
         }
         if (n_conns == 0) return;
 
-
         // Simple pipelined echo: write payload, then read payload back,
         // repeating `iterations` times per connection.
         var buf: [256]u8 = undefined;

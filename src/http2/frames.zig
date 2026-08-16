@@ -6,7 +6,6 @@ const std = @import("std");
 /// server-side frames the session emits. Frame parsing is byte-exact with
 /// the RFC: the length is a 24-bit value, the stream id the low 31 bits of
 /// a 32-bit field.
-
 pub const max_frame_size: u24 = 16384;
 pub const default_max_frame_size: u24 = 16384;
 

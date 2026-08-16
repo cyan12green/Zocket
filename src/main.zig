@@ -13,7 +13,8 @@ const build_options = @import("build_options");
 /// config is used then.
 const embedded_cfg: ?zocket.runtime.config.Config = if (build_options.config_path) |p|
     zocket.runtime.config.Config.fromEmbedded(p)
-else null;
+else
+    null;
 
 const default_pidfile = "/tmp/zocket.pid";
 
@@ -159,8 +160,7 @@ fn runServer(
         // route), mirroring the JSON load path.
         try cfg.validate(zocket.dsl.registry.default_registry);
         break :blk try zocket.runtime.server.Server.embeddedInitWithTls(allocator, cfg);
-    } else
-        zocket.runtime.server.Server.default();
+    } else zocket.runtime.server.Server.default();
     var http_srv_owns_trie = false;
     defer if (embedded_cfg != null) {
         http_srv.deinitPrepared(allocator);
@@ -184,40 +184,40 @@ fn runServer(
     defer reload_handlers.deinit(allocator);
     if (embedded_cfg == null) {
         if (opts.config_path) |path| {
-        const ReloadState = struct {
-            allocator: std.mem.Allocator,
-            config_path: []const u8,
-            handlers: *std.ArrayList(*zocket.runtime.server.Server),
+            const ReloadState = struct {
+                allocator: std.mem.Allocator,
+                config_path: []const u8,
+                handlers: *std.ArrayList(*zocket.runtime.server.Server),
 
-            fn reload(userdata: *anyopaque) ?*const zocket.runtime.server.Server {
-                const st: *@This() = @ptrCast(@alignCast(userdata));
-                const json = std.fs.cwd().readFileAlloc(st.config_path, st.allocator, .limited(1 << 20)) catch return null;
-                defer st.allocator.free(json);
-                var cfg = zocket.runtime.config.Config.fromJson(st.allocator, json) catch return null;
-                cfg.validate(zocket.dsl.registry.default_registry) catch return null;
-                // The config memory must outlive the handler (the server's
-                // route table points into it); it is freed at process exit
-                // along with the handler itself (one leak per reload).
-                const srv = st.allocator.create(zocket.runtime.server.Server) catch return null;
-                srv.* = zocket.runtime.server.Server.initWithTrie(st.allocator, cfg) catch {
-                    st.allocator.destroy(srv);
-                    return null;
-                };
-                st.handlers.append(st.allocator, srv) catch {
-                    st.allocator.destroy(srv);
-                    return null;
-                };
-                std.debug.print("reload: config re-parsed\n", .{});
-                return srv;
-            }
-        };
-        var reload_state = ReloadState{
-            .allocator = allocator,
-            .config_path = path,
-            .handlers = &reload_handlers,
-        };
-        s.reload_fn = ReloadState.reload;
-        s.reload_userdata = &reload_state;
+                fn reload(userdata: *anyopaque) ?*const zocket.runtime.server.Server {
+                    const st: *@This() = @ptrCast(@alignCast(userdata));
+                    const json = std.fs.cwd().readFileAlloc(st.config_path, st.allocator, .limited(1 << 20)) catch return null;
+                    defer st.allocator.free(json);
+                    var cfg = zocket.runtime.config.Config.fromJson(st.allocator, json) catch return null;
+                    cfg.validate(zocket.dsl.registry.default_registry) catch return null;
+                    // The config memory must outlive the handler (the server's
+                    // route table points into it); it is freed at process exit
+                    // along with the handler itself (one leak per reload).
+                    const srv = st.allocator.create(zocket.runtime.server.Server) catch return null;
+                    srv.* = zocket.runtime.server.Server.initWithTrie(st.allocator, cfg) catch {
+                        st.allocator.destroy(srv);
+                        return null;
+                    };
+                    st.handlers.append(st.allocator, srv) catch {
+                        st.allocator.destroy(srv);
+                        return null;
+                    };
+                    std.debug.print("reload: config re-parsed\n", .{});
+                    return srv;
+                }
+            };
+            var reload_state = ReloadState{
+                .allocator = allocator,
+                .config_path = path,
+                .handlers = &reload_handlers,
+            };
+            s.reload_fn = ReloadState.reload;
+            s.reload_userdata = &reload_state;
         }
     }
 
@@ -339,7 +339,6 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
     std.debug.print("zocket failed to start\n", .{});
     std.process.exit(1);
 }
-
 
 /// SIG-0 liveness probe: this stdlib's SIG enum has no zero value, so the
 /// raw syscall is used. False when the pid has exited (ESRCH); a live
