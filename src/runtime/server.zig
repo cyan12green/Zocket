@@ -67,40 +67,10 @@ pub const Server = struct {
         const routes = pipeline.assignDispatch(registry.default_registry, cfg.routes);
         const trie = router_mod.buildTrie(&routes);
         return .{
-            .cfg = .{ .routes = &routes },
+            .cfg = .{ .routes = &routes, .limits = cfg.limits, .tls = cfg.tls, .listen_port = cfg.listen_port, .log_formats = cfg.log_formats },
             .router = .{ .routes = &routes, .trie = trie },
         };
     }
-
-    /// JSON configs: the trie is built at startup (one-time cost, same shape
-    /// as the comptime-built one). The trie buffers are owned by the router;
-    /// call `deinit` to free them.
-    pub fn initWithTrie(allocator: std.mem.Allocator, cfg: Config) !Server {
-        const trie = try router_mod.buildTrieRuntime(allocator, cfg.routes);
-        const stats = try allocator.create(ServerStats);
-        errdefer allocator.destroy(stats);
-        var srv = Server{
-            .cfg = cfg,
-            .router = .{ .routes = cfg.routes, .trie = trie, .owned = true },
-            .stats = stats,
-        };
-        srv.loadTls(allocator) catch |e| {
-            srv.router.deinit(allocator);
-            allocator.destroy(stats);
-            return e;
-        };
-        return srv;
-    }
-
-    /// Free allocator-owned trie buffers (JSON-config servers only; no-op for
-    /// comptime and plain-init servers).
-    pub fn deinit(self: *Server, allocator: std.mem.Allocator) void {
-        self.router.deinit(allocator);
-        if (self.stats != &default_stats) allocator.destroy(self.stats);
-        if (self.tls_creds) |*c| allocator.free(c.cert_der);
-        self.tls_creds = null;
-    }
-
     /// The default server: echo module on the catch-all route, the pre-pipeline
     /// M3 behavior. Built at compile time (trie + dispatch specialisation).
     pub fn default() Server {
@@ -108,7 +78,7 @@ pub const Server = struct {
     }
 
     /// DM2: build a server from a comptime/embedded config, then resolve
-    /// static roots at startup — exactly what `fromJson` does at load, but
+    /// static roots at startup, but
     /// the comptime route table is immutable .rodata, so the rooted routes
     /// are copied into `allocator` with `root_real` (symlink-escape anchor)
     /// and `root_fd` (O_PATH|O_DIRECTORY for the openat2 fast path) filled
@@ -149,7 +119,7 @@ pub const Server = struct {
             prepared_len += 1;
         }
         var s = base;
-        s.cfg = .{ .routes = routes, .limits = base.cfg.limits };
+        s.cfg = .{ .routes = routes, .limits = base.cfg.limits, .tls = base.cfg.tls, .listen_port = base.cfg.listen_port, .log_formats = base.cfg.log_formats };
         s.router.routes = routes;
         return s;
     }
@@ -204,34 +174,31 @@ test "runtime server dispatches an echo request through the pipeline" {
     try testing.expectEqualStrings("body via config", resp.body);
 }
 
-test "runtime server with a JSON config drives an HTTP request to 200 echo" {
-    const json =
-        \\{ "routes": [ { "path": "/", "modules": { "content": "echo" } } ] }
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
-    try cfg.validate(registry.default_registry);
-
+test "runtime server with a conf config drives an HTTP request to 200 echo" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
     const srv = Server.init(cfg);
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
     req.target = "/submit";
-    req.body = "json-driven";
+    req.body = "conf-driven";
 
     var resp = registry.Response.init(.ok);
     var ctx = pipeline.Context{ .req = &req, .resp = &resp };
 
     try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
-    try testing.expectEqualStrings("json-driven", resp.body);
+    try testing.expectEqualStrings("conf-driven", resp.body);
 }
 
 test "runtime server yields not_handled when no module claims the request" {
-    const json =
-        \\{ "routes": [ { "path": "/static", "modules": {} } ] }
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
-
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /static {}
+        \\}
+    );
     const srv = Server.init(cfg);
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
@@ -310,20 +277,15 @@ test "comptime server dispatches a route with multiple phases via the dispatch f
     try testing.expectEqual(pipeline.Outcome.not_handled, try srv.handleRequest(&ctx2));
 }
 
-test "JSON-config server with a startup trie routes identically to the plain server" {
-    const json =
-        \\{ "routes": [
-        \\    { "path": "/api", "match": "prefix", "modules": { "content": "echo" } },
-        \\    { "path": "/exact", "match": "exact", "modules": { "content": "echo" } }
-        \\  ] }
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
-    try cfg.validate(registry.default_registry);
-
+test "conf-config server with a comptime trie routes identically to the plain server" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /api { content echo; }
+        \\    location = /exact { content echo; }
+        \\}
+    );
     const plain = Server.init(cfg);
-    var trie_srv = try Server.initWithTrie(testing.allocator, cfg);
-    defer trie_srv.deinit(testing.allocator);
+    const trie_srv = Server.comptimeInit(cfg);
 
     const targets = [_][]const u8{ "/api/users", "/exact", "/exact/x", "/nope" };
     for (targets) |t| {
@@ -434,22 +396,34 @@ test "matchFast returns pre-serialised bytes only for module-less template route
 
 // ---- DM2: comptime-embedded config as the primary path ----
 
-test "embedded comptime config parses via fromEmbedded (root-relative path)" {
-    const cfg = comptime Config.fromEmbedded("src/testdata/config.example.json");
+test "embedded comptime config parses via fromConfEmbedded (root-relative path)" {
+    const cfg = comptime Config.fromConfEmbedded("src/testdata/config.example.conf");
     try testing.expectEqual(@as(usize, 6), cfg.routes.len);
     try testing.expectEqualStrings("/echo", cfg.routes[0].path);
     try testing.expectEqualStrings("/", cfg.routes[5].path);
 }
 
-test "server from an embedded comptime config routes identically to the JSON server" {
-    const embedded = Server.comptimeInit(comptime Config.fromEmbedded("src/testdata/config.example.json"));
+test "server from an embedded comptime config routes identically to the struct-literal server" {
+    const embedded = Server.comptimeInit(comptime Config.fromConfEmbedded("src/testdata/config.example.conf"));
 
-    const json = @embedFile("../testdata/config.example.json");
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
-    try cfg.validate(registry.default_registry);
-    var json_srv = try Server.initWithTrie(testing.allocator, cfg);
-    defer json_srv.deinit(testing.allocator);
+    const literal = Server.comptimeInit(comptime Config{
+        .routes = &.{
+            .{ .path = "/echo", .match = .exact, .modules = &.{.{ .phase = .content, .module = "echo" }} },
+            .{ .path = "/gzip", .match = .prefix, .modules = &.{
+                .{ .phase = .content, .module = "echo" },
+                .{ .phase = .preaccess, .module = "conditional_get" },
+                .{ .phase = .post_access, .module = "cache_headers" },
+                .{ .phase = .log, .module = "gzip" },
+            }, .max_age_seconds = 3600 },
+            .{ .path = "/static", .match = .prefix, .modules = &.{.{ .phase = .content, .module = "static" }}, .root = "testdata", .index = "index.html", .autoindex = true },
+            .{ .path = "/health", .match = .exact, .response = .{ .status = 200, .body = "ok" } },
+            .{ .path = "/old", .match = .exact, .response = .{
+                .status = 301,
+                .headers = &.{.{ .name = "Location", .value = "/health" }},
+            } },
+            .{ .path = "/", .match = .prefix, .modules = &.{.{ .phase = .content, .module = "echo" }} },
+        },
+    });
 
     const targets = [_][]const u8{ "/echo", "/gzip", "/static/", "/health", "/old", "/", "/anything" };
     for (targets) |t| {
@@ -468,7 +442,7 @@ test "server from an embedded comptime config routes identically to the JSON ser
         var ctx_b = pipeline.Context{ .req = &req_b, .resp = &resp_b };
 
         const out_a = try embedded.handleRequest(&ctx_a);
-        const out_b = try json_srv.handleRequest(&ctx_b);
+        const out_b = try literal.handleRequest(&ctx_b);
         try testing.expectEqual(out_a, out_b);
         try testing.expectEqual(resp_a.status, resp_b.status);
         try testing.expectEqualStrings(resp_a.body, resp_b.body);
@@ -476,7 +450,7 @@ test "server from an embedded comptime config routes identically to the JSON ser
 }
 
 test "embedded comptime config gets pre-serialised fast responses (M11 path)" {
-    const srv = Server.comptimeInit(comptime Config.fromEmbedded("src/testdata/config.example.json"));
+    const srv = Server.comptimeInit(comptime Config.fromConfEmbedded("src/testdata/config.example.conf"));
 
     // /health and /old are module-less template routes: served from
     // pre-serialised bytes, no pipeline.
@@ -508,8 +482,10 @@ test "embedded comptime config gets pre-serialised fast responses (M11 path)" {
 }
 
 test "embeddedInit resolves static roots at startup (root_real + root_fd)" {
-    const cfg = comptime Config.fromJsonComptime(
-        \\{ "routes": [ { "path": "/static", "root": "testdata", "modules": { "content": "static" } } ] }
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /static { content static; root testdata; }
+        \\}
     );
     var srv = try Server.embeddedInit(testing.allocator, cfg);
     defer srv.deinitPrepared(testing.allocator);
@@ -524,18 +500,13 @@ test "embeddedInit resolves static roots at startup (root_real + root_fd)" {
     try testing.expect(srv.cfg.routes[0].dispatch != null);
 }
 
-test "JSON template route applies through the pipeline" {
-    const json =
-        \\{ "routes": [
-        \\    { "path": "/health", "match": "exact",
-        \\      "response": { "status": 200, "body": "ok-json" } }
-        \\  ] }
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
-    try cfg.validate(registry.default_registry);
-    var srv = try Server.initWithTrie(testing.allocator, cfg);
-    defer srv.deinit(testing.allocator);
+test "conf template route applies through the pipeline" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location = /health { return 200 "ok-conf"; }
+        \\}
+    );
+    const srv = Server.comptimeInit(cfg);
 
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
@@ -544,5 +515,5 @@ test "JSON template route applies through the pipeline" {
     var ctx = pipeline.Context{ .req = &req, .resp = &resp };
     try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
     try testing.expectEqual(registry.Status.ok, resp.status);
-    try testing.expectEqualStrings("ok-json", resp.body);
+    try testing.expectEqualStrings("ok-conf", resp.body);
 }

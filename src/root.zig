@@ -46,6 +46,8 @@ pub const dsl = struct {
     pub const router = @import("dsl/router.zig");
     pub const registry = @import("dsl/registry.zig");
     pub const pipeline = @import("dsl/pipeline.zig");
+    pub const conf = @import("dsl/conf.zig");
+    pub const vars = @import("dsl/vars.zig");
     pub const modules = struct {
         pub const echo = @import("dsl/modules/echo.zig");
         pub const gzip = @import("dsl/modules/gzip.zig");
@@ -61,7 +63,6 @@ pub const dsl = struct {
 pub const runtime = struct {
     pub const config = @import("runtime/config.zig");
     pub const server = @import("runtime/server.zig");
-    pub const json_config = @import("runtime/json_config.zig");
 };
 
 // This Zig snapshot only collects `test` blocks that are reachable through
@@ -97,6 +98,7 @@ comptime {
     _ = @import("dsl/router.zig");
     _ = @import("dsl/registry.zig");
     _ = @import("dsl/pipeline.zig");
+    _ = @import("dsl/conf.zig");
     _ = @import("dsl/modules/echo.zig");
     _ = @import("dsl/modules/gzip.zig");
     _ = @import("dsl/modules/cache.zig");
@@ -107,8 +109,6 @@ comptime {
     _ = @import("dsl/modules/stub_status.zig");
     _ = @import("runtime/config.zig");
     _ = @import("runtime/server.zig");
-    _ = @import("runtime/json_config.zig");
-    _ = @import("runtime/json_config_tests.zig");
     _ = @import("tls/pem.zig");
     _ = @import("tls/keyschedule.zig");
     _ = @import("tls/record.zig");

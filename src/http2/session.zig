@@ -1009,8 +1009,10 @@ test "session: an allocator-owned module body is freed (gzip path, no leak)" {
     // Server with a gzip route (content=echo, log=gzip), like the example
     // config. Run a gzip-compressible POST through the session; if the
     // compressed body is not freed, the testing allocator reports a leak.
-    const srv = server_mod.Server.comptimeInit(comptime server_mod.Config.fromJsonComptime(
-        \\{ "routes": [ { "path": "/", "modules": { "content": "echo", "log": "gzip" } } ] }
+    const srv = server_mod.Server.comptimeInit(comptime server_mod.Config.fromConfComptime(
+        \\server {
+        \\    location / { content echo; log gzip; }
+        \\}
     ));
 
     var s = Session.init(testing.allocator);

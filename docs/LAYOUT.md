@@ -11,21 +11,21 @@ test root).
 ```
 src/
   main.zig            CLI entry: --help, --version, --validate, --start/
-                      --stop/--status (pidfile daemon), --port, --threads,
-                      --single, --echo, --http, --config, --idle-timeout,
-                      --uring (flags only; all logic lives below)
+                      --stop/--status (pidfile daemon), --reload-hard,
+                      --port, --threads, --single, --echo, --http,
+                      --idle-timeout, --uring (flags only; logic below)
   root.zig            library root; re-exports + comptime test imports
   version.zig         version constant (comptime)
   embeds.zig          comptime embedded assets (@embedFile) for DM2
   ct_pool.zig         typed comptime arena for comptime builders (M15/DM1)
   fuzz.zig            fuzz driver entry (zig build fuzz)
   fuzz_main.zig       fuzz harness setup
-  testdata/           JSON config fixtures (backend/proxy/stub for the
-                      module-over-h2 tests, config.example.json)
+  testdata/           conf config fixtures (backend/proxy/stub for the
+                      module-over-h2 tests, config.example.conf)
   net/                transport + lifecycle (M1/M2/M5/M13/M14/M15/M16)
     server.zig        M1 single-threaded epoll echo (kept for A/B)
     multireactor.zig  SO_REUSEPORT accept + reactor lifecycle + graceful
-                      reload (SIGHUP) and stop (SIGTERM/SIGINT)
+                      stop (SIGTERM/SIGINT); no SIGHUP (comptime-only confs)
     reactor.zig       per-core epoll/io_uring thread: connection queue via
                       mutex+eventfd, HTTP/1.1 + h2c protocol detection,
                       epoll and io_uring I/O paths, static/sendfile flush
@@ -72,12 +72,14 @@ src/
 Other top-level files:
 
 ```
-config.example.json  reference config: routes + limits, incl. the /chunked
-                     route ("chunked": true) and module bindings
+config.example.conf  reference config: globals/limits + server/location
+                     blocks (nginx-flavored), incl. the /chunked route
 build.zig / build.zig.zon  pinned Zig snapshot; -Dconfig= embeds a config
 embeds.zig           comptime asset embedding (see src/embeds.zig)
 docs/
-  config.md          config reference (routes, modules, limits)
+  config.md          config reference (globals, server/location, reloads)
+  conf.md            conf language reference (grammar, directives, vars,
+                     regex subset, budget)
   LAYOUT.md          this file
   milestones.md      milestone log (M1-M16)
   ROADMAP.md         remaining roadmap

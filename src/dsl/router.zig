@@ -4,8 +4,18 @@ const phase_mod = @import("phase.zig");
 const registry = @import("registry.zig");
 const response_mod = @import("../http/response.zig");
 const ct_pool = @import("../ct_pool.zig");
+const vars = @import("vars.zig");
 
 pub const Phase = phase_mod.Phase;
+pub const Frag = vars.Frag;
+pub const VarId = vars.VarId;
+pub const SetVar = vars.SetVar;
+pub const ProxyHeader = vars.ProxyHeader;
+pub const CVHeader = vars.CVHeader;
+pub const ResponseTemplateCV = vars.ResponseTemplateCV;
+pub const CaptureRange = vars.CaptureRange;
+pub const Regex = vars.Regex;
+pub const RegexState = vars.RegexState;
 
 /// How a route's `path` is matched against the request target.
 pub const Match = enum {
@@ -14,6 +24,10 @@ pub const Match = enum {
     /// The target must start with `path` (nginx-style location prefix; the
     /// longest matching prefix wins).
     prefix,
+    /// Regular expression, case-sensitive (`location ~`, M-D).
+    regex,
+    /// Regular expression, case-insensitive (`location ~*`, M-D).
+    regex_ci,
 };
 
 /// One module attached to one phase of a route.
@@ -74,6 +88,22 @@ pub const Route = struct {
     /// advance or when streaming semantics are wanted. Ignored by h2.
     chunked: bool = false,
 
+    /// `^~` prefix flag (still .prefix; only precedence differs, M-D).
+    no_regex: bool = false,
+    /// Comptime-compiled NFA for .regex / .regex_ci locations (M-D).
+    pattern_regex: ?Regex = null,
+    /// User variables declared with `set` in this location (M-C).
+    set_vars: []const SetVar = &.{},
+    /// Dynamic response template (return/add_header with variables, M-B).
+    response_cv: ?ResponseTemplateCV = null,
+    /// proxy_set_header overrides (M-E).
+    proxy_headers: []const ProxyHeader = &.{},
+    /// Index into Config.log_formats; null = none (off). The access_log
+    /// module reads it; defaults to index 0 (the `combined` default) when
+    /// the route binds `log access_log;` and no `access_log` directive is
+    /// present.
+    log_format: ?usize = null,
+
     /// The module name bound to `phase` on this route, if any.
     pub fn moduleFor(self: *const Route, phase: Phase) ?[]const u8 {
         for (self.modules) |b| {
@@ -97,6 +127,9 @@ pub fn matchRoutes(route_list: []const Route, target: []const u8) ?*const Route 
                 if (!std.mem.startsWith(u8, target, r.path)) continue;
                 if (best == null or r.path.len > best.?.path.len) best = r;
             },
+            // Regex routes are walked separately (M-D); the linear fallback
+            // skips them (same as the trie).
+            .regex, .regex_ci => {},
         }
     }
     return best;
@@ -239,12 +272,6 @@ pub const TrieEdge = struct {
 pub const Trie = struct {
     nodes: []const TrieNode = &.{},
     edges: []const TrieEdge = &.{},
-    /// Full allocation sizes of `nodes`/`edges` when the trie is
-    /// allocator-owned (JSON configs). Zig's allocator contract requires
-    /// freeing the exact allocated length, and the working slices above are
-    /// trimmed to the used prefix.
-    alloc_nodes: u32 = 0,
-    alloc_edges: u32 = 0,
 };
 
 /// Bounds the trie can need: one node per path byte (plus the root) and one
@@ -333,6 +360,9 @@ fn buildCore(routes: []const Route, nodes: []TrieNode, edges: []TrieEdge) error{
                 if (n.exact_route != no_route) return error.AmbiguousRoutes;
                 n.exact_route = @intCast(ri);
             },
+            // Regex routes are not trie material (M-D): they are walked
+            // separately in declaration order.
+            .regex, .regex_ci => {},
         }
     }
 
@@ -401,35 +431,6 @@ fn buildTrieImpl(comptime routes: []const Route) Trie {
     };
 }
 
-/// Build the trie at startup for JSON-loaded route tables. The caller owns
-/// the allocated buffers and must free them with `deinitTrie`.
-pub fn buildTrieRuntime(allocator: std.mem.Allocator, routes: []const Route) error{ AmbiguousRoutes, OutOfMemory }!Trie {
-    const bounds = trieBounds(routes);
-    const nodes = try allocator.alloc(TrieNode, bounds.nodes);
-    errdefer allocator.free(nodes);
-    const edges = try allocator.alloc(TrieEdge, bounds.edges);
-    errdefer allocator.free(edges);
-    const trie = try buildCore(routes, nodes, edges);
-    return .{
-        .nodes = trie.nodes,
-        .edges = trie.edges,
-        .alloc_nodes = @intCast(bounds.nodes),
-        .alloc_edges = @intCast(bounds.edges),
-    };
-}
-
-/// Free an allocator-owned trie. The working slices are trimmed, so the
-/// freeing uses the recorded allocation sizes (allocator contract: free must
-/// receive the exact allocated length).
-pub fn deinitTrie(allocator: std.mem.Allocator, trie: *const Trie) void {
-    if (trie.alloc_nodes > 0) {
-        allocator.free(trie.nodes.ptr[0..trie.alloc_nodes]);
-    }
-    if (trie.alloc_edges > 0) {
-        allocator.free(trie.edges.ptr[0..trie.alloc_edges]);
-    }
-}
-
 fn findEdge(trie: *const Trie, node: u32, byte: u8) ?u32 {
     const n = trie.nodes[node];
     const start = n.edges_start;
@@ -474,17 +475,11 @@ pub fn trieMatch(trie: *const Trie, target: []const u8) ?u32 {
 pub const Router = struct {
     routes: []const Route = &.{},
     trie: Trie = .{},
-    /// The trie buffers are allocator-owned (JSON configs) and must be freed.
-    owned: bool = false,
 
     pub fn match(self: *const Router, target: []const u8) ?*const Route {
         if (self.trie.nodes.len == 0) return matchRoutes(self.routes, target);
         const idx = trieMatch(&self.trie, target) orelse return null;
         return &self.routes[idx];
-    }
-
-    pub fn deinit(self: *const Router, allocator: std.mem.Allocator) void {
-        if (self.owned) deinitTrie(allocator, &self.trie);
     }
 };
 
@@ -632,39 +627,6 @@ test "trie: single-segment paths" {
     try testing.expectEqual(@as(u32, 0), trieMatch(&trie, "/a").?);
     try testing.expectEqual(@as(u32, 1), trieMatch(&trie, "/b").?);
     try testing.expectEqual(@as(?u32, null), trieMatch(&trie, "/c"));
-}
-
-test "runtime-built trie agrees with the comptime trie" {
-    const allocator = testing.allocator;
-    var trie = try buildTrieRuntime(allocator, &trie_routes);
-    defer deinitTrie(allocator, &trie);
-    const comptime_trie = buildTrie(&trie_routes);
-    for (trie_targets) |t| {
-        const a = trieMatch(&trie, t);
-        const b = trieMatch(&comptime_trie, t);
-        try testing.expectEqual(a, b);
-    }
-}
-
-test "runtime trie build rejects ambiguous routes" {
-    const allocator = testing.allocator;
-    const dup = [_]Route{
-        .{ .path = "/dup", .match = .prefix },
-        .{ .path = "/dup", .match = .prefix },
-    };
-    try testing.expectError(error.AmbiguousRoutes, buildTrieRuntime(allocator, &dup));
-    // Same path with different match types is legal: exact wins.
-    const mixed = [_]Route{
-        .{ .path = "/dup", .match = .prefix },
-        .{ .path = "/dup", .match = .exact },
-    };
-    var trie = try buildTrieRuntime(allocator, &mixed);
-    defer deinitTrie(allocator, &trie);
-    // 1 root + 4 path bytes.
-    try testing.expectEqual(@as(usize, 5), trie.nodes.len);
-    try testing.expectEqual(@as(usize, 4), trie.edges.len);
-    try testing.expectEqual(@as(?u32, 1), trieMatch(&trie, "/dup"));
-    try testing.expectEqual(@as(?u32, 0), trieMatch(&trie, "/dup/x"));
 }
 
 test "Router.match falls back to the linear matcher without a trie" {

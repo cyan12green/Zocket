@@ -27,30 +27,35 @@ High-performance TCP/HTTP server in Zig.
 
 **Config & modules (nginx-style)**
 - Config-driven phase pipeline: 10 nginx phases (post_read … log), prefix/
-  exact routing, comptime route trie + per-route dispatch specialisation
-- Comptime config as the primary path (DM2): the JSON config is embedded and
-  DM1-validated at compile time — trie, dispatch and pre-serialised response
-  templates live in `.rodata`; invalid configs are compile errors
+  exact/regex routing, comptime route trie + per-route dispatch
+  specialisation
+- Nginx-conf-flavored config language (`.conf`), compiled entirely at
+  compile time (`zig build -Dconfig=<file>`): trie, dispatch, regex NFAs,
+  complex-value fragment lists and pre-serialised response templates live
+  in `.rodata`; invalid configs are compile errors — there is no runtime
+  config parse path
+- Complex values (nginx-style): `$variable` references in `log_format`,
+  `return`, `add_header`, `set` and `proxy_set_header`, rendered per
+  request with a comptime-switched getter loop
 - Module registry (echo, gzip, static + sendfile, proxy + load balancing +
   health checks, cache/Conditional-GET, response templates, stub_status,
   access/error logs) — identical behaviour over HTTP/1.1 and HTTP/2
 
 **Operations**
 - Daemon control: `--start` / `--stop` / `--status` (pidfile)
-- `--reload-soft`: in-process runtime config reparse (SIGHUP)
 - `--reload-hard`: compile-time config reload — rebuild with the config
   embedded, zero-downtime daemon swap (SO_REUSEPORT handoff, old daemon
-  drains its connections)
+  drains its connections). The only reload (configs are comptime-only)
 - Graceful shutdown: SIGTERM/SIGINT drain connections (30 s cap)
-- `--validate`: parse + validate a config and print the route table
+- `--validate`: print the route table (configs are validated at build time)
 - `--single` (M1 baseline), `--echo` (raw protocol), `--uring` (experimental)
 
 **Engineering**
 - Performance: beats nginx on every measured workload — HTTP/2 echo 3.0x
   (100 streams/conn) and 1.2x (serialized), chunked transfer 1.4-2.0x,
   static 1.7x, h1 echo/matrix 1.1-1.8x (see Benchmarks below)
-- Comptime-first: route trie, header DFA, MIME table, HPACK tables, JSON
-  config parser and protocol decode tables are all compile-time built
+- Comptime-first: route trie, header DFA, MIME table, HPACK tables, conf
+  parser and protocol decode tables are all compile-time built
 - Fuzz harness + h2spec conformance gate (`zig build fuzz`, `zig build h2test`)
 
 ## Run modes
@@ -59,9 +64,10 @@ High-performance TCP/HTTP server in Zig.
 zig build run                          HTTP mode (default), port 8080
 zig build run -- --threads N           N reactor threads (default: CPU count)
 zig build run -- --port P              change port
-zig build run -- --config <file>       HTTP with a JSON config (routes + module bindings;
-                                       server limits like buffer/body/header caps live in
-                                       the `limits` section - see docs/config.md)
+zig build -Dconfig=config.conf run     HTTP with a comptime-embedded conf
+                                       (nginx-style language; routes, module
+                                       bindings, limits and tls — see
+                                       docs/config.md and docs/conf.md)
 zig build run -- --echo                raw byte-echo protocol (M1/M2 semantics)
 zig build run -- --single              M1 single-threaded echo server (A/B)
 zig build run -- --idle-timeout S      idle connection timeout in seconds (0 disables)
@@ -69,11 +75,10 @@ zig build run -- --uring               experimental io_uring batch I/O backend
                                        (epoll is the default)
 zig build run -- --help                all flags, including daemon control:
                                        --start/--stop/--status (pidfile),
-                                       --validate (config check),
-                                       --reload-soft (in-process runtime
-                                       reparse) / --reload-hard (rebuild with
-                                       the config compiled in + zero-downtime
-                                       daemon swap)
+                                       --validate (route table),
+                                       --reload-hard (rebuild with the conf
+                                       compiled in + zero-downtime daemon
+                                       swap)
 ```
 
 ## Benchmark graphs

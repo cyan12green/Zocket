@@ -20,7 +20,7 @@ curl --version 2>/dev/null | grep -q "nghttp2" || { echo "h2test: curl lacks HTT
 [ -x "$H2SPEC" ] || { echo "h2test: h2spec not found at $H2SPEC (go install github.com/summerwind/h2spec/cmd/h2spec@latest)"; exit 1; }
 
 echo "== h2test: building server (example config, ReleaseFast) =="
-(cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=config.example.json)
+(cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=config.example.conf)
 
 echo "== h2test: starting server on :$PORT =="
 "$BIN" --http --threads 2 --port "$PORT" >"$ROOT/bench/.cache/h2test-server.log" 2>&1 &

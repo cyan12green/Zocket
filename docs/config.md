@@ -1,104 +1,124 @@
 # Zocket configuration
 
-The config has two sections: `routes` (the nginx-style location/phase
-mapping) and `limits` (runtime-tunable sizes and caps — nginx's
-`http{}`/`server{}` directive equivalents). Any `limits` field may be
-omitted; the compiled defaults apply. See `config.example.json` for a
-complete sample.
+Zocket uses an nginx-conf-flavored configuration language (`.conf` files),
+compiled **entirely at compile time**: the config is embedded with
+`zig build -Dconfig=<file>` and parsed/validated by the comptime conf
+parser in `src/dsl/conf.zig`. The built route table, trie, dispatch
+functions, pre-serialised response templates and upstream sockaddrs all
+live in `.rodata`. **There is no runtime config path** — an invalid config
+is a compile error, and `--reload-hard` (rebuild + SO_REUSEPORT swap) is
+the only reload. See `config.example.conf` for a complete sample and
+`docs/conf.md` for the full language reference (grammar, directive table,
+variable catalog, regex subset).
 
-There are two load paths:
+## Language shape (summary)
 
-- **Comptime (primary, DM2)**: `zig build -Dconfig=<file>` embeds a
-  project-root-relative JSON config at compile time. The DM1 validator
-  parses it (invalid configs are compile errors) and `Server.comptimeInit`
-  builds the route trie, dispatch specialisation, pre-serialised response
-  templates and upstream sockaddrs — all in `.rodata`, no startup parsing.
-- **Runtime (secondary/development)**: `--config <file.json>` parses the
-  config at startup with std.json (startup trie build, SIGHUP reload
-  support). Used when no `-Dconfig` was given.
-
-## routes
-
-An array of route blocks. Each block selects the modules bound to the
-nginx-style phases for matching requests.
-
-| field | type | default | description |
-|---|---|---|---|
-| `path` | string | — | URL prefix (`"prefix"`) or exact (`"exact"`) match target. Exact beats prefix; longest prefix wins. |
-| `match` | `"prefix"` \| `"exact"` | `"prefix"` | Match mode. |
-| `modules` | object | `{}` | Phase → module-name bindings (e.g. `{ "content": "echo" }`). Modules: `echo`, `static`, `gzip`, `cache`, `conditional_get`, `access_log`, `error_log`, `proxy`, `stub_status`. |
-| `response` | object | null | Fixed response template (M11): `{ "status": 200, "body": "...", "headers": [{ "name": ..., "value": ... }], "compress": false }`. Module-less template routes are served from pre-serialised bytes. |
-| `root` | string | null | Static-file root directory (with the `static` module). |
-| `index` | string | null | Directory index file for `root`. |
-| `autoindex` | bool | false | List directories when no index file exists. |
-| `embed` | string | null | Comptime-embedded file (struct-literal configs only). |
-| `max_age` | number | 0 | `Cache-Control: max-age=N` (with the `cache` module). |
-| `upstreams` | array | null | Proxy backends: `[{ "host": ..., "port": N }]`. |
-| `balance` | `"round_robin"` \| `"least_connections"` \| `"ip_hash"` | `"round_robin"` | Proxy load-balance strategy. |
-| `max_fails` | number | 3 | Proxy passive health-check failures before the backend is marked down. |
-| `fail_timeout_seconds` | number | 30 | Proxy backend recheck window after failures. |
-| `chunked` | bool | false | Route opt-in for HTTP/1.1 chunked responses: the body is framed as a single chunk (`Transfer-Encoding: chunked`) instead of Content-Length — head+size, body and terminator flush as one writev, so it costs nothing extra. Enables streaming when the body size is unknown up front. Ignored over HTTP/2 (frame-based). |
-
-## limits
-
-Runtime-tunable sizes and caps (nginx directive equivalents in the
-descriptions). All fields optional.
-
-| field | default | description |
-|---|---|---|
-| `recv_buffer_size` | `16384` | Initial per-connection receive buffer size (bytes). Larger bodies grow it (up to `max_body`) and the capacity is kept. nginx: `client_body_buffer_size`. |
-| `send_buffer_size` | `16384` | Initial per-connection send buffer size (bytes). nginx: `output_buffers`-ish. |
-| `max_body` | `16777216` | Largest request body the server buffers; requests beyond it are rejected with 431. Also the echo module's body cap. nginx: `client_max_body_size`. |
-| `max_line_bytes` | `8192` | Longest request line / header line (431). nginx: `large_client_header_buffers`. |
-| `max_headers` | `32` | Maximum number of request headers (431). |
-| `max_chunked_body` | `65536` | Largest chunked request body (413). nginx: `client_max_body_size`. |
-| `static_cache_entries` | `16` | Static fd-cache size (per reactor). nginx: `open_file_cache max=N`. |
-| `static_cache_valid_seconds` | `1` | Static cache revalidation window: entries are rechecked against the file's size/mtime after this many seconds. nginx: `open_file_cache_valid`. |
-| `static_content_cache_max` | `16384` | Files at most this large are content-cached and served as one `writev` (head + bytes, no sendfile); larger files use sendfile. nginx: `sendfile_max_chunk`-ish. |
-| `connection_pool_max` | `1024` | Recycled connections held by the per-reactor pool (bounded memory for keep-alive churn). |
-
-## Example
-
-```json
-{
-  "limits": {
-    "max_body": 1048576,
-    "max_headers": 64,
-    "static_cache_valid_seconds": 60
-  },
-  "routes": [
-    {
-      "path": "/",
-      "match": "prefix",
-      "modules": { "content": "static" },
-      "root": "/var/www"
+```
+# comments
+<global directive>;                    # limits, listen, tls, log_format
+tls { cert "file.pem"; key "file.pem"; }
+server {
+    location [modifier] <target> {     # modifier: = | ~ | ~* | ^~ | (none)
+        <phase> <module>;              # content echo; log access_log; ...
+        <location directive>;          # root, index, return, add_header, ...
     }
-  ]
 }
 ```
 
-Startup:
-- Comptime: `zig build -Dconfig=config.json run` (primary path, DM2).
-- Runtime: `zig build run -- --config config.json` (secondary path).
+Sizes accept `k`/`m`/`g` suffixes (`16m` = 16 MiB); booleans accept
+`on|off`; values are bare tokens or quoted strings (`"..."` with `\" \\ \n
+\r \t` escapes, `'...'` literal).
+
+## Global directives
+
+All `limits` fields become directives with the same name (sizes accept the
+`k/m/g` suffix, booleans `on|off`); also accepted inside `server {}`:
+
+| Directive | Field | Notes |
+|---|---|---|
+| `recv_buffer_size <size>;` | `recv_buffer_size` | nginx `client_body_buffer_size` |
+| `send_buffer_size <size>;` | `send_buffer_size` | |
+| `max_body <size>;` | `max_body` | nginx `client_max_body_size` (431 over) |
+| `max_line_bytes <size>;` | `max_line_bytes` | nginx `large_client_header_buffers` |
+| `max_headers <n>;` | `max_headers` | |
+| `max_chunked_body <size>;` | `max_chunked_body` | (413 over) |
+| `static_cache_entries <n>;` | `static_cache_entries` | nginx `open_file_cache max=N` |
+| `static_cache_valid <n>;` | `static_cache_valid_seconds` | nginx `open_file_cache_valid` |
+| `static_content_cache_max <size>;` | `static_content_cache_max` | |
+| `connection_pool_max <n>;` | `connection_pool_max` | |
+| `listen <port>;` | `Config.listen_port` | CLI `--port` wins when both |
+| `tls { cert "<path>"; key "<path>"; }` | `TlsConfig` | |
+| `log_format <name> "<cv>";` | `Config.log_formats` | duplicate names → compile error |
+
+Unknown directives → `@compileError` with `conf:<line>:<col>`.
+
+## `server {}` and `location` blocks
+
+Exactly one `server {}` is required (vhosts are a future milestone).
+Locations select routes by modifier: `=` exact, `~` regex (case-sensitive),
+`~*` regex (case-insensitive), `^~` prefix that wins over regex, or plain
+prefix. nginx precedence: exact → `^~` prefix → first regex in declaration
+order → longest plain prefix → 404.
+
+Location directives (all optional):
+
+| Directive | Effect |
+|---|---|
+| `<phase> <module>;` | Bind a module to a phase (`post_read, server_rewrite, find_config, rewrite, post_rewrite, preaccess, access, post_access, content, log`). Unknown module names are compile errors. |
+| `root <path>;` / `index <file>;` / `autoindex on\|off;` | Static-file serving (with the `static` module). |
+| `embed <path>;` | Comptime-embedded file (project-root-relative). |
+| `max_age <n>;` | `Cache-Control: max-age=N`. |
+| `chunked on\|off;` | HTTP/1.1 single-chunk responses. |
+| `return <code> ["<cv>"];` | Fixed-response template (module-less routes are served from pre-serialised bytes). |
+| `add_header <name> "<cv>";` | Append a response header to a `return` template. |
+| `set $name "<cv>";` | User variable (M-C). |
+| `proxy_pass <host>:<port>;` / `upstream <host>:<port>;` | Proxy backends (IPv4 literals only). |
+| `balance <round_robin\|least_connections\|ip_hash>;` | Load-balance strategy. |
+| `max_fails <n>;` / `fail_timeout <n>;` | Passive health checks. |
+| `proxy_set_header <name> "<cv>";` | Upstream header overrides (M-E). |
+| `access_log <format-name>\|off;` | Select a named `log_format` for the log phase. |
+
+## Example
+
+```
+max_body 1m;
+max_headers 64;
+static_cache_valid 60;
+
+tls {
+    cert "server.pem";
+    key "server.key";
+}
+
+server {
+    location / {
+        content static;
+        root /var/www;
+    }
+
+    location = /health {
+        return 200 "ok";
+    }
+}
+```
+
+Startup: `zig build -Dconfig=config.conf run` (the only path).
 
 ## Daemon control and reloads
 
-`--start`/`--stop`/`--status`/`--reload-*` turn the server into a daemon
-with config reloads. The daemon records everything needed to reproduce its
-build+start in a state file written next to the pidfile: `<pidfile>.state`
-(JSON: `config_path`, `optimize`, `port`, `threads`, `mode`, `idle_timeout`,
-`uring`, `single`, `embedded`, `project_root`). `--pidfile` defaults to
-`/tmp/zocket.pid`.
+`--start`/`--stop`/`--status`/`--reload-hard` turn the server into a
+daemon. The daemon records everything needed to reproduce its build+start in
+a state file next to the pidfile: `<pidfile>.state` (JSON: `config_path`,
+`optimize`, `port`, `threads`, `mode`, `idle_timeout`, `uring`, `single`,
+`embedded`, `project_root`). `--pidfile` defaults to `/tmp/zocket.pid`.
 
 Example lifecycle:
 
 ```sh
-zocket --start --config config.example.json --port 8080 --threads 4 \
+zocket --start --port 8080 --threads 4 \
         --pidfile /tmp/zocket.pid     # daemonize; exit 0 once listening
 zocket --status --pidfile /tmp/zocket.pid
-# ...edit the config...
-zocket --reload-soft --pidfile /tmp/zocket.pid   # fast in-process reparse
-# ...or for a full compile-time reload...
+# ...edit the conf...
 zocket --reload-hard --pidfile /tmp/zocket.pid   # rebuild + zero-downtime swap
 zocket --stop --pidfile /tmp/zocket.pid          # graceful drain + exit
 ```
@@ -110,17 +130,12 @@ zocket --stop --pidfile /tmp/zocket.pid          # graceful drain + exit
   accepting, closes its SO_REUSEPORT listeners and finishes existing
   connections (30 s cap) before exiting.
 - `zocket --status` — running / not running (stale pidfile detection).
-- `zocket --reload-soft` — **runtime reload**: sends SIGHUP; the daemon
-  re-parses its `--config` in-process (no rebuild, no restart). Only
-  applies when the daemon runs a runtime config — an embedded config is
-  immutable at runtime (use `--reload-hard`).
-- `zocket --reload-hard [--config <file>]` — **comptime reload**: rebuilds
-  the binary with the config embedded at compile time, then swaps:
-  1. `zig build -Doptimize=<recorded> -Dconfig=<config>` in the recorded
-     project root (`zig` from PATH). The DM1 validator runs at compile time:
-     **an invalid config is a compile error and aborts the reload — the old
-     daemon keeps serving untouched** (module names are checked when the new
-     daemon starts; the old daemon is still untouched either way).
+- `zocket --reload-hard` — **comptime reload** (the only reload): rebuilds
+  the binary with the conf embedded at compile time, then swaps:
+  1. `zig build -Doptimize=<recorded> -Dconfig=<conf>` in the recorded
+     project root (`zig` from PATH). The comptime conf parser validates at
+     compile time: **an invalid config is a compile error and aborts the
+     reload — the old daemon keeps serving untouched**.
   2. The freshly built `zig-out/bin/zocket --start` is exec'd with the
      recorded options — both daemons bind the port via SO_REUSEPORT, so
      there is no acceptance gap (verified: 2M requests across a swap, 0
@@ -135,12 +150,11 @@ zocket --stop --pidfile /tmp/zocket.pid          # graceful drain + exit
      the old daemon checks the pidfile before cleaning up, so it cannot
      delete the new daemon's files (the reload-hard cleanup race, covered
      by a test).
-  `--config` overrides the recorded path. Config paths must resolve inside
-  the project tree — the comptime embed (`@embedFile`) cannot reach outside
-  it (dot-directories like `.zig-cache` are excluded too).
+  Conf paths must resolve inside the project tree — the comptime embed
+  (`@embedFile`) cannot reach outside it (dot-directories like `.zig-cache`
+  are excluded too).
 
-SIGHUP alone (e.g. `kill -HUP <pid>`) still performs the fast runtime
-reparse, identical to `--reload-soft`.
+SIGHUP is deliberately not handled (configs are comptime-only).
 
 For the other run modes see the README.
 
@@ -155,12 +169,12 @@ against `std.crypto.tls.Client`, `openssl s_client` (handshake, encrypted
 round trip, close_notify) and `openssl s_client -sess_in` (resumption
 reports `Reused, TLSv1.3`).
 
-Enable HTTPS with the `tls` config section:
+Enable HTTPS with the `tls` block:
 
-```json
-{
-  "tls": { "cert": "path/to/cert.pem", "key": "path/to/key.pem" },
-  "routes": [ ... ]
+```
+tls {
+    cert "path/to/cert.pem";
+    key "path/to/key.pem";
 }
 ```
 
@@ -169,5 +183,19 @@ Enable HTTPS with the `tls` config section:
 - A connection is classified on its first record: TLS ClientHello, the
   HTTP/2 prior-knowledge preface, or HTTP/1.1. ALPN picks `h2` vs
   `http/1.1` inside TLS; no ALPN means HTTP/1.1.
-- `--validate` prints `tls: enabled/disabled`; without the section the
+- `--validate` prints `tls: enabled/disabled`; without the block the
   server stays plaintext.
+
+## Comptime branch budget
+
+The comptime branch quota is shared per compilation (config parse, regex
+compile, trie build, dispatch assignment, the h2/tls comptime tables).
+`Config.comptimeValidate` measures the config's compile cost (routes × 32 +
+fragments × 4 + source length + ...) and raises a clear compile error when
+it exceeds ~66% of the budget (safety factor 1.5):
+
+```
+conf '<embedded>': config compile cost ~N exceeds the comptime branch budget
+(<quota>, safety factor 1.5). Reduce the config (routes/regex/length) or
+raise the budget: zig build -Dconfig_branch_quota=<n>
+```

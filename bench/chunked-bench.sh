@@ -7,7 +7,7 @@
 # bench/graphs/chunked_compare.png.
 #
 # Usage: bash bench/chunked-bench.sh   (needs zig-out/bin/zocket built with
-# -Dconfig=config.example.json, nginx-v2 + echo-nginx-module, bombardier).
+# -Dconfig=config.example.conf, nginx-v2 + echo-nginx-module, bombardier).
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BOMB="${BOMB:-$HOME/go/bin/bombardier}"

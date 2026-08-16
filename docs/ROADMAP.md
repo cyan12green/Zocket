@@ -725,6 +725,29 @@ reactor tests extended for the post-101 raw phase.
 
 ---
 
+### M18.5 — Conf language (comptime-only, nginx-flavored)
+
+**Status: CORE DONE** (M-A of `docs/plan.md`; M-B..M-E follow). Replaced
+the JSON config with an nginx-conf-flavored language compiled entirely at
+comptime: `zig build -Dconfig=<file>` embeds a `.conf` parsed by
+`src/dsl/conf.zig` (tokenizer with sizes/quotes/comments/line-col errors,
+directive registry, `server`/`location` blocks with `=`/`~`/`~*`/`^~`
+modifiers, phase directives, `tls`, `log_format`, `listen`). The JSON
+runtime path is gone: `--config`, `--reload-soft` and SIGHUP reload were
+removed (`--reload-hard` is the only reload). `Config` gained
+`listen_port`/`log_formats` and the `fromConfComptime`/`fromConfEmbedded`/
+`comptimeValidate` API; a budget check (`-Dconfig_branch_quota`, default
+100000) fails with a clear error before the shared comptime branch quota is
+exhausted. `src/dsl/vars.zig` holds the complex-value types (`Frag`,
+`VarId`, `SetVar`, `LogFormat`, ...); `src/dsl/regex.zig` and the router
+regex precedence land in M-D.
+
+**Verification**: 226 tests (conf parser tests, migrated fixtures), h2test,
+fuzz; docs: `docs/conf.md` (language reference), `docs/config.md`
+rewritten, `config.example.conf` replaces the JSON sample.
+
+---
+
 ### M19 — HTTP/3 + QUIC
 
 **Status: PLANNED** (after M16 + M17; nginx `v3`, Caddy and h2o all ship
@@ -828,9 +851,10 @@ Details:
 
 ## Suggested starting milestone (next session)
 
-**M18 — WebSocket and connection upgrade** is the next milestone: protocol
-switching on `Connection: upgrade` (the reactor already classifies
-`upgrade`), RFC 6455 framing for a native websocket echo module, and
-proxied `ws://` passthrough. M17/M18's TLS scope (reactor integration,
-config `tls`, resumption tickets, HTTPS benchmarks) is complete; the
-HTTP/3 + QUIC track (M19) is the other candidate.
+**M-B/M-C (complex values, variables, `set`)** of the conf-language plan
+(`docs/plan.md`) is the next milestone: `src/dsl/vars.zig` (Frag/VarId,
+getters, `parseComplexValue`, `renderComplex`), complex-value `return`/
+`add_header`/`log_format`, and the `access_log` rewrite on `LogFormat`.
+M-A (the conf language core: tokenizer, parser, all directives,
+`Config` API, comptime-only migration, budget check) is complete; the
+WebSocket track (M18) and HTTP/3 (M19) remain the other candidates.

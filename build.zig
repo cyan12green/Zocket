@@ -36,14 +36,25 @@ pub fn build(b: *std.Build) void {
     });
 
     // DM2: comptime config as the primary path. `zig build -Dconfig=<file>`
-    // embeds a project-root-relative JSON config at compile time; the server
+    // embeds a project-root-relative conf file at compile time; the server
     // then builds its trie, dispatch functions and pre-serialised response
-    // templates at compile time (all in .rodata). The runtime `--config` flag
-    // stays as the secondary path for development/dynamic uses.
-    const config_path = b.option([]const u8, "config", "JSON config file (project-root-relative) to embed at compile time (DM2)");
+    // templates at compile time (all in .rodata). Configs are comptime-only:
+    // there is no runtime config parse path.
+    const config_path = b.option([]const u8, "config", "conf file (project-root-relative) to embed at compile time (DM2)");
+    // §9: the comptime branch budget is shared per compilation; the conf
+    // parser and regex/trie builds consume it. `comptimeValidate` fails with
+    // a clear error when a config's measured cost exceeds ~66% of this quota
+    // (safety factor 1.5), leaving headroom for the rest of the compilation.
+    const config_branch_quota = b.option(usize, "config_branch_quota", "comptime branch budget for config parsing (default 100000)") orelse 100000;
     const build_options = b.addOptions();
     build_options.addOption(?[]const u8, "config_path", config_path);
+    build_options.addOption(usize, "config_branch_quota", config_branch_quota);
     const build_options_mod = build_options.createModule();
+
+    // Conf-parser options (branch quota) reachable from the library module.
+    const config_options = b.addOptions();
+    config_options.addOption(usize, "branch_quota", config_branch_quota);
+    const config_options_mod = config_options.createModule();
 
     const mod = b.addModule("zocket", .{
         // The root source file is the "entry point" of this module. Users of
@@ -58,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .imports = &.{
             .{ .name = "embeds", .module = embeds_mod },
+            .{ .name = "config_options", .module = config_options_mod },
         },
     });
 

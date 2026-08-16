@@ -4,7 +4,7 @@
 # req/s per line, which bench/graphs.py renders into bench/graphs/h2_compare.png.
 #
 # Usage: bash bench/h2bench.sh   (needs the h2 binaries: zig-out/bin/zocket
-# built with -Dconfig=config.example.json, and nginx-v2 + h2load per AGENTS.md).
+# built with -Dconfig=config.example.conf, and nginx-v2 + h2load per AGENTS.md).
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 H2LOAD="$ROOT/third_party/nghttp2/src/h2load"

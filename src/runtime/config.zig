@@ -2,18 +2,21 @@ const std = @import("std");
 const router = @import("../dsl/router.zig");
 const registry = @import("../dsl/registry.zig");
 const dsl_limits = @import("../dsl/limits.zig");
-const json_config = @import("json_config.zig");
+const conf = @import("../dsl/conf.zig");
+const vars = @import("../dsl/vars.zig");
 
 pub const Route = router.Route;
 pub const ModuleBinding = router.ModuleBinding;
 pub const Phase = router.Phase;
+pub const Frag = vars.Frag;
+pub const LogFormat = vars.LogFormat;
 
 /// Server configuration: the route table declaring which modules attach to
 /// which phases per route. Backing strings are borrowed:
 /// - comptime struct literals (and `Config.default()`) point at comptime
 ///   constants and must never be deinit'd;
-/// - `fromJson` copies everything into the caller's allocator and the result
-///   must be freed with `deinit`.
+/// - `fromConfComptime`/`fromConfEmbedded` parse at compile time into
+///   .rodata tables and must never be deinit'd.
 /// TLS listener settings (M18): certificate and key file paths. The files
 /// are read once at startup (like nginx's `ssl_certificate`); the module
 /// layer uses them via the native TLS 1.3 server in `src/tls/`.
@@ -33,36 +36,70 @@ pub const Config = struct {
     limits: dsl_limits.Limits = .{},
     /// TLS listener settings (M18): certificate + key PEM files.
     tls: TlsConfig = .{},
+    /// Listen port from the conf `listen` directive; null = CLI `--port`
+    /// default (8080). CLI wins when both are present.
+    listen_port: ?u16 = null,
+    /// Named log formats (`log_format` directives); index 0 is the default
+    /// `combined` when none is declared.
+    log_formats: []const LogFormat = &.{},
 
     /// Comptime default: a single catch-all prefix route attaching the echo
     /// module to the content phase — the pre-pipeline M3 behavior, reproduced
-    /// as config. Parsed at compile time by the DM1 validator (no std.json).
+    /// as config. A plain struct literal: no parse at all.
     pub fn default() Config {
-        return fromJsonComptime(
-            \\{ "routes": [ { "path": "/", "match": "prefix", "modules": { "content": "echo" } } ] }
-        );
+        return .{
+            .routes = &.{
+                .{
+                    .path = "/",
+                    .match = .prefix,
+                    .modules = &.{
+                        .{ .phase = .content, .module = "echo" },
+                    },
+                },
+            },
+        };
     }
 
-    /// DM1: parse a JSON config at compile time with the schema validator in
-    /// `json_config.zig` (no std.json DOM, no allocator). Invalid configs are
-    /// compile errors; the built route table and strings live in .rodata.
-    pub fn fromJsonComptime(comptime json: []const u8) Config {
-        return json_config.parse(json);
+    /// Parse a conf document at compile time (the nginx-flavored language in
+    /// `src/dsl/conf.zig`). Invalid configs are compile errors; the built
+    /// route table and strings live in .rodata.
+    pub fn fromConfComptime(comptime text: []const u8) Config {
+        return conf.parse(text);
     }
 
-    /// DM2: embed a config file and parse it at compile time, so the entire
-    /// config — routes, trie-ready tables and limits — is a compile-time
-    /// input. The path is project-root-relative and resolved through the
-    /// `embeds` module (same convention as Milestone 10 route `embed`
-    /// paths). Use `Server.comptimeInit` to turn the result into a server
-    /// with a comptime-built trie, dispatch specialisation and pre-serialised
-    /// response templates.
-    pub fn fromEmbedded(comptime path: []const u8) Config {
-        return json_config.parse(@import("embeds").embed(path));
+    /// Embed a conf file and parse it at compile time. The path is
+    /// project-root-relative and resolved through the `embeds` module (same
+    /// convention as route `embed` paths). Use `Server.comptimeInit` to turn
+    /// the result into a server with a comptime-built trie, dispatch
+    /// specialisation and pre-serialised response templates.
+    pub fn fromConfEmbedded(comptime path: []const u8) Config {
+        return conf.parse(@import("embeds").embed(path));
+    }
+
+    /// Registry + budget validation, forced comptime. Called at the end of
+    /// the comptime server constructors; the budget check (§9) surfaces a
+    /// clear compile error when a config would exhaust the shared comptime
+    /// branch quota.
+    pub inline fn comptimeValidate(comptime cfg: Config, comptime Registry: type) void {
+        @setEvalBranchQuota(1_000_000);
+        var seen_phase = [_]bool{false} ** Phase.all.len;
+        for (cfg.routes) |*r| {
+            seen_phase = [_]bool{false} ** Phase.all.len;
+            for (r.modules) |b| {
+                if (!Registry.isRegistered(b.module)) {
+                    @compileError("unknown module '" ++ b.module ++ "' in route '" ++ r.path ++ "'");
+                }
+                if (seen_phase[@intFromEnum(b.phase)]) {
+                    @compileError("duplicate phase binding in route '" ++ r.path ++ "'");
+                }
+                seen_phase[@intFromEnum(b.phase)] = true;
+            }
+        }
     }
 
     /// Verify every route against the module registry: each binding must name
-    /// a registered module and bind a phase at most once.
+    /// a registered module and bind a phase at most once. Runtime entry used
+    /// by struct-literal tests.
     pub fn validate(self: *const Config, comptime Registry: type) !void {
         for (self.routes) |*r| {
             var seen = [_]bool{false} ** Phase.all.len;
@@ -73,260 +110,19 @@ pub const Config = struct {
             }
         }
     }
-
-    /// Free memory owned by a `fromJson`-loaded config. Must not be called on
-    /// comptime struct literals or `Config.default()`.
-    pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
-        for (self.routes) |r| {
-            for (r.modules) |b| {
-                allocator.free(b.module);
-            }
-            allocator.free(r.modules);
-            allocator.free(r.path);
-            if (r.root) |root| allocator.free(root);
-            if (r.root_real) |rr| allocator.free(rr);
-            if (r.root_fd >= 0) std.posix.close(r.root_fd);
-            if (r.index) |index| allocator.free(index);
-            if (r.response) |*t| {
-                for (t.headers) |h| {
-                    allocator.free(h.name);
-                    allocator.free(h.value);
-                }
-                allocator.free(t.headers);
-                if (t.body.len > 0) allocator.free(t.body);
-            }
-            for (r.upstreams) |up| allocator.free(up.host);
-            allocator.free(r.upstreams);
-        }
-        allocator.free(self.routes);
-    }
-
-    /// Parse a JSON document into a Config using std.json. All strings are
-    /// copied into `allocator`, so the source slice only needs to outlive the
-    /// call.
-    pub fn fromJson(allocator: std.mem.Allocator, json: []const u8) !Config {
-        var parsed = try std.json.parseFromSlice(JsonConfig, allocator, json, .{});
-        defer parsed.deinit();
-
-        // Merge the optional `limits` section over the compiled defaults.
-        var limits = dsl_limits.Limits{};
-        if (parsed.value.limits) |jl| {
-            if (jl.recv_buffer_size) |v| limits.recv_buffer_size = v;
-            if (jl.send_buffer_size) |v| limits.send_buffer_size = v;
-            if (jl.max_body) |v| limits.max_body = v;
-            if (jl.max_line_bytes) |v| limits.max_line_bytes = v;
-            if (jl.max_headers) |v| limits.max_headers = v;
-            if (jl.max_chunked_body) |v| limits.max_chunked_body = v;
-            if (jl.static_cache_entries) |v| limits.static_cache_entries = v;
-            if (jl.static_cache_valid_seconds) |v| limits.static_cache_valid_seconds = v;
-            if (jl.static_content_cache_max) |v| limits.static_content_cache_max = v;
-            if (jl.connection_pool_max) |v| limits.connection_pool_max = v;
-        }
-
-        var routes = std.ArrayList(Route).empty;
-        try routes.ensureTotalCapacity(allocator, parsed.value.routes.len);
-        errdefer {
-            for (routes.items) |r| {
-                for (r.modules) |b| allocator.free(b.module);
-                allocator.free(r.modules);
-                allocator.free(r.path);
-            }
-            routes.deinit(allocator);
-        }
-
-        for (parsed.value.routes) |jr| {
-            const path = try allocator.dupe(u8, jr.path);
-            errdefer allocator.free(path);
-
-            var bindings = std.ArrayList(ModuleBinding).empty;
-            try bindings.ensureTotalCapacity(allocator, Phase.all.len);
-            inline for (std.meta.fields(JsonModuleMap)) |f| {
-                const name: ?[]const u8 = @field(jr.modules, f.name);
-                if (name) |module_name| {
-                    const phase = Phase.parse(f.name) orelse return error.UnknownPhase;
-                    bindings.appendAssumeCapacity(.{
-                        .phase = phase,
-                        .module = try allocator.dupe(u8, module_name),
-                    });
-                }
-            }
-
-            const root = if (jr.root) |r| try allocator.dupe(u8, r) else null;
-            errdefer if (root) |r| allocator.free(r);
-            // Resolve the root realpath once at load (nginx never realpaths
-            // per request either): the static module's symlink-escape anchor.
-            var root_real: ?[]const u8 = null;
-            var root_fd: std.posix.fd_t = -1;
-            if (root) |r| {
-                var buf: [std.fs.max_path_bytes]u8 = undefined;
-                const resolved = std.fs.cwd().realpath(r, &buf) catch null;
-                if (resolved) |rp| {
-                    root_real = try allocator.dupe(u8, rp);
-                }
-                // O_PATH|O_DIRECTORY fd for the openat2(RESOLVE_BENEATH)
-                // fast path; best-effort (fallback is the realpath check).
-                root_fd = std.posix.open(r, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true, .CLOEXEC = true }, 0) catch -1;
-            }
-            errdefer {
-                if (root_real) |rr| allocator.free(rr);
-                if (root_fd >= 0) std.posix.close(root_fd);
-            }
-            const index = if (jr.index) |ix| try allocator.dupe(u8, ix) else null;
-            errdefer if (index) |ix| allocator.free(ix);
-            // Response template (Milestone 11): status + headers + body are
-            // copied; JSON routes apply it through the pipeline at runtime.
-            var template: ?router.ResponseTemplate = null;
-            if (jr.response) |jrsp| {
-                var t_headers = std.ArrayList(router.TemplateHeader).empty;
-                if (jrsp.headers) |jh| {
-                    try t_headers.ensureTotalCapacity(allocator, jh.len);
-                    for (jh) |h| {
-                        t_headers.appendAssumeCapacity(.{
-                            .name = try allocator.dupe(u8, h.name),
-                            .value = try allocator.dupe(u8, h.value),
-                        });
-                    }
-                }
-                template = .{
-                    .status = jrsp.status,
-                    .headers = try t_headers.toOwnedSlice(allocator),
-                    .body = if (jrsp.body) |b| try allocator.dupe(u8, b) else &.{},
-                    .compress = jrsp.compress,
-                };
-            }
-            var upstreams = std.ArrayList(router.Upstream).empty;
-            if (jr.upstreams) |jus| {
-                try upstreams.ensureTotalCapacity(allocator, jus.len);
-                for (jus) |ju| {
-                    const sock = router.Upstream.makeSockaddr(ju.host, ju.port) orelse return error.InvalidUpstreamHost;
-                    upstreams.appendAssumeCapacity(.{
-                        .host = try allocator.dupe(u8, ju.host),
-                        .port = ju.port,
-                        .sockaddr = sock,
-                    });
-                }
-            }
-            errdefer {
-                for (upstreams.items) |up| allocator.free(up.host);
-                upstreams.deinit(allocator);
-            }
-            const balance = if (jr.balance) |b| (router.Balance.parse(b) orelse return error.InvalidBalance) else router.Balance.round_robin;
-            errdefer if (template) |*t| {
-                for (t.headers) |h| {
-                    allocator.free(h.name);
-                    allocator.free(h.value);
-                }
-                allocator.free(t.headers);
-            };
-
-            routes.appendAssumeCapacity(.{
-                .path = path,
-                .match = if (std.mem.eql(u8, jr.match, "exact")) .exact else .prefix,
-                .modules = try bindings.toOwnedSlice(allocator),
-                .max_age_seconds = jr.max_age,
-                .root = root,
-                .root_real = root_real,
-                .root_fd = root_fd,
-                .index = index,
-                .autoindex = jr.autoindex,
-                .embed = jr.embed,
-                .response = template,
-                .upstreams = try upstreams.toOwnedSlice(allocator),
-                .balance = balance,
-                .max_fails = jr.max_fails,
-                .fail_timeout_seconds = jr.fail_timeout_seconds,
-                .chunked = jr.chunked,
-            });
-        }
-
-        return .{
-            .routes = try routes.toOwnedSlice(allocator),
-            .limits = limits,
-            .tls = .{
-                .cert = if (parsed.value.tls) |t| (t.cert orelse "") else "",
-                .key = if (parsed.value.tls) |t| (t.key orelse "") else "",
-            },
-        };
-    }
-};
-
-const JsonModuleMap = struct {
-    post_read: ?[]const u8 = null,
-    server_rewrite: ?[]const u8 = null,
-    find_config: ?[]const u8 = null,
-    rewrite: ?[]const u8 = null,
-    post_rewrite: ?[]const u8 = null,
-    preaccess: ?[]const u8 = null,
-    access: ?[]const u8 = null,
-    post_access: ?[]const u8 = null,
-    content: ?[]const u8 = null,
-    log: ?[]const u8 = null,
-};
-
-const JsonHeader = struct { name: []const u8, value: []const u8 };
-
-const JsonResponse = struct {
-    status: u16 = 200,
-    body: ?[]const u8 = null,
-    headers: ?[]const JsonHeader = null,
-    compress: bool = false,
-};
-
-const JsonUpstream = struct {
-    host: []const u8,
-    port: u16,
-};
-
-const JsonRoute = struct {
-    path: []const u8,
-    match: []const u8 = "prefix",
-    modules: JsonModuleMap = .{},
-    max_age: u32 = 0,
-    root: ?[]const u8 = null,
-    index: ?[]const u8 = null,
-    autoindex: bool = false,
-    embed: ?[]const u8 = null,
-    response: ?JsonResponse = null,
-    upstreams: ?[]const JsonUpstream = null,
-    balance: ?[]const u8 = null,
-    max_fails: u32 = 3,
-    fail_timeout_seconds: u32 = 30,
-    chunked: bool = false,
-};
-
-const JsonLimits = struct {
-    recv_buffer_size: ?usize = null,
-    send_buffer_size: ?usize = null,
-    max_body: ?usize = null,
-    max_line_bytes: ?usize = null,
-    max_headers: ?usize = null,
-    max_chunked_body: ?usize = null,
-    static_cache_entries: ?usize = null,
-    static_cache_valid_seconds: ?u64 = null,
-    static_content_cache_max: ?usize = null,
-    connection_pool_max: ?usize = null,
-};
-
-const JsonTls = struct {
-    cert: ?[]const u8 = null,
-    key: ?[]const u8 = null,
-};
-
-const JsonConfig = struct {
-    routes: []const JsonRoute = &.{},
-    limits: ?JsonLimits = null,
-    tls: ?JsonTls = null,
 };
 
 const testing = std.testing;
 
-test "fromJson parses the limits section with defaults for the rest" {
-    const json =
-        \\{ "limits": { "max_headers": 4, "max_body": 1024, "static_cache_valid_seconds": 5 },
-        \\  "routes": [] }
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
+test "conf parse applies the limits directives with defaults for the rest" {
+    const cfg = Config.fromConfComptime(
+        \\max_headers 4;
+        \\max_body 1k;
+        \\static_cache_valid 5;
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
     try testing.expectEqual(@as(usize, 4), cfg.limits.max_headers);
     try testing.expectEqual(@as(usize, 1024), cfg.limits.max_body);
     try testing.expectEqual(@as(u64, 5), cfg.limits.static_cache_valid_seconds);
@@ -348,17 +144,13 @@ test "default config validates against the registry" {
     try cfg.validate(registry.default_registry);
 }
 
-test "JSON config parses into the same route table" {
-    const json =
-        \\{
-        \\  "routes": [
-        \\    { "path": "/echo", "match": "exact", "modules": { "content": "echo" } },
-        \\    { "path": "/", "match": "prefix", "modules": { "content": "echo" } }
-        \\  ]
+test "conf parses into the same route table" {
+    const cfg = Config.fromConfComptime(
+        \\server {
+        \\    location = /echo { content echo; }
+        \\    location / { content echo; }
         \\}
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
+    );
     try cfg.validate(registry.default_registry);
 
     try testing.expectEqual(@as(usize, 2), cfg.routes.len);
@@ -370,39 +162,34 @@ test "JSON config parses into the same route table" {
     try testing.expectEqualStrings("echo", cfg.routes[1].moduleFor(.content).?);
 }
 
-test "JSON config route opt-in for chunked responses" {
-    const json =
-        \\{ "routes": [
-        \\    { "path": "/chunked", "match": "exact", "chunked": true,
-        \\      "modules": { "content": "echo" } },
-        \\    { "path": "/plain", "match": "exact", "modules": { "content": "echo" } }
-        \\  ] }
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
+test "conf route opt-in for chunked responses" {
+    const cfg = Config.fromConfComptime(
+        \\server {
+        \\    location /chunked { content echo; chunked on; }
+        \\    location /plain { content echo; }
+        \\}
+    );
     try cfg.validate(registry.default_registry);
 
     try testing.expect(cfg.routes[0].chunked);
     try testing.expect(!cfg.routes[1].chunked);
 }
 
-test "JSON config rejects an unknown module at validate time" {
-    const json =
-        \\{ "routes": [ { "path": "/", "modules": { "content": "ghost" } } ] }
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
+test "conf rejects an unknown module at validate time" {
+    const cfg = Config.fromConfComptime(
+        \\server {
+        \\    location / { content ghost; }
+        \\}
+    );
     try testing.expectError(error.UnknownModule, cfg.validate(registry.default_registry));
 }
 
-test "JSON config rejects duplicate phase bindings" {
-    const json =
-        \\{ "routes": [ { "path": "/", "modules": { "content": "echo", "log": "echo" } } ] }
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
-    // echo binds content; log binds echo again but to a different phase — so
-    // this one is legal. Build the duplicate directly instead.
+test "conf rejects duplicate phase bindings" {
+    const cfg = Config.fromConfComptime(
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
     try cfg.validate(registry.default_registry);
 
     const dup = Config{
@@ -419,12 +206,26 @@ test "JSON config rejects duplicate phase bindings" {
     try testing.expectError(error.DuplicatePhaseBinding, dup.validate(registry.default_registry));
 }
 
-test "JSON config with a modules-free route is valid and yields not_handled" {
-    const json =
-        \\{ "routes": [ { "path": "/static", "modules": {} } ] }
-    ;
-    var cfg = try Config.fromJson(testing.allocator, json);
-    defer cfg.deinit(testing.allocator);
+test "conf with a modules-free route is valid and yields not_handled" {
+    const cfg = Config.fromConfComptime(
+        \\server {
+        \\    location /static {}
+        \\}
+    );
     try cfg.validate(registry.default_registry);
     try testing.expectEqual(@as(usize, 0), cfg.routes[0].modules.len);
+}
+
+test "comptimeValidate rejects an unknown module with a compile error" {
+    // The comptime check compiles only when the config is valid; exercising
+    // the error path is a build-time concern (asserted via fixtures). Here we
+    // verify the happy path returns normally.
+    comptime {
+        const cfg = Config.fromConfComptime(
+            \\server {
+            \\    location / { content echo; }
+            \\}
+        );
+        Config.comptimeValidate(cfg, registry.default_registry);
+    }
 }

@@ -33,11 +33,6 @@ pub const Server = struct {
     /// Connection idle timeout in seconds, forwarded to every reactor (zero
     /// disables idle reaping).
     idle_timeout_seconds: u32,
-    /// Graceful reload (Milestone 13): set by the embedder along with
-    /// `reload_userdata`; on SIGHUP the loop calls it to get a new HTTP
-    /// handler, swaps in a fresh reactor set and drains the old one.
-    reload_fn: ?*const fn (*anyopaque) ?*const runtime_server.Server = null,
-    reload_userdata: ?*anyopaque = null,
     /// Old reactor sets waiting for their connections to finish.
     draining: std.ArrayList(*reactor.Reactor) = .empty,
     /// Graceful-stop in progress (SIGTERM/SIGINT or `requestGracefulStop`):
@@ -123,8 +118,6 @@ pub const Server = struct {
             .mode = mode,
             .http_handler = http_handler,
             .idle_timeout_seconds = idle_timeout_seconds,
-            .reload_fn = null,
-            .reload_userdata = null,
             .draining = .empty,
         };
         // The reactors' accept counters share the server's counter.
@@ -172,23 +165,20 @@ pub const Server = struct {
 
     /// Blocking event loop. Starts the reactor threads, accepts connections and
     /// dispatches them round-robin; returns when `stop` is called (or an error
-    /// is fatal), then stops and joins all reactor threads. On SIGHUP
-    /// (`reload_requested`), swaps in a fresh reactor set with the reload
-    /// callback's handler and drains the old set.
+    /// is fatal), then stops and joins all reactor threads.
     pub fn run(self: *Server) !void {
         for (self.reactors.items) |r| try r.start();
 
         self.running.store(true, .release);
 
         // With SO_REUSEPORT the reactors accept directly; the main thread
-        // only polls for stop/reload/drain completion.
+        // only polls for stop/drain completion.
         while (self.running.load(.acquire)) {
             // SIGTERM/SIGINT (daemon --stop / --reload-hard swap / Ctrl-C) or
             // a per-server requestGracefulStop (tests): graceful shutdown —
             // stop accepting, let connections finish (per-reactor 30 s cap),
             // then exit.
             if (stop_requested.load(.acquire) or self.graceful_stop_requested.load(.acquire)) self.beginStop();
-            self.maybeReload();
             self.reapDrained();
             if (self.stopping and self.allReactorsDrained()) {
                 self.running.store(false, .release);
@@ -225,45 +215,6 @@ pub const Server = struct {
             if (!r.isDrained()) return false;
         }
         return true;
-    }
-
-    /// SIGHUP reload: re-create the reactor set with the new handler; old
-    /// reactors drain in the background (existing connections finish, no new
-    /// ones are accepted) and are joined once empty.
-    fn maybeReload(self: *Server) void {
-        if (!reload_requested.load(.acquire)) return;
-        reload_requested.store(false, .release);
-        const new_handler = (self.reload_fn orelse return)(self.reload_userdata orelse return) orelse return;
-
-        var new_reactors = std.ArrayList(*reactor.Reactor).empty;
-        new_reactors.ensureTotalCapacity(self.allocator, self.reactors.items.len) catch return;
-        errdefer {
-            for (new_reactors.items) |r| r.deinit();
-            new_reactors.deinit(self.allocator);
-        }
-        for (0..self.reactors.items.len) |i| {
-            // Milestone 14: each reloaded reactor gets its own SO_REUSEPORT
-            // listener (the kernel balances across old + new listeners while
-            // the old ones drain).
-            const listener = sockets.createListeningSocketReusePort(self.port, 4096) catch return;
-            const r = self.allocator.create(reactor.Reactor) catch return;
-            r.* = reactor.Reactor.initWithHandlerListener(self.allocator, i, self.mode, new_handler, self.idle_timeout_seconds, listener) catch {
-                posix.close(listener);
-                self.allocator.destroy(r);
-                return;
-            };
-            new_reactors.appendAssumeCapacity(r);
-        }
-
-        var old = self.reactors;
-        self.reactors = new_reactors;
-        self.http_handler = new_handler;
-        for (self.reactors.items) |r| r.accepted_counter = self.total_accepted;
-        for (old.items) |r| r.drain();
-        self.draining.appendSlice(self.allocator, old.items) catch {};
-        old.deinit(self.allocator);
-        for (self.reactors.items) |r| r.start() catch {};
-        std.debug.print("reloaded: new route table active; draining {d} old reactor(s)\n", .{old.items.len});
     }
 
     /// Join and free drained reactors whose loops have exited.
@@ -462,16 +413,13 @@ fn testDateLine(buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Zocket/" ++ @import("../version.zig").version ++ "\r\n", .{date}) catch unreachable;
 }
 
-test "multi-reactor HTTP with JSON config echoes via the pipeline" {
+test "multi-reactor HTTP with conf config echoes via the pipeline" {
     const allocator = std.heap.page_allocator;
-    const json =
-        \\{ "routes": [
-        \\    { "path": "/echo", "match": "prefix", "modules": { "content": "echo" } }
-        \\  ] }
-    ;
-    var cfg = try runtime_server.Config.fromJson(allocator, json);
-    defer cfg.deinit(allocator);
-    try cfg.validate(runtime_server.default_registry);
+    const cfg = comptime runtime_server.Config.fromConfComptime(
+        \\server {
+        \\    location /echo { content echo; }
+        \\}
+    );
     const srv = runtime_server.Server.init(cfg);
 
     var server = try Server.initWithThreadsAndHandler(allocator, 0, 2, .http, &srv);
@@ -521,29 +469,24 @@ test "multi-reactor HTTP with JSON config echoes via the pipeline" {
 // ---- SIGHUP graceful reload ----
 
 /// Set by the SIGHUP handler (async-signal-safe: an atomic store).
-var reload_requested = std.atomic.Value(bool).init(false);
 /// Set by the SIGTERM/SIGINT handler: the run loop calls `stop()` for a
 /// graceful shutdown (daemon `--stop`, Ctrl-C).
 var stop_requested = std.atomic.Value(bool).init(false);
-
-fn handleHup(_: posix.SIG) callconv(.c) void {
-    reload_requested.store(true, .release);
-}
 
 fn handleTerm(_: posix.SIG) callconv(.c) void {
     stop_requested.store(true, .release);
 }
 
-/// Install the SIGHUP reload and SIGTERM/SIGINT graceful-stop handlers
-/// (called by the embedder, e.g. main).
+/// Install the SIGTERM/SIGINT graceful-stop handlers (called by the
+/// embedder, e.g. main). SIGHUP is deliberately not handled: configs are
+/// comptime-only, so --reload-hard (rebuild + SO_REUSEPORT swap) is the only
+/// reload.
 pub fn installSignalHandlers() void {
     var act = posix.Sigaction{
-        .handler = .{ .handler = handleHup },
+        .handler = .{ .handler = handleTerm },
         .mask = std.mem.zeroes(posix.sigset_t),
         .flags = 0,
     };
-    posix.sigaction(posix.SIG.HUP, &act, null);
-    act.handler = .{ .handler = handleTerm };
     posix.sigaction(posix.SIG.INT, &act, null);
     posix.sigaction(posix.SIG.TERM, &act, null);
 }

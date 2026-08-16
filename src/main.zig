@@ -4,15 +4,14 @@ const zocket = @import("zocket");
 const build_options = @import("build_options");
 
 /// DM2: comptime config as the primary path. When built with
-/// `zig build -Dconfig=<file>`, the JSON config is embedded at compile time
-/// and parsed by the DM1 validator; the server below is built with
+/// `zig build -Dconfig=<file>`, the conf file is embedded at compile time
+/// and parsed by the comptime conf parser; the server below is built with
 /// `Server.comptimeInit`, so the route trie, dispatch functions,
 /// pre-serialised response templates and upstream sockaddrs all live in
 /// .rodata. Invalid configs are compile errors. Null when no build-time
-/// config was given — the runtime `--config` path (secondary) or the default
-/// config is used then.
+/// config was given — the default config is used then.
 const embedded_cfg: ?zocket.runtime.config.Config = if (build_options.config_path) |p|
-    zocket.runtime.config.Config.fromEmbedded(p)
+    zocket.runtime.config.Config.fromConfEmbedded(p)
 else
     null;
 
@@ -20,10 +19,12 @@ const default_pidfile = "/tmp/zocket.pid";
 
 const ServerOpts = struct {
     port: u16 = 8080,
+    /// True when `--port` was given explicitly (the CLI wins over a conf
+    /// `listen` directive; otherwise the conf's `listen_port` applies).
+    port_set: bool = false,
     threads: ?usize = null,
     single: bool = false,
     mode: zocket.reactor.Mode = .http,
-    config_path: ?[]const u8 = null,
     idle_timeout: u32 = zocket.reactor.default_idle_timeout_seconds,
     uring: bool = false,
 };
@@ -38,67 +39,33 @@ fn printUsage() void {
         \\  --stop               stop the daemon (sends SIGTERM; graceful
         \\                       drain of existing connections)
         \\  --status             report whether the daemon is running
-        \\  --reload-soft        runtime reload: the daemon re-parses its
-        \\                       --config in-process (no rebuild)
         \\  --reload-hard        comptime reload: rebuild with the config
         \\                       embedded at compile time (config validated
         \\                       at compile time), start the new daemon,
         \\                       then hand off — old connections drain
-        \\                       (zero downtime; --config overrides the
-        \\                       recorded config path)
+        \\                       (zero downtime; the only reload — configs
+        \\                       are comptime-only)
         \\
         \\Server options:
-        \\  --port <n>           listen port (default 8080)
+        \\  --port <n>           listen port (default 8080; a conf `listen`
+        \\                       directive is overridden by this flag)
         \\  --threads <n>        reactor threads (default: CPU count)
         \\  --single             Milestone 1 single-threaded echo server
         \\  --echo               raw byte-echo protocol
         \\  --http               HTTP/1.1 + h2c prior-knowledge (default)
-        \\  --config <file>      JSON config (routes + per-phase modules)
         \\  --idle-timeout <s>   connection idle timeout, 0 disables
         \\  --uring              use the io_uring I/O backend (experimental)
         \\  --pidfile <file>     pid file for --start/--stop/--status/
-        \\                       --reload-* (default /tmp/zocket.pid)
-        \\                       (default /tmp/zocket.pid)
+        \\                       --reload-hard (default /tmp/zocket.pid)
         \\
         \\Utilities:
-        \\  --validate           parse and validate the config, print the route
-        \\                       table, then exit (0 = valid)
+        \\  --validate           validate the build-time config (compile-time
+        \\                       configs are validated at build; this prints
+        \\                       the route table and exits)
         \\  --version, -v        print the version
         \\  --help, -h           this help
         \\
     , .{});
-}
-
-/// Resolve the effective config: the build-time embedded config (DM2), the
-/// runtime `--config` file (std.json at startup), or the comptime default.
-/// The returned struct owns the config's memory (loaded) and the JSON buffer
-/// (freed right after fromJson, which copies every string).
-const ResolvedConfig = struct {
-    cfg: zocket.runtime.config.Config,
-    json_buf: ?[]u8 = null,
-    loaded: ?zocket.runtime.config.Config = null,
-
-    fn deinit(self: *ResolvedConfig, allocator: std.mem.Allocator) void {
-        if (self.json_buf) |b| allocator.free(b);
-        if (self.loaded) |*l| l.deinit(allocator);
-    }
-};
-
-fn resolveConfig(
-    allocator: std.mem.Allocator,
-    embedded: ?zocket.runtime.config.Config,
-    config_path: ?[]const u8,
-) !ResolvedConfig {
-    if (embedded) |cfg| return .{ .cfg = cfg };
-    if (config_path) |p| {
-        const json_buf = try std.fs.cwd().readFileAlloc(p, allocator, .limited(1 << 20));
-        errdefer allocator.free(json_buf);
-        var loaded = try zocket.runtime.config.Config.fromJson(allocator, json_buf);
-        errdefer loaded.deinit(allocator);
-        try loaded.validate(zocket.dsl.registry.default_registry);
-        return .{ .cfg = loaded, .json_buf = json_buf, .loaded = loaded };
-    }
-    return .{ .cfg = zocket.runtime.config.Config.default() };
 }
 
 fn printConfigSummary(cfg: zocket.runtime.config.Config) void {
@@ -114,6 +81,8 @@ fn printConfigSummary(cfg: zocket.runtime.config.Config) void {
             switch (r.match) {
                 .exact => "exact",
                 .prefix => "prefix",
+                .regex => "regex",
+                .regex_ci => "regex_ci",
             },
         });
         for (r.modules) |b| {
@@ -146,90 +115,41 @@ fn runServer(
     //   1. DM2: the config embedded at build time (`-Dconfig=<file>`); the
     //      server is built at compile time (trie + dispatch specialisation),
     //      everything in .rodata;
-    //   2. the `--config` file, parsed at startup with std.json; its trie is
-    //      built at startup and freed with the server (secondary path);
-    //   3. the comptime default (echo on every path), as `Server.default()`.
-    var resolved = try resolveConfig(allocator, embedded_cfg, opts.config_path);
-    defer resolved.deinit(allocator);
-
+    //   2. the comptime default (echo on every path), as `Server.default()`.
     var http_srv: zocket.runtime.server.Server = if (embedded_cfg) |cfg| blk: {
-        // DM2: module names are validated at startup (the DM1 comptime
-        // parser checks structure/phases; registry membership is a runtime
-        // check, consistent with the runtime `--config` path). Static roots
-        // are resolved at startup too (realpath + O_PATH fd per rooted
-        // route), mirroring the JSON load path.
-        try cfg.validate(zocket.dsl.registry.default_registry);
+        // DM2: registry membership is validated at compile time (comptime
+        // conf parser checks structure/registry via comptimeValidate).
+        // Static roots are resolved at startup too (realpath + O_PATH fd per
+        // rooted route), mirroring the old JSON load path.
+        comptime zocket.runtime.config.Config.comptimeValidate(cfg, zocket.dsl.registry.default_registry);
         break :blk try zocket.runtime.server.Server.embeddedInitWithTls(allocator, cfg);
     } else zocket.runtime.server.Server.default();
-    var http_srv_owns_trie = false;
     defer if (embedded_cfg != null) {
         http_srv.deinitPrepared(allocator);
     };
-    if (resolved.loaded) |cfg| {
-        http_srv = try zocket.runtime.server.Server.initWithTrie(allocator, cfg);
-        http_srv_owns_trie = true;
-    }
-    defer if (http_srv_owns_trie) http_srv.deinit(allocator);
 
     const n = opts.threads orelse (std.Thread.getCpuCount() catch 1);
-    var s = try zocket.multireactor.Server.initWithThreadsAndHandlerTimeout(allocator, opts.port, n, opts.mode, &http_srv, opts.idle_timeout);
+    // Effective port: an explicit CLI --port wins; otherwise the conf's
+    // `listen` directive applies; otherwise the 8080 default.
+    const port = if (opts.port_set) opts.port else if (embedded_cfg) |cfg|
+        (cfg.listen_port orelse opts.port)
+    else
+        opts.port;
+    var s = try zocket.multireactor.Server.initWithThreadsAndHandlerTimeout(allocator, port, n, opts.mode, &http_srv, opts.idle_timeout);
     defer s.deinit();
 
-    // Graceful reload (Milestone 13): SIGHUP re-parses the config and swaps
-    // in a fresh reactor set; old connections drain on the old set. Only
-    // meaningful with a runtime `--config` file (a build-time embedded config
-    // is immutable); old handlers stay alive until process exit.
+    // Signal handlers: SIGTERM/SIGINT graceful stop. SIGHUP is not handled —
+    // configs are comptime-only, so --reload-hard (rebuild + SO_REUSEPORT
+    // swap) is the only reload.
     zocket.multireactor.installSignalHandlers();
-    var reload_handlers = std.ArrayList(*zocket.runtime.server.Server).empty;
-    defer reload_handlers.deinit(allocator);
-    if (embedded_cfg == null) {
-        if (opts.config_path) |path| {
-            const ReloadState = struct {
-                allocator: std.mem.Allocator,
-                config_path: []const u8,
-                handlers: *std.ArrayList(*zocket.runtime.server.Server),
-
-                fn reload(userdata: *anyopaque) ?*const zocket.runtime.server.Server {
-                    const st: *@This() = @ptrCast(@alignCast(userdata));
-                    const json = std.fs.cwd().readFileAlloc(st.config_path, st.allocator, .limited(1 << 20)) catch return null;
-                    defer st.allocator.free(json);
-                    var cfg = zocket.runtime.config.Config.fromJson(st.allocator, json) catch return null;
-                    cfg.validate(zocket.dsl.registry.default_registry) catch return null;
-                    // The config memory must outlive the handler (the server's
-                    // route table points into it); it is freed at process exit
-                    // along with the handler itself (one leak per reload).
-                    const srv = st.allocator.create(zocket.runtime.server.Server) catch return null;
-                    srv.* = zocket.runtime.server.Server.initWithTrie(st.allocator, cfg) catch {
-                        st.allocator.destroy(srv);
-                        return null;
-                    };
-                    st.handlers.append(st.allocator, srv) catch {
-                        st.allocator.destroy(srv);
-                        return null;
-                    };
-                    std.debug.print("reload: config re-parsed\n", .{});
-                    return srv;
-                }
-            };
-            var reload_state = ReloadState{
-                .allocator = allocator,
-                .config_path = path,
-                .handlers = &reload_handlers,
-            };
-            s.reload_fn = ReloadState.reload;
-            s.reload_userdata = &reload_state;
-        }
-    }
 
     switch (opts.mode) {
-        .echo => std.debug.print("Starting multi-reactor TCP echo server on port {} with {} threads\n", .{ opts.port, n }),
+        .echo => std.debug.print("Starting multi-reactor TCP echo server on port {} with {} threads\n", .{ port, n }),
         .http => {
             if (embedded_cfg) |cfg| {
-                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (comptime-embedded config: {d} routes)\n", .{ opts.port, n, cfg.routes.len });
-            } else if (opts.config_path) |p| {
-                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (JSON config: {s})\n", .{ opts.port, n, p });
+                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (comptime-embedded config: {d} routes)\n", .{ port, n, cfg.routes.len });
             } else {
-                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (default config)\n", .{ opts.port, n });
+                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (default config)\n", .{ port, n });
             }
         },
     }
@@ -265,7 +185,7 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
     // project-root-relative: the comptime embed (`@embedFile`) resolves
     // against the project root, so --reload-hard can rebuild with it.
     const project_root = resolveProjectRoot(allocator);
-    var recorded_config = opts.config_path orelse build_options.config_path;
+    var recorded_config = build_options.config_path;
     if (project_root) |root| {
         if (recorded_config) |p| {
             if (std.fs.path.isAbsolute(p)) {
@@ -275,7 +195,12 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
     }
     const state = StateFile{
         .config_path = recorded_config,
-        .port = opts.port,
+        // Record the effective port (CLI --port wins; else conf listen; else
+        // 8080) so --reload-hard reproduces the daemon's listener.
+        .port = if (opts.port_set) opts.port else if (embedded_cfg) |cfg|
+            (cfg.listen_port orelse opts.port)
+        else
+            opts.port,
         .threads = opts.threads,
         .mode = @tagName(opts.mode),
         .idle_timeout = opts.idle_timeout,
@@ -473,8 +398,8 @@ const StateFile = struct {
     uring: bool = false,
     single: bool = false,
     /// True when the daemon runs a comptime-embedded config (built with
-    /// -Dconfig): immutable at runtime, so --reload-soft (SIGHUP reparse)
-    /// cannot apply and --reload-hard is the only way.
+    /// -Dconfig). Configs are comptime-only, so this is always true for
+    /// daemons started from a build; --reload-hard is the only reload.
     embedded: bool = false,
     project_root: ?[]const u8 = null,
 };
@@ -557,35 +482,6 @@ fn rebuild(allocator: std.mem.Allocator, project_root: []const u8, config_path: 
     }
 }
 
-/// Runtime reload (--reload-soft): ask the daemon to re-parse its config
-/// in-process (SIGHUP → the existing Milestone 13 reload machinery). No
-/// rebuild; requires the daemon to run a runtime `--config` (an embedded
-/// comptime config is immutable at runtime — use --reload-hard).
-fn softReload(allocator: std.mem.Allocator, pidfile: []const u8) !void {
-    const pid = readPidfile(allocator, pidfile) catch {
-        std.debug.print("zocket: no pid file at {s} — nothing to reload\n", .{pidfile});
-        return;
-    };
-    if (!processAlive(pid)) {
-        std.debug.print("zocket: daemon pid {d} is not running (stale pid file)\n", .{pid});
-        return;
-    }
-    if (readStateFile(allocator, pidfile)) |st| {
-        var state = st;
-        defer freeStateFile(allocator, &state);
-        if (state.embedded) {
-            std.debug.print("zocket: daemon runs a comptime-embedded config — use --reload-hard\n", .{});
-            return;
-        }
-        if (state.config_path == null) {
-            std.debug.print("zocket: daemon runs without a config — nothing to reload\n", .{});
-            return;
-        }
-    } else |_| {}
-    std.posix.kill(pid, std.posix.SIG.HUP) catch return;
-    std.debug.print("zocket: runtime reload requested (pid {d}) — config re-parsed in-process\n\n", .{pid});
-}
-
 /// Comptime reload (--reload-hard): rebuild the binary with the config
 /// embedded at compile time, start the new daemon, then hand off — the old
 /// daemon drains (stops accepting, closes its SO_REUSEPORT listeners,
@@ -593,6 +489,7 @@ fn softReload(allocator: std.mem.Allocator, pidfile: []const u8) !void {
 /// for new connections: both daemons bind the port via SO_REUSEPORT while
 /// the old one drains. Invalid configs abort at compile time.
 fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u8) !void {
+    _ = opts;
     const old_pid = readPidfile(allocator, pidfile) catch {
         std.debug.print("zocket: no pid file at {s} — nothing to reload\n", .{pidfile});
         return;
@@ -607,12 +504,12 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
     };
     defer freeStateFile(allocator, &state);
 
-    // Config source: --reload-hard --config <file> overrides the recorded
-    // path. The comptime embed (@embedFile) can only reach files inside the
-    // project tree, so the config must resolve there; normalize absolute
-    // paths against the recorded project root.
-    var config_path = opts.config_path orelse state.config_path orelse {
-        std.debug.print("zocket: no config to recompile (daemon started without one; pass --config)\n", .{});
+    // Config source: the recorded path from --start. The comptime embed
+    // (@embedFile) can only reach files inside the project tree, so the
+    // config must resolve there; normalize absolute paths against the
+    // recorded project root.
+    var config_path = state.config_path orelse {
+        std.debug.print("zocket: no config to recompile (daemon started without one)\n", .{});
         return;
     };
     const project_root = state.project_root orelse {
@@ -637,7 +534,7 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
     // Start the new daemon by exec'ing the freshly built binary with the
     // recorded options via `--start` (bind → pid/state files → readiness
     // handshake → exit 0). The config is baked into the binary at compile
-    // time, so no --config at runtime. SO_REUSEPORT: both daemons bind the
+    // time (configs are comptime-only). SO_REUSEPORT: both daemons bind the
     // port while the old one drains, so there is no acceptance gap.
     const exe_path = try std.fmt.allocPrint(allocator, "{s}/zig-out/bin/zocket", .{project_root});
     defer allocator.free(exe_path);
@@ -714,7 +611,6 @@ pub fn main() !void {
     var do_start = false;
     var do_stop = false;
     var do_status = false;
-    var do_reload_soft = false;
     var do_reload_hard = false;
 
     var args = std.process.args();
@@ -725,6 +621,7 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--port")) {
             const v = args.next() orelse return error.MissingPortArgument;
             opts.port = try std.fmt.parseInt(u16, v, 10);
+            opts.port_set = true;
         } else if (std.mem.eql(u8, arg, "--threads")) {
             const v = args.next() orelse return error.MissingThreadsArgument;
             opts.threads = try std.fmt.parseInt(usize, v, 10);
@@ -739,8 +636,6 @@ pub fn main() !void {
             opts.mode = .echo;
         } else if (std.mem.eql(u8, arg, "--http")) {
             opts.mode = .http;
-        } else if (std.mem.eql(u8, arg, "--config")) {
-            opts.config_path = args.next() orelse return error.MissingConfigArgument;
         } else if (std.mem.eql(u8, arg, "--validate")) {
             validate = true;
         } else if (std.mem.eql(u8, arg, "--start")) {
@@ -749,8 +644,6 @@ pub fn main() !void {
             do_stop = true;
         } else if (std.mem.eql(u8, arg, "--status")) {
             do_status = true;
-        } else if (std.mem.eql(u8, arg, "--reload-soft")) {
-            do_reload_soft = true;
         } else if (std.mem.eql(u8, arg, "--reload-hard")) {
             do_reload_hard = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
@@ -777,32 +670,13 @@ pub fn main() !void {
     }
 
     if (validate) {
-        // An explicit --config wins here: the user asks "is THIS file
-        // valid?". The build-time embedded config is the fallback.
-        if (opts.config_path) |p| {
-            const json_buf = std.fs.cwd().readFileAlloc(p, allocator, .limited(1 << 20)) catch |e| {
-                std.debug.print("zocket: cannot read config {s}: {s}\n", .{ p, @errorName(e) });
-                std.process.exit(1);
-            };
-            defer allocator.free(json_buf);
-            var loaded = zocket.runtime.config.Config.fromJson(allocator, json_buf) catch |e| {
-                std.debug.print("zocket: config invalid: {s}\n", .{@errorName(e)});
-                std.process.exit(1);
-            };
-            defer loaded.deinit(allocator);
-            loaded.validate(zocket.dsl.registry.default_registry) catch |e| {
-                std.debug.print("zocket: config invalid: {s}\n", .{@errorName(e)});
-                std.process.exit(1);
-            };
-            printConfigSummary(loaded);
-            return;
+        // Configs are compile-time validated by `-Dconfig`; --validate prints
+        // the built route table (the embedded config, or the default).
+        if (embedded_cfg) |cfg| {
+            printConfigSummary(cfg);
+        } else {
+            printConfigSummary(zocket.runtime.config.Config.default());
         }
-        var resolved = resolveConfig(allocator, embedded_cfg, null) catch |e| {
-            std.debug.print("zocket: config invalid: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        };
-        defer resolved.deinit(allocator);
-        printConfigSummary(resolved.cfg);
         return;
     }
     if (do_stop) {
@@ -811,10 +685,6 @@ pub fn main() !void {
     }
     if (do_status) {
         try statusDaemon(allocator, pidfile);
-        return;
-    }
-    if (do_reload_soft) {
-        try softReload(allocator, pidfile);
         return;
     }
     if (do_reload_hard) {

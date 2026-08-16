@@ -77,7 +77,7 @@ STATIC_MODE=${STATIC_MODE:-0}
 STATIC_SIZES=${STATIC_SIZES:-""}
 STATIC_DIR="$ROOT/bench/.cache/static-1024"
 STATIC_FILE="$STATIC_DIR/static"
-STATIC_CONFIG="$ROOT/bench/.cache/static.json"
+STATIC_CONFIG="$ROOT/bench/.cache/static.conf"
 
 gen_static_file() {
     # $1 = size in bytes. Deterministic xorshift64 fill so the bytes are
@@ -100,16 +100,24 @@ open(sys.argv[2], 'wb').write(out[:n])
 " "$size" "$STATIC_FILE"
     # Zocket config: prefix route "/" rooted at the static dir; the
     # static module resolves /static -> $DIR/static (sendfile >= 16 KB).
-    cat > "$STATIC_CONFIG" <<JSON
-{ "routes": [ { "path": "/", "match": "prefix", "root": "$STATIC_DIR", "modules": { "content": "static" } } ] }
-JSON
+    # Conf files are comptime-only: write a .conf and rebuild with it
+    # (path project-root-relative for the @embedFile reach).
+    cat > "$STATIC_CONFIG" <<CONF
+server {
+    location / {
+        content static;
+        root $STATIC_DIR;
+    }
+}
+CONF
+    (cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig="${STATIC_CONFIG#"$ROOT"/}")
 }
 
 start_servers() {
     # $1 = tcp port, $2 = actix port, $3 = bun port, $4 = httpx port,
     # $5 = nginx port, $6 = caddy port
     if [ "$STATIC_MODE" = "1" ]; then
-        "$TCP_BIN" --port "$1" --threads 4 --config "$STATIC_CONFIG" >/dev/null 2>&1 &
+        "$TCP_BIN" --http --port "$1" --threads 4 >/dev/null 2>&1 &
         ACTIX_STATIC="$STATIC_FILE" "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 &
         BUN_STATIC="$STATIC_FILE" "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 &
         "$HX_BIN" --port "$4" --static "$STATIC_FILE" >/dev/null 2>&1 &

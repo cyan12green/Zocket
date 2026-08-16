@@ -2305,16 +2305,13 @@ test "reactor HTTP 64 KiB POST is echoed with 200 (regression: was 431) and keep
 // A JSON config loaded at runtime, driving requests through the pipeline in a
 // reactor: unmatched requests fall back to the default 404 (no module
 // attached), matched ones go through the echo module.
-test "reactor runs a JSON-config pipeline with default 404 fallback" {
+test "reactor runs a conf-config pipeline with default 404 fallback" {
     const allocator = testing.allocator;
-    const json =
-        \\{ "routes": [
-        \\    { "path": "/only", "match": "exact", "modules": { "content": "echo" } }
-        \\  ] }
-    ;
-    var cfg = try runtime_server.Config.fromJson(allocator, json);
-    defer cfg.deinit(allocator);
-    try cfg.validate(runtime_server.default_registry);
+    const cfg = comptime runtime_server.Config.fromConfComptime(
+        \\server {
+        \\    location = /only { content echo; }
+        \\}
+    );
     const srv = runtime_server.Server.init(cfg);
 
     var r = try Reactor.initWithHandler(allocator, 0, .http, &srv);
@@ -2479,15 +2476,11 @@ test "reactor serves a chunked request end to end" {
 
 test "reactor serves a chunked response when the route opts in" {
     const allocator = testing.allocator;
-    const json =
-        \\{ "routes": [
-        \\    { "path": "/chunked", "match": "exact", "chunked": true,
-        \\      "modules": { "content": "echo" } }
-        \\  ] }
-    ;
-    var cfg = try runtime_server.Config.fromJson(allocator, json);
-    defer cfg.deinit(allocator);
-    try cfg.validate(runtime_server.default_registry);
+    const cfg = comptime runtime_server.Config.fromConfComptime(
+        \\server {
+        \\    location /chunked { content echo; chunked on; }
+        \\}
+    );
     const srv = runtime_server.Server.init(cfg);
 
     var r = try Reactor.initWithHandler(allocator, 0, .http, &srv);

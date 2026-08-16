@@ -3,14 +3,14 @@
 # ALPN h2). Interleaved reps per workload; results land in bench/results/tls/
 # as one req/s per line (rendered by bench/graphs.py).
 #
-# Usage: bash bench/tlsbench.sh   (needs zig-out/bin/zocket with the TLS
-# config, nginx-tls + h2load per AGENTS.md; certs in src/testdata/tls/).
+# Usage: bash bench/tlsbench.sh   (rebuilds zocket with the TLS conf
+# embedded, nginx-tls + h2load per AGENTS.md; certs in src/testdata/tls/).
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 H2LOAD="$ROOT/third_party/nghttp2/src/h2load"
 NGINX="$ROOT/bench/.cache/nginx-tls/sbin/nginx"
 NCONF="$ROOT/bench/.cache/nginx-tls.conf"
-ZCONF="/tmp/opencode/tls-bench-config.json"
+ZCONF="bench/.cache/tls-bench.conf"
 ZPORT=18441
 NPORT=18402
 REPS=8
@@ -20,7 +20,10 @@ mkdir -p "$OUT"
 [ -x "$H2LOAD" ] || { echo "tlsbench: h2load missing (third_party/nghttp2, see AGENTS.md)"; exit 1; }
 [ -x "$NGINX" ] || { echo "tlsbench: nginx-tls missing (build with --with-http_ssl_module --with-http_v2_module)"; exit 1; }
 
-"$ROOT/zig-out/bin/zocket" --http --threads 4 --port $ZPORT --config "$ZCONF" >"$OUT/zocket.log" 2>&1 &
+# Conf files are comptime-only: rebuild with the TLS conf embedded.
+(cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig="$ZCONF")
+
+"$ROOT/zig-out/bin/zocket" --http --threads 4 --port $ZPORT >"$OUT/zocket.log" 2>&1 &
 ZS=$!
 "$NGINX" -c "$NCONF" >"$OUT/nginx.log" 2>&1 &
 NS=$!
