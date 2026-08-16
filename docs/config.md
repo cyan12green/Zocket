@@ -143,3 +143,31 @@ SIGHUP alone (e.g. `kill -HUP <pid>`) still performs the fast runtime
 reparse, identical to `--reload-soft`.
 
 For the other run modes see the README.
+
+## TLS (M18)
+
+The `src/tls/` module provides a native Zig TLS 1.3 server (no OpenSSL):
+ECDSA P-256/P-384 certificates (RSA unsupported — `std.crypto` has none),
+X25519 ECDHE, AES-128-GCM-SHA256 / ChaCha20-Poly1305-SHA256 /
+AES-256-GCM-SHA384, ALPN (`h2` / `http/1.1`), HelloRetryRequest, in-place
+record decryption, and stateless session tickets (PSK resumption). Verified
+against `std.crypto.tls.Client`, `openssl s_client` (handshake, encrypted
+round trip, close_notify) and `openssl s_client -sess_in` (resumption
+reports `Reused, TLSv1.3`).
+
+Enable HTTPS with the `tls` config section:
+
+```json
+{
+  "tls": { "cert": "path/to/cert.pem", "key": "path/to/key.pem" },
+  "routes": [ ... ]
+}
+```
+
+- The cert must be ECDSA (P-256 or P-384); the key must be the matching
+  SEC1 EC private key (PKCS#8 also accepted).
+- A connection is classified on its first record: TLS ClientHello, the
+  HTTP/2 prior-knowledge preface, or HTTP/1.1. ALPN picks `h2` vs
+  `http/1.1` inside TLS; no ALPN means HTTP/1.1.
+- `--validate` prints `tls: enabled/disabled`; without the section the
+  server stays plaintext.

@@ -21,6 +21,16 @@ pub const http = struct {
     pub const arena = @import("http/arena.zig");
 };
 
+pub const tls = struct {
+    pub const conn = @import("tls/conn.zig");
+    pub const session = @import("tls/session.zig");
+    pub const handshake = @import("tls/handshake.zig");
+    pub const record = @import("tls/record.zig");
+    pub const keyschedule = @import("tls/keyschedule.zig");
+    pub const cert = @import("tls/cert.zig");
+    pub const pem = @import("tls/pem.zig");
+    pub const testdata = @import("tls/testdata.zig");
+};
 pub const http2 = struct {
     pub const hpack = @import("http2/hpack.zig");
     pub const frames = @import("http2/frames.zig");
@@ -99,4 +109,10 @@ comptime {
     _ = @import("runtime/server.zig");
     _ = @import("runtime/json_config.zig");
     _ = @import("runtime/json_config_tests.zig");
+    _ = @import("tls/pem.zig");
+    _ = @import("tls/keyschedule.zig");
+    _ = @import("tls/record.zig");
+    _ = @import("tls/cert.zig");
+    _ = @import("tls/handshake.zig");
+    _ = @import("tls/session.zig");
 }

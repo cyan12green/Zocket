@@ -18,8 +18,12 @@ High-performance TCP/HTTP server in Zig.
   pipelining, chunked request bodies, HEAD, 400/413/431/501 handling
 - HTTP/2 (h2c prior-knowledge): HPACK (comptime Huffman + static tables),
   flow control, CONTINUATION, trailers, RST/GOAWAY
+- TLS 1.3 (native Zig, no OpenSSL): ECDSA certs, ALPN h2 + http/1.1,
+  stateless session tickets + PSK resumption, HTTPS end-to-end over h1
+  and h2
 - Chunked transfer responses, per-route opt-in (`"chunked": true`)
-- Automatic protocol detection per connection (h2 preface vs HTTP/1.1)
+- Automatic protocol detection per connection (TLS ClientHello vs h2
+  preface vs HTTP/1.1)
 
 **Config & modules (nginx-style)**
 - Config-driven phase pipeline: 10 nginx phases (post_read … log), prefix/
@@ -93,6 +97,8 @@ just run `python3 bench/graphs.py --run` (full suite + graphs):
 
 ![HTTP/1.1 chunked transfer — Zocket vs nginx, POST echo](bench/graphs/chunked_compare.png)
 
+![HTTP/2 over TLS — Zocket vs nginx, h2load](bench/graphs/tls_compare.png)
+
 ## Tests and benchmarks
 
 - `zig build test` — unit + concurrency + fuzz-smoke tests (206 passing).
@@ -111,6 +117,11 @@ just run `python3 bench/graphs.py --run` (full suite + graphs):
   nginx (POST echo, `chunked: true` route vs nginx `echo_flush`); renders
   `bench/graphs/chunked_compare.png`. Zocket beats nginx 1.4–2.0x across
   body sizes and connection counts.
+- `bench/tlsbench.sh` — HTTP/2 over TLS comparison against nginx
+  (`--with-http_ssl_module --with-http_v2_module`, see
+  `bench/build-nginx-tls.sh`) with `h2load`; renders
+  `bench/graphs/tls_compare.png`. Zocket beats nginx 1.1–2.9x on the
+  multiplexed HTTPS workloads (m=1 parity).
 - `bench/http-check.py`, `bench/echo-check.py` — end-to-end correctness checks.
 
 ## AI Disclosure

@@ -230,6 +230,52 @@ def plot_h2_compare():
     print("h2_compare.png")
 
 
+def plot_tls_compare():
+    """HTTP/2 over TLS, Zocket vs nginx (h2load results from bench/results/tls)."""
+    tdir = os.path.join(ROOT, "bench", "results", "tls")
+    workloads = [
+        ("empty100", "GET /\nm=100 streams"),
+        ("echo100", "GET /echo\nm=100 streams"),
+        ("echo1", "GET /echo\nm=1 stream"),
+        ("static100", "GET /static\nm=100 streams"),
+    ]
+    if not os.path.isdir(tdir):
+        print("tls_compare.png: no bench/results/tls data (run bench/tlsbench.sh first)")
+        return
+    labels = []
+    z_meds, n_meds = [], []
+    for wl, label in workloads:
+        zv = _h2_med(tdir, f"{wl}_z.txt")
+        nv = _h2_med(tdir, f"{wl}_n.txt")
+        if zv is None or nv is None:
+            print(f"tls_compare.png: missing {wl} data, skipping")
+            return
+        labels.append(label)
+        z_meds.append(zv)
+        n_meds.append(nv)
+
+    x = list(range(len(labels)))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    bars = []
+    bars += ax.bar([p - width / 2 for p in x], z_meds, width, label="Zocket", color="#111111")
+    bars += ax.bar([p + width / 2 for p in x], n_meds, width, label="nginx", color="#b22222")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_title("HTTP/2 over TLS (h2 via ALPN) — Zocket vs nginx, h2load, 4 connections (req/s, higher is better)", fontsize=11)
+    ax.set_ylabel("req/s")
+    for bar, v in zip(bars, z_meds + n_meds):
+        ax.text(bar.get_x() + bar.get_width() / 2, v, f"{v:,.0f}",
+                ha="center", va="bottom", fontsize=7)
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.ticklabel_format(axis="y", style="sci", scilimits=(4, 4))
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "tls_compare.png"), dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print("tls_compare.png")
+
+
 def _h2_med(h2dir, name):
     """Median of the per-rep req/s values; None when no valid data."""
     path = os.path.join(h2dir, name)
@@ -317,6 +363,7 @@ def main():
     plot_static()
     plot_nginx_compare()
     plot_h2_compare()
+    plot_tls_compare()
     plot_chunked_compare()
     print("done")
 

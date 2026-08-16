@@ -128,6 +128,29 @@ Zocket's single-chunk framing wins ~2x.
 | POST echo 8 KB, 100 conns | 121,147 | 62,494 | **Zocket 1.94x** |
 | POST echo 8 KB, 1000 conns | 93,064 | 64,762 | **Zocket 1.44x** |
 
+### HTTP/2 over TLS (h2 via ALPN) — Zocket vs nginx (h2load)
+
+Date: 2026-08-16. Load generator: `h2load` (nghttp2/1.59.0), `-c 4 -m
+<streams>`, 100k requests, TLS 1.3 (AES_128_GCM_SHA256), self-signed
+cert. nginx-tls: nginx 1.28.0 with `--with-http_ssl_module
+--with-http_v2_module` + echo-nginx-module (see `bench/build-nginx-tls.sh`);
+Zocket: the native Zig TLS 1.3 server (M17/M18) with `tls` config section.
+Interleaved, warm-up rep discarded, 8 reps; medians (req/s).
+
+| workload (4 conns) | Zocket | nginx | vs |
+|---|---:|---:|---:|
+| GET / (empty), m=100 | 423,531 | 151,535 | **Zocket 2.79x** |
+| GET /echo, m=100 | 380,179 | 135,517 | **Zocket 2.81x** |
+| GET /echo, m=1 | 65,527 | 73,671 | 0.89x (parity) |
+| GET /static (1 KB), m=100 | 91,459 | 95,177 | 0.96x (parity) |
+
+TLS costs Zocket ~15-20% over the h2c numbers (460k → 380k on echo m=100)
+while nginx loses ~9%; the multiplexed workloads still lead by ~2.8x.
+m=1 is latency-bound and lands at parity, as does the 1 KB static file
+(the benchmark file exceeds the 16 KB content-cache threshold only at
+larger sizes; static results sit at parity run-to-run on this shared
+workstation).
+
 ## Reproducing
 
 ```sh
@@ -150,6 +173,9 @@ bash bench/h2bench.sh
 
 # chunked transfer vs nginx (needs nginx-v2 + echo-nginx-module)
 bash bench/chunked-bench.sh
+
+# HTTP/2 over TLS vs nginx (needs nginx-tls: --with-http_ssl_module --with-http_v2_module)
+bash bench/tlsbench.sh
 
 # graphs for everything (matrix/static/nginx/h2/chunked)
 python3 bench/graphs.py

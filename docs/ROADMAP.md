@@ -681,24 +681,29 @@ present at comptime.
 
 ### M17 — TLS/HTTPS
 
-**Status: PLANNED**. Server-side TLS (1.2/1.3) with SNI and ALPN.
-Prerequisite for HTTP/2 on the internet (ALPN `h2`) and for HTTP/3.
+**Status: DONE** (native, no OpenSSL). Server-side TLS 1.3 with ALPN
+(`h2` / `http/1.1`), delivered as a native Zig implementation in
+`src/tls/` — `std.crypto` has a client but no server, so this is written
+from the RFCs (RFC 8446/8448 vectors).
 
-- **Backend**: OpenSSL C bindings (the repo's raw-syscall style already
-  holds C deps via third-party submodules). `std.crypto.tls` is deferred
-  (immature in the pinned snapshot); the choice is documented in the
-  module. Per-listener cert/key from the config (`limits`-style section or
-  a `server` block: `ssl_certificate`, `ssl_certificate_key`,
-  `ssl_protocols`).
-- **Handshake**: accept-time async handshake on the reactor (the epoll
-  loop already drives fd readiness); session resumption (TLS 1.3 0-RTT
-  later), SNI to select the cert, ALPN to select h2/h1.
-- **Write path**: the response serializer feeds the OpenSSL BIO; sendfile
-  falls back to buffered writes under TLS (no file splicing through TLS).
+- **Backend**: no C deps. ECDSA P-256/P-384 certificates (RSA unsupported
+  — `std.crypto` has none), X25519 ECDHE, AES-128-GCM-SHA256 /
+  ChaCha20-Poly1305-SHA256 / AES-256-GCM-SHA384, HRR, in-place record
+  decryption. Per-listener cert/key from the config `tls` section
+  (`cert`, `key`).
+- **Handshake**: drive-the-session on the reactor (the epoll loop already
+  drives fd readiness); M18 added stateless session tickets + PSK
+  resumption (`openssl s_client -sess_in` reports `Reused, TLSv1.3`);
+  SNI not needed (single cert per listener). ALPN selects h2/h1.
+- **Write path**: the response serializer feeds the TLS session; sendfile
+  falls back to memory-buffered bodies under TLS (no file splicing
+  through TLS).
 
-**Verification**: `openssl s_client -tls1_3 -alpn h2`, curl https, h2spec
-over TLS, and the standard A/B (the cipher path adds measurable
-per-request cost — document it separately from plaintext numbers).
+**Verification**: `openssl s_client -tls1_3 -alpn h2`, curl https
+(h1 + h2), h2spec over TLS, resumption via `-sess_out`/`-sess_in`, and
+the standard A/B — `bench/tlsbench.sh` (Zocket leads the multiplexed
+workloads 1.1-2.9x vs nginx; m=1 parity; per-request TLS cost is ~15%
+over the h2c numbers, documented in `bench/BENCH.md`).
 
 ---
 
@@ -710,6 +715,10 @@ protocol switching: on `Connection: upgrade` + `Upgrade: <proto>` return
 session becomes a raw byte pipe, or a websocket content module owns the
 connection). RFC 6455 framing (FIN/opcode/mask/length) for a native
 websocket echo module; upstream passthrough for proxied `ws://`.
+
+(Note: the M18 session-ticket work originally planned under M17 was
+delivered there — TLS reactor integration, config `tls`, resumption
+tickets and HTTPS benchmarks landed with M17/M18's TLS scope.)
 
 **Verification**: ws clients (e.g. `websocat`), the existing socketpair
 reactor tests extended for the post-101 raw phase.
@@ -819,9 +828,9 @@ Details:
 
 ## Suggested starting milestone (next session)
 
-**M16 — HTTP/2** is the next milestone: the biggest remaining gap versus
-nginx, self-contained on the existing transport, and the prerequisite for
-the gRPC/observability track. It should start with framing + HPACK +
-single-stream correctness, then multiplexing and the A/B vs HTTP/1.1.
-M17 (TLS) can proceed in parallel once the OpenSSL binding pattern is
-established.
+**M18 — WebSocket and connection upgrade** is the next milestone: protocol
+switching on `Connection: upgrade` (the reactor already classifies
+`upgrade`), RFC 6455 framing for a native websocket echo module, and
+proxied `ws://` passthrough. M17/M18's TLS scope (reactor integration,
+config `tls`, resumption tickets, HTTPS benchmarks) is complete; the
+HTTP/3 + QUIC track (M19) is the other candidate.

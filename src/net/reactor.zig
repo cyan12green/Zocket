@@ -15,6 +15,8 @@ const iouring_mod = @import("iouring.zig");
 const limits_mod = @import("../dsl/limits.zig");
 const version_mod = @import("../version.zig");
 const http2_session = @import("../http2/session.zig");
+const tls_conn = @import("../tls/conn.zig");
+const buffer_mod = @import("buffer.zig");
 const http2_frames = @import("../http2/frames.zig");
 
 /// I/O backend selection. Default: epoll (measured at parity with the ring
@@ -46,9 +48,21 @@ const HttpSession = struct {
     parser: http_parser.Parser,
     req: http_parser.Request,
     /// HTTP/2 session (Milestone 16), created lazily when the connection
-    /// preface is detected. When non-null the connection is in HTTP/2 mode
-    /// and `parser`/`req` are unused.
+    /// preface is detected (or negotiated over TLS via ALPN). When non-null
+    /// the connection is in HTTP/2 mode and `parser`/`req` are unused.
     h2: ?http2_session.Session = null,
+    /// TLS 1.3 session (M18): created lazily when the first record looks
+    /// like a ClientHello. When non-null the recv buffer holds ciphertext;
+    /// the plaintext lands in `tls_plain` and the parser reads from there.
+    tls: ?tls_conn.TlsConn = null,
+    /// Decrypted plaintext for the HTTP parser (TLS connections only).
+    tls_plain: buffer_mod.Buffer = undefined,
+    tls_plain_data: [16 * 1024]u8 = undefined,
+    /// Staging for takeOut/takePlaintext and the serialized response head.
+    tls_scratch: [16 * 1024 + 64]u8 = undefined,
+    /// Response head staging for TLS serialization.
+    tls_stage: buffer_mod.Buffer = undefined,
+    tls_stage_data: [16 * 1024]u8 = undefined,
     /// Reusable h2 output-buffer scratch (kept across processHttp2 calls so
     /// response frames never reallocate per request).
     h2_out: std.ArrayList(u8) = .empty,
@@ -103,6 +117,11 @@ const HttpSession = struct {
 /// owns it exclusively from that point on, so the connection map and all
 /// epoll_ctl calls for a given fd are confined to this thread.
 pub const Reactor = struct {
+    /// Re-entrancy guard for the TLS processing path: flushHttp's recursion
+    /// (finalizeFlush → processHttp) re-enters processHttpTls while the
+    /// outer call is mid-accounting (plaintext not yet advanced); the
+    /// recursion must not re-process it.
+    tls_processing: bool = false,
     allocator: std.mem.Allocator,
     id: usize,
     mode: Mode,
@@ -608,9 +627,31 @@ pub const Reactor = struct {
             const session = self.http_sessions.getPtr(fd) orelse return;
             const conn = self.connections.get(fd) orelse return;
             // HTTP/1 stops parsing while a response is being flushed (the
-            // pipelined request bytes stay buffered); HTTP/2 must keep
-            // reading (WINDOW_UPDATE, PING, RST_STREAM) while writing.
-            if (session.writing and session.h2 == null) return;
+            // pipelined request bytes stay buffered); HTTP/2 and TLS must
+            // keep reading while writing (h2 control frames; the TLS
+            // handshake's client Finished arrives while the flight flushes).
+            if (session.writing and session.h2 == null and
+                (session.tls == null or session.tls.?.stage() == .application)) return;
+
+            // TLS detection (M18): a connection whose first record is a
+            // ClientHello (handshake record type 22, legacy version 3.x,
+            // handshake type 1) switches to the TLS 1.3 session.
+            if (session.tls == null and session.h2 == null) {
+                const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
+                if (recv_slice.len >= 6 and recv_slice[0] == 0x16 and recv_slice[1] == 0x03 and recv_slice[5] == 0x01) {
+                    if (self.http_handler) |handler| {
+                        if (handler.tls_creds) |*creds| {
+                            session.tls = tls_conn.TlsConn.init(creds);
+                            session.tls_plain = buffer_mod.Buffer.fromSlice(&session.tls_plain_data);
+                            session.tls_stage = buffer_mod.Buffer.fromSlice(&session.tls_stage_data);
+                        }
+                    }
+                }
+            }
+            if (session.tls != null) {
+                self.processHttpTls(fd, &session.tls.?);
+                return;
+            }
 
             // HTTP/2 detection (h2c prior knowledge, RFC 9113 §3.4): a
             // connection whose first bytes are the client preface switches to
@@ -659,140 +700,12 @@ pub const Reactor = struct {
                     return;
                 },
                 .complete => {
-                    session.resp = http_response.Response.init(.ok);
-                    var ctx = dsl_pipeline.Context{
-                        .req = &session.req,
-                        .resp = &session.resp,
-                        .allocator = self.allocator,
-                        .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0 },
-                        .stats = self.stats,
-                        .static_cache = &self.static_cache,
-                        .limits = &self.limits,
-                    };
-                    const handler = self.http_handler orelse &default_http_handler;
-
-                    // Milestone 11 fast path: module-less response-template
-                    // routes are written straight from their pre-serialised
-                    // bytes (status line + template headers + Connection +
-                    // Content-Length + body), byte-identical to the pipeline
-                    // equivalent but with zero dispatch.
-                    if (handler.matchFast(&ctx)) |fb| {
-                        const close = !session.req.keep_alive;
-                        conn.send_buf.compact();
-                        _ = conn.send_buf.writeSlice(fb.head);
-                        var hdr_buf: [96]u8 = undefined;
-                        const hdr = std.fmt.bufPrint(&hdr_buf, "Connection: {s}\r\nContent-Length: {d}\r\n\r\n", .{
-                            if (close) "close" else "keep-alive",
-                            fb.body.len, // HEAD keeps the would-be body length
-                        }) catch unreachable;
-                        _ = conn.send_buf.writeSlice(hdr);
-                        if (session.req.method != .head) {
-                            _ = conn.send_buf.writeSlice(fb.body);
-                        }
-                        session.close_after_write = close;
-                        if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
-                        self.markWriting(fd);
-                        session.writing = true;
-                        self.flushHttp(fd);
-                        if (!self.connections.contains(fd)) return;
-                        const sess = self.http_sessions.getPtr(fd) orelse return;
-                        if (!sess.writing) continue; // flushed fully; next pipelined request
-                        sess.out_armed = true;
-                        self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
-                        return;
-                    }
-
-                    const request_outcome = handler.handleRequest(&ctx) catch {
-                        self.respondAndClose(fd, .internal_error);
-                        return;
-                    };
-                    if (request_outcome == .not_handled) {
-                        // No module claimed the request (no route matched, a
-                        // short-circuit, or no module attached): default 404.
-                        session.resp = http_response.Response.init(.not_found);
-                        session.resp.setBody(http_response.Status.not_found.reasonPhrase());
-                    }
-                    const close = ctx.close_after_write or !session.req.keep_alive;
-                    session.resp.setHeader("Connection", if (close) "close" else "keep-alive");
-                    // nginx-parity headers, both effectively free: Date comes
-                    // from the once-per-second cache, Server is a comptime
-                    // literal.
-                    session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
-                    session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
-                    conn.send_buf.compact();
-                    // The head (fast single-pass writer, fast itoa) goes into
-                    // the send buffer, the body stays put: one writev of two
-                    // iovs. (Sending the head as many iovec segments instead
-                    // cost more kernel iov handling than the serialisation
-                    // saved — measured -8% on the echo workload.)
-                    // Chunked routes (config `chunked: true`) use three iovs:
-                    // head+size line, body, terminator.
-                    const is_head = session.req.method == .head;
-                    const chunked = session.resp.chunked and
-                        session.resp.status != .not_modified;
-                    if (chunked) {
-                        // HEAD claims no body: size line omitted, only the
-                        // empty-chunk terminator is sent. Sendfile bodies
-                        // frame `file_len` bytes (the size line is known at
-                        // head time; the terminator flushes after sendfile).
-                        const cl: usize = if (is_head) 0 else if (session.resp.body_from_file) session.resp.file_len else session.resp.body.len;
-                        const framing = session.resp.writeChunkedHeadToBuffer(&conn.send_buf, cl, &session.tail_scratch) catch {
-                            self.freeResponseBody(session);
-                            self.removeConnection(fd);
-                            return;
-                        };
-                        _ = framing.head_len; // head+size in send_buf, body is its own iov
-                        session.pending_tail = framing.tail;
-                    } else if (session.resp.body_from_file) {
-                        session.pending_tail = &.{};
-                        session.resp.writeHeadToBufferWithLength(&conn.send_buf, session.resp.file_len) catch {
-                            self.freeResponseBody(session);
-                            self.removeConnection(fd);
-                            return;
-                        };
-                    } else {
-                        session.pending_tail = &.{};
-                        session.resp.writeHeadToBuffer(&conn.send_buf) catch {
-                            self.freeResponseBody(session);
-                            self.removeConnection(fd);
-                            return;
-                        };
-                    }
-                    if (session.req.method == .head or session.resp.body.len == 0) {
-                        session.pending_body = &.{};
-                        session.pending_body_owned = false;
-                        self.freeResponseBody(session);
-                    } else {
-                        session.pending_body = session.resp.body;
-                        session.pending_body_owned = session.resp.body_owned;
-                    }
-                    if (session.resp.body_from_file) {
-                        // Take ownership of the module's fd; the body goes via
-                        // sendfile once the head has flushed. Cached fds stay
-                        // with the cache.
-                        session.file_fd = session.resp.file_fd;
-                        session.file_fd_cached = session.resp.file_fd_cached;
-                        session.file_offset = session.resp.file_offset;
-                        session.file_remaining = if (session.req.method == .head) 0 else session.resp.file_len;
-                    }
-                    session.close_after_write = close;
-                    if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
-                    self.markWriting(fd);
-                    session.writing = true;
-                    self.flushHttp(fd);
-                    if (!self.connections.contains(fd)) return;
-                    const sess = self.http_sessions.getPtr(fd) orelse return;
-                    if (!sess.writing) continue; // flushed fully; next pipelined request
-                    // Partially flushed: re-arm EPOLLOUT (epoll_ctl MOD
-                    // re-evaluates readiness, so this delivers the event).
-                    sess.out_armed = true;
-                    self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
+                    if (self.handleHttpRequest(fd, false)) continue;
                     return;
                 },
             }
         }
     }
-
 
     /// Drain the ring's completions (called when the ring fd is epoll-ready)
     /// and dispatch them; then resubmit reads for connections without one.
@@ -1007,6 +920,19 @@ pub const Reactor = struct {
             }
             sess.parser.deinit();
             sess.req.deinit();
+            if (sess.tls) |*tc| {
+                // Best-effort close_notify before the FIN, then drain.
+                if (tc.stage() == .application) {
+                    tc.shutdown() catch {};
+                    var out: [4096]u8 = undefined;
+                    const m = tc.takeOut(&out);
+                    if (m > 0) {
+                        _ = posix.write(conn.fd, out[0..m]) catch {};
+                    }
+                }
+                tc.deinit();
+            }
+            if (sess.h2) |*h2| h2.deinit();
         }
     }
 
@@ -1212,12 +1138,399 @@ pub const Reactor = struct {
         }
     }
 
+    /// Handle one parsed HTTP request: run the pipeline, serialize the
+    /// response, flush. `tls_mode` routes the response through the TLS
+    /// session (encrypted) instead of the writev/sendfile path. Returns
+    /// true when the caller should continue parsing the next pipelined
+    /// request (plaintext only; TLS processes one request per pass).
+    fn handleHttpRequest(self: *Reactor, fd: posix.fd_t, tls_mode: bool) bool {
+        const conn = self.connections.get(fd) orelse return false;
+        const session = self.http_sessions.getPtr(fd) orelse return false;
+        const close0 = !session.req.keep_alive;
+        session.resp = http_response.Response.init(.ok);
+        var ctx = dsl_pipeline.Context{
+            .req = &session.req,
+            .resp = &session.resp,
+            .allocator = self.allocator,
+            .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0 },
+            .stats = self.stats,
+            .static_cache = &self.static_cache,
+            .limits = &self.limits,
+        };
+        const handler = self.http_handler orelse &default_http_handler;
+
+        if (!tls_mode) {
+            // Milestone 11 fast path: module-less response-template routes are
+            // written straight from their pre-serialised bytes (status line +
+            // template headers + Connection + Content-Length + body),
+            // byte-identical to the pipeline equivalent but with zero dispatch.
+            if (handler.matchFast(&ctx)) |fb| {
+                conn.send_buf.compact();
+                _ = conn.send_buf.writeSlice(fb.head);
+                var hdr_buf: [96]u8 = undefined;
+                const hdr = std.fmt.bufPrint(&hdr_buf, "Connection: {s}\r\nContent-Length: {d}\r\n\r\n", .{
+                    if (close0) "close" else "keep-alive",
+                    fb.body.len, // HEAD keeps the would-be body length
+                }) catch unreachable;
+                _ = conn.send_buf.writeSlice(hdr);
+                if (session.req.method != .head) {
+                    _ = conn.send_buf.writeSlice(fb.body);
+                }
+                session.close_after_write = close0;
+                if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+                self.markWriting(fd);
+                session.writing = true;
+                self.flushHttp(fd);
+                if (!self.connections.contains(fd)) return false;
+                const sess = self.http_sessions.getPtr(fd) orelse return false;
+                if (!sess.writing) return true; // flushed fully; next pipelined request
+                sess.out_armed = true;
+                self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
+                return false;
+            }
+        }
+
+        const request_outcome = handler.handleRequest(&ctx) catch {
+            self.respondAndClose(fd, .internal_error);
+            return false;
+        };
+        if (request_outcome == .not_handled) {
+            // No module claimed the request (no route matched, a
+            // short-circuit, or no module attached): default 404.
+            session.resp = http_response.Response.init(.not_found);
+            session.resp.setBody(http_response.Status.not_found.reasonPhrase());
+        }
+        const close = ctx.close_after_write or !session.req.keep_alive;
+        session.resp.setHeader("Connection", if (close) "close" else "keep-alive");
+        // nginx-parity headers, both effectively free: Date comes
+        // from the once-per-second cache, Server is a comptime literal.
+        session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
+        session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
+        conn.send_buf.compact();
+
+        if (tls_mode) {
+            self.handleHttpResponseTls(fd, close);
+            return false;
+        }
+
+        // The head (fast single-pass writer, fast itoa) goes into
+        // the send buffer, the body stays put: one writev of two
+        // iovs. (Sending the head as many iovec segments instead
+        // cost more kernel iov handling than the serialisation
+        // saved — measured -8% on the echo workload.)
+        // Chunked routes (config `chunked: true`) use three iovs:
+        // head+size line, body, terminator.
+        const is_head = session.req.method == .head;
+        const chunked = session.resp.chunked and
+            session.resp.status != .not_modified;
+        if (chunked) {
+            // HEAD claims no body: size line omitted, only the
+            // empty-chunk terminator is sent. Sendfile bodies
+            // frame `file_len` bytes (the size line is known at
+            // head time; the terminator flushes after sendfile).
+            const cl: usize = if (is_head) 0 else if (session.resp.body_from_file) session.resp.file_len else session.resp.body.len;
+            const framing = session.resp.writeChunkedHeadToBuffer(&conn.send_buf, cl, &session.tail_scratch) catch {
+                self.freeResponseBody(session);
+                self.removeConnection(fd);
+                return false;
+            };
+            _ = framing.head_len; // head+size in send_buf, body is its own iov
+            session.pending_tail = framing.tail;
+        } else if (session.resp.body_from_file) {
+            session.pending_tail = &.{};
+            session.resp.writeHeadToBufferWithLength(&conn.send_buf, session.resp.file_len) catch {
+                self.freeResponseBody(session);
+                self.removeConnection(fd);
+                return false;
+            };
+        } else {
+            session.pending_tail = &.{};
+            session.resp.writeHeadToBuffer(&conn.send_buf) catch {
+                self.freeResponseBody(session);
+                self.removeConnection(fd);
+                return false;
+            };
+        }
+        if (session.req.method == .head or session.resp.body.len == 0) {
+            session.pending_body = &.{};
+            session.pending_body_owned = false;
+            self.freeResponseBody(session);
+        } else {
+            session.pending_body = session.resp.body;
+            session.pending_body_owned = session.resp.body_owned;
+        }
+        if (session.resp.body_from_file) {
+            // Take ownership of the module's fd; the body goes via
+            // sendfile once the head has flushed. Cached fds stay
+            // with the cache.
+            session.file_fd = session.resp.file_fd;
+            session.file_fd_cached = session.resp.file_fd_cached;
+            session.file_offset = session.resp.file_offset;
+            session.file_remaining = if (session.req.method == .head) 0 else session.resp.file_len;
+        }
+        session.close_after_write = close;
+        if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+        self.markWriting(fd);
+        session.writing = true;
+        self.flushHttp(fd);
+        if (!self.connections.contains(fd)) return false;
+        const sess = self.http_sessions.getPtr(fd) orelse return false;
+        if (!sess.writing) return true; // flushed fully; next pipelined request
+        // Partially flushed: re-arm EPOLLOUT (epoll_ctl MOD
+        // re-evaluates readiness, so this delivers the event).
+        sess.out_armed = true;
+        self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
+        return false;
+    }
+
+    /// TLS response path (M18): the head and body go through the TLS session
+    /// (encrypted); the ciphertext lands in the send buffer and flushes like
+    /// the plaintext path. Sendfile is disabled over TLS — file bodies are
+    /// read into memory (the static content cache covers small files).
+    fn handleHttpResponseTls(self: *Reactor, fd: posix.fd_t, close: bool) void {
+        const conn = self.connections.get(fd) orelse return;
+        const session = self.http_sessions.getPtr(fd) orelse return;
+        const tc = &session.tls.?;
+
+        // File bodies: read into memory (no sendfile over TLS in M18).
+        if (session.resp.body_from_file) {
+            const file_len: usize = @intCast(session.resp.file_len);
+            const fbuf = self.allocator.alloc(u8, file_len) catch {
+                self.removeConnection(fd);
+                return;
+            };
+            var got: usize = 0;
+            while (got < file_len) {
+                const n = posix.read(session.resp.file_fd, fbuf[got..]) catch break;
+                if (n == 0) break;
+                got += n;
+            }
+            if (!session.resp.file_fd_cached) posix.close(session.resp.file_fd);
+            session.resp.setBody(fbuf[0..got]);
+            session.resp.body_owned = true;
+            session.resp.body_from_file = false;
+        }
+
+        // Serialize the head into the staging buffer, then push head + body
+        // through the TLS session.
+        session.tls_stage.compact();
+        session.resp.writeHeadToBuffer(&session.tls_stage) catch {
+                self.freeResponseBody(session);
+            self.removeConnection(fd);
+            return;
+        };
+        tc.write(session.tls_stage.peek()) catch {
+                self.freeResponseBody(session);
+            self.removeConnection(fd);
+            return;
+        };
+        if (session.req.method != .head and session.resp.body.len > 0) {
+            tc.write(session.resp.body) catch {
+                        self.freeResponseBody(session);
+                self.removeConnection(fd);
+                return;
+            };
+        }
+        self.freeResponseBody(session);
+
+        // Drain the produced records into the send buffer and flush.
+        var drained: usize = 0;
+        while (true) {
+            const oslice = tc.takeOutSlice();
+            if (oslice.len == 0) break;
+            drained += oslice.len;
+            // Grow to fit the whole batch: takeOutSlice returns the entire
+            // out buffer at once, so a doubling grow would truncate the
+            // writeSlice below and silently drop records.
+            if (conn.send_buf.availableWrite() < oslice.len) {
+                if (conn.send_buf.data.len < connection.Connection.max_recv_buffer) {
+                    conn.send_buf.grow(self.allocator, @min(connection.Connection.max_recv_buffer, conn.send_buf.data.len + oslice.len)) catch {
+                        self.removeConnection(fd);
+                        return;
+                    };
+                } else {
+                    self.removeConnection(fd);
+                    return;
+                }
+            }
+            _ = conn.send_buf.writeSlice(oslice);
+            tc.consumeOut(oslice.len);
+        }
+        session.close_after_write = close;
+        if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+        self.markWriting(fd);
+        session.writing = true;
+        self.flushHttp(fd);
+        if (!self.connections.contains(fd)) return;
+        const sess = self.http_sessions.getPtr(fd) orelse return;
+        if (sess.writing) {
+            sess.out_armed = true;
+            self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
+        }
+    }
+
+    /// Drive the TLS 1.3 session for `fd` (M18): feed the buffered ciphertext,
+    /// drain produced records to the socket, and once the handshake is done,
+    /// feed the decrypted plaintext into the HTTP parser (or the h2 session
+    /// when ALPN negotiated h2). The response path routes through
+    /// `tls_conn.write`; the ciphertext is flushed via the normal send buffer.
+    fn processHttpTls(self: *Reactor, fd: posix.fd_t, tc: *tls_conn.TlsConn) void {
+        if (self.tls_processing) return; // re-entrant from a flush recursion
+        self.tls_processing = true;
+        defer self.tls_processing = false;
+        const conn = self.connections.get(fd) orelse return;
+        const session = self.http_sessions.getPtr(fd) orelse return;
+
+        // Feed all buffered ciphertext into the TLS session.
+        const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
+        if (recv_slice.len > 0) {
+            tc.feed(recv_slice) catch {
+                        self.removeConnection(fd);
+                return;
+            };
+            conn.recv_buf.read_pos = conn.recv_buf.write_pos;
+        }
+
+        // Drain produced records into the send buffer and flush.
+        var wrote = false;
+        while (true) {
+            const oslice = tc.takeOutSlice();
+            if (oslice.len == 0) break;
+            if (conn.send_buf.availableWrite() < oslice.len) {
+                if (conn.send_buf.data.len < connection.Connection.max_recv_buffer) {
+                    conn.send_buf.grow(self.allocator, @min(connection.Connection.max_recv_buffer, conn.send_buf.data.len + oslice.len)) catch {
+                        self.removeConnection(fd);
+                        return;
+                    };
+                } else {
+                    self.removeConnection(fd);
+                    return;
+                }
+            }
+            _ = conn.send_buf.writeSlice(oslice);
+            tc.consumeOut(oslice.len);
+            wrote = true;
+        }
+        if (wrote) {
+            self.markWriting(fd);
+            session.writing = true;
+            self.flushHttp(fd);
+            if (!self.connections.contains(fd)) return;
+            const sess = self.http_sessions.getPtr(fd) orelse return;
+            if (sess.writing) {
+                sess.out_armed = true;
+                self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
+                return;
+            }
+            const s2 = self.http_sessions.getPtr(fd) orelse return;
+            if (s2.tls == null) return;
+        }
+
+        // The handshake is done: parse the decrypted plaintext.
+        if (tc.stage() != .application) return;
+        if (self.connections.get(fd) == null) {
+            return;
+        }
+        const sess = self.http_sessions.getPtr(fd) orelse {
+            return;
+        };
+
+        // Route to the h2 session when ALPN negotiated it.
+        if (sess.h2 == null and std.mem.eql(u8, tc.alpn(), "h2")) {
+            sess.h2 = http2_session.Session.init(self.allocator);
+            if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+        }
+
+        // Drain ALL pending plaintext (one feed can decrypt several records;
+        // the staging buffer grows for bodies larger than one record) and
+        // process until no progress is possible. A single pass would stall
+        // requests larger than the staging buffer: the remaining plaintext
+        // waits for an EPOLLIN that never comes (the client is waiting for
+        // the response).
+        while (true) {
+            if (sess.h2) |*h2s| {
+                // Zero-copy: the h2 session parses straight out of the TLS
+                // session's plaintext buffer; only consumed bytes advance.
+                const plain = tc.plaintextSlice();
+                if (plain.len == 0) break;
+                const consumed = self.processHttp2From(fd, h2s, plain);
+                tc.consumePlaintext(consumed);
+                if (consumed == 0) break; // no progress possible
+            } else {
+                if (sess.tls_plain.availableWrite() == 0) sess.tls_plain.compact();
+                const p = tc.takePlaintext(&sess.tls_scratch);
+                if (p > 0) {
+                    if (sess.tls_plain.availableWrite() < p) {
+                        sess.tls_plain.grow(self.allocator, sess.tls_plain.data.len + p) catch {
+                            self.removeConnection(fd);
+                            return;
+                        };
+                    }
+                    _ = sess.tls_plain.writeSlice(sess.tls_scratch[0..p]);
+                }
+                const before = sess.tls_plain.availableRead();
+                self.processHttpFrom(fd, &sess.tls_plain);
+                if (self.http_sessions.getPtr(fd) == null) return; // connection gone
+                if (sess.tls_plain.availableRead() == before and p == 0) break;
+            }
+        }
+        if (sess.h2) |*h2s| self.flushH2Output(fd, h2s);
+    }
+
+    /// Process a request from an arbitrary plaintext buffer (TLS path).
+    fn processHttpFrom(self: *Reactor, fd: posix.fd_t, plain: *buffer_mod.Buffer) void {
+        const session = self.http_sessions.getPtr(fd) orelse return;
+        const outcome = session.parser.parse(plain, &session.req);
+        switch (outcome) {
+            .incomplete => {
+                if (plain.availableWrite() == 0) {
+                    // Plaintext staging exhausted without a complete request:
+                    // keep the partial parse state; more plaintext arrives on
+                    // the next read (requests larger than the 16 KiB staging
+                    // are parsed incrementally).
+                    plain.compact();
+                }
+                return;
+            },
+            .complete => {},
+            .bad_request, .header_too_large, .payload_too_large, .unsupported, .out_of_memory => {
+                self.respondAndClose(fd, switch (outcome) {
+                    .bad_request => .bad_request,
+                    .header_too_large => .header_too_large,
+                    .payload_too_large => .payload_too_large,
+                    .unsupported => .not_implemented,
+                    .out_of_memory => .internal_error,
+                    else => unreachable,
+                });
+                return;
+            },
+        }
+        _ = self.handleHttpRequest(fd, true);
+    }
+
     /// Drive the HTTP/2 session for `fd`: feed all buffered receive bytes,
     /// append the produced frames to the send buffer and flush. On a
     /// connection-level error send GOAWAY then close.
     fn processHttp2(self: *Reactor, fd: posix.fd_t, h2s: *http2_session.Session) void {
         const conn = self.connections.get(fd) orelse return;
-        const session_p = self.http_sessions.getPtr(fd) orelse return;
+        const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
+        const consumed = self.processHttp2Slice(fd, h2s, recv_slice);
+        // Only the bytes of complete frames are consumed; an incomplete
+        // trailing frame stays buffered for the next read. Advance before
+        // flushing: flushHttp recurses back here and must not reprocess.
+        conn.recv_buf.read_pos += consumed;
+        self.flushH2Output(fd, h2s);
+    }
+
+    /// Process h2 bytes from an arbitrary slice (the recv buffer for h2c,
+    /// the TLS plaintext buffer for h2-over-TLS). Returns the consumed count.
+    fn processHttp2From(self: *Reactor, fd: posix.fd_t, h2s: *http2_session.Session, plain: []const u8) usize {
+        return self.processHttp2Slice(fd, h2s, plain);
+    }
+
+    fn processHttp2Slice(self: *Reactor, fd: posix.fd_t, h2s: *http2_session.Session, recv_slice: []const u8) usize {
+        const conn = self.connections.get(fd) orelse return 0;
+        const session_p = self.http_sessions.getPtr(fd) orelse return 0;
         const out = &session_p.h2_out;
         out.clearRetainingCapacity();
 
@@ -1232,9 +1545,8 @@ pub const Reactor = struct {
             .version_string = "Zocket/" ++ version_mod.version,
         };
 
-        const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
         const consumed = h2s.process(recv_slice, out, &handler) catch |e| blk: {
-            // Connection-level protocol violation: GOAWAY then close.
+                // Connection-level protocol violation: GOAWAY then close.
             var gbuf = std.ArrayList(u8).empty;
             defer gbuf.deinit(self.allocator);
             const code: u32 = switch (e) {
@@ -1246,34 +1558,66 @@ pub const Reactor = struct {
             http2_frames.writeGoaway(&gbuf, self.allocator, h2s.max_stream_id, code, @errorName(e)) catch {};
             self.appendH2Output(fd, &gbuf);
             self.markWriting(fd);
-            const sess = self.http_sessions.getPtr(fd) orelse return;
+            const sess = self.http_sessions.getPtr(fd) orelse return 0;
             sess.writing = true;
             sess.close_after_write = true;
-            self.flushHttp(fd);
             break :blk 0;
         };
-        conn.recv_buf.read_pos += consumed;
-
         if (out.items.len > 0) {
             self.appendH2Output(fd, out);
-            const sess = self.http_sessions.getPtr(fd) orelse return;
+            const sess = self.http_sessions.getPtr(fd) orelse return consumed;
+            if (sess.tls != null) {
+                // h2 over TLS: drain the encrypted records into send_buf.
+                while (true) {
+                    // Zero-copy drain: the session's out buffer is copied
+                    // once into the send buffer (no scratch staging).
+                    const oslice = sess.tls.?.takeOutSlice();
+                    if (oslice.len == 0) break;
+                    if (conn.send_buf.availableWrite() < oslice.len) {
+                        conn.send_buf.grow(self.allocator, conn.send_buf.data.len + oslice.len) catch {
+                            self.removeConnection(fd);
+                            return consumed;
+                        };
+                    }
+                    _ = conn.send_buf.writeSlice(oslice);
+                    sess.tls.?.consumeOut(oslice.len);
+                }
+            }
             if (!sess.writing) {
                 self.markWriting(fd);
                 sess.writing = true;
             }
-            self.flushHttp(fd);
         }
+        return consumed;
+    }
+
+    /// Flush h2 output produced by processHttp2Slice, then handle a session
+    /// close. Must run after the caller advanced its buffer past the
+    /// consumed bytes: flushHttp recurses (finalizeFlush → processHttp →
+    /// processHttp2) and must not see the same bytes twice.
+    fn flushH2Output(self: *Reactor, fd: posix.fd_t, h2s: *http2_session.Session) void {
+        const sess = self.http_sessions.getPtr(fd) orelse return;
+        if (sess.writing) self.flushHttp(fd);
         // If the session asked to close (GOAWAY received), finish draining
         // and close.
         if (h2s.closing) {
-            const sess = self.http_sessions.getPtr(fd) orelse return;
-            if (!sess.writing) self.removeConnection(fd);
+            const s2 = self.http_sessions.getPtr(fd) orelse return;
+            if (!s2.writing) self.removeConnection(fd);
         }
     }
 
     fn appendH2Output(self: *Reactor, fd: posix.fd_t, out: *const std.ArrayList(u8)) void {
         const conn = self.connections.get(fd) orelse return;
         if (out.items.len == 0) return;
+        const session = self.http_sessions.getPtr(fd) orelse return;
+        if (session.tls != null) {
+            // h2 over TLS (M18): the frames must be encrypted. The caller
+            // (processHttp2Slice) drains + flushes afterwards.
+            session.tls.?.write(out.items) catch {
+                self.removeConnection(fd);
+            };
+            return;
+        }
         conn.send_buf.compact();
         // writeSlice silently truncates at the buffer's capacity; grow to
         // fit the whole frame batch (HTTP/1 keeps send_buf small because the
@@ -1507,6 +1851,18 @@ pub const Reactor = struct {
             sess.h2_out.deinit(self.allocator);
             sess.parser.deinit();
             sess.req.deinit();
+            if (sess.tls) |*tc| {
+                // Best-effort close_notify before the FIN, then drain.
+                if (tc.stage() == .application) {
+                    tc.shutdown() catch {};
+                    var out: [4096]u8 = undefined;
+                    const m = tc.takeOut(&out);
+                    if (m > 0) {
+                        _ = posix.write(fd, out[0..m]) catch {};
+                    }
+                }
+                tc.deinit();
+            }
         }
     }
 

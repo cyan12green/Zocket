@@ -5,6 +5,7 @@ const registry = @import("../dsl/registry.zig");
 const router_mod = @import("../dsl/router.zig");
 
 pub const Config = config_mod.Config;
+const tls_cert = @import("../tls/cert.zig");
 pub const default_registry = registry.default_registry;
 pub const ServerStats = registry.ServerStats;
 
@@ -28,6 +29,23 @@ pub const Server = struct {
     /// process-global `default_stats` for comptime/default servers and at an
     /// allocator-owned struct for JSON-config servers (freed by `deinit`).
     stats: *ServerStats = &default_stats,
+    /// TLS credentials (M18): loaded once at startup from the config `tls`
+    /// section (cert + key PEM files). The reactor uses them to instantiate
+    /// a native TLS 1.3 session per connection. `cert_der` is
+    /// allocator-owned; freed by `deinit`.
+    tls_creds: ?tls_cert.Credentials = null,
+
+    /// Load the TLS credentials when the config enables TLS (reads the PEM
+    /// files once at startup — nginx reads `ssl_certificate` at startup too).
+    pub fn loadTls(self: *Server, allocator: std.mem.Allocator) !void {
+        if (self.cfg.tls.enabled()) {
+            const cert_pem = try std.fs.cwd().readFileAlloc(self.cfg.tls.cert, allocator, .limited(1 << 20));
+            defer allocator.free(cert_pem);
+            const key_pem = try std.fs.cwd().readFileAlloc(self.cfg.tls.key, allocator, .limited(1 << 20));
+            defer allocator.free(key_pem);
+            self.tls_creds = try tls_cert.loadCredentials(allocator, cert_pem, key_pem);
+        }
+    }
 
     /// Plain constructor: no trie, linear route matching. Kept for tests and
     /// embedders that construct routes at runtime.
@@ -61,11 +79,17 @@ pub const Server = struct {
         const trie = try router_mod.buildTrieRuntime(allocator, cfg.routes);
         const stats = try allocator.create(ServerStats);
         errdefer allocator.destroy(stats);
-        return .{
+        var srv = Server{
             .cfg = cfg,
             .router = .{ .routes = cfg.routes, .trie = trie, .owned = true },
             .stats = stats,
         };
+        srv.loadTls(allocator) catch |e| {
+            srv.router.deinit(allocator);
+            allocator.destroy(stats);
+            return e;
+        };
+        return srv;
     }
 
     /// Free allocator-owned trie buffers (JSON-config servers only; no-op for
@@ -73,6 +97,8 @@ pub const Server = struct {
     pub fn deinit(self: *Server, allocator: std.mem.Allocator) void {
         self.router.deinit(allocator);
         if (self.stats != &default_stats) allocator.destroy(self.stats);
+        if (self.tls_creds) |*c| allocator.free(c.cert_der);
+        self.tls_creds = null;
     }
 
     /// The default server: echo module on the catch-all route, the pre-pipeline
@@ -89,6 +115,17 @@ pub const Server = struct {
     /// in. The dispatch functions, trie and everything else stay comptime;
     /// the trie's positional route indices apply to the copy unchanged.
     /// Free the allocator-owned copy with `deinitPrepared`.
+    /// Like `embeddedInit`, but with the TLS credentials loaded at startup
+    /// (the config `tls` section; the cert/key PEM files are runtime files).
+    pub fn embeddedInitWithTls(allocator: std.mem.Allocator, comptime cfg: Config) !Server {
+        var srv = try embeddedInit(allocator, cfg);
+        srv.loadTls(allocator) catch |e| {
+            srv.deinitPrepared(allocator);
+            return e;
+        };
+        return srv;
+    }
+
     pub fn embeddedInit(allocator: std.mem.Allocator, comptime cfg: Config) !Server {
         const base = comptimeInit(cfg);
         const routes = try allocator.alloc(router_mod.Route, base.cfg.routes.len);

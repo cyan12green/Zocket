@@ -102,6 +102,11 @@ fn resolveConfig(
 
 fn printConfigSummary(cfg: zocket.runtime.config.Config) void {
     std.debug.print("config OK: {d} routes\n", .{cfg.routes.len});
+    if (cfg.tls.enabled()) {
+        std.debug.print("tls: enabled (cert {s}, key {s})\n", .{ cfg.tls.cert, cfg.tls.key });
+    } else {
+        std.debug.print("tls: disabled\n", .{});
+    }
     for (cfg.routes) |r| {
         std.debug.print("  {s} [{s}]", .{
             r.path,
@@ -153,7 +158,7 @@ fn runServer(
         // are resolved at startup too (realpath + O_PATH fd per rooted
         // route), mirroring the JSON load path.
         try cfg.validate(zocket.dsl.registry.default_registry);
-        break :blk try zocket.runtime.server.Server.embeddedInit(allocator, cfg);
+        break :blk try zocket.runtime.server.Server.embeddedInitWithTls(allocator, cfg);
     } else
         zocket.runtime.server.Server.default();
     var http_srv_owns_trie = false;

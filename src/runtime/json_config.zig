@@ -81,6 +81,8 @@ const Builder = struct {
     upstreams: ct_pool.CtPool(Upstream, upstream_cap) = .{},
     strings: ct_pool.CtPool(u8, string_cap) = .{},
     limits: Limits = .{},
+    tls_cert: Str = .{ .src = "" },
+    tls_key: Str = .{ .src = "" },
 };
 
 /// Resolve a Str into its final comptime slice: zero-copy for unescaped
@@ -124,6 +126,9 @@ fn keyHash(key: []const u8) u64 {
 // the switch, which alone can blow the budget.
 const H_limits = keyHash("limits");
 const H_routes = keyHash("routes");
+const H_tls = keyHash("tls");
+const H_cert = keyHash("cert");
+const H_key = keyHash("key");
 const H_recv_buffer_size = keyHash("recv_buffer_size");
 const H_send_buffer_size = keyHash("send_buffer_size");
 const H_max_body = keyHash("max_body");
@@ -332,6 +337,7 @@ const Cursor = struct {
             switch (k.hash) {
                 H_limits => parseLimits(self, b),
                 H_routes => parseRoutes(self, b),
+                H_tls => parseTls(self, b),
                 else => self.fail("unknown top-level key '" ++ k.key ++ "'"),
             }
             switch (self.peek()) {
@@ -345,6 +351,34 @@ const Cursor = struct {
         }
         self.skipWs();
         if (self.pos != self.src.len) self.fail("trailing data after config object");
+    }
+
+    fn parseTls(self: *Cursor, b: *Builder) void {
+        self.expect('{');
+        var seen: [16]u64 = undefined;
+        var seen_len: usize = 0;
+        inline while (true) {
+            if (self.peek() == '}') {
+                self.pos += 1;
+                break;
+            }
+            const k = self.parseKey();
+            markSeen(&seen, &seen_len, k.hash, k.key);
+            self.expect(':');
+            switch (k.hash) {
+                H_cert => b.tls_cert = self.parseString(b),
+                H_key => b.tls_key = self.parseString(b),
+                else => self.fail("unknown tls key '" ++ k.key ++ "'"),
+            }
+            switch (self.peek()) {
+                ',' => self.pos += 1,
+                '}' => {
+                    self.pos += 1;
+                    break;
+                },
+                else => self.fail("expected ',' or '}'"),
+            }
+        }
     }
 
     fn parseLimits(self: *Cursor, b: *Builder) void {
@@ -756,7 +790,14 @@ fn build(b: *const Builder) Config {
     };
 
     const routes: []const Route = routes_built.items[0..routes_built.len];
-    return .{ .routes = routes, .limits = b.limits };
+    return .{
+        .routes = routes,
+        .limits = b.limits,
+        .tls = .{
+            .cert = resolve(b.tls_cert, strings),
+            .key = resolve(b.tls_key, strings),
+        },
+    };
 }
 
 /// Parse a JSON config at compile time. Invalid input, unknown keys, unknown

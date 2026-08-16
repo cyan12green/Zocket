@@ -14,11 +14,25 @@ pub const Phase = router.Phase;
 ///   constants and must never be deinit'd;
 /// - `fromJson` copies everything into the caller's allocator and the result
 ///   must be freed with `deinit`.
+/// TLS listener settings (M18): certificate and key file paths. The files
+/// are read once at startup (like nginx's `ssl_certificate`); the module
+/// layer uses them via the native TLS 1.3 server in `src/tls/`.
+pub const TlsConfig = struct {
+    cert: []const u8 = "",
+    key: []const u8 = "",
+    /// Whether TLS is enabled at all (a `tls` section present).
+    pub fn enabled(self: *const TlsConfig) bool {
+        return self.cert.len > 0 and self.key.len > 0;
+    }
+};
+
 pub const Config = struct {
     routes: []const Route = &.{},
     /// Runtime-tunable server limits (the `limits` JSON section). The
     /// reactor applies them to buffers, parsers, caches and pools.
     limits: dsl_limits.Limits = .{},
+    /// TLS listener settings (M18): certificate + key PEM files.
+    tls: TlsConfig = .{},
 
     /// Comptime default: a single catch-all prefix route attaching the echo
     /// module to the content phase — the pre-pipeline M3 behavior, reproduced
@@ -225,7 +239,14 @@ pub const Config = struct {
             });
         }
 
-        return .{ .routes = try routes.toOwnedSlice(allocator), .limits = limits };
+        return .{
+            .routes = try routes.toOwnedSlice(allocator),
+            .limits = limits,
+            .tls = .{
+                .cert = if (parsed.value.tls) |t| (t.cert orelse "") else "",
+                .key = if (parsed.value.tls) |t| (t.key orelse "") else "",
+            },
+        };
     }
 };
 
@@ -286,9 +307,15 @@ const JsonLimits = struct {
     connection_pool_max: ?usize = null,
 };
 
+const JsonTls = struct {
+    cert: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+};
+
 const JsonConfig = struct {
     routes: []const JsonRoute = &.{},
     limits: ?JsonLimits = null,
+    tls: ?JsonTls = null,
 };
 
 const testing = std.testing;
