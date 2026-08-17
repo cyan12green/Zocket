@@ -19,10 +19,11 @@ const vars = @import("vars.zig");
 /// prefix wins) and records the match on the context; it is resolved up front so
 /// every phase — including `post_read`/`server_rewrite`, which nginx runs before
 /// location config — can carry route-scoped modules. The remaining phases then
-/// run in `Phase.all` order, dispatching the module the matched route binds to
-/// each phase. Any module may claim the request (`handled`) or short-circuit it;
-/// the walk stops immediately in either case. If the chain ends without a claim
-/// the caller sends the default response.
+/// run in `Phase.all` order. Multiple modules may share a phase on a route: they
+/// form a chain executed in config declaration order (nginx-style). Within a
+/// chain a module returning `.pass` moves to the next module in the same phase;
+/// `.handled` or `.short_circuit` stops the whole walk. If the chain ends
+/// without a claim the caller sends the default response.
 ///
 /// `Registry` is the comptime module registry used for dispatch (a `Registry`
 /// value from `registry.zig`); it is a parameter so tests can register their
@@ -32,14 +33,14 @@ pub fn run(comptime Registry: type, routes: []const router.Route, ctx: *Context)
 }
 
 /// Like `run`, but route matching goes through a pre-built `Router` (the
-/// comptime trie for struct-literal configs, the startup-built trie for JSON
-/// configs). Pass null to use the linear `matchRoutes` fallback.
+/// comptime trie for struct-literal and conf-derived configs). Pass null to
+/// use the linear `matchRoutes` fallback.
 ///
-/// The `log` phase is special: its module (if bound) runs as post-processing
+/// The `log` phase is special: its modules (if bound) run as post-processing
 /// after the walk ends — whether a module claimed the request, short-circuited
 /// it, or nothing claimed it — so logging and response transforms (gzip) see
 /// the final response. The walk loop skips the log phase; this function runs
-/// it once at the end.
+/// it once at the end, in declaration order.
 pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr: ?*const router.Router, ctx: *Context) !Outcome {
     const route = if (rtr) |r| blk: {
         // M-D: the router records regex captures; copy them into the context
@@ -84,18 +85,26 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
     const outcome = blk: {
         for (Phase.all) |phase| {
             if (phase == .log) continue;
-            const name = r.moduleFor(phase) orelse continue;
-            const run_fn = Registry.resolve(name) orelse return error.UnknownModule;
-            switch (try run_fn(ctx)) {
-                .pass => continue,
-                .handled => break :blk Outcome.handled,
-                .short_circuit => break :blk Outcome.not_handled,
+            // nginx-style chain: every module bound to this phase runs in
+            // config declaration order. `.pass` moves to the next module in
+            // the same phase; `.handled`/`.short_circuit` stop the walk.
+            for (r.modules) |b| {
+                if (b.phase != phase) continue;
+                const run_fn = Registry.resolve(b.module) orelse return error.UnknownModule;
+                switch (try run_fn(ctx)) {
+                    .pass => continue,
+                    .handled => break :blk Outcome.handled,
+                    .short_circuit => break :blk Outcome.not_handled,
+                }
             }
         }
         break :blk Outcome.not_handled;
     };
-    if (r.moduleFor(.log)) |name| {
-        const run_fn = Registry.resolve(name).?;
+    // The log phase runs as post-processing: every log-bound module, in
+    // declaration order (gzip transforms, access/error logs).
+    for (r.modules) |b| {
+        if (b.phase != .log) continue;
+        const run_fn = Registry.resolve(b.module).?;
         // Post-processing: its action does not change the outcome.
         _ = try run_fn(ctx);
     }
@@ -142,12 +151,13 @@ fn applyTemplateCV(ctx: *Context, t: router.ResponseTemplateCV) void {
 /// Comptime-specialised dispatch function for one route (Milestone 7 Part B).
 /// The bound modules are called directly, phase by phase — the equivalent of
 /// an unrolled switch over the route's bindings with the module resolution
-/// resolved at compile time:
+/// resolved at compile time. Modules sharing a phase form a chain in config
+/// declaration order (nginx-style), exactly like the loop-walk path:
 ///
 /// ```zig
 /// fn dispatch(ctx) !Outcome {
-///     switch (try echo.run(ctx)) { .handled => {}, else => {} }
-///     switch (try access_log.run(ctx)) { .handled => {}, else => {} }
+///     switch (try echo.run(ctx)) { .handled => return .handled, else => {} }
+///     switch (try static.run(ctx)) { .handled => return .handled, else => {} }
 ///     return .not_handled;
 /// }
 /// ```
@@ -155,40 +165,47 @@ pub fn dispatchForRoute(comptime Registry: type, comptime route: router.Route) D
     const Impl = struct {
         fn run(ctx: *Context) anyerror!Outcome {
             var outcome: Outcome = .not_handled;
-            inline for (Phase.all) |phase| {
-                if (phase == .log) continue;
-                if (route.moduleFor(phase)) |name| {
-                    const run_fn = Registry.resolve(name).?;
-                    switch (try run_fn(ctx)) {
-                        .pass => {},
-                        .handled => {
-                            outcome = .handled;
-                            break;
-                        },
-                        .short_circuit => {
-                            outcome = .not_handled;
-                            break;
-                        },
+            // nginx-style chains: modules sharing a phase run in declaration
+            // order; `.pass` moves to the next, `.handled`/`.short_circuit`
+            // stop the walk. The label lets the inner (same-phase) loop stop
+            // the outer phase loop too.
+            phases: {
+                inline for (Phase.all) |phase| {
+                    if (phase == .log) continue;
+                    inline for (route.modules) |b| {
+                        if (b.phase != phase) continue;
+                        const run_fn = Registry.resolve(b.module).?;
+                        switch (try run_fn(ctx)) {
+                            .pass => {},
+                            .handled => {
+                                outcome = .handled;
+                                break :phases;
+                            },
+                            .short_circuit => {
+                                outcome = .not_handled;
+                                break :phases;
+                            },
+                        }
                     }
                 }
             }
             // The log phase runs as post-processing (same contract as the
-            // loop-walk path).
-            if (route.moduleFor(.log)) |name| {
-                const run_fn = Registry.resolve(name).?;
+            // loop-walk path): every log-bound module, in declaration order.
+            inline for (route.modules) |b| {
+                if (b.phase != .log) continue;
+                const run_fn = Registry.resolve(b.module).?;
                 _ = try run_fn(ctx);
             }
-            if (outcome == .not_handled) {
-                if (route.response) |t| {
-                    applyTemplate(ctx, t);
-                    return .handled;
-                }
-                if (route.response_cv) |t| {
-                    applyTemplateCV(ctx, t);
-                    return .handled;
-                }
+            if (outcome == .handled) return .handled;
+            if (route.response) |t| {
+                applyTemplate(ctx, t);
+                return .handled;
             }
-            return outcome;
+            if (route.response_cv) |t| {
+                applyTemplateCV(ctx, t);
+                return .handled;
+            }
+            return .not_handled;
         }
     };
     return Impl.run;
@@ -311,6 +328,16 @@ const HandlerRegistry = registry.Registry(.{
 const PassThroughRegistry = registry.Registry(.{
     pass_mod.make("post_read_mod", .post_read),
     claim_mod.make("content_claim", .content),
+});
+
+/// Multiple modules sharing the content phase (nginx-style chain): three
+/// pass modules plus a claiming module, all in the content phase.
+const ChainRegistry = registry.Registry(.{
+    pass_mod.make("chain_a", .content),
+    pass_mod.make("chain_b", .content),
+    pass_mod.make("chain_c", .content),
+    claim_mod.make("chain_claim", .content),
+    pass_mod.make("log_mod", .log),
 });
 
 fn runWith(comptime R: type, routes: []const router.Route, req: *Request) !struct { outcome: Outcome, resp: Response } {
@@ -446,6 +473,89 @@ test "unknown module binding is a config error" {
     var resp = Response.init(.ok);
     var ctx = Context{ .req = &req, .resp = &resp };
     try testing.expectError(error.UnknownModule, run(OrderRegistry, &routes, &ctx));
+}
+
+// ---- Same-phase module chains (nginx-style, declaration order) ----
+
+test "same-phase chain runs modules in config order when all pass" {
+    const routes = [_]router.Route{.{ .path = "/", .match = .prefix, .modules = &.{
+        .{ .phase = .content, .module = "chain_a" },
+        .{ .phase = .content, .module = "chain_b" },
+        .{ .phase = .content, .module = "chain_c" },
+        .{ .phase = .log, .module = "log_mod" },
+    } }};
+
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/";
+    req.decoded_target = "/";
+
+    const res = try runWith(ChainRegistry, &routes, &req);
+    // Nothing claimed: the whole chain walked.
+    try testing.expectEqual(Outcome.not_handled, res.outcome);
+    // Headers appear in declaration order: chain_a, chain_b, chain_c, log.
+    try testing.expectEqual(@as(usize, 4), res.resp.header_count);
+    try testing.expectEqualStrings("chain_a", res.resp.headers[0].value);
+    try testing.expectEqualStrings("chain_b", res.resp.headers[1].value);
+    try testing.expectEqualStrings("chain_c", res.resp.headers[2].value);
+    try testing.expectEqualStrings("log_mod", res.resp.headers[3].value);
+}
+
+test "a handled module stops the rest of its phase chain" {
+    const routes = [_]router.Route{.{ .path = "/", .match = .prefix, .modules = &.{
+        .{ .phase = .content, .module = "chain_a" },
+        .{ .phase = .content, .module = "chain_claim" },
+        .{ .phase = .content, .module = "chain_c" },
+        .{ .phase = .log, .module = "log_mod" },
+    } }};
+
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/";
+    req.decoded_target = "/";
+
+    const res = try runWith(ChainRegistry, &routes, &req);
+    // chain_a passed, chain_claim handled: chain_c in the same phase never ran.
+    try testing.expectEqual(Outcome.handled, res.outcome);
+    try testing.expectEqual(@as(usize, 3), res.resp.header_count);
+    try testing.expectEqualStrings("chain_a", res.resp.headers[0].value);
+    try testing.expectEqualStrings("chain_claim", res.resp.headers[1].value);
+    // The log phase still runs as post-processing after a handled response.
+    try testing.expectEqualStrings("log_mod", res.resp.headers[2].value);
+}
+
+test "dispatch specialisation chains same-phase modules like the loop walk" {
+    const routes = comptime &[_]router.Route{.{ .path = "/", .match = .prefix, .modules = &.{
+        .{ .phase = .content, .module = "chain_a" },
+        .{ .phase = .content, .module = "chain_b" },
+        .{ .phase = .content, .module = "chain_claim" },
+        .{ .phase = .content, .module = "chain_c" },
+        .{ .phase = .log, .module = "log_mod" },
+    } }};
+
+    // Loop-walk baseline.
+    var req_a = Request.init(testing.allocator);
+    defer req_a.deinit();
+    req_a.target = "/";
+    req_a.decoded_target = "/";
+    const res_a = try runWith(ChainRegistry, routes, &req_a);
+
+    // Comptime dispatch.
+    const dispatched = comptime assignDispatch(ChainRegistry, routes);
+    var req_b = Request.init(testing.allocator);
+    defer req_b.deinit();
+    req_b.target = "/";
+    req_b.decoded_target = "/";
+    const res_b = try runWith(ChainRegistry, &dispatched, &req_b);
+
+    // Identical outcome and chain order; chain_c never ran either way.
+    try testing.expectEqual(res_a.outcome, res_b.outcome);
+    try testing.expectEqual(Outcome.handled, res_b.outcome);
+    try testing.expectEqual(@as(usize, 4), res_b.resp.header_count);
+    try testing.expectEqualStrings("chain_a", res_b.resp.headers[0].value);
+    try testing.expectEqualStrings("chain_b", res_b.resp.headers[1].value);
+    try testing.expectEqualStrings("chain_claim", res_b.resp.headers[2].value);
+    try testing.expectEqualStrings("log_mod", res_b.resp.headers[3].value);
 }
 
 // ---- Milestone 7: comptime dispatch specialisation ----

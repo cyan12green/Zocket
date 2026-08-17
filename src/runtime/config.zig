@@ -82,31 +82,23 @@ pub const Config = struct {
     /// branch quota.
     pub inline fn comptimeValidate(comptime cfg: Config, comptime Registry: type) void {
         @setEvalBranchQuota(1_000_000);
-        var seen_phase = [_]bool{false} ** Phase.all.len;
         for (cfg.routes) |*r| {
-            seen_phase = [_]bool{false} ** Phase.all.len;
             for (r.modules) |b| {
                 if (!Registry.isRegistered(b.module)) {
                     @compileError("unknown module '" ++ b.module ++ "' in route '" ++ r.path ++ "'");
                 }
-                if (seen_phase[@intFromEnum(b.phase)]) {
-                    @compileError("duplicate phase binding in route '" ++ r.path ++ "'");
-                }
-                seen_phase[@intFromEnum(b.phase)] = true;
             }
         }
     }
 
     /// Verify every route against the module registry: each binding must name
-    /// a registered module and bind a phase at most once. Runtime entry used
-    /// by struct-literal tests.
+    /// a registered module. Multiple modules may share a phase — they form a
+    /// chain run in declaration order (nginx-style). Runtime entry used by
+    /// struct-literal tests.
     pub fn validate(self: *const Config, comptime Registry: type) !void {
         for (self.routes) |*r| {
-            var seen = [_]bool{false} ** Phase.all.len;
             for (r.modules) |b| {
                 if (!Registry.isRegistered(b.module)) return error.UnknownModule;
-                if (seen[@intFromEnum(b.phase)]) return error.DuplicatePhaseBinding;
-                seen[@intFromEnum(b.phase)] = true;
             }
         }
     }
@@ -184,7 +176,7 @@ test "conf rejects an unknown module at validate time" {
     try testing.expectError(error.UnknownModule, cfg.validate(registry.default_registry));
 }
 
-test "conf rejects duplicate phase bindings" {
+test "multiple modules may share a phase (they form a declaration-order chain)" {
     const cfg = Config.fromConfComptime(
         \\server {
         \\    location / { content echo; }
@@ -192,18 +184,18 @@ test "conf rejects duplicate phase bindings" {
     );
     try cfg.validate(registry.default_registry);
 
-    const dup = Config{
+    const chain = Config{
         .routes = &.{
             .{
                 .path = "/",
                 .modules = &.{
-                    .{ .phase = .content, .module = "echo" },
+                    .{ .phase = .content, .module = "static" },
                     .{ .phase = .content, .module = "echo" },
                 },
             },
         },
     };
-    try testing.expectError(error.DuplicatePhaseBinding, dup.validate(registry.default_registry));
+    try chain.validate(registry.default_registry);
 }
 
 test "conf with a modules-free route is valid and yields not_handled" {

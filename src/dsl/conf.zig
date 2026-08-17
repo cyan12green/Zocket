@@ -3,6 +3,7 @@ const config_mod = @import("../runtime/config.zig");
 const dsl_limits = @import("limits.zig");
 const router = @import("router.zig");
 const phase_mod = @import("phase.zig");
+const registry_mod = @import("registry.zig");
 const ct_pool = @import("../ct_pool.zig");
 const vars = @import("vars.zig");
 const regex_mod = @import("regex.zig");
@@ -1138,6 +1139,42 @@ test "conf: phase directives bind modules" {
     try testing.expectEqualStrings("cache_headers", r.moduleFor(.post_access).?);
     try testing.expectEqualStrings("gzip", r.moduleFor(.log).?);
     try testing.expectEqual(@as(usize, 4), r.modules.len);
+}
+
+test "conf: multiple modules per phase form a declaration-order chain" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content static;
+        \\        preaccess conditional_get;
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    const r = cfg.routes[0];
+    // `moduleFor` returns the first binding for a phase.
+    try testing.expectEqualStrings("static", r.moduleFor(.content).?);
+    try testing.expectEqualStrings("conditional_get", r.moduleFor(.preaccess).?);
+    // The full chain keeps declaration order across interleaved phases.
+    try testing.expectEqual(@as(usize, 3), r.modules.len);
+    try testing.expectEqualStrings("static", r.modules[0].module);
+    try testing.expectEqual(Phase.content, r.modules[0].phase);
+    try testing.expectEqualStrings("conditional_get", r.modules[1].module);
+    try testing.expectEqual(Phase.preaccess, r.modules[1].phase);
+    try testing.expectEqualStrings("echo", r.modules[2].module);
+    try testing.expectEqual(Phase.content, r.modules[2].phase);
+    // The chain validates: same-phase duplicates are now legal.
+    comptime {
+        const c = Config.fromConfComptime(
+            \\server {
+            \\    location / {
+            \\        content static;
+            \\        content echo;
+            \\    }
+            \\}
+        );
+        Config.comptimeValidate(c, registry_mod.default_registry);
+    }
 }
 
 test "conf: quoted strings with escapes" {

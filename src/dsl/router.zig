@@ -106,7 +106,10 @@ pub const Route = struct {
     /// present.
     log_format: ?usize = null,
 
-    /// The module name bound to `phase` on this route, if any.
+    /// The first module name bound to `phase` on this route, if any. Multiple
+    /// modules may share a phase (nginx-style chains); `self.modules` is kept
+    /// in config declaration order, so callers that need the whole chain
+    /// iterate `self.modules` filtering on `phase` instead of using this.
     pub fn moduleFor(self: *const Route, phase: Phase) ?[]const u8 {
         for (self.modules) |b| {
             if (b.phase == phase) return b.module;

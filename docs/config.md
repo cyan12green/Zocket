@@ -344,10 +344,14 @@ Default: —
 
 Context: location
 
-Binds a module to a phase. At most one module per phase per location
-(a duplicate phase binding is a compile error); unknown module names are
-compile errors. The pipeline walks the phases in order; `find_config` runs
-the route matcher up front so every phase can carry route-scoped modules.
+Binds a module to a phase. Multiple modules may be bound to the same phase
+(nesting is allowed): they form a chain run in config declaration order
+(nginx-style). A module that `pass`es lets the next module in the same phase
+run; a module that handles the request (or short-circuits) stops the chain.
+The `log` phase is post-processing — every log-bound module runs in order
+regardless of the walk's outcome. Unknown module names are compile errors.
+The pipeline walks the phases in order; `find_config` runs the route matcher
+up front so every phase can carry route-scoped modules.
 
 The 10 phases, in execution order (nginx request-processing stages):
 
