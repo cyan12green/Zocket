@@ -16,12 +16,12 @@ src/
                       --idle-timeout, --uring (flags only; logic below)
   root.zig            library root; re-exports + comptime test imports
   version.zig         version constant (comptime)
-  embeds.zig          comptime embedded assets (@embedFile) for DM2
-  ct_pool.zig         typed comptime arena for comptime builders (M15/DM1)
+  ct_pool.zig         typed comptime arena for comptime builders (M15)
   fuzz.zig            fuzz driver entry (zig build fuzz)
   fuzz_main.zig       fuzz harness setup
-  testdata/           conf config fixtures (backend/proxy/stub for the
-                      module-over-h2 tests, config.example.conf)
+  testdata/           conf fixture (config.example.conf) + TLS test certs;
+                      backend.json/proxy.json/stub.json are legacy JSON
+                      fixtures (unused since M18.5)
   net/                transport + lifecycle (M1/M2/M5/M13/M14/M15/M16)
     server.zig        M1 single-threaded epoll echo (kept for A/B)
     multireactor.zig  SO_REUSEPORT accept + reactor lifecycle + graceful
@@ -50,38 +50,47 @@ src/
     hpack.zig         HPACK decode/encode (comptime static tables + Huffman)
     session.zig       streams, flow control, CONTINUATION, trailers, RST/
                       GOAWAY; per-connection request pool + arena
-  dsl/                config pipeline (M4/M7/M9-M12/M15)
+  dsl/                config pipeline (M4/M7/M9-M12/M15/M18.5)
     phase.zig         nginx-style phase enum (post_read ... log)
-    router.zig        prefix/exact routing + comptime trie (M7)
+    router.zig        prefix/exact/regex matching + comptime trie (M7/M-D)
     registry.zig      comptime module registry + Context (module = value:
                       name, phase, run(ctx) -> Action)
     pipeline.zig      phase dispatch loop (route match -> per-phase modules)
+    conf.zig          comptime-only nginx-flavored conf parser (M18.5): the
+                      only config path (`-Dconfig=<file>`, `conf:<line>:<col>`
+                      errors, budget check)
+    vars.zig          complex values: Frag/VarId/SetVar/LogFormat + $variable
+                      getters (M-B/M-C)
+    regex.zig         router regex compilation (M-D, ~ / ~* to NFAs)
+    limits.zig        limits defaults/directives (recv/send sizes, max_body,
+                      max_headers, static cache, connection pool)
     static_cache.zig  nginx open_file_cache equivalent: fd + content cache (M15)
     modules/          echo, gzip, cache (304/Conditional-GET), access_log,
                       error_log, proxy, static, stub_status
-  runtime/            config loading + server wiring (M4/DM1/DM2)
-    config.zig        Config: comptime struct literal, JSON (std.json), or
-                      embedded file; limits + routes + validation
-    json_config.zig   DM1: comptime JSON parser/validator (fromJsonComptime /
-                      fromEmbedded), the primary config path
-    json_config_tests.zig  DM1 parser tests
+  runtime/            config + server wiring (M4/M18.5)
+    config.zig        Config: comptime struct literal (Config.default()) or
+                      the conf parser (fromConfComptime/fromConfEmbedded);
+                      limits + routes + validation (comptimeValidate)
     server.zig        shared Server the reactors call (pipeline Context ->
                       handleRequest -> modules -> response)
+  tls/                native TLS 1.3 server (M17/M18): pem, cert (ECDSA
+                      P-256/P-384), handshake (X25519, HRR, ALPN), keyschedule,
+                      record, session, tickets (stateless PSK resumption)
 ```
 
 Other top-level files:
 
 ```
 config.example.conf  reference config: globals/limits + server/location
-                     blocks (nginx-flavored), incl. the /chunked route
+                     blocks (nginx-flavored)
 build.zig / build.zig.zon  pinned Zig snapshot; -Dconfig= embeds a config
-embeds.zig           comptime asset embedding (see src/embeds.zig)
+embeds.zig           comptime asset embedding (@embedFile wrapper, project
+                     root; resolved via the `embeds` module)
 docs/
-  config.md          config reference (globals, server/location, reloads)
-  conf.md            conf language reference (grammar, directives, vars,
-                     regex subset, budget)
+  config.md          conf language reference + config how-to (grammar,
+                     directives, vars, regex subset, budget, reloads)
   LAYOUT.md          this file
-  milestones.md      milestone log (M1-M16)
+  milestones.md      milestone log (M1-M18.5)
   ROADMAP.md         remaining roadmap
 bench/
   bench.sh / bench2.sh     bombardier + echo-client sweeps (echo protocols)

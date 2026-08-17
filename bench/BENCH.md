@@ -38,7 +38,7 @@ still carry run-to-run variance (see the per-rep spread in `bench/results/`).
 | six-server matrix | `bench/compare-servers.sh` | GET empty, POST /echo | `-c 100`, 12 reps, interleaved | Zocket vs actix-web, Bun.serve, httpx.zig, nginx, Caddy (co-resident) |
 | static file serving | `bench/compare-servers.sh --static` | GET /static, 1 KB / 1 MB | `-c 100/1000`, 12 reps, interleaved | same six |
 | HTTP/2 (h2c) | `bench/h2bench.sh` | GET /echo, GET /static | 4 conns, m=100 / m=1, 8 reps x 100k requests, interleaved, warm-up rep discarded | Zocket vs nginx (`--with-http_v2_module`) |
-| chunked transfer | `bench/chunked-bench.sh` | POST echo, 128 B / 8 KB | `-c 10/100/1000`, 3 reps x 5 s, interleaved | Zocket `/chunked` route (`"chunked": true`) vs nginx `echo -n` + `echo_flush` |
+| chunked transfer | `bench/chunked-bench.sh` | POST echo, 128 B / 8 KB | `-c 10/100/1000`, 3 reps x 5 s, interleaved | Zocket `/chunked` route (`chunked on;` route opt-in) vs nginx `echo -n` + `echo_flush` |
 
 ### Protocol
 
@@ -67,7 +67,7 @@ still carry run-to-run variance (see the per-rep spread in `bench/results/`).
   pipelining) before HTTP sweeps.
 - HTTP/2: `zig build h2test` (h2spec conformance, ≥130/145) + `zig build
   fuzz` before/after h2 benchmark work.
-- `zig build test` (201 tests incl. concurrency) must stay green.
+- `zig build test` (265 tests incl. concurrency) must stay green.
 
 ## Current results
 
@@ -112,7 +112,7 @@ are comptime-built.
 
 Date: 2026-08-15. Load generator: `bombardier` (POST echo, `-m POST -b`),
 5 s reps, 3 reps, interleaved; medians (req/s). Zocket: the `/chunked`
-route in `config.example.json` (`"chunked": true` — the body is framed as
+route (`chunked on;` route opt-in — the body is framed as
 a single chunk; zero-copy: head+size, body, terminator as one writev).
 nginx: `echo -n $echo_request_body` + `echo_flush` (echo-nginx-module),
 which forces chunked because the length is unknown when the head is sent.

@@ -466,11 +466,11 @@ test "multi-reactor HTTP with conf config echoes via the pipeline" {
     server.stop();
     run_thread.join();
 }
-// ---- SIGHUP graceful reload ----
+// ---- signal handling ----
 
-/// Set by the SIGHUP handler (async-signal-safe: an atomic store).
 /// Set by the SIGTERM/SIGINT handler: the run loop calls `stop()` for a
-/// graceful shutdown (daemon `--stop`, Ctrl-C).
+/// graceful shutdown (daemon `--stop`, Ctrl-C). SIGHUP is deliberately not
+/// handled (see `installSignalHandlers`).
 var stop_requested = std.atomic.Value(bool).init(false);
 
 fn handleTerm(_: posix.SIG) callconv(.c) void {

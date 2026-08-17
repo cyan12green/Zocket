@@ -21,7 +21,7 @@ High-performance TCP/HTTP server in Zig.
 - TLS 1.3 (native Zig, no OpenSSL): ECDSA certs, ALPN h2 + http/1.1,
   stateless session tickets + PSK resumption, HTTPS end-to-end over h1
   and h2
-- Chunked transfer responses, per-route opt-in (`"chunked": true`)
+- Chunked transfer responses, per-route opt-in (`chunked on;`)
 - Automatic protocol detection per connection (TLS ClientHello vs h2
   preface vs HTTP/1.1)
 
@@ -67,7 +67,7 @@ zig build run -- --port P              change port
 zig build -Dconfig=config.conf run     HTTP with a comptime-embedded conf
                                        (nginx-style language; routes, module
                                        bindings, limits and tls — see
-                                       docs/config.md and docs/conf.md)
+                                       docs/config.md)
 zig build run -- --echo                raw byte-echo protocol (M1/M2 semantics)
 zig build run -- --single              M1 single-threaded echo server (A/B)
 zig build run -- --idle-timeout S      idle connection timeout in seconds (0 disables)
@@ -106,7 +106,7 @@ just run `python3 bench/graphs.py --run` (full suite + graphs):
 
 ## Tests and benchmarks
 
-- `zig build test` — unit + concurrency + fuzz-smoke tests (206 passing).
+- `zig build test` — unit + concurrency + fuzz-smoke tests (265 passing).
 - `bench/bench.sh`, `bench/bench2.sh`, `bench/summarize.py` — reproducible
   benchmark harness; results and methodology in `bench/BENCH.md`.
 - `bench/compare-servers.sh` — cross-language comparison against actix-web,
@@ -119,7 +119,7 @@ just run `python3 bench/graphs.py --run` (full suite + graphs):
   via `python3 bench/graphs.py`. Zocket beats nginx on h2 echo (3.0x at
   100 streams/conn, 1.2x serialized) and static (1.7x).
 - `bench/chunked-bench.sh` — HTTP/1.1 chunked-transfer comparison against
-  nginx (POST echo, `chunked: true` route vs nginx `echo_flush`); renders
+  nginx (POST echo, `chunked on;` route vs nginx `echo_flush`); renders
   `bench/graphs/chunked_compare.png`. Zocket beats nginx 1.4–2.0x across
   body sizes and connection counts.
 - `bench/tlsbench.sh` — HTTP/2 over TLS comparison against nginx

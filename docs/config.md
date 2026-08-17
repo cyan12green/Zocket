@@ -1,116 +1,645 @@
 # Zocket configuration
 
-Zocket uses an nginx-conf-flavored configuration language (`.conf` files),
-compiled **entirely at compile time**: the config is embedded with
-`zig build -Dconfig=<file>` and parsed/validated by the comptime conf
-parser in `src/dsl/conf.zig`. The built route table, trie, dispatch
-functions, pre-serialised response templates and upstream sockaddrs all
-live in `.rodata`. **There is no runtime config path** — an invalid config
-is a compile error, and `--reload-hard` (rebuild + SO_REUSEPORT swap) is
-the only reload. See `config.example.conf` for a complete sample and
-`docs/conf.md` for the full language reference (grammar, directive table,
-variable catalog, regex subset).
+Zocket is configured with an nginx-conf-flavored language (`.conf` files),
+compiled **entirely at compile time**: the file is embedded with
+`zig build -Dconfig=<file>` and parsed/validated by the comptime parser in
+`src/dsl/conf.zig`. The built route table, matching trie, per-route dispatch
+specialisation, pre-serialised response templates and upstream sockaddrs all
+live in `.rodata` — there is no runtime config parse, no config file reading
+at startup.
 
-## Language shape (summary)
+Consequences of the comptime design:
+
+- An invalid configuration is a **compile error** (`conf:<line>:<col>: ...`),
+  never a runtime failure.
+- The **only** reload is `--reload-hard`: it rebuilds the binary with the
+  conf embedded and zero-downtime swaps the daemon. SIGHUP is deliberately
+  not handled.
+- `--validate` prints the route table; configs are validated at build time.
+- Comptime embeds (`@embedFile`) can only reach files inside the project
+  tree (no dot-directories), so conf files — and any `embed` targets — must
+  live in the repo.
+
+This file is the full reference: language grammar, every directive, the
+variable catalog, location matching, the regex subset, the comptime budget,
+and the operation how-tos. `config.example.conf` is a complete working
+sample.
+
+## Building and running
+
+```sh
+zig build -Dconfig=config.example.conf run                 # build + run, port 8080
+zig build -Dconfig=config.example.conf run -- --port 9000  # override the conf's listen
+zig build -Dconfig=config.example.conf run -- --threads 4  # physical-core count is best
+zig build -Dconfig=config.example.conf -Doptimize=ReleaseFast  # benchmarking
+zig build -Dconfig=config.example.conf run -- --start --pidfile /tmp/zocket.pid  # daemonize
+zig build -Dconfig=config.example.conf run -- --validate   # print the route table
+```
+
+With no `-Dconfig`, the server runs the comptime default: a catch-all prefix
+route binding `echo` to the `content` phase (the pre-pipeline M3 behavior).
+
+## Language grammar
 
 ```
-# comments
-<global directive>;                    # limits, listen, tls, log_format
-tls { cert "file.pem"; key "file.pem"; }
-server {
-    location [modifier] <target> {     # modifier: = | ~ | ~* | ^~ | (none)
-        <phase> <module>;              # content echo; log access_log; ...
-        <location directive>;          # root, index, return, add_header, ...
-    }
-}
+conf     := stmt* EOF
+stmt     := directive ';' | block
+block    := NAME ARG* '{' stmt* '}'
+directive:= NAME ARG* ';'
+ARG      := quoted | token | size | number
+quoted   := '"' ( any char except '"', with \ escapes: \" \\ \n \r \t ) '"'
+           | "'" ( any char except "'" ) "'"
+token    := one or more of [A-Za-z0-9_./:$@#!?=+\-%]
+size     := number followed by suffix k|K|m|M|g|G  (1024-multipliers)
+number   := [0-9]+
+comment  := '#' to end of line (outside quoted strings)
 ```
 
-Sizes accept `k`/`m`/`g` suffixes (`16m` = 16 MiB); booleans accept
-`on|off`; values are bare tokens or quoted strings (`"..."` with `\" \\ \n
-\r \t` escapes, `'...'` literal).
+- Tokens are separated by whitespace; `;`, `{`, `}` terminate
+  directives/blocks. Unquoted tokens never contain whitespace.
+- Booleans accept `on` / `off`. Values are bare tokens or quoted strings
+  (`"..."` with `\" \\ \n \r \t` escapes, `'...'` literal).
+- Errors carry `conf:<line>:<col>: <message>`.
 
-## Global directives
+The structure is **flat**: top-level directives plus exactly one `server {}`
+block (vhosts are a future milestone) holding `location {}` blocks. There is
+no `http {}` section.
 
-All `limits` fields become directives with the same name (sizes accept the
-`k/m/g` suffix, booleans `on|off`); also accepted inside `server {}`:
+## Directives
 
-| Directive | Field | Notes |
+- [access_log](#access_log)
+- [add_header](#add_header)
+- [autoindex](#autoindex)
+- [balance](#balance)
+- [chunked](#chunked)
+- [connection_pool_max](#connection_pool_max)
+- [embed](#embed)
+- [fail_timeout](#fail_timeout)
+- [index](#index)
+- [listen](#listen)
+- [location](#location)
+- [log_format](#log_format)
+- [max_age](#max_age)
+- [max_body](#max_body)
+- [max_chunked_body](#max_chunked_body)
+- [max_fails](#max_fails)
+- [max_headers](#max_headers)
+- [max_line_bytes](#max_line_bytes)
+- [phase module](#phase-module)
+- [proxy_pass](#proxy_pass)
+- [proxy_set_header](#proxy_set_header)
+- [recv_buffer_size](#recv_buffer_size)
+- [return](#return)
+- [root](#root)
+- [send_buffer_size](#send_buffer_size)
+- [server](#server)
+- [set](#set)
+- [static_cache_entries](#static_cache_entries)
+- [static_cache_valid](#static_cache_valid)
+- [static_content_cache_max](#static_content_cache_max)
+- [tls](#tls)
+- [upstream](#upstream)
+
+### access_log
+
+Syntax: `access_log format-name | off;`
+
+Default: combined
+
+Context: location
+
+Selects a named `log_format` (see the [log_format](#log_format) directive)
+for the `log` phase; the value `off` disables logging for the location. When
+a location binds `log access_log;` but declares no `access_log` directive,
+the default nginx `combined` format is used:
+
+```
+$ip - - [$date] "$request" $status $bytes "$referer" "$user_agent"
+```
+
+An unknown format name is a compile error (`access_log: unknown log format
+'...'`).
+
+### add_header
+
+Syntax: `add_header name value;`
+
+Default: —
+
+Context: location
+
+Appends a response header to the route's `return` template. The value is a
+[complex value](#embedded-variables) (variables allowed). Headers are emitted
+in declaration order; the whole template is pre-serialised at compile time
+when every value is literal, or rendered per request when any value contains
+a variable.
+
+### autoindex
+
+Syntax: `autoindex on | off;`
+
+Default: `autoindex off;`
+
+Context: location
+
+With the `static` module: when a request targets a directory and the
+configured `index` file is absent (or no `index` is configured), serve a
+generated directory listing instead of 404.
+
+### balance
+
+Syntax: `balance round_robin | least_connections | ip_hash;`
+
+Default: `balance round_robin;`
+
+Context: location
+
+Load-balance strategy the `proxy` module applies across the location's
+upstream backends.
+
+### chunked
+
+Syntax: `chunked on | off;`
+
+Default: `chunked off;`
+
+Context: location
+
+Route opt-in for HTTP/1.1 chunked transfer encoding: the response is framed
+with `Transfer-Encoding: chunked` instead of Content-Length. Content-Length
+lets the response flush as a single writev, so leave off unless the body
+size is not known in advance or streaming semantics are wanted. Ignored by
+HTTP/2 (which frames responses itself).
+
+### connection_pool_max
+
+Syntax: `connection_pool_max number;`
+
+Default: `connection_pool_max 1024;`
+
+Context: main, server
+
+Maximum recycled connections held by each reactor's pool.
+
+### embed
+
+Syntax: `embed path;`
+
+Default: —
+
+Context: location
+
+Comptime-embedded static file (project-root-relative; the `static` module
+serves it from `.rodata`). An invalid path is a compile error. Because the
+bytes cannot change, the embedded file is served with an effectively
+infinite cache lifetime.
+
+### fail_timeout
+
+Syntax: `fail_timeout number;`
+
+Default: `fail_timeout 30;`
+
+Context: location
+
+Seconds a backend stays marked down after `max_fails` consecutive
+connect/read failures (passive health check used by the `proxy` module).
+
+### index
+
+Syntax: `index file;`
+
+Default: —
+
+Context: location
+
+Directory index file for the `static` module (e.g. `index index.html;`).
+
+### listen
+
+Syntax: `listen port;`
+
+Default: `listen 8080;`
+
+Context: main, server
+
+Listen port. Absent = the CLI `--port` default (8080); when both are given
+the CLI `--port` flag wins over the conf directive.
+
+### location
+
+Syntax: `location [ = | ~ | ~* | ^~ ] uri { ... }`
+
+Default: —
+
+Context: server
+
+Declares a route. The modifier selects the matching rule (see [Location
+matching](#location-matching) for precedence):
+
+| Modifier | Meaning | Match |
 |---|---|---|
-| `recv_buffer_size <size>;` | `recv_buffer_size` | nginx `client_body_buffer_size` |
-| `send_buffer_size <size>;` | `send_buffer_size` | |
-| `max_body <size>;` | `max_body` | nginx `client_max_body_size` (431 over) |
-| `max_line_bytes <size>;` | `max_line_bytes` | nginx `large_client_header_buffers` |
-| `max_headers <n>;` | `max_headers` | |
-| `max_chunked_body <size>;` | `max_chunked_body` | (413 over) |
-| `static_cache_entries <n>;` | `static_cache_entries` | nginx `open_file_cache max=N` |
-| `static_cache_valid <n>;` | `static_cache_valid_seconds` | nginx `open_file_cache_valid` |
-| `static_content_cache_max <size>;` | `static_content_cache_max` | |
-| `connection_pool_max <n>;` | `connection_pool_max` | |
-| `listen <port>;` | `Config.listen_port` | CLI `--port` wins when both |
-| `tls { cert "<path>"; key "<path>"; }` | `TlsConfig` | |
-| `log_format <name> "<cv>";` | `Config.log_formats` | duplicate names → compile error |
+| (none) | prefix — longest match wins | `prefix` |
+| `=` | exact | `exact` |
+| `~` | regular expression, case-sensitive | `regex` |
+| `~*` | regular expression, case-insensitive | `regex_ci` |
+| `^~` | prefix that wins over regex | `prefix` + no-regex |
 
-Unknown directives → `@compileError` with `conf:<line>:<col>`.
+The body holds [phase bindings](#phase-module) and location directives:
+[autoindex](#autoindex), [balance](#balance), [chunked](#chunked),
+[embed](#embed), [fail_timeout](#fail_timeout), [index](#index),
+[max_age](#max_age), [max_fails](#max_fails), [proxy_pass](#proxy_pass),
+[proxy_set_header](#proxy_set_header), [return](#return), [root](#root),
+[set](#set), [upstream](#upstream), [access_log](#access_log),
+[add_header](#add_header). Unknown directives are compile errors.
 
-## `server {}` and `location` blocks
+### log_format
 
-Exactly one `server {}` is required (vhosts are a future milestone).
-Locations select routes by modifier: `=` exact, `~` regex (case-sensitive),
-`~*` regex (case-insensitive), `^~` prefix that wins over regex, or plain
-prefix. nginx precedence: exact → `^~` prefix → first regex in declaration
-order → longest plain prefix → 404.
+Syntax: `log_format name value;`
 
-Location directives (all optional):
+Default: `combined` (`$ip - - [$date] "$request" $status $bytes "$referer" "$user_agent"`)
 
-| Directive | Effect |
+Context: main, server
+
+Defines a named log format; `value` is a [complex value](#embedded-variables)
+compiled once at comptime into a fragment list (no per-request string
+scanning). A route selects one with [access_log](#access_log). Up to 16 named
+formats may be declared (a 17th is a compile error). The first declared
+format fills index 0; the `combined` default is used when no `access_log`
+directive is present.
+
+### max_age
+
+Syntax: `max_age number;`
+
+Default: `max_age 0;`
+
+Context: location
+
+Default cache lifetime in seconds; the `cache_headers` module
+(`post_access` phase) emits `Cache-Control: max-age=N` from it. 0 = no-cache.
+
+### max_body
+
+Syntax: `max_body size;`
+
+Default: `max_body 16m;`
+
+Context: main, server
+
+Largest request body the server buffers — the receive-buffer growth cap.
+Requests beyond it are rejected with **431** (the `echo` module's ceiling is
+this value). nginx equivalent: `client_max_body_size`. Chunked request bodies
+are capped separately by [max_chunked_body](#max_chunked_body).
+
+### max_chunked_body
+
+Syntax: `max_chunked_body size;`
+
+Default: `max_chunked_body 64k;`
+
+Context: main, server
+
+Largest chunked request body; requests beyond it are rejected with **413**.
+nginx equivalent: `client_max_body_size`.
+
+### max_fails
+
+Syntax: `max_fails number;`
+
+Default: `max_fails 3;`
+
+Context: location
+
+Consecutive connect/read failures after which a backend is marked down for
+`fail_timeout` seconds (passive health check, `proxy` module).
+
+### max_headers
+
+Syntax: `max_headers number;`
+
+Default: `max_headers 32;`
+
+Context: main, server
+
+Maximum number of request headers; over it the request is rejected with
+**431**.
+
+### max_line_bytes
+
+Syntax: `max_line_bytes size;`
+
+Default: `max_line_bytes 8k;`
+
+Context: main, server
+
+Longest request line or header line; longer lines are rejected with **431**.
+nginx equivalent: `large_client_header_buffers`.
+
+### phase module
+
+Syntax: `<phase> <module>;`
+
+Default: —
+
+Context: location
+
+Binds a module to a phase. At most one module per phase per location
+(a duplicate phase binding is a compile error); unknown module names are
+compile errors. The pipeline walks the phases in order; `find_config` runs
+the route matcher up front so every phase can carry route-scoped modules.
+
+The 10 phases, in execution order (nginx request-processing stages):
+
+| Phase | Notes |
 |---|---|
-| `<phase> <module>;` | Bind a module to a phase (`post_read, server_rewrite, find_config, rewrite, post_rewrite, preaccess, access, post_access, content, log`). Unknown module names are compile errors. |
-| `root <path>;` / `index <file>;` / `autoindex on\|off;` | Static-file serving (with the `static` module). |
-| `embed <path>;` | Comptime-embedded file (project-root-relative). |
-| `max_age <n>;` | `Cache-Control: max-age=N`. |
-| `chunked on\|off;` | HTTP/1.1 single-chunk responses. |
-| `return <code> ["<cv>"];` | Fixed-response template (module-less routes are served from pre-serialised bytes). |
-| `add_header <name> "<cv>";` | Append a response header to a `return` template. |
-| `set $name "<cv>";` | User variable (M-C). |
-| `proxy_pass <host>:<port>;` / `upstream <host>:<port>;` | Proxy backends (IPv4 literals only). |
-| `balance <round_robin\|least_connections\|ip_hash>;` | Load-balance strategy. |
-| `max_fails <n>;` / `fail_timeout <n>;` | Passive health checks. |
-| `proxy_set_header <name> "<cv>";` | Upstream header overrides (M-E). |
-| `access_log <format-name>\|off;` | Select a named `log_format` for the log phase. |
+| `post_read` | before any config is matched |
+| `server_rewrite` | |
+| `find_config` | runs the route matcher; route is set here |
+| `rewrite` | e.g. `proxy` |
+| `post_rewrite` | |
+| `preaccess` | e.g. `conditional_get` |
+| `access` | |
+| `post_access` | e.g. `cache_headers` |
+| `content` | e.g. `echo`, `static`, `stub_status` |
+| `log` | runs as post-processing after the walk (gzip transforms, access/error logs) |
 
-## Example
+Registered modules:
+
+| Module | Phase | What it does |
+|---|---|---|
+| `echo` | content | 200 OK echoing the request body; bodies over `max_body` get 413 + close |
+| `static` | content | serves files from `root` (openat2-contained), embedded files, directory `index`/`autoindex`, fd + content cache, sendfile for large files |
+| `stub_status` | content | shared server counters page |
+| `proxy` | rewrite | reverse proxy to the route's upstreams; load-balancing, passive health checks, keep-alive pool |
+| `conditional_get` | preaccess | If-Modified-Since / If-None-Match → 304 |
+| `cache_headers` | post_access | emits `Cache-Control: max-age=N` from `max_age` (and ETag / Last-Modified) |
+| `gzip` | log | compresses the final body when the client sent `Accept-Encoding: gzip` and it shrinks (min 20 bytes) |
+| `access_log` | log | writes an access line per request (named `log_format` or `combined`) |
+| `error_log` | log | error logging |
+
+### proxy_pass
+
+Syntax: `proxy_pass host:port;`
+
+Default: —
+
+Context: location
+
+Adds a single upstream backend for the `proxy` module — sugar for
+[upstream](#upstream). The host must be an IPv4 literal; any other value is a
+compile error (sockaddrs are pre-computed at comptime — no DNS).
+
+### proxy_set_header
+
+Syntax: `proxy_set_header name value;`
+
+Default: —
+
+Context: location
+
+Overrides one request header sent to the upstream. The value is a [complex
+value](#embedded-variables) resolved against the location's `set` scope.
+
+### recv_buffer_size
+
+Syntax: `recv_buffer_size size;`
+
+Default: `recv_buffer_size 16k;`
+
+Context: main, server
+
+Initial per-connection receive buffer size. nginx equivalent:
+`client_body_buffer_size`.
+
+### return
+
+Syntax: `return code [value];`
+
+Default: —
+
+Context: location
+
+Fixed-response template served from pre-serialised bytes — module-less
+routes (redirects, health checks, error pages) skip the pipeline entirely.
+`value` is a [complex value](#embedded-variables): when any fragment is a
+variable the route uses the dynamic renderer instead, and [add_header](#add_header)
+headers apply. `return 301 "";` together with `add_header Location "/...";` is
+the idiomatic redirect (see the example below).
+
+### root
+
+Syntax: `root path;`
+
+Default: —
+
+Context: location
+
+Root directory for the `static` module. Targets are resolved against it with
+openat2(`RESOLVE_BENEATH`), giving kernel-enforced containment.
+
+### send_buffer_size
+
+Syntax: `send_buffer_size size;`
+
+Default: `send_buffer_size 16k;`
+
+Context: main, server
+
+Initial per-connection send buffer size.
+
+### server
+
+Syntax: `server { ... }`
+
+Default: —
+
+Context: main
+
+The server block. Exactly one is required (a missing or a second one is a
+compile error; vhosts are a future milestone). Contents: any global directive
+(merged) plus [location](#location) blocks.
+
+### set
+
+Syntax: `set $name value;`
+
+Default: —
+
+Context: location
+
+Declares a user variable scoped to the location. The name must be
+`[A-Za-z_][A-Za-z0-9_]*`; `$1..$9` and `$$` are reserved. Duplicate names in
+the same location, forward references (before the `set`), and more than 8
+variables per location are compile errors. The value is a [complex
+value](#embedded-variables) and may reference variables declared before it;
+references render lazily into the request arena and are cached per request.
+
+### static_cache_entries
+
+Syntax: `static_cache_entries number;`
+
+Default: `static_cache_entries 16;`
+
+Context: main, server
+
+Static fd-cache size. nginx equivalent: `open_file_cache max=N`.
+
+### static_cache_valid
+
+Syntax: `static_cache_valid number;`
+
+Default: `static_cache_valid 1;`
+
+Context: main, server
+
+Static-cache revalidation window in seconds. nginx equivalent:
+`open_file_cache_valid`.
+
+### static_content_cache_max
+
+Syntax: `static_content_cache_max size;`
+
+Default: `static_content_cache_max 16k;`
+
+Context: main, server
+
+Files at most this large are content-cached and served as a single writev;
+larger files go through sendfile. nginx equivalent: `sendfile_max_chunk`-ish.
+
+### tls
+
+Syntax: `tls { cert file; key file; }`
+
+Default: —
+
+Context: main, server
+
+Enables HTTPS via the native Zig TLS 1.3 server (`src/tls/`, no OpenSSL).
+Without the block the server stays plaintext; a connection is classified on
+its first record (TLS ClientHello / HTTP/2 prior-knowledge preface /
+HTTP/1.1), and ALPN picks `h2` vs `http/1.1` inside TLS.
+
+- The certificate must be ECDSA (P-256 or P-384) — RSA is unsupported — and
+  the key the matching SEC1 EC private key (PKCS#8 accepted).
+- Only one `tls` block is allowed; `cert` and `key` are each single-valued.
+- `--validate` prints `tls: enabled/disabled`.
+
+### upstream
+
+Syntax: `upstream host:port;`
+
+Default: —
+
+Context: location
+
+Appends an upstream backend for the `proxy` module. The host must be an IPv4
+literal (compile error otherwise). Multiple `upstream` directives build the
+backend list. A single backend can be written more concisely with
+[proxy_pass](#proxy_pass). Note: the `proxy` module tracks at most 8 backends
+per route — a route declaring more is silently skipped by the module (the
+location yields 404), so keep backend lists within 8.
+
+## Embedded variables
+
+Any value of a variable-capable directive (`log_format`, `return`,
+`add_header`, `set`, `proxy_set_header`) is a **complex value**: a compiled
+list of fragments built once at compile time and rendered per request by a
+comptime-switched getter loop — zero string scanning at runtime.
+
+Syntax: `$name` (variable reference), `$$` (literal `$`), `${name}` (braced
+name, allows `-` etc.).
+
+Built-in variables:
+
+| Variable | Value |
+|---|---|
+| `$method` | request method (GET/HEAD/POST/PUT/DELETE/OPTIONS/PATCH; `?` when unknown) |
+| `$request_uri` | raw request target incl. query string |
+| `$uri` | decoded request target |
+| `$args` / `$query_string` | query string incl. the leading `?` |
+| `$host` | `Host` header (`""` when absent) |
+| `$status` | response status code |
+| `$body_bytes_sent` / `$bytes` | response body length |
+| `$remote_addr` / `$ip` | client IPv4 (`-` when unknown) |
+| `$remote_port` | `-` (not tracked yet) |
+| `$server_protocol` | `HTTP/1.1` etc. |
+| `$scheme` | `http` (TLS later) |
+| `$request_time` | seconds since request start |
+| `$content_length` | request Content-Length |
+| `$content_type` | request Content-Type |
+| `$date` / `$time_local` | combined-log date (`02/Jan/2006:15:04:05 +0000`) |
+| `$time_iso8601` | ISO-8601 timestamp (`2026-08-16T18:00:00+00:00`) |
+| `$request` | `METHOD target HTTP/1.1` |
+| `$referer` | `Referer` header (`-` when absent) |
+| `$user_agent` | `User-Agent` header (`-` when absent) |
+
+Generic variables:
+
+| Variable | Value |
+|---|---|
+| `$http_<name>` | request header; `_`→`-` (e.g. `$http_user_agent` → `user-agent`), case-insensitive hash match |
+| `$arg_<name>` | query parameter (verbatim, case-sensitive) |
+| `$cookie_<name>` | cookie (lowercased) |
+| `$1..$9` | regex capture groups — valid inside regex-matched locations; `""` when no capture |
+
+Name resolution order: `$1..$9` capture → `http_*` header → `arg_*` query →
+`cookie_*` cookie → declared `set` variable in scope → built-in → otherwise a
+compile error (`unknown variable '$...'`).
+
+## Location matching
+
+nginx precedence:
+
+1. Exact (`=`) match wins immediately.
+2. Longest `^~`-flagged prefix wins immediately (regex skipped).
+3. First regex (`~`/`~*`) match in **declaration order** wins immediately
+   (captures recorded into `$1..$9`).
+4. Otherwise the longest plain prefix wins; else 404 (`not_handled`).
+
+## Regular expressions
+
+The regex subset supported by `location ~` / `~*` (comptime-compiled into a
+Thompson NFA, `src/dsl/regex.zig`):
+
+- Literals (escaped metachars: `\. \/ \\ \* \+ \? \( \) \[ \] \{ \} \| \^ \$`).
+- `.` matches any byte except `\n`.
+- Classes `[...]` and `[^...]` with ranges (`a-z`), escapes
+  (`\d \w \s \D \W \S` and escaped metachars); literal `]` as first member.
+- `\d` `[0-9]`, `\w` `[A-Za-z0-9_]`, `\s` `[ \t\r\n]`, `\D \W \S` complements.
+- Quantifiers `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` (greedy only).
+- Groups `(...)` (capturing) and `(?:...)` (non-capturing).
+- Alternation `|`.
+- Anchors `^` (start) and `$` (end).
+
+No backreferences, no lookaround, no lazy/possessive modifiers, no `\b`, no
+named groups. Malformed patterns are compile errors carrying the pattern
+text.
+
+## Comptime branch budget
+
+The config parse, regex compilation, trie build and dispatch assignment share
+the per-compilation comptime branch quota (default 100000,
+`-Dconfig_branch_quota=<n>`). The validate step measures the config's compile
+cost and fails with a clear error before the quota is exhausted (safety
+factor 1.5 — it triggers at ~66% of the quota):
 
 ```
-max_body 1m;
-max_headers 64;
-static_cache_valid 60;
-
-tls {
-    cert "server.pem";
-    key "server.key";
-}
-
-server {
-    location / {
-        content static;
-        root /var/www;
-    }
-
-    location = /health {
-        return 200 "ok";
-    }
-}
+conf '<embedded>': config compile cost ~N exceeds the comptime branch budget
+(<quota>, safety factor 1.5). Reduce the config (routes/regex/length) or
+raise the budget: zig build -Dconfig_branch_quota=<n>
 ```
 
-Startup: `zig build -Dconfig=config.conf run` (the only path).
+Cost units: conf byte 1, directive 8, block opened 16, complex-value fragment
+4, regex pattern byte 3, regex NFA state 2, route 32.
 
 ## Daemon control and reloads
 
-`--start`/`--stop`/`--status`/`--reload-hard` turn the server into a
-daemon. The daemon records everything needed to reproduce its build+start in
-a state file next to the pidfile: `<pidfile>.state` (JSON: `config_path`,
-`optimize`, `port`, `threads`, `mode`, `idle_timeout`, `uring`, `single`,
-`embedded`, `project_root`). `--pidfile` defaults to `/tmp/zocket.pid`.
+`--start`/`--stop`/`--status`/`--reload-hard` turn the server into a daemon.
+The daemon records everything needed to reproduce its build+start in a state
+file next to the pidfile: `<pidfile>.state` (JSON: `config_path`, `optimize`,
+`port`, `threads`, `mode`, `idle_timeout`, `uring`, `single`, `embedded`,
+`project_root`). `--pidfile` defaults to `/tmp/zocket.pid`.
 
 Example lifecycle:
 
@@ -138,64 +667,114 @@ zocket --stop --pidfile /tmp/zocket.pid          # graceful drain + exit
      reload — the old daemon keeps serving untouched**.
   2. The freshly built `zig-out/bin/zocket --start` is exec'd with the
      recorded options — both daemons bind the port via SO_REUSEPORT, so
-     there is no acceptance gap (verified: 2M requests across a swap, 0
-     errors).
+     there is no acceptance gap.
   3. The old daemon gets SIGTERM and drains: it stops accepting, closes its
      listeners (so every new connection goes to the new daemon), serves any
      connections already in its accept backlog, and finishes its in-flight
      requests before exiting. The only loss window is the µs between the
-     drain request and the listener close (a connection whose SYN lands
-     exactly there is reset — the same instant nginx's reload has).
+     drain request and the listener close.
   4. The pid/state files are only removed by a daemon that still owns them:
      the old daemon checks the pidfile before cleaning up, so it cannot
-     delete the new daemon's files (the reload-hard cleanup race, covered
-     by a test).
+     delete the new daemon's files.
   Conf paths must resolve inside the project tree — the comptime embed
   (`@embedFile`) cannot reach outside it (dot-directories like `.zig-cache`
   are excluded too).
 
 SIGHUP is deliberately not handled (configs are comptime-only).
 
-For the other run modes see the README.
+## Examples
 
-## TLS (M18)
-
-The `src/tls/` module provides a native Zig TLS 1.3 server (no OpenSSL):
-ECDSA P-256/P-384 certificates (RSA unsupported — `std.crypto` has none),
-X25519 ECDHE, AES-128-GCM-SHA256 / ChaCha20-Poly1305-SHA256 /
-AES-256-GCM-SHA384, ALPN (`h2` / `http/1.1`), HelloRetryRequest, in-place
-record decryption, and stateless session tickets (PSK resumption). Verified
-against `std.crypto.tls.Client`, `openssl s_client` (handshake, encrypted
-round trip, close_notify) and `openssl s_client -sess_in` (resumption
-reports `Reused, TLSv1.3`).
-
-Enable HTTPS with the `tls` block:
+### Basic
 
 ```
+max_body 16m;
+max_line_bytes 8k;
+max_headers 64;
+
 tls {
-    cert "path/to/cert.pem";
-    key "path/to/key.pem";
+    cert "server.pem";
+    key "server.key";
+}
+
+server {
+    listen 8080;
+
+    location = /health {
+        return 200 "ok";
+    }
+
+    location / {
+        content echo;
+    }
 }
 ```
 
-- The cert must be ECDSA (P-256 or P-384); the key must be the matching
-  SEC1 EC private key (PKCS#8 also accepted).
-- A connection is classified on its first record: TLS ClientHello, the
-  HTTP/2 prior-knowledge preface, or HTTP/1.1. ALPN picks `h2` vs
-  `http/1.1` inside TLS; no ALPN means HTTP/1.1.
-- `--validate` prints `tls: enabled/disabled`; without the block the
-  server stays plaintext.
-
-## Comptime branch budget
-
-The comptime branch quota is shared per compilation (config parse, regex
-compile, trie build, dispatch assignment, the h2/tls comptime tables).
-`Config.comptimeValidate` measures the config's compile cost (routes × 32 +
-fragments × 4 + source length + ...) and raises a clear compile error when
-it exceeds ~66% of the budget (safety factor 1.5):
+### Redirect, variables, captures and templates
 
 ```
-conf '<embedded>': config compile cost ~N exceeds the comptime branch budget
-(<quota>, safety factor 1.5). Reduce the config (routes/regex/length) or
-raise the budget: zig build -Dconfig_branch_quota=<n>
+log_format combined "$ip - - [$date] \"$request\" $status $bytes \"$referer\" \"$user_agent\"";
+log_format short "$request $status";
+
+server {
+    location = /old {
+        return 301 "";
+        add_header Location "/health";
+    }
+
+    location ~ ^/api/([0-9]+)/ {
+        content echo;
+        set $api_ver "$1";
+        add_header X-API-Version "$api_ver";
+        access_log combined;
+    }
+
+    location / {
+        content echo;
+        access_log short;
+    }
+}
 ```
+
+### Static files and proxying
+
+```
+server {
+    location ^~ /static/ {
+        content static;
+        root testdata;
+        index index.html;
+        autoindex on;
+        max_age 3600;
+    }
+
+    location /proxy {
+        rewrite proxy;
+        proxy_pass 127.0.0.1:9000;
+        proxy_set_header X-Forwarded-Host "$host";
+    }
+
+    location /lb {
+        rewrite proxy;
+        upstream 10.0.0.1:8000;
+        upstream 10.0.0.2:8001;
+        balance least_connections;
+        max_fails 5;
+        fail_timeout 15;
+    }
+}
+```
+
+### Comptime embedded asset
+
+```
+server {
+    location /favicon.ico {
+        content static;
+        embed static/favicon.ico;
+    }
+}
+```
+
+See `config.example.conf` for the full reference sample, including the
+gzip/conditional-GET/cache-headers pipeline (`log gzip;`,
+`preaccess conditional_get;`, `post_access cache_headers;`).

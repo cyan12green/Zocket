@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # HTTP/1.1 chunked-transfer benchmark: Zocket /chunked (route opt-in
-# "chunked": true) vs nginx (echo-nginx-module with echo_flush, which
+# `chunked on;`) vs nginx (echo-nginx-module with echo_flush, which
 # forces chunked because the length is unknown at header time). POST echo:
 # the request body is echoed back, framed as chunks. Interleaved reps;
 # results land in bench/results/chunked/, rendered by bench/graphs.py into
 # bench/graphs/chunked_compare.png.
 #
 # Usage: bash bench/chunked-bench.sh   (needs zig-out/bin/zocket built with
-# -Dconfig=config.example.conf, nginx-v2 + echo-nginx-module, bombardier).
+# a conf that declares `location /chunked { content echo; chunked on; }`,
+# nginx-v2 + echo-nginx-module, bombardier). NOTE: config.example.conf has
+# no /chunked route; a plain `--http` build serves plain (Content-Length)
+# echo on every path, so without a chunked-on conf build the Zocket side
+# measures unframed echo, not chunked transfer.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BOMB="${BOMB:-$HOME/go/bin/bombardier}"

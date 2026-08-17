@@ -334,7 +334,7 @@ Path B.
 206, multi → 200, invalid → 416), 304 path, byte-identical file bodies.
 Path B (embedded): comptime-embedded file produces byte-identical response
 to the equivalent disk-served file. `testdata/` with small test files.
-Integration: `--config config.example.json` mapping `/` → static, curl
+Integration: `-Dconfig` with a conf mapping `/` → static, curl
 multiple paths. A/B M10 vs M9 (<5%) recorded.
 
 **Comptime**: MIME table (M6). `@embedFile` does not need comptime
@@ -377,9 +377,9 @@ so `rewrite`/`access` modules can still override. This composes with M9's
 comptime pre-compression: a static response can declare both `response`
 and `compress: gzip` to get comptime-compressed fast-path bytes.
 
-Config example:
-```json
-{ "path": "/health", "match": "exact", "response": { "status": 200, "body": "ok" } }
+Config example (conf):
+```
+location = /health { return 200 "ok"; }
 ```
 
 **Verification**: fast-path response is byte-identical to the equivalent
@@ -466,6 +466,12 @@ Gates met: 4 new unit tests + e2e verification (combined-format lines on
 stderr, parse-error warn lines, stub counters under load, the full SIGHUP
 config-A→B dance with old-connection drain), `zig build test` 149/149,
 M13 A/B in `bench/BENCH.md` (+0.6% / -0.7%, within gate).
+
+> **Note (M18.5)**: the SIGHUP config-reparse reload was removed when
+> configs became comptime-only. `--reload-hard` (rebuild with the new conf,
+> SO_REUSEPORT daemon swap + drain) is now the only reload; SIGHUP is
+> deliberately not handled. The M13 module work (access log, error log,
+> stub_status) remains.
 
 *Depends on*: M10 (static files for log content) + M12 (proxy metrics).
 
@@ -671,7 +677,7 @@ frames HEADERS+DATA vs the h1 serializer) but the modules are
 protocol-agnostic. Fixing a pre-existing M12 bug exposed by this: the
 comptime `assignDispatch` upstream-sockaddr assignment wrote through a
 `[]const` slice (build error for any comptime/embedded config with a proxy
-route); sockaddr is now precomputed by the DM1/DM2 parser and verified
+route); sockaddr is now precomputed by the conf parser and verified
 present at comptime.
 
 **Comptime**: HPACK static table (61 entries) and the Huffman decode trie
@@ -727,7 +733,7 @@ reactor tests extended for the post-101 raw phase.
 
 ### M18.5 — Conf language (comptime-only, nginx-flavored)
 
-**Status: CORE DONE** (M-A of `docs/plan.md`; M-B..M-E follow). Replaced
+**Status: DONE** (M-A..M-E of the conf-language plan). Replaced
 the JSON config with an nginx-conf-flavored language compiled entirely at
 comptime: `zig build -Dconfig=<file>` embeds a `.conf` parsed by
 `src/dsl/conf.zig` (tokenizer with sizes/quotes/comments/line-col errors,
@@ -739,22 +745,23 @@ removed (`--reload-hard` is the only reload). `Config` gained
 `comptimeValidate` API; a budget check (`-Dconfig_branch_quota`, default
 100000) fails with a clear error before the shared comptime branch quota is
 exhausted. `src/dsl/vars.zig` holds the complex-value types (`Frag`,
-`VarId`, `SetVar`, `LogFormat`, ...); `src/dsl/regex.zig` and the router
-regex precedence land in M-D.
+`VarId`, `SetVar`, `LogFormat`, ...) with the `$variable` getters and
+`parseComplexValue`/`renderComplex` (M-B/M-C); `src/dsl/regex.zig` compiles
+router regexes (`~`/`~*`) into NFAs (M-D); `proxy_set_header` rendering is
+M-E.
 
-**Verification**: 226 tests (conf parser tests, migrated fixtures), h2test,
-fuzz; docs: `docs/conf.md` (language reference), `docs/config.md`
-rewritten, `config.example.conf` replaces the JSON sample.
+**Verification**: 265 tests (conf parser tests, migrated fixtures), h2test,
+fuzz; docs: `docs/config.md` rewritten (consolidated conf language reference +
+config how-to), `config.example.conf` replaces the JSON sample.
 
 ---
 
 ### M19 — HTTP/3 + QUIC
 
-**Status: PLANNED** (after M16 + M17; nginx `v3`, Caddy and h2o all ship
-it). RFC 9000 (QUIC) + RFC 9114 (HTTP/3): connection migration, 0-RTT,
+**Status: PLANNED** (nginx `v3`, Caddy and h2o all ship it). RFC 9000 (QUIC) + RFC 9114 (HTTP/3): connection migration, 0-RTT,
 UDP transport. The largest single item — realistically via a QUIC C
 dependency (quiche / lsquic) or by waiting for Zig std support; scope and
-feasibility are revisited once M16/M17 land. Delivery is incremental: UDP
+feasibility are revisited before pickup. Delivery is incremental: UDP
 receive path -> QUIC handshake -> HTTP/3 framing -> ALPN `h3`.
 
 ---
@@ -795,7 +802,9 @@ is picked up.
 
 ### DM1 — Comptime JSON config validation ✅ DONE
 
-**Status**: shipped. `std.json`'s DOM cannot run at comptime (no allocator,
+**Status**: shipped. (Superseded by M18.5: the JSON config path and
+`src/runtime/json_config.zig` were removed — the conf language in
+`src/dsl/conf.zig` took over all comptime config work.) `std.json`'s DOM cannot run at comptime (no allocator,
 `@intFromPtr` in `std.mem`), so `src/runtime/json_config.zig` implements a
 DOM-free comptime JSON parser/validator for the config schema: objects,
 arrays, strings, integers, booleans, escapes (`\u` included). Malformed
@@ -822,17 +831,19 @@ compile time; `Config.default()` now goes through the validator too.
 
 ### DM2 — Comptime config as the primary path ✅ DONE
 
-**Status**: shipped. Build with `zig build -Dconfig=<file>` to embed a
+**Status**: shipped. (Superseded by M18.5: `-Dconfig` now embeds a `.conf`
+parsed by the conf language, and the runtime JSON path described below no
+longer exists.) Build with `zig build -Dconfig=<file>` to embed a
 project-root-relative JSON config at compile time (resolved through the
 `embeds` module, same convention as M10 route `embed` paths). The config is
 parsed by the DM1 validator at compile time (invalid configs are compile
 errors), then `Server.comptimeInit` builds the route trie, per-route dispatch
 functions, pre-serialised response templates (`response_bytes`, M11) and
 upstream sockaddrs — everything in `.rodata`, no startup parsing, no
-allocator, no trie build at boot. The runtime `--config` flag remains the
-secondary path for development/dynamic uses (startup std.json parse +
-startup trie + SIGHUP reload). Config source priority: `-Dconfig` (embedded)
-> `--config` (runtime) > default.
+allocator, no trie build at boot. A runtime `--config` JSON flag briefly
+remained the secondary path for development/dynamic uses (startup std.json
+parse + startup trie + SIGHUP reload) until M18.5 removed it. Config source
+priority is now `-Dconfig` (embedded conf) > default.
 
 Details:
 - `Config.fromEmbedded(path)` is now root-relative via `embeds.embed`.
@@ -851,10 +862,13 @@ Details:
 
 ## Suggested starting milestone (next session)
 
-**M-B/M-C (complex values, variables, `set`)** of the conf-language plan
-(`docs/plan.md`) is the next milestone: `src/dsl/vars.zig` (Frag/VarId,
-getters, `parseComplexValue`, `renderComplex`), complex-value `return`/
-`add_header`/`log_format`, and the `access_log` rewrite on `LogFormat`.
-M-A (the conf language core: tokenizer, parser, all directives,
-`Config` API, comptime-only migration, budget check) is complete; the
-WebSocket track (M18) and HTTP/3 (M19) remain the other candidates.
+The conf-language plan is fully delivered: M-A (the conf language core:
+tokenizer, parser, all directives, `Config` API, comptime-only migration,
+budget check), M-B/M-C (complex values, variables, `set` —
+`src/dsl/vars.zig`: `Frag`/`VarId`, getters, `parseComplexValue`,
+`renderComplex`, complex-value `return`/`add_header`/`log_format`, the
+`access_log` rewrite on `LogFormat`), M-D (regex engine + router
+integration) and M-E (`proxy_set_header`). Remaining candidates: the
+WebSocket track (M18), HTTP/3 (M19), or the planned-after-protocol backlog
+(rate limiting, header manipulation, auth, per-request timeouts,
+`proxy_cache`, IPv6 listeners).
