@@ -297,6 +297,77 @@ test "comptime server dispatches a route with multiple phases via the dispatch f
     try testing.expectEqual(pipeline.Outcome.not_handled, try srv.handleRequest(&ctx2));
 }
 
+/// Runs one chain-e2e case through the real comptime-dispatch server and
+/// asserts the expected claim (`want` present, `want_absent` absent). Mirrors
+/// the curl checks in the testdata/chain-e2e.conf fixture.
+fn runChainCase(
+    srv: *const Server,
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    body: []const u8,
+    stats: *const registry.ServerStats,
+    want: []const u8,
+    want_absent: []const u8,
+) !void {
+    var req = registry.Request.init(allocator);
+    defer req.deinit();
+    req.target = target;
+    req.decoded_target = target;
+    req.body = body;
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp, .allocator = allocator, .stats = stats };
+
+    const out = try srv.handleRequest(&ctx);
+    defer if (resp.body_owned) allocator.free(resp.body);
+    try testing.expectEqual(pipeline.Outcome.handled, out);
+    // The conf-derived server runs the comptime dispatch path (what the curl
+    // e2e exercised), not the loop walk.
+    try testing.expect(ctx.route.?.dispatch != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, want) != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, want_absent) == null);
+}
+
+test "chain e2e regression: same-phase modules chain through the comptime dispatch" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location = /chain/stub-first {
+        \\        content stub_status;
+        \\        content echo;
+        \\    }
+        \\
+        \\    location = /chain/echo-first {
+        \\        content echo;
+        \\        content stub_status;
+        \\    }
+        \\
+        \\    location = /chain/fallback {
+        \\        content static;
+        \\        content echo;
+        \\    }
+        \\
+        \\    location = /chain/static-then-stub {
+        \\        content static;
+        \\        content stub_status;
+        \\    }
+        \\}
+    );
+    const srv = Server.comptimeInit(cfg);
+    var stats = registry.ServerStats.init();
+
+    // stub_status claims first: echo must never run.
+    try runChainCase(&srv, testing.allocator, "/chain/stub-first", "STUB-MUST-NOT-APPEAR", &stats,
+        "Active connections:", "STUB-MUST-NOT-APPEAR");
+    // echo claims first: stub_status must never run.
+    try runChainCase(&srv, testing.allocator, "/chain/echo-first", "ECHO-BODY-FIRST", &stats,
+        "ECHO-BODY-FIRST", "Active connections:");
+    // static passes (no root): echo falls through to.
+    try runChainCase(&srv, testing.allocator, "/chain/fallback", "FALLBACK-CHAIN", &stats,
+        "FALLBACK-CHAIN", "Active connections:");
+    // static passes: stub_status claims, echo (later) must never run.
+    try runChainCase(&srv, testing.allocator, "/chain/static-then-stub", "STUB-AFTER-PASS", &stats,
+        "Active connections:", "STUB-AFTER-PASS");
+}
+
 test "conf-config server with a comptime trie routes identically to the plain server" {
     const cfg = comptime Config.fromConfComptime(
         \\server {
