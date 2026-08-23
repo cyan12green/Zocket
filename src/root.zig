@@ -19,6 +19,7 @@ pub const http = struct {
     pub const response = @import("http/response.zig");
     pub const header_dfa = @import("http/header_dfa.zig");
     pub const websocket = @import("http/websocket.zig");
+    pub const shmem = @import("dsl/shmem.zig");
     pub const arena = @import("http/arena.zig");
 };
 
@@ -90,6 +91,7 @@ comptime {
     _ = @import("dsl/modules/headers.zig");
     _ = @import("dsl/modules/auth_basic.zig");
     _ = @import("dsl/modules/limit.zig");
+    _ = @import("dsl/shmem.zig");
     _ = @import("dsl/htpasswd.zig");
     _ = @import("http/arena.zig");
     _ = @import("http2/hpack.zig");

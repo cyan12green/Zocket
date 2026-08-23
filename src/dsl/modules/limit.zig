@@ -20,16 +20,27 @@
 
 const std = @import("std");
 const registry = @import("../registry.zig");
+const shmem = @import("../shmem.zig");
 
 pub const Context = registry.Context;
 pub const Action = registry.Action;
 
-/// Table capacity: power of two, generous for per-IP keys. Eviction is not
-/// performed — entries are refreshed in place and stale buckets are simply
-/// reused when their key hash matches nothing (open addressing wraps).
+/// Zone capacity (power of two, generous for per-IP keys): the shared-
+/// memory ceiling for both limit zones. At capacity an UNKNOWN client is
+/// refused — fail-closed, the correct at-capacity policy for limiting.
 const table_bits = 12;
 const table_len = 1 << table_bits;
-const table_mask = table_len - 1;
+
+const ReqState = struct {
+    credit_ns: u64,
+    last_ns: u64,
+};
+const ConnState = struct {
+    active: u32,
+};
+
+var req_zone = shmem.KeyedTable(ReqState, table_len){};
+var conn_zone = shmem.KeyedTable(ConnState, table_len){};
 
 fn hashKey(ctx: *Context) u64 {
     // FNV-1a over the dotted client IP; zero IPs (tests, socketpairs)
@@ -43,19 +54,6 @@ fn hashKey(ctx: *Context) u64 {
     return h;
 }
 
-var state_mutex: std.Thread.Mutex = .{};
-
-/// Leaky-bucket state for limit_req: accrued nanosecond-credit (capped at
-/// burst intervals) plus the timestamp it was last topped up. A fresh key
-/// starts with a FULL bucket — the burst is there to absorb spikes, not to
-/// punish first contact.
-var req_credit = [_]u64{0} ** table_len;
-var req_last_ns = [_]u64{0} ** table_len;
-var req_key_hash = [_]u64{0} ** table_len;
-
-/// In-flight counters for limit_conn.
-var conn_active = [_]u32{0} ** table_len;
-var conn_key_hash = [_]u64{0} ** table_len;
 
 pub const limit_req = registry.Module{
     .name = "limit_req",
@@ -81,12 +79,6 @@ fn reject(ctx: *Context) Action {
     return .handled;
 }
 
-fn slotFor(table: []const u64, key: u64) usize {
-    var i: usize = @intCast(key & table_mask);
-    while (table[i] != 0 and table[i] != key) : (i = (i + 1) & table_mask) {}
-    return i;
-}
-
 fn runReq(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
     if (route.limit_req_rate == 0) return .pass;
@@ -96,24 +88,23 @@ fn runReq(ctx: *Context) anyerror!Action {
     const max_credit_ns = burst * interval_ns;
 
     const key = hashKey(ctx);
-    state_mutex.lock();
-    defer state_mutex.unlock();
-
-    const idx = slotFor(&req_key_hash, key);
     const now = ctx.now_ns;
-    if (req_key_hash[idx] != key) {
-        // Fresh or recycled slot: full bucket, clock starts now.
-        req_key_hash[idx] = key;
-        req_last_ns[idx] = now;
-        req_credit[idx] = max_credit_ns;
-    } else if (now > req_last_ns[idx]) {
-        const elapsed = now - req_last_ns[idx];
-        req_last_ns[idx] = now;
-        req_credit[idx] = @min(req_credit[idx] + elapsed, max_credit_ns);
-    }
 
-    if (req_credit[idx] >= interval_ns) {
-        req_credit[idx] -= interval_ns;
+    // Leaky bucket in nanosecond credit: a fresh key starts with a FULL
+    // bucket — the burst absorbs spikes, first contact is not punished.
+    // The whole read-modify-write runs under the zone mutex.
+    req_zone.mutex.lock();
+    defer req_zone.mutex.unlock();
+    const r = req_zone.upsertLocked(key) orelse return reject(ctx);
+    if (!r.existed) {
+        r.slot.* = .{ .credit_ns = max_credit_ns, .last_ns = now };
+    } else if (now > r.slot.last_ns) {
+        const elapsed = now - r.slot.last_ns;
+        r.slot.last_ns = now;
+        r.slot.credit_ns = @min(r.slot.credit_ns + elapsed, max_credit_ns);
+    }
+    if (r.slot.credit_ns >= interval_ns) {
+        r.slot.credit_ns -= interval_ns;
         return .pass;
     }
     // Bucket empty: reject without consuming anything.
@@ -125,22 +116,17 @@ fn runConn(ctx: *Context) anyerror!Action {
     if (route.limit_conn_max == 0) return .pass;
     const key = hashKey(ctx);
 
-    state_mutex.lock();
-    const idx = blk: {
-        const i = slotFor(&conn_key_hash, key);
-        if (conn_key_hash[i] != key) {
-            conn_key_hash[i] = key;
-            conn_active[i] = 0;
+    var admitted = false;
+    {
+        conn_zone.mutex.lock();
+        defer conn_zone.mutex.unlock();
+        const r = conn_zone.upsertLocked(key) orelse return reject(ctx);
+        if (r.slot.active < route.limit_conn_max) {
+            r.slot.active += 1;
+            admitted = true;
         }
-        break :blk i;
-    };
-    const active = conn_active[idx];
-    if (active >= route.limit_conn_max) {
-        state_mutex.unlock();
-        return reject(ctx);
     }
-    conn_active[idx] = active + 1;
-    state_mutex.unlock();
+    if (!admitted) return reject(ctx);
 
     // Mark this request as holding a slot so the release module (log phase,
     // always-run) decrements exactly once.
@@ -155,11 +141,11 @@ fn runConnRelease(ctx: *Context) anyerror!Action {
     ctx.mod_state = null;
 
     const key = hashKey(ctx);
-    state_mutex.lock();
-    defer state_mutex.unlock();
-    const idx = slotFor(&conn_key_hash, key);
-    conn_key_hash[idx] = key;
-    if (conn_active[idx] > 0) conn_active[idx] -= 1;
+    conn_zone.mutex.lock();
+    defer conn_zone.mutex.unlock();
+    if (conn_zone.upsertLocked(key)) |r| {
+        if (r.slot.active > 0) r.slot.active -= 1;
+    }
     return .pass;
 }
 
