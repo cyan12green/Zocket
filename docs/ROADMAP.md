@@ -99,7 +99,7 @@ byte-budgeted LRU stores; nothing grows under load):
 
 ---
 
-## Module framework v2 — handler / filter / upstream (PLANNED → Stage 1 in progress)
+## Module framework v2 — handler / filter / upstream (Stage 1 DONE; Stage 2 next)
 
 The pipeline currently has one module kind bound to phases, with the `log`
 phase doubling as the response-transform slot and the proxy doing blocking
@@ -209,10 +209,20 @@ Tracked backlog (design notes recorded here; build later):
 
 ### Delivery stages and gates
 
-- **Stage 1** (kinds + filters + contexts + items 1-5): registry/router/
-  pipeline/conf + `dsl/testing.zig`. Hard-break migrations applied. Gate:
-  full suite green, backlog bench numbers hold (filters add zero
-  indirection), example conf builds.
+- **Stage 1** DONE (2026-08-23): `Kind{handler,filter}` with comptime-
+  checked bindings (`<phase> <filter>` is a compile error); per-route
+  `Route.filters` applied reverse-declaration after walk+template in BOTH
+  dispatch and loop-walk paths; `matchFast` gated off for filtered routes;
+  conf contexts http/server/location for filters with all-or-nothing
+  inheritance (+optional explicit `http {}` block); hard-break migrations
+  applied (`log gzip;` -> `gzip on;`, cache_headers/store via presence);
+  lifecycle hooks (`initModules(limits)` from reactor startup, gated),
+  named state slots (`ctx.setState/getState`) replacing the single
+  mod_state, module directive lists, buffer-ownership contract docs,
+  `dsl/testing.zig` kit. Migrated to filter kind: gzip, headers,
+  cache_headers, proxy_cache_store. 321 tests. Directive-schema arm
+  validation is partial (names published + uniqueness checks; generic
+  param validation deferred).
 - **Stage 2** (async upstreams + items 6-8): `Action.async{fd, want}`
   outcome; reactor registers upstream fds into the connection epoll set
   tagged by session; completions dispatch to the module's `on_ready`.

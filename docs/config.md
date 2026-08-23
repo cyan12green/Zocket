@@ -344,7 +344,34 @@ Default: —
 
 Context: location
 
-Binds a module to a phase. Multiple modules may be bound to the same phase
+Modules come in two kinds. **Handlers** bind to phases (`<phase> <module>;`)
+and run during the request walk — first claim wins. **Filters** transform the
+finished response: they run after every outcome (including template
+responses), in REVERSE declaration order, and never gate content generation.
+
+### filter
+
+Syntax: `filter <name>;`
+
+Default: —
+
+Contexts: http, server, location
+
+Binds a filter to the current scope. Scopes inherit all-or-nothing: a
+location that declares no filters inherits its server's set; a server that
+declares none inherits the `http` block's. Filters may also activate via
+their own directives (declaring `add_header ...` binds the headers filter;
+`gzip on;` binds gzip; `max_age <n>;` binds cache_headers; `proxy_cache on;`
+binds the cache store). Binding a filter with a `<phase> <name>;` directive
+is a compile error.
+
+An optional `http { ... }` block may wrap server blocks; top-level
+directives keep working and act as the implicit http scope.
+
+Currently registered filters: `headers`, `gzip`, `cache_headers`,
+`proxy_cache_store`.
+
+Binds a handler module to a phase. Multiple handlers may share a phase
 (nesting is allowed): they form a chain run in config declaration order
 (nginx-style). A module that `pass`es lets the next module in the same phase
 run; a module that handles the request (or short-circuits) stops the chain.

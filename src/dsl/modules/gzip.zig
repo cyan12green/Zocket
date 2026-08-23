@@ -20,8 +20,11 @@ pub const min_compress_bytes = 20;
 /// is too small, already encoded, or does not shrink.
 pub const gzip = registry.Module{
     .name = "gzip",
+    // Legacy marker only: filters run after the walk, ordered per route.
     .phase = .log,
+    .kind = .filter,
     .run = run,
+    .directives = &.{"gzip"},
 };
 
 fn run(ctx: *Context) anyerror!Action {

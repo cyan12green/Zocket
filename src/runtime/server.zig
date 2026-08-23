@@ -182,7 +182,9 @@ pub const Server = struct {
             ctx.captures = caps.ranges;
             ctx.capture_count = caps.count;
         }
-        if (route.modules.len != 0) return null;
+        // Filters transform responses; a filtered route must go through
+        // the pipeline even when it has no handlers.
+        if (route.modules.len != 0 or route.filters.len != 0) return null;
         const fb = route.response_bytes orelse return null;
         ctx.route = route;
         return fb;
@@ -356,6 +358,32 @@ test "auth_basic guards a conf route end to end" {
     var ok_ctx = pipeline.Context{ .req = &ok, .resp = &ok_resp };
     try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ok_ctx));
     try testing.expectEqualStrings("hi", ok_resp.body);
+}
+
+test "filters disable the fast path; template routes run through pipeline" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location = /tpl {
+        \\        return 200 "raw";
+        \\        add_header X-F "on";
+        \\    }
+        \\}
+    );
+    const srv = Server.comptimeInit(cfg);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/tpl";
+    req.decoded_target = "/tpl";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+    // The headers FILTER ran on top of the template body.
+    try testing.expectEqualStrings("raw", resp.body);
+    var saw = false;
+    for (resp.headers[0..resp.header_count]) |h| {
+        if (std.mem.eql(u8, h.name, "X-F") and std.mem.eql(u8, h.value, "on")) saw = true;
+    }
+    try testing.expect(saw);
 }
 
 test "headers module applies ops through the comptime dispatch" {

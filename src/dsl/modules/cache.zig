@@ -20,6 +20,7 @@ pub const conditional_get = registry.Module{
 /// no-cache) and, when the content metadata is known, `ETag` and
 /// `Last-Modified`.
 pub const cache_headers = registry.Module{
+    .kind = .filter,
     .name = "cache_headers",
     .phase = .post_access,
     .run = cacheRun,

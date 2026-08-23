@@ -25,15 +25,15 @@ pub const auth_request = registry.Module{
 fn run(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
     const uri = route.auth_request_uri orelse return .pass;
-    if (ctx.mod_state == @as(?*anyopaque, @ptrCast(&in_subrequest_marker))) {
+    if (ctx.getState("auth_request") == @as(?*anyopaque, @ptrCast(&in_subrequest_marker))) {
         // We are ALREADY inside an auth subrequest: refuse to recurse.
         return failWith(ctx, .internal_error);
     }
     const hook = ctx.subrequest orelse return failWith(ctx, .internal_error);
 
     var status: u16 = 0;
-    ctx.mod_state = @ptrCast(&in_subrequest_marker);
-    defer ctx.mod_state = null;
+    ctx.setState("auth_request", @ptrCast(&in_subrequest_marker));
+    defer ctx.setState("auth_request", null);
     hook.call(hook.impl, ctx.req, uri, &status) catch return failWith(ctx, .internal_error);
 
     if (status >= 200 and status <= 299) return .pass;

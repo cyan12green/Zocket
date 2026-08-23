@@ -130,15 +130,15 @@ fn runConn(ctx: *Context) anyerror!Action {
 
     // Mark this request as holding a slot so the release module (log phase,
     // always-run) decrements exactly once.
-    ctx.mod_state = @ptrCast(&acquired_marker);
+    ctx.setState("limit_conn", @ptrCast(&acquired_marker));
     return .pass;
 }
 
 var acquired_marker: u8 = 0;
 
 fn runConnRelease(ctx: *Context) anyerror!Action {
-    if (ctx.mod_state != @as(?*anyopaque, @ptrCast(&acquired_marker))) return .pass;
-    ctx.mod_state = null;
+    if (ctx.getState("limit_conn") != @as(?*anyopaque, @ptrCast(&acquired_marker))) return .pass;
+    ctx.setState("limit_conn", null);
 
     const key = hashKey(ctx);
     conn_zone.mutex.lock();

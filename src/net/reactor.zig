@@ -305,6 +305,9 @@ pub const Reactor = struct {
             self.limits.send_buffer_size,
             self.limits.max_body,
         );
+        // Module lifecycle runs once per process (gated inside): modules
+        // size their shmem zones from the configured limits here.
+        runtime_server.default_registry.initModules(&self.limits);
 
         errdefer self.ep.close();
         self.ep.add(self.wakeup.fd, epoll.Events.In, self.wakeup.fd) catch {

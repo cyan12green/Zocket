@@ -20,6 +20,8 @@ pub const http = struct {
     pub const header_dfa = @import("http/header_dfa.zig");
     pub const websocket = @import("http/websocket.zig");
     pub const shmem = @import("dsl/shmem.zig");
+    /// Test-only helpers; not part of the server surface.
+    pub const testing_kit = @import("dsl/testing.zig");
     pub const arena = @import("http/arena.zig");
 };
 
@@ -92,6 +94,7 @@ comptime {
     _ = @import("dsl/modules/auth_basic.zig");
     _ = @import("dsl/modules/limit.zig");
     _ = @import("dsl/shmem.zig");
+    _ = @import("dsl/testing.zig");
     _ = @import("dsl/modules/precompressed.zig");
     _ = @import("dsl/modules/auth_request.zig");
     _ = @import("dsl/modules/proxy_cache.zig");
@@ -129,4 +132,11 @@ comptime {
     _ = @import("tls/cert.zig");
     _ = @import("tls/handshake.zig");
     _ = @import("tls/session.zig");
+}
+
+comptime {
+    const reg = @import("dsl/registry.zig");
+    if (reg.default_registry.all.len > reg.max_module_states) {
+        @compileError("registry exceeds max_module_states");
+    }
 }

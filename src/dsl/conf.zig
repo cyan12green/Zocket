@@ -22,6 +22,7 @@ const ResponseTemplateCV = router.ResponseTemplateCV;
 const CVHeader = router.CVHeader;
 const SetVar = router.SetVar;
 const HeaderOp = router.HeaderOp;
+const default_registry = @import("registry.zig").default_registry;
 const ProxyHeader = router.ProxyHeader;
 const Regex = router.Regex;
 const Upstream = router.Upstream;
@@ -92,6 +93,9 @@ const H_consistent_hash = keyHash("consistent_hash");
 const H_least_time = keyHash("least_time");
 const H_sticky_cookie = keyHash("sticky_cookie");
 const H_health_check = keyHash("health_check");
+const H_filter = keyHash("filter");
+const H_http = keyHash("http");
+const H_gzip = keyHash("gzip");
 const H_precompressed = keyHash("precompressed");
 const H_auth_request = keyHash("auth_request");
 const H_proxy_cache = keyHash("proxy_cache");
@@ -185,6 +189,9 @@ const LocationSpec = struct {
     /// builder's header-op pool (headers module, post_access).
     header_ops_start: usize = 0,
     header_ops_len: usize = 0,
+    /// Location-scope filter bindings: range into the builder's filter pool.
+    filters_start: usize = 0,
+    filters_len: usize = 0,
     /// `auth_basic "<realm>";` / `auth_basic_user_file <path>;` — presence
     /// of either binds the access-phase auth_basic module.
     auth_realm: ?Str = null,
@@ -260,6 +267,13 @@ const Builder = struct {
     /// (nginx add_header inheritance semantics).
     server_header_ops: ct_pool.CtPool(HeaderSpec, 64) = .{},
     server_header_ops_len: usize = 0,
+    /// Filter bindings per scope. Inheritance is all-or-nothing:
+    /// location > server > http(top-level).
+    http_filters: ct_pool.CtPool(ModuleBinding, 32) = .{},
+    http_filters_len: usize = 0,
+    server_filters: ct_pool.CtPool(ModuleBinding, 32) = .{},
+    server_filters_len: usize = 0,
+    filters: ct_pool.CtPool(ModuleBinding, 64) = .{},
     limits: Limits = .{},
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
@@ -270,17 +284,53 @@ const Builder = struct {
     cost: usize = 0,
 };
 
-/// Bind a module to the location unless already bound: directive-presence
-/// activation, nginx-filter style (declaring `header_set ...;` runs the
-/// headers filter without a manual `<phase> headers;`). Shared by every
-/// directive-driven module so activation stays one call, not a copy-paste.
+/// Bind a HANDLER module to the location unless already bound: directive-
+/// presence activation, nginx-filter style. Compile error when the name is
+/// a filter — filters bind via `filter <name>;` or their own directives.
 fn ensureModuleBound(b: *Builder, spec: *LocationSpec, phase: Phase, comptime module_name: []const u8) void {
+    comptime if (default_registry.kindOf(module_name) == .filter) {
+        @compileError(module_name ++ " is a filter: activate it with 'filter " ++ module_name ++ ";' or its own directives");
+    };
     for (b.modules.items[spec.modules_start..][0..spec.modules_len]) |mb| {
         if (std.mem.eql(u8, mb.module, module_name)) return;
     }
     if (spec.modules_len == 0) spec.modules_start = b.modules.len;
     _ = b.modules.create(.{ .phase = phase, .module = module_name });
     spec.modules_len += 1;
+}
+
+fn appendFilterBinding(b: *Builder, spec: *LocationSpec, fname: []const u8) void {
+    for (b.filters.items[spec.filters_start..][0..spec.filters_len]) |mb| {
+        if (std.mem.eql(u8, mb.module, fname)) return;
+    }
+    if (spec.filters_len == 0) spec.filters_start = b.filters.len;
+    _ = b.filters.create(.{ .phase = .log, .module = fname });
+    spec.filters_len += 1;
+}
+
+/// Bind a FILTER module to the LOCATION scope unless already present.
+fn ensureFilterBound(b: *Builder, spec: *LocationSpec, comptime module_name: []const u8) void {
+    comptime if (default_registry.kindOf(module_name) != .filter) {
+        @compileError(module_name ++ " is not a filter");
+    };
+    for (b.filters.items[spec.filters_start..][0..spec.filters_len]) |mb| {
+        if (std.mem.eql(u8, mb.module, module_name)) return;
+    }
+    if (spec.filters_len == 0) spec.filters_start = b.filters.len;
+    _ = b.filters.create(.{ .phase = .log, .module = module_name });
+    spec.filters_len += 1;
+}
+
+/// Bind a FILTER to the SERVER scope stash.
+fn ensureServerFilterBound(b: *Builder, comptime module_name: []const u8) void {
+    comptime if (default_registry.kindOf(module_name) != .filter) {
+        @compileError(module_name ++ " is not a filter");
+    };
+    for (b.server_filters.items[0..b.server_filters_len]) |mb| {
+        if (std.mem.eql(u8, mb.module, module_name)) return;
+    }
+    _ = b.server_filters.create(.{ .phase = .log, .module = module_name });
+    b.server_filters_len += 1;
 }
 
 /// Parse one response-header op directive (nginx `add_header`, plus this
@@ -313,7 +363,7 @@ fn parseHeaderOpDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) He
 /// Store a parsed header op on a location and activate the headers filter
 /// (directive-presence binding).
 fn appendHeaderOp(b: *Builder, spec: *LocationSpec, hs: HeaderSpec) void {
-    ensureModuleBound(b, spec, .log, "headers");
+    ensureFilterBound(b, spec, "headers");
     if (spec.header_ops_len == 0) spec.header_ops_start = b.header_ops.len;
     _ = b.header_ops.create(hs);
     spec.header_ops_len += 1;
@@ -645,11 +695,27 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
 
 /// Parse the phase-directive bindings and route directives inside a location.
 fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime name: []const u8) void {
-    // Phase directives: `<phase> <module>;`.
+    // Generic filter binding: `filter <name>;` (location scope).
+    if (keyHash(name) == H_filter) {
+        const fname = resolve(lx.value(b, name), b.strings.items[0..]);
+        if (default_registry.kindOf(fname) != .filter) {
+            lx.fail("filter: unknown or non-filter module name");
+        }
+        lx.expectTerminator("filter");
+        appendFilterBinding(b, spec, fname);
+        b.cost += 8;
+        return;
+    }
+    // Phase directives: `<phase> <module>;` — HANDLERS only now.
     if (Phase.parse(name)) |phase| {
         if (spec.modules_len == 0) spec.modules_start = b.modules.len;
         const m = lx.value(b, name);
         const module_name = resolve(m, b.strings.items[0..]);
+        if (default_registry.kindOf(module_name) == .filter) {
+            // Runtime name -> cannot concat into comptime message; the
+            // generic hint keeps migration obvious.
+            lx.fail("this module is a FILTER: bind it with 'filter <name>;' or its own directives, not a phase");
+        }
         _ = b.modules.create(.{ .phase = phase, .module = module_name });
         spec.modules_len += 1;
         lx.expectTerminator(name);
@@ -674,8 +740,10 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             lx.expectTerminator(name);
         },
         H_max_age => {
+            // Presence activates the cache_headers FILTER for this location.
             spec.max_age = lx.number(name, u32);
             lx.expectTerminator(name);
+            ensureFilterBound(b, spec, "cache_headers");
         },
         H_chunked => {
             spec.chunked = lx.boolOnOff(name);
@@ -837,7 +905,7 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             lx.expectTerminator("proxy_cache");
             if (spec.cache_enabled) {
                 ensureModuleBound(b, spec, .rewrite, "proxy_cache");
-                ensureModuleBound(b, spec, .log, "proxy_cache_store");
+                ensureFilterBound(b, spec, "proxy_cache_store");
             }
             b.cost += 8;
         },
@@ -872,6 +940,16 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             lx.expectTerminator("precompressed");
             spec.precompressed_gz = true;
             ensureModuleBound(b, spec, .content, "precompressed");
+            b.cost += 8;
+        },
+        H_gzip => {
+            const t = lx.token() orelse lx.fail("gzip: expected on|off");
+            const vs = t.srcOf("gzip: value cannot contain escapes");
+            const on = if (std.mem.eql(u8, vs, "on")) true
+            else if (std.mem.eql(u8, vs, "off")) false
+            else lx.fail("gzip: expected on|off");
+            lx.expectTerminator("gzip");
+            if (on) ensureFilterBound(b, spec, "gzip");
             b.cost += 8;
         },
         H_health_check => {
@@ -1031,6 +1109,18 @@ fn parseLocation(lx: *Lexer, b: *Builder) void {
         const dn = t.srcOf("location: directive cannot contain escapes");
         parseLocationDirective(lx, b, &spec, dn);
     }
+    // Filter inheritance (all-or-nothing): location > server > http.
+    if (spec.filters_len == 0) {
+        if (b.server_filters_len > 0) {
+            for (b.server_filters.items[0..b.server_filters_len]) |mb| {
+                appendFilterBinding(b, &spec, mb.module);
+            }
+        } else if (b.http_filters_len > 0) {
+            for (b.http_filters.items[0..b.http_filters_len]) |mb| {
+                appendFilterBinding(b, &spec, mb.module);
+            }
+        }
+    }
     // nginx inheritance: a location that declares no header ops of its own
     // inherits the server-level ones (all-or-nothing, like nginx).
     if (spec.header_ops_len == 0 and b.server_header_ops_len > 0) {
@@ -1040,6 +1130,35 @@ fn parseLocation(lx: *Lexer, b: *Builder) void {
     }
     _ = b.routes.create(spec);
     b.cost += 16 + 32;
+}
+
+/// Parse `filter <name>;` (server/http scopes): validates the kind and
+/// returns the resolved module name.
+fn parseScopedFilter(lx: *Lexer, b: *Builder) []const u8 {
+    // lx.value accepts bare tokens and stores them in the string pool.
+    const fname = resolve(lx.value(b, "filter"), b.strings.items[0..]);
+    if (default_registry.kindOf(fname) != .filter) {
+        lx.fail("filter: module is not a filter");
+    }
+    lx.expectTerminator("filter");
+    b.cost += 8;
+    return fname;
+}
+
+fn appendHttpFilter(b: *Builder, fname: []const u8) void {
+    for (b.http_filters.items[0..b.http_filters_len]) |mb| {
+        if (std.mem.eql(u8, mb.module, fname)) return;
+    }
+    _ = b.http_filters.create(.{ .phase = .log, .module = fname });
+    b.http_filters_len += 1;
+}
+
+fn appendServerFilter(b: *Builder, fname: []const u8) void {
+    for (b.server_filters.items[0..b.server_filters_len]) |mb| {
+        if (std.mem.eql(u8, mb.module, fname)) return;
+    }
+    _ = b.server_filters.create(.{ .phase = .log, .module = fname });
+    b.server_filters_len += 1;
 }
 
 fn parseServer(lx: *Lexer, b: *Builder) void {
@@ -1055,6 +1174,10 @@ fn parseServer(lx: *Lexer, b: *Builder) void {
         const dn = t.srcOf("server: directive cannot contain escapes");
         if (std.mem.eql(u8, dn, "location")) {
             parseLocation(lx, b);
+            continue;
+        }
+        if (keyHash(dn) == H_filter) {
+            appendServerFilter(b, parseScopedFilter(lx, b));
             continue;
         }
         // Server-scope response-header ops: inherited by locations without
@@ -1082,12 +1205,45 @@ fn parseTop(lx: *Lexer, b: *Builder) void {
         if (lx.eof()) break;
         const t = lx.token() orelse break;
         const dn = t.srcOf("directive cannot contain escapes");
+        if (std.mem.eql(u8, dn, "http")) {
+            // Explicit http scope: globals + servers + http-level filters.
+            lx.expectOpen("http");
+            while (true) {
+                if (lx.peek() == '}') {
+                    lx.pos += 1;
+                    break;
+                }
+                const ht = lx.token() orelse lx.fail("http: expected a directive");
+                const hdn = ht.srcOf("http: directive cannot contain escapes");
+                if (std.mem.eql(u8, hdn, "server")) {
+                    parseServer(lx, b);
+                    continue;
+                }
+                if (keyHash(hdn) == H_filter) {
+                    const fname = parseScopedFilter(lx, b);
+                    for (b.http_filters.items[0..b.http_filters_len]) |mb| {
+                        if (std.mem.eql(u8, mb.module, fname)) lx.fail("duplicate filter '" ++ "'");
+                    }
+                    _ = b.http_filters.create(.{ .phase = .log, .module = fname });
+                    b.http_filters_len += 1;
+                    continue;
+                }
+                if (parseGlobalDirective(lx, b, hdn)) continue;
+                lx.fail("unknown http directive");
+            }
+            b.cost += 16;
+            continue;
+        }
         if (std.mem.eql(u8, dn, "server")) {
             parseServer(lx, b);
             continue;
         }
+        if (keyHash(dn) == H_filter) {
+            appendHttpFilter(b, parseScopedFilter(lx, b));
+            continue;
+        }
         if (parseGlobalDirective(lx, b, dn)) continue;
-        lx.fail("unknown directive '" ++ dn ++ "'");
+        lx.fail("unknown directive");
     }
 }
 
@@ -1247,6 +1403,23 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .ranges = ranges };
     };
 
+    // Filter bindings per route: location-scope list (inheritance already
+    // applied at parse time).
+    const FilterTable = struct { items: [64]ModuleBinding, ranges: [route_cap]Range };
+    const filter_table: FilterTable = comptime blk: {
+        var items: [64]ModuleBinding = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.filters_len };
+            for (b.filters.items[spec.filters_start..][0..spec.filters_len]) |mb| {
+                items[pos] = mb;
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
     const Routes = struct { items: [route_cap]Route, len: usize };
     const routes_built: Routes = comptime blk: {
         var items: [route_cap]Route = undefined;
@@ -1321,6 +1494,7 @@ fn build(b: *const Builder) Config {
                 .set_vars = route_sets,
                 .proxy_headers = proxy_table.items[pr.start..][0..pr.len],
                 .headers_ops = header_op_table.items[header_op_table.ranges[ri].start..][0..header_op_table.ranges[ri].len],
+                .filters = filter_table.items[filter_table.ranges[ri].start..][0..filter_table.ranges[ri].len],
                 .auth_basic_realm = if (spec.auth_realm) |r| resolve(r, strings) else null,
                 .auth_basic_users = if (spec.auth_file) |f|
                     htpasswd_mod.parse(embeds_mod.embed(resolve(f, strings)))
@@ -1480,23 +1654,26 @@ test "conf: size suffixes and on|off" {
     try testing.expect(!cfg.routes[0].chunked);
 }
 
-test "conf: phase directives bind modules" {
+test "conf: phase directives bind handlers; directives bind filters" {
     const cfg = parse(
         \\server {
         \\    location /gzip {
         \\        content echo;
         \\        preaccess conditional_get;
-        \\        post_access cache_headers;
-        \\        log gzip;
+        \\        max_age 3600;
+        \\        gzip on;
         \\    }
         \\}
     );
     const r = cfg.routes[0];
+    // Handlers stay phase-bound.
     try testing.expectEqualStrings("echo", r.moduleFor(.content).?);
     try testing.expectEqualStrings("conditional_get", r.moduleFor(.preaccess).?);
-    try testing.expectEqualStrings("cache_headers", r.moduleFor(.post_access).?);
-    try testing.expectEqualStrings("gzip", r.moduleFor(.log).?);
-    try testing.expectEqual(@as(usize, 4), r.modules.len);
+    try testing.expectEqual(@as(usize, 2), r.modules.len);
+    // Filters live on their own list, in declaration order.
+    try testing.expectEqual(@as(usize, 2), r.filters.len);
+    try testing.expectEqualStrings("cache_headers", r.filters[0].module);
+    try testing.expectEqualStrings("gzip", r.filters[1].module);
 }
 
 test "conf: add/set/remove_header ops parse into declaration-order ops" {
@@ -1513,7 +1690,8 @@ test "conf: add/set/remove_header ops parse into declaration-order ops" {
     const ops = cfg.routes[0].headers_ops;
     try testing.expectEqual(@as(usize, 3), ops.len);
     // Directive presence auto-bound the headers module (deduped).
-    try testing.expectEqualStrings("headers", cfg.routes[0].moduleFor(.log).?);
+    try testing.expectEqual(@as(usize, 1), cfg.routes[0].filters.len);
+    try testing.expectEqualStrings("headers", cfg.routes[0].filters[0].module);
     try testing.expectEqual(vars.HeaderOpKind.set, ops[0].kind);
     try testing.expect(!ops[0].always);
     try testing.expectEqualStrings("X-Frame-Options", ops[0].name);
@@ -1522,6 +1700,38 @@ test "conf: add/set/remove_header ops parse into declaration-order ops" {
     try testing.expect(ops[1].value.len > 0);
     try testing.expectEqual(vars.HeaderOpKind.remove, ops[2].kind);
     try testing.expectEqual(@as(usize, 0), ops[2].value.len);
+}
+
+test "conf: filters inherit http > server > location all-or-nothing" {
+    const cfg = parse(
+        \\http {
+        \\    filter gzip;
+        \\    server {
+        \\        filter headers;
+        \\        location /a { content echo; }
+        \\        location /b {
+        \\            content echo;
+        \\            filter proxy_cache_store;
+        \\        }
+        \\    }
+        \\}
+    );
+    // /a declares none -> inherits SERVER's set only (all-or-nothing).
+    try testing.expectEqual(@as(usize, 1), cfg.routes[0].filters.len);
+    try testing.expectEqualStrings("headers", cfg.routes[0].filters[0].module);
+    // /b declares its own -> exactly that.
+    try testing.expectEqual(@as(usize, 1), cfg.routes[1].filters.len);
+    try testing.expectEqualStrings("proxy_cache_store", cfg.routes[1].filters[0].module);
+
+    // Bare server under a top-level (implicit http) filter inherits it.
+    const cfg2 = parse(
+        \\filter gzip;
+        \\server {
+        \\    location /x { content echo; }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 1), cfg2.routes[0].filters.len);
+    try testing.expectEqualStrings("gzip", cfg2.routes[0].filters[0].module);
 }
 
 test "conf: server-level header ops are inherited by bare locations" {
@@ -1543,7 +1753,7 @@ test "conf: server-level header ops are inherited by bare locations" {
     // /bare inherited the server-level op.
     try testing.expectEqual(@as(usize, 1), cfg.routes[1].headers_ops.len);
     try testing.expectEqualStrings("X-Server-Wide", cfg.routes[1].headers_ops[0].name);
-    try testing.expectEqualStrings("headers", cfg.routes[1].moduleFor(.log).?);
+    try testing.expectEqualStrings("headers", cfg.routes[1].filters[0].module);
 }
 
 test "conf: multiple modules per phase form a declaration-order chain" {
@@ -1702,18 +1912,19 @@ test "conf: exact and regex location modifiers parse" {
     try testing.expect(cfg.routes[2].pattern_regex != null);
 }
 
-test "conf: gzip route binds 4 distinct phases" {
+test "conf: migrated gzip route separates handlers from filters" {
     const cfg = parse(
         \\server {
         \\    location /gzip {
         \\        content echo;
         \\        preaccess conditional_get;
-        \\        post_access cache_headers;
-        \\        log gzip;
+        \\        max_age 3600;
+        \\        gzip on;
         \\    }
         \\}
     );
-    try testing.expectEqual(@as(usize, 4), cfg.routes[0].modules.len);
+    try testing.expectEqual(@as(usize, 2), cfg.routes[0].modules.len);
+    try testing.expectEqual(@as(usize, 2), cfg.routes[0].filters.len);
 }
 
 test "conf: variable return body produces response_cv" {

@@ -66,23 +66,22 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
     // Comptime-specialised dispatch (struct-literal configs).
     // Zero loops, zero moduleFor scans, zero Registry.resolve at runtime.
     if (r.dispatch) |f| {
-        const out = try f(ctx);
+        var out = try f(ctx);
         // Template fallback when no module claimed the request.
         if (out == .not_handled) {
             if (r.response) |t| {
                 applyTemplate(ctx, t);
-                return .handled;
-            }
-            // M-B: dynamic (variable-capable) templates render into the arena.
-            if (r.response_cv) |t| {
+                out = .handled;
+            } else if (r.response_cv) |t| {
                 applyTemplateCV(ctx, t);
-                return .handled;
+                out = .handled;
             }
         }
+        try applyFilters(Registry, r, ctx);
         return out;
     }
 
-    const outcome = blk: {
+    var outcome = blk: {
         for (Phase.all) |phase| {
             if (phase == .log) continue;
             // nginx-style chain: every module bound to this phase runs in
@@ -113,15 +112,31 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
         // not claim the request falls back to the template.
         if (r.response) |t| {
             applyTemplate(ctx, t);
-            return .handled;
+            outcome = .handled;
         }
-        // M-B: dynamic templates render per request (variables/captures).
-        if (r.response_cv) |t| {
+        // Dynamic templates render per request (variables/captures).
+        else if (r.response_cv) |t| {
             applyTemplateCV(ctx, t);
-            return .handled;
+            outcome = .handled;
         }
     }
+    try applyFilters(Registry, r, ctx);
     return outcome;
+}
+
+/// Apply a route's bound FILTERS in reverse declaration order (nginx
+/// output-filter convention): the LAST declared filter sits closest to the
+/// final response. Runs after the walk AND the template fallback, so
+/// filters see the finished module-produced response. Filter actions are
+/// ignored — filters transform, they do not claim.
+fn applyFilters(comptime Registry: type, route: *const router.Route, ctx: *Context) !void {
+    var i: usize = route.filters.len;
+    while (i > 0) {
+        i -= 1;
+        const b = route.filters[i];
+        const run_fn = Registry.resolve(b.module) orelse continue;
+        _ = try run_fn(ctx);
+    }
 }
 
 /// Runtime application of a response template (JSON-config routes, whose
@@ -680,4 +695,88 @@ test "response_cv renders set user variables lazily with caching" {
     try testing.expectEqualStrings("g=hi-example.com again=hi-example.com", resp.body);
     // Cached after first render.
     try testing.expectEqualStrings("hi-example.com", ctx.user_slots[0].?);
+}
+
+// ---- filter chain (framework v2) ----
+
+const filter_mod = struct {
+    fn make(comptime name: []const u8, comptime tag: []const u8) registry.Module {
+        return .{
+            .name = name,
+            .phase = .log,
+            .kind = .filter,
+            .run = struct {
+                fn run(ctx: *Context) anyerror!Action {
+                    ctx.resp.setHeader("X-F", tag);
+                    // Filters transform; they never claim.
+                    return .pass;
+                }
+            }.run,
+        };
+    }
+};
+
+const FilterRegistry = registry.Registry(.{
+    claim_mod.make("chain_claim", .content),
+    filter_mod.make("f_first", "first"),
+    filter_mod.make("f_last", "last"),
+});
+
+test "filters apply in reverse declaration order after handlers and templates" {
+    const routes = [_]router.Route{.{ .path = "/", .match = .prefix, .modules = &.{
+        .{ .phase = .content, .module = "chain_claim" },
+    }, .filters = &.{
+        .{ .phase = .log, .module = "f_first" },
+        .{ .phase = .log, .module = "f_last" },
+    } }};
+
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/";
+    req.decoded_target = "/";
+    const res = try runWith(FilterRegistry, &routes, &req);
+    try testing.expectEqual(Outcome.handled, res.outcome); // chain_a claimed
+
+    const hdrs = res.resp.headers[0..res.resp.header_count];
+    // Handler header first, then filters REVERSED (f_last applied before
+    // f_first => f_first's value ends up last on the wire).
+    var seen: [8][]const u8 = undefined;
+    var n: usize = 0;
+    for (hdrs) |h| {
+        if (std.mem.eql(u8, h.name, "X-Order")) seen[n] = h.value;
+        if (std.mem.eql(u8, h.name, "X-F")) {
+            seen[n] = h.value;
+            n += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("last", seen[0]);
+    try testing.expectEqualStrings("first", seen[1]);
+}
+
+test "filters run even when nothing handled (template path)" {
+    const TemplateRegistry = registry.Registry(.{
+        filter_mod.make("f_first", "first"),
+        filter_mod.make("f_last", "last"),
+    });
+    const routes = [_]router.Route{.{ .path = "/t", .match = .exact, .response = .{
+        .status = 200,
+        .headers = &.{},
+        .body = "tpl",
+    }, .filters = &.{
+        .{ .phase = .log, .module = "f_first" },
+        .{ .phase = .log, .module = "f_last" },
+    } }};
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/t";
+    req.decoded_target = "/t";
+    const res = try runWith(TemplateRegistry, &routes, &req);
+    try testing.expectEqual(Outcome.handled, res.outcome);
+    try testing.expectEqualStrings("tpl", res.resp.body);
+    var count: usize = 0;
+    for (res.resp.headers[0..res.resp.header_count]) |h| {
+        if (std.mem.eql(u8, h.name, "X-F")) count += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), count);
 }

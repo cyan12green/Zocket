@@ -37,15 +37,43 @@ pub const Outcome = enum {
 /// struct-literal configs; null for JSON-loaded routes (loop-walk fallback).
 pub const DispatchFn = *const fn (ctx: *Context) anyerror!Outcome;
 
+/// The kind of a module decides WHERE and WHEN it runs.
+///
+/// - `.handler` participates in the phase walk (first claim wins; every
+///   phase runs in order until something answers). Request-side decisions
+///   (auth, rate limiting, content generation) are handlers.
+/// - `.filter` runs AFTER any handler produced a response — including the
+///   not_handled/template path — in reverse declaration order, always.
+///   Filters mutate `ctx.resp` only; they never gate whether content is
+///   generated. Response transforms are filters.
+pub const Kind = enum { handler, filter };
+
+/// Server-lifecycle hooks: called once per process for every registered
+/// module that declares them, at reactor startup (after limits are known)
+/// and at shutdown. Modules use init to size shared-memory zones from the
+/// configured limits and start background workers; lazy first-use init is
+/// no longer needed.
+pub const Lifecycle = struct {
+    init: *const fn (limits: ?*const Limits) anyerror!void,
+    deinit: *const fn () void,
+};
+
 /// The standard module interface. A module is a comptime value of this type,
 /// exported by its source file; the registry below enumerates them. `run` is
-/// the per-request handler: it may mutate the context and returns an `Action`
-/// telling the phase dispatch loop what to do next.
+/// the per-request entry point: for handlers it may claim the request and
+/// returns an `Action` telling the phase dispatch loop what to do next; for
+/// filters it mutates the already-produced response.
 pub const Module = struct {
     name: []const u8,
-    /// The phase this module attaches to.
+    /// The phase this module attaches to (handlers). Filters ignore this:
+    /// they run after the whole walk, ordered per route by declaration.
     phase: Phase,
     run: *const fn (ctx: *Context) anyerror!Action,
+    kind: Kind = .handler,
+    lifecycle: ?*const Lifecycle = null,
+    /// Directives owned by this module (comptime names; used for docs,
+    /// uniqueness checks, and kind-aware binding errors).
+    directives: []const []const u8 = &.{},
 };
 
 /// What a module run decided for the current request.
@@ -109,12 +137,10 @@ pub const Context = struct {
     /// Monotonic request timestamp in ns (reactor clock; 0 when unset, e.g.
     /// unit tests set it explicitly). Rate buckets and LB timing read this.
     now_ns: u64 = 0,
-    /// Module-private per-request scratch (opaque): whichever module claims
-    /// it first during a walk may park a pointer/id here for its own later
-    /// phases to read (limit_conn's acquire/release pair, proxy_cache's
-    /// pending record). Convention, not ownership — modules must tolerate
-    /// finding it null and must not free what they did not allocate.
-    mod_state: ?*anyopaque = null,
+    /// Named per-module request-state slots, keyed by registry index
+    /// (compile-time checked via `state`/`setState`). Each module owns its
+    /// slot for the duration of one walk — no cross-module collisions.
+    module_states: [max_module_states]?*anyopaque = [_]?*anyopaque{null} ** max_module_states,
 
     /// Internal-subrequest hook (auth_request): installed by the reactor,
     /// implemented by the runtime Server so modules can run a request
@@ -144,7 +170,22 @@ pub const Context = struct {
     pub fn sharedFmt(ctx: *Context, comptime fmt: []const u8, args: anytype) ?[]const u8 {
         return std.fmt.allocPrint(ctx.req.arena.asAllocator(), fmt, args) catch null;
     }
+
+    /// This module's private slot for the current request. Typical use:
+    /// park a small flag/record in shared memory and store its address so
+    /// a later phase of the SAME module can find it.
+    pub fn setState(ctx: *Context, comptime module_name: []const u8, ptr: ?*anyopaque) void {
+        ctx.module_states[default_registry.indexOf(module_name)] = ptr;
+    }
+
+    pub fn getState(ctx: *Context, comptime module_name: []const u8) ?*anyopaque {
+        return ctx.module_states[default_registry.indexOf(module_name)];
+    }
 };
+
+/// Upper bound for registered modules; asserted against the registry at
+/// comptime in root-level tests.
+pub const max_module_states = 32;
 
 /// Shared connection/request counters: updated atomically by
 /// the reactors, rendered by the stub_status module. Defined here so the
@@ -183,6 +224,10 @@ pub const ModuleInfo = struct {
 /// comptime-unrolled switch, which is how config-declared names (from JSON or
 /// a struct literal) reach the concrete modules. There is no dynamic loading:
 /// every module a config can name must be in the list.
+/// One-per-process lifecycle gate shared by every registry instantiation
+/// (only default_registry declares lifecycles in practice).
+var lifecycle_init_gate = std.atomic.Value(bool).init(false);
+
 pub fn Registry(comptime modules: anytype) type {
     return struct {
         pub const all = modules;
@@ -217,7 +262,52 @@ pub fn Registry(comptime modules: anytype) type {
         pub fn isRegistered(name: []const u8) bool {
             return resolve(name) != null;
         }
-    };
+
+        /// Registry index of `name` (compile error when unknown): the key
+        /// for named per-module request-state slots on Context.
+        pub fn indexOf(comptime name: []const u8) usize {
+            inline for (all, 0..) |m, i| {
+                if (comptime std.mem.eql(u8, m.name, name)) return i;
+            }
+            @compileError("unknown module: " ++ name);
+        }
+
+        pub fn kindOf(name: []const u8) ?Kind {
+            inline for (all) |m| {
+                if (std.mem.eql(u8, m.name, name)) return m.kind;
+            }
+            return null;
+        }
+
+        pub fn isHandler(name: []const u8) bool {
+            return kindOf(name) == .handler;
+        }
+
+        pub fn isFilter(name: []const u8) bool {
+            return kindOf(name) == .filter;
+        }
+
+        /// Run every declared module lifecycle init exactly once per
+        /// process (guarded; multiple reactors call this). Modules size
+        /// their shmem zones from `limits` here.
+        pub fn initModules(limits: ?*const Limits) void {
+            if (lifecycle_init_gate.swap(true, .acq_rel)) return;
+            inline for (all) |m| {
+                if (m.lifecycle) |lc| lc.init(limits) catch |e| {
+                    std.debug.print("module '{s}' init failed: {s}\n", .{ m.name, @errorName(e) });
+                };
+            }
+        }
+
+        /// Symmetric shutdown (best-effort; process exit tolerates leaks).
+        pub fn deinitModules() void {
+            if (!lifecycle_init_gate.load(.acquire)) return;
+            inline for (all) |m| {
+                if (m.lifecycle) |lc| lc.deinit();
+            }
+            lifecycle_init_gate.store(false, .release);
+        }
+};
 }
 
 /// The registry used by the server: enumerate every built-in module here. Each

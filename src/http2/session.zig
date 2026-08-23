@@ -1011,7 +1011,7 @@ test "session: an allocator-owned module body is freed (gzip path, no leak)" {
     // compressed body is not freed, the testing allocator reports a leak.
     const srv = server_mod.Server.comptimeInit(comptime server_mod.Config.fromConfComptime(
         \\server {
-        \\    location / { content echo; log gzip; }
+        \\    location / { content echo; gzip on; }
         \\}
     ));
 

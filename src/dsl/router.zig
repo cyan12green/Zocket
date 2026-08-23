@@ -151,6 +151,11 @@ pub const Route = struct {
     /// modules may share a phase (nginx-style chains); `self.modules` is kept
     /// in config declaration order, so callers that need the whole chain
     /// iterate `self.modules` filtering on `phase` instead of using this.
+    /// Response FILTERS bound to this route (declaration order; applied in
+    /// reverse after the handler walk and any template fallback). Distinct
+    /// from `modules` so kind semantics stay explicit.
+    filters: []const ModuleBinding = &.{},
+
     pub fn moduleFor(self: *const Route, phase: Phase) ?[]const u8 {
         for (self.modules) |b| {
             if (b.phase == phase) return b.module;

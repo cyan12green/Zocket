@@ -145,8 +145,9 @@ pub const proxy_cache = registry.Module{
 
 pub const proxy_cache_store = registry.Module{
     .name = "proxy_cache_store",
+    .kind = .filter,
+    .run = runStore,    // Legacy marker only: filters run after the walk.
     .phase = .log,
-    .run = runStore,
 };
 
 fn enabled(ctx: *Context) ?*const registry.Route {
