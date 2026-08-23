@@ -56,8 +56,9 @@ CELLS=(headers auth_sha precompressed cache_hit limit_req)
 PATHS=(/h /auth /f8k /cached /limited)
 
 start_zocket() {
-    # Front server with all benchmark routes.
-    "$TCP_BIN" --port "$ZPORT" --threads 4 >/dev/null 2>&1 &
+    # Front server with all benchmark routes. ZOCKET_WRAP lets a debugger
+    # wrap it: ZOCKET_WRAP="gdb -batch -ex bt -ex 'info threads' --args ".
+    ${ZOCKET_WRAP:+$ZOCKET_WRAP} "$TCP_BIN" --port "$ZPORT" --threads 4 >"${ZOCKET_LOG:-/dev/null}" 2>&1 &
     ZPID=$!
     # Origin for the cache cell: plain default-config Zocket (echo).
     "$ORIGIN_BIN" --http --port "$ORIGIN" --threads 2 >/dev/null 2>&1 &

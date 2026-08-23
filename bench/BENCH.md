@@ -187,30 +187,29 @@ Historical milestone-by-milestone numbers and the full six-server tables:
 ## Backlog modules vs nginx (`backlog-bench.sh`, 2026-08-23)
 
 Feature-level head-to-heads, one conf per server exercising the new
-modules; bombardier c=100, 6 interleaved reps with port-swap (medians;
-crashed-server reps excluded by zero-completion filter):
+modules; bombardier c=100, 6 interleaved reps with port-swap (medians):
 
 | Cell | Endpoint | Zocket | nginx 1.28 | Ratio |
 |---|---|---:|---:|---:|
-| headers (3 ops/req) | GET /h | 225.6k | 199.9k | **1.13x** |
-| auth_basic ({SHA}) | GET /auth | 175.7k | 122.3k | **1.44x** |
-| precompressed (.gz 8 KiB) | GET /f8k | 148.1k | 95.8k | **1.55x** |
-| proxy_cache HIT | GET /cached | 95.2k | 150.4k | 0.63x |
-| limit_req accepted | GET /limited | ~2.0k/s (rest 503) | ~2.0k/s (rest 503) | parity |
+| headers (3 ops/req) | GET /h | 255.5k | 234.1k | **1.09x** |
+| auth_basic ({SHA}) | GET /auth | 228.7k | 188.3k | **1.21x** |
+| precompressed (.gz 8 KiB) | GET /f8k | 194.9k | 133.5k | **1.46x** |
+| proxy_cache HIT | GET /cached | 242.1k | 172.1k | **1.41x** |
+| limit_req | GET /limited | ~2.0k/s accepted, rest 503 | same | parity |
 
-- headers/auth/precompressed: Zocket leads — the header ops ride the
-  log-phase chain on pre-rendered arena values and the .gz twin path is a
-  single open+read vs nginx's gzip_static filter stack.
-- proxy_cache HIT trails: our `LruStore.lookup` is a linear scan under one
-  zone mutex vs nginx's shm rbtree. Known cost; hash-bucketed index is the
-  follow-up.
-- limit_req: both engines accept ~rate+burst and shed the rest as 503
-  (nginx 12.1k accepted / 1.28M shed per 6 s rep; Zocket identical shape).
+- Zocket leads every cell. The header ops ride the log-phase chain on
+  arena-rendered values; the .gz twin path is one open+read vs nginx's
+  gzip_static filter stack; auth verification is a hash-tagged header
+  lookup + timing-safe compare.
+- proxy_cache HIT initially trailed (0.63x) and crashed intermittently:
+  the log-phase storer re-stored cache-served responses on every HIT,
+  replacing (freeing) the live blob under concurrent readers — a
+  use-after-free AND a throughput drain. Fixed two ways: the storer
+  skips responses already carrying X-Cache, and `LruStore.getCopy`
+  copies blobs out under the zone mutex so readers never race an
+  evict/replace. Regression test: "HIT responses are not re-stored".
+- limit_req: both engines accept ~rate+burst and shed the rest as 503;
+  the summary row reports bombardier attempt rate against the shedding
+  server (identical shape both sides).
 - Graph: `bench/graphs/backlog_compare.png`; JSON in
   `bench/results/backlog/<cell>/`.
-
-**Known issue**: intermittent SIGSEGV of the front server under the full
-mixed-cell suite (~once per suite, 4 threads; never reproduced per-cell or
-under gdb). Repro recipe: `bash bench/backlog-bench.sh --reps 3`.
-Top-priority follow-up; affected reps are filtered from medians.
-

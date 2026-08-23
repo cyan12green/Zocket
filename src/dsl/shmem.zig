@@ -216,6 +216,27 @@ pub fn LruStore(comptime max_entries: usize) type {
             return {};
         }
 
+        /// Lookup with the blob copied out UNDER the zone mutex: callers
+        /// get arena/allocator-owned bytes they can read without racing a
+        /// concurrent evict-or-replace on another reactor thread.
+        pub fn getCopy(self: *Self, key: u64, alloc: std.mem.Allocator) ?struct {
+            meta: u64,
+            meta2: u64,
+            bytes: []u8,
+        } {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (&self.entries) |*e| {
+                if (e.used and e.key == key) {
+                    const copy = alloc.dupe(u8, e.bytes) catch return null;
+                    self.clock += 1;
+                    e.tick = self.clock;
+                    return .{ .meta = e.meta, .meta2 = e.meta2, .bytes = copy };
+                }
+            }
+            return null;
+        }
+
         /// Invalidate one key (revalidation that must forget stale data).
         pub fn remove(self: *Self, key: u64) void {
             self.mutex.lock();

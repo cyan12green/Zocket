@@ -519,7 +519,7 @@ pub const Reactor = struct {
         var it = self.http_sessions.iterator();
         outer: while (it.next()) |kv| {
             const fd = kv.key_ptr.*;
-            const sess = kv.value_ptr.*;
+            const sess = kv.value_ptr; // *HttpSession — no giant copies
             if (sess.upgraded or sess.h2 != null or sess.tls != null or sess.writing) continue;
             const first = sess.first_byte_at orelse continue;
             const header_phase = switch (sess.parser.state) {

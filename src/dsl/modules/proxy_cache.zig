@@ -189,6 +189,13 @@ fn runStore(ctx: *Context) anyerror!Action {
     const route = enabled(ctx) orelse return .pass;
     _ = route;
     if (!cacheableRequest(ctx)) return .pass;
+    // Cache-served responses (HIT/STALE) reach here too — the log phase
+    // runs after every outcome. Re-storing them replaces the live blob
+    // other reactors are reading (the benchmark-suite segfault); only
+    // genuine origin responses enter the store.
+    for (ctx.resp.headers[0..ctx.resp.header_count]) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "X-Cache")) return .pass;
+    }
 
     const key = cacheKey(ctx);
     const now = ctx.now_ns;
@@ -196,17 +203,14 @@ fn runStore(ctx: *Context) anyerror!Action {
     if (ctx.resp.status == .not_modified) {
         // Upstream confirmed our validator: refresh freshness of the stored
         // representation and answer the CLIENT from the store (200).
-        const found: ?shmem.LruStore(max_entries).Entry = getStore(budgetFor(ctx)).lookup(key);
-        if (found) |e| {
-            // Copy aside first: put() releases the previous copy before
-            // writing the new one, and both e.bytes and any view into it
-            // die in that window.
-            const blob = ctx.sharedDupe(e.bytes) orelse return error.OutOfMemory;
-            _ = getStore(budgetFor(ctx)).put(key, blob, now, 0);
-            if (deserialize(blob)) |old| {
+        if (getStore(budgetFor(ctx)).getCopy(key, ctx.req.arena.asAllocator())) |got| {
+            if (deserialize(got.bytes)) |old| {
                 applyStored(ctx, old, "REVALIDATED");
+                // Refresh stored_at_ns by re-putting the ARENA copy; the
+                // old store bytes were released inside put() safely (we
+                // hold our own duplicate).
+                _ = getStore(budgetFor(ctx)).put(key, got.bytes, now, 0);
             }
-            return .pass;
         }
         return .pass;
     }
@@ -394,6 +398,50 @@ test "grace window serves stale" {
     try testing.expectEqual(Action.handled, try runLookup(&late.ctx));
     try testing.expectEqualStrings("old-but-fine", late.ctx.resp.body);
     try testing.expectEqualStrings("STALE", headerOf(late.ctx.resp, "X-Cache").?);
+}
+
+test "HIT responses are not re-stored (benchmark-suite segfault regression)" {
+    resetZone();
+    defer resetZone();
+    const route = Route{
+        .path = "/p",
+        .proxy_cache_enabled = true,
+        .upstreams = &.{.{ .host = "127.0.0.1", .port = 9 }},
+    };
+
+    // Origin response seeds the store.
+    var seed: Case = undefined;
+    makeCase(&seed, .get, "/p/x");
+    defer seed.req.deinit();
+    seed.ctx.route = &route;
+    seed.ctx.resp.setBody("payload");
+    try testing.expectEqual(Action.pass, try runStore(&seed.ctx));
+
+    // The stored blob's identity BEFORE the hit.
+    var before: [*]u8 = undefined;
+    for (&store.entries) |*e| {
+        if (e.used and e.key == cacheKey(&seed.ctx)) before = e.bytes.ptr;
+    }
+
+    // A HIT serves from the store; the storer then sees X-Cache and skips.
+    var hit: Case = undefined;
+    makeCase(&hit, .get, "/p/x");
+    defer hit.req.deinit();
+    hit.ctx.route = &route;
+    try testing.expectEqual(Action.handled, try runLookup(&hit.ctx));
+    try testing.expectEqualStrings("HIT", headerOf(hit.ctx.resp, "X-Cache").?);
+    try testing.expectEqual(Action.pass, try runStore(&hit.ctx));
+
+    // The original blob was NOT freed/replaced underneath anyone reading it.
+    var after_same = false;
+    var n_entries: usize = 0;
+    for (&store.entries) |*e| {
+        if (e.used) {
+            n_entries += 1;
+            if (e.key == cacheKey(&hit.ctx)) after_same = e.bytes.ptr == before;
+        }
+    }
+    try testing.expect(after_same);
 }
 
 fn headerOf(resp: *const Response, name: []const u8) ?[]const u8 {
