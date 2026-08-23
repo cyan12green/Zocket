@@ -84,12 +84,7 @@ byte-budgeted LRU stores; nothing grows under load):
 - DONE Runtime zone-size knobs: `limits.proxy_cache_max_bytes` /
   `proxy_cache_max_entries` size the response zone at startup; the LruStore
   is runtime-sized with a chained hash directory (O(1) HIT lookups).
-- OPEN Reverse proxy async upstreams: forwards currently block the reactor
-  thread for the origin round trip (0.60x vs nginx on the dedicated proxy
-  cell; every other cell leads). Fix: register upstream fds in the
-  connection epoll set and drive a small request state machine. The cheap
-  half is already done (non-blocking sockets, arena-built requests,
-  lock-free health slots — 2x measured).
+- OPEN Module framework v2 (this file): Stage 1 in progress; Stage 2 (async upstreams) follows.
 - BLOCKED ON VENDORING Brotli + zstd compression: std.zig has no encoders
   for either (zstd is decompress-only); needs a vendored codec decision
   (C dependency vs pure-Zig port) before pickup.
@@ -101,6 +96,129 @@ byte-budgeted LRU stores; nothing grows under load):
   9110 §6.3).
 - gRPC proxying (on top of M16).
 - IPv6 listeners (dual-stack).
+
+---
+
+## Module framework v2 — handler / filter / upstream (PLANNED → Stage 1 in progress)
+
+The pipeline currently has one module kind bound to phases, with the `log`
+phase doubling as the response-transform slot and the proxy doing blocking
+upstream I/O inside a rewrite binding. This work splits the framework along
+nginx's proven seams — content handlers vs output filters vs upstreams —
+while keeping everything comptime-composed, and codifies the
+futureproofing requirements that must hold as it grows.
+
+### Target model
+
+| Kind | Contract | Runs | Examples |
+|---|---|---|---|
+| **handler** | `run(ctx) -> Action{pass, handled, short_circuit}` | phase walk; first claim wins; every phase runs in order until something answers | echo, static, auth_basic, auth_request, limit_req/limit_conn, conditional_get, precompressed, proxy_cache checker |
+| **filter** | post-response transform; `run(ctx)` mutates `ctx.resp` | after ANY outcome (incl. not_handled -> template), **reverse declaration order**, always; composed per route at comptime into direct calls (.rodata, zero indirection) | gzip, headers(set/add/remove), cache_headers, proxy_cache store |
+| **upstream** | non-blocking state machine (`on_ready`) over backend I/O handles | owns backend connections; driven by reactor events via a single registration seam | proxy (+ active health checks formally housed here) |
+
+Semantic line: request-side decisions are phase handlers; response-side
+transforms are filters; backend I/O is upstream. Filters see only
+`ctx.resp` — they never gate whether content is generated (that is what the
+access phases and short_circuit are for).
+
+### Config surface: context hierarchy + inheritance (nginx-style)
+
+- New optional `http {}` block wrapping `server {}` blocks; existing
+  top-level directives keep working and act as the implicit http scope (no
+  mass config breakage).
+- `filter <name>;` valid in http / server / location scopes. Directive-
+  presence activation keeps working (declaring `add_header ...` binds the
+  headers filter into the CURRENT scope).
+- Inheritance is all-or-nothing per level: a location that declares no
+  filters inherits its server's set; a server that declares none inherits
+  the http scope's.
+- Handlers stay location-bound via `<phase> <module>;` exactly as today.
+
+### Hard breaks (accepted)
+
+- `log gzip;` / `post_access cache_headers;` style bindings for modules
+  migrated to filter kind become compile errors with a migration hint
+  (`gzip is a filter: use 'gzip on;' / 'filter gzip;'`).
+- Migrated to filters in Stage 1: `gzip`, `headers`, `cache_headers`,
+  `proxy_cache_store`. Everything else stays a handler; `access_log` /
+  `error_log` remain log-phase handlers (they log, they do not transform).
+
+### Comptime guarantees (unchanged, extended)
+
+- Per-route dispatch = comptime-unrolled handler walk + reversed filter
+  nest + upstream entry point, all frozen into `.rodata`; no runtime
+  registration, no Registry.resolve on the hot path.
+- Kind checking at binding time is a compile error (a filter named in a
+  phase directive cannot slip through).
+- `matchFast` stays byte-exact: disabled when a route declares any filter.
+
+### Futureproofing requirements (binding for this and future work)
+
+Folded into Stage 1:
+
+1. **Module lifecycle hooks**: `lifecycle: ?*const Lifecycle {init(limits),
+   deinit()}` called for every registered module at server start/stop.
+   Replaces lazy first-use initialization (zone creation, background thread
+   spawn) with an auditable ordered startup/shutdown.
+2. **Named per-module state slots**: `ctx.state(module) ?*anyopaque` keyed by
+   the module's registry index replaces the collision-prone single
+   `mod_state` pointer (limit_conn and proxy_cache cannot coexist today).
+3. **Declared directive schema**: each module publishes its directives and
+   parameter names as comptime data; the conf parser validates parse arms
+   against them; enables generated docs and `--describe-modules`.
+4. **Buffer-ownership contract**: a response body is exactly one of
+   {comptime static, shared-arena slice, shmem copy made under lock};
+   debug builds poison-check non-owned bodies at flush. Codified next to
+   `Response`.
+5. **Module test kit** (`dsl/testing.zig`): safe Case builders (the
+   self-referential struct trap has bitten twice), mock-upstream helper,
+   deterministic clock injection.
+
+Folded into Stage 2 (rides the upstream seam):
+
+6. **First-class subrequests + internal redirects**: generalize the
+   auth_request hook into `ctx.subrequest(uri) -> Subresponse` (depth-
+   limited mini-pipeline walk) plus `Action.internal_redirect(target)`
+   (error_page chains, X-Accel-Redirect style).
+7. **Transport abstraction for upstreams**: `on_ready` receives an opaque
+   IoHandle (fd today), so QUIC-stream upstreams slot in without touching
+   modules again.
+8. **Streaming body escape hatch**: modules declare `streams_response`;
+   such routes bypass body filters (header filters still run) until an
+   incremental filter API exists. Documented constraint, never silent.
+
+Tracked backlog (design notes recorded here; build later):
+
+9. **Reload-surviving zones**: `--reload-hard` execs a fresh process today,
+   resetting limit buckets and caches. Direction: back named shmem zones
+   with memfd_create handed through the daemon state file.
+10. **Metrics/tracing contract**: per-module counters in shmem, request-id
+    propagation, OTel-ready span points (handler entry, filter exit,
+    upstream done).
+11. **Error taxonomy**: `ModuleError` enum with central status mapping
+    (502/500/503 semantics) replacing anyerror guesswork.
+12. **Vhost readiness audit**: globals assuming a single server block
+    (health-route registry, default stats) get keyed by server before
+    vhosts land.
+13. **Capability flags**: `needs_body`, `streams_response`,
+    `touches_headers` declared per module; reactor can spool huge uploads
+    and validate bindings smarter.
+14. **HTTP-version conformance gate**: CI exercises every built-in module
+    over h2 (only some are verified today); enforces protocol-agnostic
+    modules ahead of HTTP/3.
+
+### Delivery stages and gates
+
+- **Stage 1** (kinds + filters + contexts + items 1-5): registry/router/
+  pipeline/conf + `dsl/testing.zig`. Hard-break migrations applied. Gate:
+  full suite green, backlog bench numbers hold (filters add zero
+  indirection), example conf builds.
+- **Stage 2** (async upstreams + items 6-8): `Action.async{fd, want}`
+  outcome; reactor registers upstream fds into the connection epoll set
+  tagged by session; completions dispatch to the module's `on_ready`.
+  Proxy migrates (connect -> send -> read_head -> read_body state machine,
+  buffers in HttpSession); blocking path deleted. Bench gate: proxy cell
+  >= 0.85x vs nginx, all other cells hold.
 
 ---
 ---
