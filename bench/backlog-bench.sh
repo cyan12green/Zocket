@@ -52,8 +52,8 @@ fi
 mkdir -p "$RES"
 ORIGIN_BIN="$ROOT/bench/.cache/zocket-origin"
 
-CELLS=(headers auth_sha precompressed cache_hit limit_req)
-PATHS=(/h /auth /f8k /cached /limited)
+CELLS=(headers auth_sha precompressed proxy cache_hit limit_req)
+PATHS=(/h /auth /f8k /proxied /cached /limited)
 
 start_zocket() {
     # Front server with all benchmark routes. ZOCKET_WRAP lets a debugger

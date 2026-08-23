@@ -15,8 +15,9 @@ CELLS = [
     ("headers", "headers\n(3 ops/req)"),
     ("auth_sha", "auth_basic\n({SHA})"),
     ("precompressed", "precompressed\n(.gz 8 KiB)"),
+    ("proxy", "reverse proxy\n(to origin)"),
     ("cache_hit", "proxy_cache\n(HIT)"),
-    ("limit_req", "limit_req\n(accepted)"),
+    ("limit_req", "limit_req\n(pass-through)"),
 ]
 
 def load(f):

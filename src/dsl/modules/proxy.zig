@@ -58,13 +58,17 @@ threadlocal var active: [max_backends]u32 = [_]u32{0} ** max_backends;
 /// Per-backend liveness, SHARED across reactors (and with the active
 /// health-checker thread) via a shmem zone. Keyed by (route pointer,
 /// backend index); routes are compile-time immortal pointers.
+/// All fields are atomics: after one-time slot resolution the request hot
+/// path reads/writes them WITHOUT any zone mutex (torn/stale reads are
+/// benign heuristics here — worst case one extra request hits a backend
+/// that just went down).
 const BackendState = struct {
-    fails: u32 = 0, // consecutive request failures (passive)
-    alive: bool = true,
-    probe_ok: u32 = 0, // consecutive successful probes (rise threshold)
-    probe_fails: u32 = 0, // consecutive failed probes (fall threshold)
-    last_fail_ns: u64 = 0,
-    probe_next_due_ns: u64 = 0,
+    fails: std.atomic.Value(u32) = .init(0), // consecutive passive failures
+    alive: std.atomic.Value(bool) = .init(true),
+    probe_ok: std.atomic.Value(u32) = .init(0),
+    probe_fails: std.atomic.Value(u32) = .init(0),
+    last_fail_ns: std.atomic.Value(u64) = .init(0),
+    probe_next_due_ns: std.atomic.Value(u64) = .init(0),
 };
 var health_zone = @import("../shmem.zig").KeyedTable(BackendState, 4096){};
 
@@ -79,6 +83,28 @@ var probeFn: *const fn (up: *const router.Upstream, path: []const u8, timeout_s:
 var hc_mutex: std.Thread.Mutex = .{};
 var hc_routes: std.ArrayList(*const registry.Route) = .empty;
 var hc_thread_started: bool = false;
+
+/// Per-reactor slot cache: resolved ONCE per route (under the zone mutex,
+/// which also seeds the entry), then every request touches the *BackendState
+/// directly — zero locking on the hot path.
+threadlocal var hc_cached_route: ?*const registry.Route = null;
+threadlocal var hc_cached_slots: [max_backends]?*BackendState = [_]?*BackendState{null} ** max_backends;
+
+fn healthSlot(route: *const registry.Route, idx: usize) ?*BackendState {
+    if (hc_cached_route != route) {
+        hc_mutex.lock();
+        defer hc_mutex.unlock();
+        for (0..max_backends) |i| {
+            const key = backendKey(route, i);
+            if (health_zone.upsertLocked(key)) |r| {
+                if (!r.existed) r.slot.* = .{};
+                hc_cached_slots[i] = r.slot;
+            }
+        }
+        hc_cached_route = route;
+    }
+    return hc_cached_slots[idx];
+}
 threadlocal var rr_counter: usize = 0;
 /// least_time: exponential weighted moving average of upstream response
 /// latency per backend, in ns (1/8 weight per sample).
@@ -175,9 +201,9 @@ fn forward(
 
     // Success: clear passive failures, refresh the EWMA latency sample,
     // then copy the response into ctx.resp.
-    if (health_zone.upsertLocked(backendKey(route, pick))) |r| {
-        r.slot.fails = 0;
-        r.slot.last_fail_ns = 0;
+    if (healthSlot(route, pick)) |slot| {
+        slot.fails.store(0, .monotonic);
+        slot.last_fail_ns.store(0, .monotonic);
     }
     active[pick] -|= 1;
     pool[pick] = .{ .fd = fd, .last_used_ns = started_ns };
@@ -314,27 +340,25 @@ fn pickBackend(route: *const registry.Route, upstreams: []const router.Upstream,
 }
 
 fn backendUsable(route: *const registry.Route, idx: usize, now_ns: u64) bool {
-    const key = backendKey(route, idx);
-    health_zone.mutex.lock();
-    defer health_zone.mutex.unlock();
-    const r = health_zone.upsertLocked(key) orelse return false;
-    if (!r.existed) r.slot.* = .{}; // assume alive until proven otherwise
-    if (!r.slot.alive) return false; // only the active checker revives
-    if (r.slot.fails < route.max_fails) return true;
+    const slot = healthSlot(route, idx) orelse return false;
+    if (!slot.alive.load(.acquire)) return false; // only the checker revives
+    if (slot.fails.load(.monotonic) < route.max_fails) return true;
     if (route.health_check_path != null) return false; // wait for rise
     // No active checker: honor the passive retry window.
-    if (now_ns >= r.slot.last_fail_ns +% @as(u64, route.fail_timeout_seconds) * std.time.ns_per_s) {
-        r.slot.fails = 0;
+    const last = slot.last_fail_ns.load(.monotonic);
+    if (now_ns >= last +% @as(u64, route.fail_timeout_seconds) * std.time.ns_per_s) {
+        slot.fails.store(0, .monotonic);
         return true;
     }
     return false;
 }
 
 fn markFailure(idx: usize, route: *const registry.Route, now_ns: u64) void {
-    if (health_zone.upsertLocked(backendKey(route, idx))) |r| {
-        r.slot.fails += 1;
-        r.slot.last_fail_ns = now_ns;
-        if (r.slot.fails >= route.max_fails) r.slot.alive = false;
+    const slot = healthSlot(route, idx) orelse return;
+    _ = slot.fails.fetchAdd(1, .monotonic);
+    slot.last_fail_ns.store(now_ns, .monotonic);
+    if (slot.fails.load(.monotonic) >= route.max_fails) {
+        slot.alive.store(false, .release);
     }
 }
 
@@ -351,43 +375,39 @@ pub fn runHealthChecksOnce(now_ns: u64) void {
         const path = route.health_check_path orelse continue;
         const timeout: u32 = if (route.health_check_timeout_s != 0) route.health_check_timeout_s else 1;
         for (route.upstreams, 0..) |*up, i| {
-            const key = backendKey(route, i);
-            var next_due: u64 = 0;
-            {
+            // Resolve once per sweep (mutex), then touch only atomics.
+            const slot = blk: {
                 health_zone.mutex.lock();
                 defer health_zone.mutex.unlock();
-                const r = health_zone.upsertLocked(key) orelse continue;
-                if (!r.existed) r.slot.* = .{}; // assume alive until proven otherwise
-                next_due = r.slot.probe_next_due_ns;
-                if (now_ns < next_due) continue;
-            }
+                const r = health_zone.upsertLocked(backendKey(route, i)) orelse continue;
+                if (!r.existed) r.slot.* = .{};
+                break :blk r.slot;
+            };
+            if (now_ns < slot.probe_next_due_ns.load(.monotonic)) continue;
             const ok = probeFn(up, path, timeout);
             const interval = @as(u64, if (route.health_check_interval_s != 0) route.health_check_interval_s else 5) * std.time.ns_per_s;
-            health_zone.mutex.lock();
-            defer health_zone.mutex.unlock();
-            const r = health_zone.upsertLocked(key) orelse continue;
-            r.slot.probe_next_due_ns = now_ns + interval;
+            slot.probe_next_due_ns.store(now_ns + interval, .monotonic);
             if (ok) {
-                r.slot.probe_ok += 1;
-                r.slot.probe_fails = 0;
+                _ = slot.probe_ok.fetchAdd(1, .monotonic);
+                slot.probe_fails.store(0, .monotonic);
                 const rise: u32 = if (route.health_check_rise != 0) route.health_check_rise else 2;
-                if (r.slot.probe_ok >= rise) {
-                    r.slot.alive = true;
-                    r.slot.fails = 0;
-                    r.slot.probe_ok = 0;
+                if (slot.probe_ok.load(.monotonic) >= rise) {
+                    slot.alive.store(true, .release);
+                    slot.fails.store(0, .monotonic);
+                    slot.probe_ok.store(0, .monotonic);
                 }
             } else {
-                r.slot.probe_ok = 0;
-                r.slot.probe_fails += 1;
+                slot.probe_ok.store(0, .monotonic);
+                _ = slot.probe_fails.fetchAdd(1, .monotonic);
                 const fall: u32 = if (route.health_check_fall != 0) route.health_check_fall else 3;
-                if (r.slot.probe_fails >= fall) r.slot.alive = false;
+                if (slot.probe_fails.load(.monotonic) >= fall) {
+                    slot.alive.store(false, .release);
+                }
             }
         }
     }
 }
 
-/// Register a route for background checking and start the checker thread
-/// once. Called from forward() on the first proxied request per route.
 /// Register a route for periodic checking (idempotent). Returns true when
 /// the route was newly added.
 fn registerHealthRoute(route: *const registry.Route) bool {
@@ -481,11 +501,34 @@ fn acquirePooled(idx: usize, now_ns: u64) posix_fd {
     return fd;
 }
 
+/// Connect timeout for upstream sockets (bounded so a half-dead backend
+/// cannot park a reactor thread indefinitely).
+const upstream_connect_timeout_ms: i32 = 1000;
+
 fn connectUpstream(up: *const router.Upstream) !posix_fd {
-    const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    // Non-blocking + CLOEXEC: the connect completes under a bounded poll,
+    // and every later read/write on this fd gets EAGAIN handling instead
+    // of parking the reactor thread on a slow backend.
+    const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
     errdefer posix_close(fd);
-    try std.posix.connect(fd, &up.sockaddr, 16);
+    std.posix.connect(fd, &up.sockaddr, 16) catch |e| switch (e) {
+        error.WouldBlock => {}, // EINPROGRESS: finish under poll below
+        else => return e,
+    };
+    var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+    const ready = std.posix.poll(&pfds, upstream_connect_timeout_ms) catch return error.ConnectTimeout;
+    if (ready == 0) return error.ConnectTimeout;
+    var err_bytes: [4]u8 = undefined;
+    std.posix.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, &err_bytes) catch return error.ConnectFailed;
+    if (std.mem.readInt(i32, &err_bytes, .little) != 0) return error.ConnectFailed;
     return fd;
+}
+
+/// Wait for readability/up to `timeout_ms`; false on timeout or poll error.
+fn waitReadable(fd: posix_fd, timeout_ms: i32) bool {
+    var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&pfds, timeout_ms) catch return false;
+    return ready > 0 and (pfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
 }
 
 fn setRecvTimeout(fd: posix_fd) void {
@@ -500,7 +543,10 @@ fn posix_close(fd: posix_fd) void {
 // ---- upstream request forwarding ----
 
 fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) !void {
-    const allocator = ctx.allocator orelse return error.NoAllocator;
+    // The shared request memory is a bump arena: building here costs no
+    // malloc/free pairs and everything dies with the response (page_allocator
+    // here meant an mmap+munmap pair PER REQUEST).
+    const allocator = ctx.req.arena.asAllocator();
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
@@ -511,8 +557,9 @@ fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) 
 
     try out.appendSlice(allocator, "Host: ");
     try out.appendSlice(allocator, up.host);
+    var port_buf: [8]u8 = undefined;
     try out.appendSlice(allocator, ":");
-    try out.appendSlice(allocator, std.fmt.allocPrint(allocator, "{d}\r\n", .{up.port}) catch return error.OutOfMemory);
+    try out.appendSlice(allocator, std.fmt.bufPrint(&port_buf, "{d}\r\n", .{up.port}) catch return error.OutOfMemory);
 
     var ip_buf: [16]u8 = undefined;
     const ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ctx.client_ip[0], ctx.client_ip[1], ctx.client_ip[2], ctx.client_ip[3] }) catch "0.0.0.0";
@@ -570,13 +617,22 @@ fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) 
         try vars.renderComplex(ctx, ph.value, &sink);
         try out.appendSlice(allocator, "\r\n");
     }
+    var cl_buf: [24]u8 = undefined;
     try out.appendSlice(allocator, "Content-Length: ");
-    try out.appendSlice(allocator, std.fmt.allocPrint(allocator, "{d}\r\n\r\n", .{ctx.req.body.len}) catch return error.OutOfMemory);
+    try out.appendSlice(allocator, std.fmt.bufPrint(&cl_buf, "{d}\r\n\r\n", .{ctx.req.body.len}) catch return error.OutOfMemory);
     try out.appendSlice(allocator, ctx.req.body);
 
     var remaining = out.items;
     while (remaining.len > 0) {
-        const n = try std.posix.write(fd, remaining);
+        const n = std.posix.write(fd, remaining) catch |e| switch (e) {
+            error.WouldBlock => {
+                var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+                const ready = std.posix.poll(&pfds, upstream_connect_timeout_ms) catch return error.UpstreamWriteFailed;
+                if (ready == 0) return error.UpstreamWriteFailed;
+                continue;
+            },
+            else => return e,
+        };
         remaining = remaining[n..];
     }
 }
@@ -680,9 +736,17 @@ const UpstreamReader = struct {
     }
 
     fn fill(self: *UpstreamReader, fd: posix_fd) !usize {
-        const n = try std.posix.read(fd, self.buf[self.used..]);
-        self.used += n;
-        return n;
+        while (true) {
+            const n = std.posix.read(fd, self.buf[self.used..]) catch |e| switch (e) {
+                error.WouldBlock => {
+                    if (!waitReadable(fd, upstream_connect_timeout_ms)) return error.UpstreamTimeout;
+                    continue;
+                },
+                else => return e,
+            };
+            self.used += n;
+            return n;
+        }
     }
 };
 
@@ -840,8 +904,8 @@ test "passive failures trip the shared circuit; success clears it" {
 
     // A successful request clears the passive counter (retry window open).
     if (health_zone.upsertLocked(key)) |r| {
-        r.slot.fails = 0;
-        r.slot.alive = true;
+        r.slot.fails.store(0, .monotonic);
+        r.slot.alive.store(true, .release);
     }
     try testing.expect(backendUsable(&route, 0, 0));
 }

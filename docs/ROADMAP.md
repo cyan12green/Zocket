@@ -84,6 +84,12 @@ byte-budgeted LRU stores; nothing grows under load):
 - DONE Runtime zone-size knobs: `limits.proxy_cache_max_bytes` /
   `proxy_cache_max_entries` size the response zone at startup; the LruStore
   is runtime-sized with a chained hash directory (O(1) HIT lookups).
+- OPEN Reverse proxy async upstreams: forwards currently block the reactor
+  thread for the origin round trip (0.60x vs nginx on the dedicated proxy
+  cell; every other cell leads). Fix: register upstream fds in the
+  connection epoll set and drive a small request state machine. The cheap
+  half is already done (non-blocking sockets, arena-built requests,
+  lock-free health slots — 2x measured).
 - BLOCKED ON VENDORING Brotli + zstd compression: std.zig has no encoders
   for either (zstd is decompress-only); needs a vendored codec decision
   (C dependency vs pure-Zig port) before pickup.
