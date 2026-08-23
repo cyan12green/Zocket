@@ -57,6 +57,11 @@ threadlocal var active: [max_backends]u32 = [_]u32{0} ** max_backends;
 threadlocal var consecutive_fails: [max_backends]u32 = [_]u32{0} ** max_backends;
 threadlocal var failed_at_ns: [max_backends]u64 = [_]u64{0} ** max_backends;
 threadlocal var rr_counter: usize = 0;
+/// least_time: exponential weighted moving average of upstream response
+/// latency per backend, in ns (1/8 weight per sample).
+threadlocal var ewma_ns: [max_backends]u64 = [_]u64{0} ** max_backends;
+/// xorshift state for the random strategy.
+var rng_state: u64 = 0x9E3779B97F4A7C15;
 
 fn run(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
@@ -64,16 +69,61 @@ fn run(ctx: *Context) anyerror!Action {
     if (upstreams.len == 0 or upstreams.len > max_backends) return .pass;
 
     const now_ns = nowNs();
+    // Sticky sessions (cookie-based): a valid previously-assigned tag pins
+    // the request to its backend while that backend stays usable.
+    if (route.sticky_cookie) |name| {
+        if (stickyBackendFromCookie(ctx, name, upstreams, route, now_ns)) |idx| {
+            return forward(ctx, route, upstreams, idx, now_ns, false);
+        }
+    }
     const pick = try pickBackend(route, upstreams, ctx, now_ns) orelse {
         return badGateway(ctx);
     };
+    return forward(ctx, route, upstreams, pick, now_ns, route.sticky_cookie != null);
+}
 
+/// Parse `Cookie: ...; <name>=sN; ...` for a backend tag within range and
+/// usable at `now_ns`. Tags are "s" + backend index (stable per config).
+fn stickyBackendFromCookie(
+    ctx: *Context,
+    name: []const u8,
+    upstreams: []const router.Upstream,
+    route: *const registry.Route,
+    now_ns: u64,
+) ?usize {
+    const cookie_header = ctx.req.header("cookie") orelse return null;
+    var it = std.mem.splitScalar(u8, cookie_header, ';');
+    while (it.next()) |pair_raw| {
+        const pair = std.mem.trim(u8, pair_raw, " \t");
+        if (pair.len <= name.len + 2 or !std.mem.startsWith(u8, pair, name)) continue;
+        if (pair[name.len] != '=') continue;
+        const tag = pair[name.len + 1 ..];
+        if (tag.len < 2 or tag[0] != 's') continue;
+        const idx = std.fmt.parseInt(usize, tag[1..], 10) catch continue;
+        if (idx >= upstreams.len) continue;
+        if (!backendUsable(route, idx, now_ns)) continue;
+        return idx;
+    }
+    return null;
+}
+
+/// Connect/send/read against backend `pick`, copy the response into the
+/// context and finish LB bookkeeping (EWMA latency sample on success,
+/// failure marking on error). `offer_sticky` adds the Set-Cookie binding
+/// when the route asked for affinity and the client had none.
+fn forward(
+    ctx: *Context,
+    route: *const registry.Route,
+    upstreams: []const router.Upstream,
+    pick: usize,
+    started_ns: u64,
+    offer_sticky: bool,
+) anyerror!Action {
     const up = &upstreams[pick];
-    var fd = acquirePooled(pick, now_ns);
+    var fd = acquirePooled(pick, started_ns);
     if (fd < 0) {
-        fd = connectUpstream(up) catch |e| {
-            std.debug.print("DBG connect: {s}\n", .{@errorName(e)});
-            markFailure(pick, route, now_ns);
+        fd = connectUpstream(up) catch {
+            markFailure(pick, route, started_ns);
             return badGateway(ctx);
         };
         setRecvTimeout(fd);
@@ -83,27 +133,31 @@ fn run(ctx: *Context) anyerror!Action {
     sendUpstreamRequest(fd, ctx, up) catch {
         posix_close(fd);
         active[pick] -|= 1;
-        markFailure(pick, route, now_ns);
+        markFailure(pick, route, started_ns);
         return badGateway(ctx);
     };
 
     // Read the upstream response (status + headers + body).
     var reader = UpstreamReader.init();
-    const read_result = reader.read(fd) catch |e| blk: {
-        std.debug.print("DBG read: {s}\n", .{@errorName(e)});
+    const read_result = reader.read(fd) catch blk: {
         break :blk null;
     };
     if (read_result == null) {
         posix_close(fd);
         active[pick] -|= 1;
-        markFailure(pick, route, now_ns);
+        markFailure(pick, route, started_ns);
         return badGateway(ctx);
     }
 
-    // Success: copy the upstream response into ctx.resp.
+    // Success: EWMA latency sample, then copy the response into ctx.resp.
     consecutive_fails[pick] = 0;
     active[pick] -|= 1;
-    pool[pick] = .{ .fd = fd, .last_used_ns = now_ns };
+    pool[pick] = .{ .fd = fd, .last_used_ns = started_ns };
+    const elapsed = nowNs() -% started_ns;
+    ewma_ns[pick] = if (ewma_ns[pick] == 0)
+        elapsed
+    else
+        ewma_ns[pick] - (ewma_ns[pick] >> 3) + (elapsed >> 3);
 
     const r = read_result.?;
     ctx.resp.status = @enumFromInt(r.status);
@@ -117,13 +171,20 @@ fn run(ctx: *Context) anyerror!Action {
         };
         if (!skip) ctx.resp.setHeader(h.name, h.value);
     }
-    const allocator = ctx.allocator orelse return .handled;
-    const body = allocator.dupe(u8, r.body) catch {
-        // The body slice lives in the reader's buffer; dup it or serve empty.
-        return badGateway(ctx);
-    };
+
+    // The body slice lives in the reader's stack buffer: copy into the
+    // shared request memory (the server reclaims it after the response).
+    const body = ctx.sharedDupe(r.body) orelse return badGateway(ctx);
     ctx.resp.body = body;
-    ctx.resp.body_owned = true;
+
+    // Offer the sticky binding to clients that did not present one.
+    if (offer_sticky) {
+        if (ctx.route.?.sticky_cookie) |name| {
+            var tag_buf: [32]u8 = undefined;
+            const tag = std.fmt.bufPrint(&tag_buf, "{s}=s{d}; Path=/", .{ name, pick }) catch "";
+            if (tag.len > 0) ctx.resp.setHeader("Set-Cookie", tag);
+        }
+    }
     return .handled;
 }
 
@@ -154,6 +215,54 @@ fn pickBackend(route: *const registry.Route, upstreams: []const router.Upstream,
                 if (!backendUsable(route, idx, now_ns)) continue;
                 if (active[idx] < best_active) {
                     best_active = active[idx];
+                    best = idx;
+                }
+            }
+            return best;
+        },
+        .random => {
+            // xorshift64* seeded from the request clock + client IP; usable
+            // backends get equal probability.
+            var st = rng_state ^ now_ns ^ (@as(u64, ctx.client_ip[0]) << 24 |
+                @as(u64, ctx.client_ip[1]) << 16 | @as(u64, ctx.client_ip[2]) << 8 |
+                @as(u64, ctx.client_ip[3]));
+            st ^= st >> 12;
+            st ^= st << 25;
+            st ^= st >> 27;
+            rng_state = st;
+            const start = @as(usize, @intCast((st *% 0x2545F4914F6CDD1D) % upstreams.len));
+            for (0..upstreams.len) |_| {
+                const idx = (start + @as(usize, @intCast(rr_counter))) % upstreams.len;
+                rr_counter +%= 1;
+                if (backendUsable(route, idx, now_ns)) return idx;
+            }
+            return null;
+        },
+        .consistent_hash => {
+            // Same client -> same backend while it is usable; a failure
+            // reshuffles only the failed backend's share.
+            var h: u64 = 0xcbf29ce484222325;
+            for (ctx.client_ip) |b| {
+                h ^= b;
+                h *%= 0x100000001b3;
+            }
+            // Deterministic probe order from the client's own hash: no
+            // shared counters, so identical keys always map identically.
+            const start: usize = @intCast(h % upstreams.len);
+            for (0..upstreams.len) |k| {
+                const idx = (start + k) % upstreams.len;
+                if (backendUsable(route, idx, now_ns)) return idx;
+            }
+            return null;
+        },
+        .least_time => {
+            var best: ?usize = null;
+            var best_ewma: u64 = std.math.maxInt(u64);
+            for (upstreams, 0..) |_, idx| {
+                if (!backendUsable(route, idx, now_ns)) continue;
+                // Never-tried backends win ties by looking free (0 ns).
+                if (ewma_ns[idx] < best_ewma) {
+                    best_ewma = ewma_ns[idx];
                     best = idx;
                 }
             }
@@ -436,4 +545,104 @@ test "balance strategy parse" {
     try testing.expectEqual(router.Balance.least_connections, router.Balance.parse("least_connections").?);
     try testing.expectEqual(router.Balance.ip_hash, router.Balance.parse("ip_hash").?);
     try testing.expectEqual(@as(?router.Balance, null), router.Balance.parse("maglev"));
+}
+
+test "balance strategy parse accepts the new strategies" {
+    try testing.expectEqual(router.Balance.random, router.Balance.parse("random").?);
+    try testing.expectEqual(router.Balance.consistent_hash, router.Balance.parse("consistent_hash").?);
+    try testing.expectEqual(router.Balance.least_time, router.Balance.parse("least_time").?);
+}
+
+test "consistent_hash keeps one client on one backend" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.client_ip = .{ 192, 168, 1, 7 };
+
+    const route = registry.Route{
+        .path = "/",
+        .balance = .consistent_hash,
+        .upstreams = &.{
+            .{ .host = "127.0.0.1", .port = 1 },
+            .{ .host = "127.0.0.1", .port = 2 },
+            .{ .host = "127.0.0.1", .port = 3 },
+        },
+    };
+    const now = nowNs();
+    const first = (try pickBackend(&route, route.upstreams, &ctx, now)).?;
+    for (0..8) |_| {
+        const again = (try pickBackend(&route, route.upstreams, &ctx, now)).?;
+        try testing.expectEqual(first, again);
+    }
+}
+
+test "least_time prefers the lower EWMA and samples complete requests" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.client_ip = .{ 10, 0, 0, 1 };
+
+    const route = registry.Route{
+        .path = "/",
+        .balance = .least_time,
+        .upstreams = &.{
+            .{ .host = "127.0.0.1", .port = 1 },
+            .{ .host = "127.0.0.1", .port = 2 },
+        },
+    };
+    // Backend 0 has seen fast responses; backend 1 slow ones.
+    ewma_ns[0] = 2 * std.time.ns_per_ms;
+    ewma_ns[1] = 20 * std.time.ns_per_ms;
+    defer {
+        ewma_ns[0] = 0;
+        ewma_ns[1] = 0;
+    }
+
+    const picked = (try pickBackend(&route, route.upstreams, &ctx, nowNs())).?;
+    try testing.expectEqual(@as(usize, 0), picked);
+
+    // EWMA update math: new = old - old/8 + sample/8.
+    const old_v: u64 = 8_000;
+    ewma_ns[0] = old_v;
+    ewma_ns[0] -= old_v >> 3;
+    ewma_ns[0] += 16_000 >> 3;
+    try testing.expectEqual(old_v - old_v / 8 + 2_000, ewma_ns[0]);
+}
+
+test "sticky cookie routes back to the tagged backend" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    _ = req.addHeaderParsed("Cookie", "a=1; zsid=s2; b=2") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+
+    const route = registry.Route{
+        .path = "/",
+        .sticky_cookie = "zsid",
+        .max_fails = 1,
+        .upstreams = &.{
+            .{ .host = "127.0.0.1", .port = 1 },
+            .{ .host = "127.0.0.1", .port = 2 },
+            .{ .host = "127.0.0.1", .port = 3 },
+        },
+    };
+    const picked = stickyBackendFromCookie(&ctx, "zsid", route.upstreams, &route, nowNs());
+    try testing.expectEqual(@as(usize, 2), picked.?);
+
+    // Out-of-range and malformed tags fall through to null.
+    var bad = registry.Request.init(testing.allocator);
+    defer bad.deinit();
+    _ = bad.addHeaderParsed("Cookie", "zsid=s9") catch unreachable;
+    var bad_resp = registry.Response.init(.ok);
+    var bad_ctx = Context{ .req = &bad, .resp = &bad_resp };
+    try testing.expect(stickyBackendFromCookie(&bad_ctx, "zsid", route.upstreams, &route, nowNs()) == null);
+
+    var junk = registry.Request.init(testing.allocator);
+    defer junk.deinit();
+    _ = junk.addHeaderParsed("Cookie", "zsid=hello") catch unreachable;
+    var junk_resp = registry.Response.init(.ok);
+    var junk_ctx = Context{ .req = &junk, .resp = &junk_resp };
+    try testing.expect(stickyBackendFromCookie(&junk_ctx, "zsid", route.upstreams, &route, nowNs()) == null);
 }

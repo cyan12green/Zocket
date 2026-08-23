@@ -118,6 +118,10 @@ pub const Route = struct {
     /// Concurrency cap (limit_conn module): max simultaneous in-flight
     /// requests per client key. 0 disables.
     limit_conn_max: u32 = 0,
+    /// Sticky sessions (cookie-based affinity): when set, the proxy module
+    /// reads this cookie for a previously-assigned backend tag and answers
+    /// new clients with a Set-Cookie binding them to their backend.
+    sticky_cookie: ?[]const u8 = null,
     /// Index into Config.log_formats; null = none (off). The access_log
     /// module reads it; defaults to index 0 (the `combined` default) when
     /// the route binds `log access_log;` and no `access_log` directive is
@@ -195,11 +199,22 @@ pub const Balance = enum {
     round_robin,
     least_connections,
     ip_hash,
+    /// Random among usable backends (xorshift seeded from the request).
+    random,
+    /// Consistent hash of the client key: same client lands on the same
+    /// backend while it stays usable, reshuffling only its share on failure.
+    consistent_hash,
+    /// Least-latency first: exponential weighted moving average of upstream
+    /// response time per backend.
+    least_time,
 
     pub fn parse(s: []const u8) ?Balance {
         if (std.mem.eql(u8, s, "round_robin")) return .round_robin;
         if (std.mem.eql(u8, s, "least_connections")) return .least_connections;
         if (std.mem.eql(u8, s, "ip_hash")) return .ip_hash;
+        if (std.mem.eql(u8, s, "random")) return .random;
+        if (std.mem.eql(u8, s, "consistent_hash")) return .consistent_hash;
+        if (std.mem.eql(u8, s, "least_time")) return .least_time;
         return null;
     }
 };

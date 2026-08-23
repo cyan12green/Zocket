@@ -87,6 +87,10 @@ const H_set_header = keyHash("set_header");
 const H_remove_header = keyHash("remove_header");
 const H_auth_basic = keyHash("auth_basic");
 const H_auth_basic_user_file = keyHash("auth_basic_user_file");
+const H_random = keyHash("random");
+const H_consistent_hash = keyHash("consistent_hash");
+const H_least_time = keyHash("least_time");
+const H_sticky_cookie = keyHash("sticky_cookie");
 const H_limit_req = keyHash("limit_req");
 const H_limit_conn = keyHash("limit_conn");
 const H_set = keyHash("set");
@@ -177,6 +181,8 @@ const LocationSpec = struct {
     /// of either binds the access-phase auth_basic module.
     auth_realm: ?Str = null,
     auth_file: ?Str = null,
+    /// `sticky_cookie name;` (cookie-based backend affinity)
+    sticky: ?Str = null,
     /// `limit_req rate=N burst=M;` / `limit_conn N;`
     limit_rate: u32 = 0,
     limit_burst: u32 = 0,
@@ -749,7 +755,10 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
                 H_round_robin => .round_robin,
                 H_least_connections => .least_connections,
                 H_ip_hash => .ip_hash,
-                else => lx.fail("balance: expected round_robin|least_connections|ip_hash"),
+                H_random => .random,
+                H_consistent_hash => .consistent_hash,
+                H_least_time => .least_time,
+                else => lx.fail("balance: expected round_robin|least_connections|ip_hash|random|consistent_hash|least_time"),
             };
             lx.expectTerminator("balance");
             b.cost += 8;
@@ -778,6 +787,12 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
         H_set_header, H_remove_header => {
             const hs = parseHeaderOpDirective(lx, b, name);
             appendHeaderOp(b, spec, hs);
+        },
+        H_sticky_cookie => {
+            const t = lx.value(b, "sticky_cookie");
+            lx.expectTerminator("sticky_cookie");
+            spec.sticky = t;
+            b.cost += 8;
         },
         H_limit_req => {
             // `limit_req rate=N burst=M;` (burst defaults to rate).
@@ -1190,6 +1205,7 @@ fn build(b: *const Builder) Config {
                     htpasswd_mod.parse(embeds_mod.embed(resolve(f, strings)))
                 else
                     &.{},
+                .sticky_cookie = if (spec.sticky) |sc| resolve(sc, strings) else null,
                 .limit_req_rate = spec.limit_rate,
                 .limit_req_burst = spec.limit_burst,
                 .limit_conn_max = spec.limit_conn_max,
