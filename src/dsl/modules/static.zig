@@ -8,12 +8,12 @@ const parser = @import("../../http/parser.zig");
 pub const Context = registry.Context;
 pub const Action = registry.Action;
 
-/// Static file serving (Milestone 10). Bound to the `content` phase. Two
+/// Static file serving. Bound to the `content` phase. Two
 /// paths:
 /// - **Disk** (runtime config): `root` (+ optional `index` file, `autoindex`)
 ///   on the route. The decoded request target is resolved against the root;
 ///   `..` segments and symlink escapes are blocked; files are stat'ed for
-///   ETag (`"mtime-size"`), Last-Modified, Content-Type (M6 MIME table) and
+///   ETag (`"mtime-size"`), Last-Modified, Content-Type (MIME table) and
 ///   Content-Length; single ranges yield 206, unsatisfiable ones 416,
 ///   multi-range requests fall back to the full 200; conditional requests
 ///   (If-None-Match / If-Modified-Since) yield 304.
@@ -430,7 +430,7 @@ fn serveFd(ctx: *Context, opts: ServeFdOptions) !Action {
         return .handled;
     }
 
-    // Milestone 14: push the body from the file straight into the socket.
+    // Push the body from the file straight into the socket.
     // sendfile for every size (like nginx): one kernel copy, no userspace
     // buffer, no per-request allocation. The reactor takes ownership of
     // the fd.

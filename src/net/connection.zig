@@ -25,16 +25,14 @@ pub const Connection = struct {
     send_buf: buffer.Buffer,
     read_storage: [default_buf_size]u8 = undefined,
     write_storage: [default_buf_size]u8 = undefined,
-    /// Idle-timeout timer slot (Milestone 5). Armed by the reactor when the
+    /// Idle-timeout timer slot. Armed by the reactor when the
     /// connection is registered and re-armed on every recv; the reactor's
     /// timer wheel unlinks and fires it when the connection goes idle.
     timer: timer_wheel.TimerEntry = .{},
-    /// Wheel tick the idle timer was last armed at (Milestone 14 follow-up):
-    /// lets the reactor skip the rearm when back-to-back recvs fall in the
+    /// Wheel tick the idle timer was last armed at /// lets the reactor skip the rearm when back-to-back recvs fall in the
     /// same tick.
     timer_last_tick: u64 = 0,
-    /// IPv4 address of the peer, in network byte order (Milestone 12; set by
-    /// the accept path for the proxy module's X-Forwarded-For/X-Real-IP).
+    /// IPv4 address of the peer, in network byte order.
     peer_ip: [4]u8 = .{ 0, 0, 0, 0 },
     /// True when this object came from a reactor connection pool (free-list
     /// link in `next`); external connections (tests, attach path) destroy

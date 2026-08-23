@@ -92,7 +92,7 @@ pub const Session = struct {
         return null;
     }
 
-    /// FNV-1a hash of a header/pseudo-header name (DM1 pattern): the request
+    /// FNV-1a hash of a header/pseudo-header name (same hash-dispatch pattern as the conf parser): the request
     /// classifier dispatches on a single integer compare instead of a chain
     /// of string equality checks.
     fn hdrHash(name: []const u8) u64 {

@@ -5,7 +5,7 @@ const vars = @import("../vars.zig");
 pub const Context = registry.Context;
 pub const Action = registry.Action;
 
-/// Access logging (Milestone 13; M-B rewrite). Bound to the `log` phase,
+/// Access logging. Bound to the `log` phase,
 /// which runs as pipeline post-processing after every request. The format
 /// is a named `log_format` from the config, compiled at comptime into a
 /// complex-value fragment list; per-request rendering walks the constant

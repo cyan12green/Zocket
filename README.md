@@ -48,7 +48,7 @@ High-performance TCP/HTTP server in Zig.
   drains its connections). The only reload (configs are comptime-only)
 - Graceful shutdown: SIGTERM/SIGINT drain connections (30 s cap)
 - `--validate`: print the route table (configs are validated at build time)
-- `--single` (M1 baseline), `--echo` (raw protocol), `--uring` (experimental)
+- `--single` (single-threaded A/B baseline), `--echo` (raw protocol), `--uring` (experimental)
 
 **Engineering**
 - Performance: beats nginx on every measured workload — HTTP/2 echo 3.0x
@@ -68,8 +68,8 @@ zig build -Dconfig=config.conf run     HTTP with a comptime-embedded conf
                                        (nginx-style language; routes, module
                                        bindings, limits and tls — see
                                        docs/config.md)
-zig build run -- --echo                raw byte-echo protocol (M1/M2 semantics)
-zig build run -- --single              M1 single-threaded echo server (A/B)
+zig build run -- --echo                raw byte-echo protocol
+zig build run -- --single              single-threaded echo server (A/B baseline)
 zig build run -- --idle-timeout S      idle connection timeout in seconds (0 disables)
 zig build run -- --uring               experimental io_uring batch I/O backend
                                        (epoll is the default)

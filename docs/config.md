@@ -37,7 +37,7 @@ zig build -Dconfig=config.example.conf run -- --validate   # print the route tab
 ```
 
 With no `-Dconfig`, the server runs the comptime default: a catch-all prefix
-route binding `echo` to the `content` phase (the pre-pipeline M3 behavior).
+route binding `echo` to the `content` phase (the pre-pipeline hardcoded behavior).
 
 ## Language grammar
 
@@ -62,7 +62,7 @@ comment  := '#' to end of line (outside quoted strings)
 - Errors carry `conf:<line>:<col>: <message>`.
 
 The structure is **flat**: top-level directives plus exactly one `server {}`
-block (vhosts are a future milestone) holding `location {}` blocks. There is
+block (vhosts are future work) holding `location {}` blocks. There is
 no `http {}` section.
 
 ## Directives

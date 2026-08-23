@@ -24,7 +24,7 @@ pub const FrameType = enum(u8) {
     /// ignored and discarded).
     unknown = 0xff,
 
-    /// Comptime-built decode table (M8-style): type byte -> FrameType with
+    /// Comptime-built decode table (hash-dispatch style): type byte -> FrameType with
     /// zero branches per lookup; unknown/undefined bytes map to `.unknown`
     /// (RFC 9113 §4.1: they MUST be ignored and discarded).
     pub const decode_table: [256]FrameType = blk: {

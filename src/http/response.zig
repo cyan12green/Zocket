@@ -187,12 +187,12 @@ pub const Response = struct {
     /// the response itself lives on the caller's stack for the request.
     scratch: [96]u8 = undefined,
     scratch_used: usize = 0,
-    /// sendfile body (Milestone 14): when set, the body is pushed from the
+    /// sendfile body: when set, the body is pushed from the
     /// file directly into the socket instead of being copied through
     /// userspace. The caller (reactor) takes ownership of `file_fd`.
     body_from_file: bool = false,
     file_fd: posix_fd = -1,
-    /// The file fd comes from the reactor's static cache (Milestone 14
+    /// The file fd comes from the reactor's static cache (
     /// follow-up, nginx open_file_cache): the reactor must NOT close it
     /// after sendfile — the cache owns it.
     file_fd_cached: bool = false,

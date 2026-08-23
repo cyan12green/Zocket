@@ -3,12 +3,12 @@
 //! the record-hash, the signature-hash and the ECDSA curve so every
 //! (cipher, certificate) combination compiles down to its exact types.
 //!
-//! Buffering model (M17): raw ciphertext accumulates in `in_buf`; records
+//! Buffering model: raw ciphertext accumulates in `in_buf`; records
 //! are decrypted IN PLACE within it (ciphertext region becomes plaintext,
 //! no copy); handshake messages assemble in `handshake_buf`; application
 //! plaintext is copied into `plaintext_out` for the caller; ciphertext
 //! ready to send sits in `out_buf` (drained with `takeOut`). The reactor
-//! integration (M18) wires these to the connection buffers.
+//! The connection layer wires these to the connection buffers.
 
 const std = @import("std");
 const tls = std.crypto.tls;
@@ -68,7 +68,7 @@ pub fn Session(
         /// The signature transcript (same messages, its own hash type).
         sig_transcript: SigHash = .init(.{}),
         stage: Stage = .waiting_hello,
-        /// Resumed session master secret (from a validated ticket, M18).
+        /// Resumed session master secret (from a validated session ticket).
         psk: [64]u8 = undefined,
         psk_len: usize = 0,
         /// Ticket nonce counter for NewSessionTicket issuance.
@@ -413,11 +413,11 @@ pub fn Session(
                 self.alpn = handshake_mod.selectAlpn(hello.alpn) orelse "";
             }
 
-            // PSK resumption (M18): open the ticket, require psk_dhe_ke
+            // PSK resumption: open the ticket, require psk_dhe_ke
             // mode, and verify the binder over the truncated ClientHello.
             var resumed_psk: ?[]const u8 = null;
             if (hello.psk_identity.len > 0) {
-                // PSK resumption (M18): the first ClientHello carries a
+                // PSK resumption: the first ClientHello carries a
                 // session ticket. Require psk_dhe_ke mode, open the ticket,
                 // derive the PSK from the resumption master secret and the
                 // ticket nonce, then verify the binder over the truncated
@@ -620,7 +620,7 @@ pub fn Session(
 }
 
 /// Instantiate the right concrete session for a cipher suite and certificate
-/// curve. M17 supports the four common combinations; the union dispatches to
+/// curve. Four common combinations are supported; the union dispatches to
 /// the exact comptime types.
 pub const AnySession = union(enum) {
     aes128_p256: Session(std.crypto.aead.aes_gcm.Aes128Gcm, std.crypto.hash.sha2.Sha256, std.crypto.hash.sha2.Sha256, std.crypto.sign.ecdsa.EcdsaP256Sha256, 0x0403),
@@ -638,7 +638,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const TestSession = Session(Aes128Gcm, Sha256, Sha256, EcdsaP256, 0x0403);
 
-// The definitive M17 interop test: the std TLS 1.3 client performs a full
+// Definitive interop test: the std TLS 1.3 client performs a full
 // handshake against our server session over a socketpair, then both sides
 // exchange application data encrypted in both directions. Any mismatch in
 // the key schedule, transcript, records or signatures fails here.

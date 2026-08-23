@@ -63,11 +63,11 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
     // Content-Length. The flag travels on the response; h2 ignores it.
     if (r.chunked) ctx.resp.chunked = true;
 
-    // Milestone 7: comptime-specialised dispatch (struct-literal configs).
+    // Comptime-specialised dispatch (struct-literal configs).
     // Zero loops, zero moduleFor scans, zero Registry.resolve at runtime.
     if (r.dispatch) |f| {
         const out = try f(ctx);
-        // Milestone 11: template fallback when no module claimed the request.
+        // Template fallback when no module claimed the request.
         if (out == .not_handled) {
             if (r.response) |t| {
                 applyTemplate(ctx, t);
@@ -109,7 +109,7 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
         _ = try run_fn(ctx);
     }
     if (outcome == .not_handled) {
-        // Milestone 11: a route with a response template and modules that did
+        // A route with a response template and modules that did
         // not claim the request falls back to the template.
         if (r.response) |t| {
             applyTemplate(ctx, t);
@@ -148,7 +148,7 @@ fn applyTemplateCV(ctx: *Context, t: router.ResponseTemplateCV) void {
     ctx.resp.body = vars.renderComplexArena(ctx, t.body, &ctx.req.arena) orelse "";
 }
 
-/// Comptime-specialised dispatch function for one route (Milestone 7 Part B).
+/// Comptime-specialised dispatch function for one route.
 /// The bound modules are called directly, phase by phase — the equivalent of
 /// an unrolled switch over the route's bindings with the module resolution
 /// resolved at compile time. Modules sharing a phase form a chain in config
@@ -224,19 +224,19 @@ fn assignDispatchImpl(comptime Registry: type, comptime routes: []const router.R
     inline for (routes, 0..) |r, i| {
         out[i] = r;
         out[i].dispatch = dispatchForRoute(Registry, r);
-        // Milestone 10: comptime-embedded static assets. An invalid embed
+        // Comptime-embedded static assets. An invalid embed
         // path is a compile error here. Paths are project-root-relative
         // (the `embeds` module lives at the root for @embedFile).
         if (r.embed) |embed_path| {
             out[i].embed_bytes = @import("embeds").embed(embed_path);
         }
-        // Milestone 11: fixed-response templates serialised at compile time.
+        // Fixed-response templates serialised at compile time.
         if (r.response) |t| {
             out[i].response_bytes = router.serializeResponseTemplate(t);
         }
-        // Milestone 12: upstream sockaddrs must be pre-computed at compile
+        // Upstream sockaddrs must be pre-computed at compile
         // time (host literals — no DNS, no runtime byte-swapping). The
-        // DM1/DM2 config parser fills them in; struct-literal configs must
+        // The conf parser fills them in; struct-literal configs must
         // set `.sockaddr` via `Upstream.makeSockaddr`. A stale default
         // (family 0) would fail the connect at runtime, so reject it here.
         inline for (r.upstreams) |up| {
@@ -558,7 +558,7 @@ test "dispatch specialisation chains same-phase modules like the loop walk" {
     try testing.expectEqualStrings("log_mod", res_b.resp.headers[3].value);
 }
 
-// ---- Milestone 7: comptime dispatch specialisation ----
+// ---- Comptime dispatch specialisation ----
 
 test "dispatch specialisation matches the loop walk outcome and state" {
     const routes = comptime echoRoutes();

@@ -329,10 +329,10 @@ comptime {
     if (static_table.len != 61) @compileError("HPACK static table must be 61 entries");
 }
 
-// ---- comptime name hashing (M8 pattern) ----
+// ---- ---- comptime name hashing ---- ----
 
 /// FNV-1a (32-bit) over lower-cased bytes — the same hasher the HTTP/1
-/// header parser uses (Milestone 8), so known names match as integers.
+/// header parser uses, so known names match as integers.
 fn nameHash(name: []const u8) u32 {
     var h: u32 = 2166136261;
     for (name) |c| {

@@ -48,7 +48,7 @@ pub fn Secrets(comptime Su: type) type {
         /// transcript hash of the ClientHello. Called by the server right
         /// after parsing ClientHello (and again with the second ClientHello
         /// after a HelloRetryRequest — the first one is dropped from the
-        /// transcript, RFC 8446 §4.1.2). `psk` (M18 session tickets) carries
+        /// transcript, RFC 8446 §4.1.2). `psk` (session-ticket resumption) carries
         /// the resumed session's master secret: early_secret extracts it
         /// instead of zeros.
         pub fn deriveHandshake(self: *Self, ecdhe: []const u8, client_hello_hash: [Su.hash_length]u8, psk: ?[]const u8) void {

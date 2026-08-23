@@ -1,4 +1,4 @@
-//! TLS connection wrapper (M18): an `AnySession` behind a small dispatch
+//! TLS connection wrapper: an `AnySession` behind a small dispatch
 //! layer so the reactor never deals with the concrete (cipher, curve)
 //! instantiation. The variant is chosen after the first ClientHello is
 //! buffered (its cipher-suite list decides the suite; the certificate curve

@@ -11,7 +11,7 @@ const ct_pool = @import("../ct_pool.zig");
 /// string comparison, no collision handling. Names outside the set (or
 /// near-misses like `content-length-x`) land on the "unknown" tag.
 ///
-/// This is the Milestone-8 lookup structure in state-machine form: the same
+/// This is the hash lookup in state-machine form: the same
 /// role as `parser.header_hasher` (which remains for the response-side
 /// modules), but classification is exact and one pass.
 /// Alphabet classes: 'a'-'z' (0-25, lower-cased), '0'-'9' (26-35), '-' (36),

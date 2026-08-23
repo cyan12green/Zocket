@@ -11,7 +11,7 @@ pub const Action = registry.Action;
 /// default); tiny bodies rarely shrink and waste a compression pass.
 pub const min_compress_bytes = 20;
 
-/// Gzip response transform (Milestone 9 Part A). Bound to the `log` phase,
+/// Gzip response transform. Bound to the `log` phase,
 /// which the pipeline runs as post-processing after the content module has
 /// produced the response. When the client sent `Accept-Encoding: gzip`, the
 /// body is compressed with `std.compress.flate` (gzip container) into an
@@ -52,7 +52,7 @@ fn hasHeader(resp: *registry.Response, comptime name: []const u8) bool {
 }
 
 /// True if a comma-separated header value (with optional `;` parameters)
-/// contains the given token. Token matching is a hash compare (Milestone 8).
+/// contains the given token. Token matching is a hash compare.
 fn acceptsToken(value: []const u8, comptime token: []const u8) bool {
     var tokens = std.mem.tokenizeAny(u8, value, ",");
     while (tokens.next()) |t| {

@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// nginx-style request-processing phases, in execution order. The names follow
 /// nginx's configuration/rewrite stages; the internal behavior is our own (see
-/// `docs/M4.md` for the mapping).
+/// the nginx phase model for the mapping).
 pub const Phase = enum {
     post_read,
     server_rewrite,

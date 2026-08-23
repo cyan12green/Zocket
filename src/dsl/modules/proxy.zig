@@ -7,7 +7,7 @@ const vars = @import("../vars.zig");
 pub const Context = registry.Context;
 pub const Action = registry.Action;
 
-/// Reverse proxy (Milestone 12). Bound to the `rewrite` phase: forwards the
+/// Reverse proxy. Bound to the `rewrite` phase: forwards the
 /// request to the route's upstream backends and copies the upstream response
 /// into `ctx.resp`. Per-reactor (thread-local) keep-alive connection pool
 /// (one socket per backend, reaped lazily after an idle window), passive
@@ -18,7 +18,7 @@ pub const Action = registry.Action;
 /// Upstream TLS is deferred to a future Zig snapshot with `std.crypto.tls`.
 ///
 /// The upstream I/O is synchronous: a hung upstream stalls its reactor for
-/// the socket receive timeout (5 s) — a documented M12 limitation.
+/// the socket receive timeout (5 s) — a documented limitation.
 pub const proxy = registry.Module{
     .name = "proxy",
     .phase = .rewrite,

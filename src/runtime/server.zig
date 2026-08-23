@@ -16,7 +16,7 @@ var default_stats: ServerStats = .{};
 /// shared by every reactor; it holds the route table and dispatches each fully
 /// parsed request through the DSL phase pipeline.
 ///
-/// Route lookup goes through a trie-backed `Router` (Milestone 7): built at
+/// Route lookup goes through a trie-backed `Router` built at
 /// compile time for struct-literal configs (`comptimeInit`), at startup for
 /// JSON configs (`initWithTrie`). Struct-literal routes additionally carry
 /// comptime-specialised dispatch functions; JSON routes use the loop-walk
@@ -25,11 +25,11 @@ var default_stats: ServerStats = .{};
 pub const Server = struct {
     cfg: Config,
     router: router_mod.Router = .{},
-    /// Shared connection/request counters (Milestone 13). Points at the
+    /// Shared connection/request counters. Points at the
     /// process-global `default_stats` for comptime/default servers and at an
     /// allocator-owned struct for JSON-config servers (freed by `deinit`).
     stats: *ServerStats = &default_stats,
-    /// TLS credentials (M18): loaded once at startup from the config `tls`
+    /// TLS credentials loaded once at startup from the config `tls`
     /// section (cert + key PEM files). The reactor uses them to instantiate
     /// a native TLS 1.3 session per connection. `cert_der` is
     /// allocator-owned; freed by `deinit`.
@@ -53,7 +53,7 @@ pub const Server = struct {
         return .{ .cfg = cfg, .router = .{ .routes = cfg.routes } };
     }
 
-    /// Struct-literal configs (Milestone 7): the route trie and the per-route
+    /// Struct-literal configs the route trie and the per-route
     /// dispatch functions are built at compile time; the whole route table,
     /// trie and dispatch pointers live in .rodata. Duplicate routes are a
     /// compile error (see `router.comptimeCheckAmbiguous`). The body is
@@ -73,12 +73,12 @@ pub const Server = struct {
         };
     }
     /// The default server: echo module on the catch-all route, the pre-pipeline
-    /// M3 behavior. Built at compile time (trie + dispatch specialisation).
+    /// Matches the original hardcoded handler. Built at compile time (trie + dispatch specialisation).
     pub fn default() Server {
         return comptimeInit(comptime Config.default());
     }
 
-    /// DM2: build a server from a comptime/embedded config, then resolve
+    /// Build a server from a comptime/embedded config, then resolve
     /// static roots at startup, but
     /// the comptime route table is immutable .rodata, so the rooted routes
     /// are copied into `allocator` with `root_real` (symlink-escape anchor)
@@ -143,7 +143,7 @@ pub const Server = struct {
         return pipeline.runWithRouter(registry.default_registry, self.cfg.routes, &self.router, ctx);
     }
 
-    /// Milestone 11 fast path: when the matched route is a module-less
+    /// Fast path: when the matched route is a module-less
     /// response template, return its pre-serialised bytes so the caller can
     /// write them straight to the wire — no pipeline, no response builder,
     /// no function call through the phase chain. Returns null when any
@@ -252,7 +252,7 @@ test "runtime server yields not_handled when no module claims the request" {
     try testing.expectEqual(pipeline.Outcome.not_handled, try srv.handleRequest(&ctx));
 }
 
-// ---- Milestone 7: comptime server (trie + dispatch specialisation) ----
+// ---- Comptime server (trie + dispatch specialisation) ----
 
 test "comptime server routes identically to the plain server" {
     const plain = Server.init(Config.default());
@@ -504,7 +504,7 @@ test "conf-config server with a comptime trie routes identically to the plain se
     }
 }
 
-// ---- Milestone 11: response templates ----
+// ---- Response templates ----
 
 test "comptime template route serves through the dispatch fallback" {
     const cfg = comptime Config{
@@ -591,7 +591,7 @@ test "matchFast returns pre-serialised bytes only for module-less template route
     try testing.expectEqual(@as(?router_mod.FastResponse, null), srv.matchFast(&ctx3));
 }
 
-// ---- DM2: comptime-embedded config as the primary path ----
+// ---- Comptime-embedded config as the primary path ----
 
 test "embedded comptime config parses via fromConfEmbedded (root-relative path)" {
     const cfg = comptime Config.fromConfEmbedded("src/testdata/config.example.conf");
@@ -648,7 +648,7 @@ test "server from an embedded comptime config routes identically to the struct-l
     }
 }
 
-test "embedded comptime config gets pre-serialised fast responses (M11 path)" {
+test "embedded comptime config gets pre-serialised fast responses (pre-serialised path)" {
     const srv = Server.comptimeInit(comptime Config.fromConfEmbedded("src/testdata/config.example.conf"));
 
     // /health and /old are module-less template routes: served from

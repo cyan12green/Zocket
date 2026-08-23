@@ -29,7 +29,7 @@ const runtime_server = @import("../runtime/server.zig");
 
 const max_events = 1024;
 
-/// Default connection idle timeout in seconds (Milestone 5). Zero disables
+/// Default connection idle timeout in seconds. Zero disables
 /// idle reaping.
 pub const default_idle_timeout_seconds: u32 = 60;
 
@@ -39,7 +39,7 @@ const default_http_handler = runtime_server.Server.default();
 
 /// Connection protocol handled by a reactor.
 pub const Mode = enum {
-    /// Raw byte echo (Milestone 1/2 semantics).
+    /// Raw byte echo.
     echo,
     /// HTTP/1.1: parse requests, respond with the request body echoed.
     http,
@@ -48,11 +48,11 @@ pub const Mode = enum {
 const HttpSession = struct {
     parser: http_parser.Parser,
     req: http_parser.Request,
-    /// HTTP/2 session (Milestone 16), created lazily when the connection
+    /// HTTP/2 session, created lazily when the connection
     /// preface is detected (or negotiated over TLS via ALPN). When non-null
     /// the connection is in HTTP/2 mode and `parser`/`req` are unused.
     h2: ?http2_session.Session = null,
-    /// TLS 1.3 session (M18): created lazily when the first record looks
+    /// TLS 1.3 session created lazily when the first record looks
     /// like a ClientHello. When non-null the recv buffer holds ciphertext;
     /// the plaintext lands in `tls_plain` and the parser reads from there.
     tls: ?tls_conn.TlsConn = null,
@@ -78,10 +78,10 @@ const HttpSession = struct {
     /// Close the connection once the current response has been flushed
     /// (errors, and requests that asked for Connection: close).
     close_after_write: bool = false,
-    /// Stub-status accounting state (Milestone 13): which shared counter the
+    /// Stub-status accounting state which shared counter the
     /// connection currently contributes to.
     stat_state: enum { waiting, reading, writing } = .waiting,
-    /// sendfile state (Milestone 14): while `file_remaining > 0` the body is
+    /// sendfile state while `file_remaining > 0` the body is
     /// pushed from this fd into the socket.
     file_fd: posix.fd_t = -1,
     /// The fd is owned by the reactor's static cache (nginx open_file_cache
@@ -108,7 +108,7 @@ const HttpSession = struct {
     /// until the op is processed, so it must outlive flushHttp's stack).
     write_iovs: [3]posix.iovec_const = undefined,
     write_iov_count: usize = 0,
-    /// M18: true once a 101 Switching Protocols handshake has been sent and
+    /// True once a 101 Switching Protocols handshake has been sent and
     /// the connection left HTTP behind (websocket byte-pipe mode).
     upgraded: bool = false,
     /// Request-timeout bookkeeping (slowloris defense): when the first byte
@@ -122,7 +122,7 @@ const HttpSession = struct {
 
 /// A single-reactor worker: its own thread, its own epoll instance and its own
 /// connection registry, wired for the echo protocol (identical semantics to the
-/// Milestone 1 single-threaded server). Inbound connections are handed over
+/// single-threaded server). Inbound connections are handed over
 /// from any thread via `attach`, which queues the connection behind a mutex and
 /// pokes the loop with an eventfd; the reactor thread then registers the fd and
 /// owns it exclusively from that point on, so the connection map and all
@@ -140,7 +140,7 @@ pub const Reactor = struct {
     wakeup: eventfd.EventFd,
     connections: std.AutoHashMap(posix.fd_t, *connection.Connection),
     http_sessions: std.AutoHashMap(posix.fd_t, HttpSession),
-    /// Config-driven HTTP request processor (Milestone 4). Only used in `.http`
+    /// Config-driven HTTP request processor. Only used in `.http`
     /// mode; when null, `default_http_handler` is used. Shared read-only across
     /// reactors, so it is safe to call from the reactor thread.
     http_handler: ?*const runtime_server.Server,
@@ -164,13 +164,13 @@ pub const Reactor = struct {
     /// after `advanceTo` returns (the wheel callback must not tear down
     /// objects whose entries are still linked).
     expired_fds: std.ArrayList(posix.fd_t),
-    /// Shared connection/request counters (Milestone 13); null in echo mode.
+    /// Shared connection/request counters; null in echo mode.
     stats: ?*runtime_server.ServerStats = null,
-    /// Static-file fd cache (nginx open_file_cache equivalent, Milestone 14
+    /// Static-file fd cache (nginx open_file_cache equivalent),
     /// follow-up): per-reactor, no locks. Served from it, a cached file
     /// costs zero open/stat/close syscalls and zero ETag/date formatting.
     static_cache: static_cache_mod.StaticCache = undefined,
-    /// Connection pool (Milestone 14 follow-up): accepts recycle pooled
+    /// Connection pool accepts recycle pooled
     /// connections, so steady-state connection churn costs zero allocations.
     conn_pool: connection.ConnectionPool = undefined,
     /// I/O backend: io_uring (reads/writes batched on the ring, no EAGAIN
@@ -195,14 +195,14 @@ pub const Reactor = struct {
     limits: limits_mod.Limits = .{},
     date_len: usize = 0,
     date_sec: u64 = 0,
-    /// Per-reactor listener (Milestone 14, SO_REUSEPORT): when set, this
+    /// Per-reactor listener when set, this
     /// reactor accepts connections directly from the kernel; -1 otherwise.
     listener: posix.fd_t = -1,
     /// Total accepted counter shared with the server (bumped per accept).
     accepted_counter: ?*std.atomic.Value(usize) = null,
     /// Last wall tick the request-timeout sweep ran (1 Hz gating).
     last_timeout_sweep_tick: u64 = 0,
-    /// Graceful-drain mode (Milestone 13): stop accepting new connections
+    /// Graceful-drain mode stop accepting new connections
     /// and exit the loop once the connection map empties (or a timeout).
     draining: std.atomic.Value(bool) = .init(false),
     drained: std.atomic.Value(bool) = .init(false),
@@ -232,7 +232,7 @@ pub const Reactor = struct {
     }
 
     /// Like `initWithHandlerTimeout`, with a per-reactor listener
-    /// (SO_REUSEPORT accept path, Milestone 14).
+    /// (SO_REUSEPORT accept path).
     pub fn initWithHandlerListener(
         allocator: std.mem.Allocator,
         id: usize,
@@ -377,7 +377,7 @@ pub const Reactor = struct {
         }
     }
 
-    /// Graceful drain (Milestone 13): stop accepting new connections; the
+    /// Graceful drain stop accepting new connections; the
     /// loop exits once every existing connection has finished (or after
     /// `drain_timeout_ns`). The reactor thread must be joined afterwards.
     pub fn drain(self: *Reactor) void {
@@ -699,14 +699,14 @@ pub const Reactor = struct {
             if (session.writing and session.h2 == null and
                 (session.tls == null or session.tls.?.stage() == .application)) return;
 
-            // M18: upgraded connections left HTTP behind — their bytes are
+            // Upgraded connections left HTTP behind — their bytes are
             // websocket frames now.
             if (session.upgraded) {
                 self.processWebsocket(fd);
                 return;
             }
 
-            // TLS detection (M18): a connection whose first record is a
+            // TLS detection a connection whose first record is a
             // ClientHello (handshake record type 22, legacy version 3.x,
             // handshake type 1) switches to the TLS 1.3 session.
             if (session.tls == null and session.h2 == null) {
@@ -773,7 +773,7 @@ pub const Reactor = struct {
                     return;
                 },
                 .complete => {
-                    // M18: connection upgrade (RFC 6455 §4.2 and friends): on
+                    // Connection upgrade (RFC 6455 §4.2 and friends): on
                     // `Connection: upgrade` + `Upgrade: <proto>` reply
                     // 101 Switching Protocols and hand the connection over —
                     // HTTP parsing stops and the session becomes a byte pipe
@@ -1193,7 +1193,7 @@ pub const Reactor = struct {
         var count: usize = 0;
         build_iovs(session, conn, &iov, &count);
         if (count == 0) {
-            // Milestone 14: push any file body straight into the socket.
+            // Push any file body straight into the socket.
             if (session.file_remaining > 0) {
                 var off: i64 = @intCast(session.file_offset);
                 while (session.file_remaining > 0) {
@@ -1256,7 +1256,7 @@ pub const Reactor = struct {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
 
-        // Milestone 14: push any file body straight into the socket.
+        // Push any file body straight into the socket.
         if (session.file_remaining > 0) {
             var off: i64 = @intCast(session.file_offset);
             while (session.file_remaining > 0) {
@@ -1367,7 +1367,7 @@ pub const Reactor = struct {
         };
 
         if (!tls_mode) {
-            // Milestone 11 fast path: module-less response-template routes are
+            // Fast path: module-less response-template routes are
             // written straight from their pre-serialised bytes (status line +
             // template headers + Connection + Content-Length + body),
             // byte-identical to the pipeline equivalent but with zero dispatch.
@@ -1490,7 +1490,7 @@ pub const Reactor = struct {
         return false;
     }
 
-    /// TLS response path (M18): the head and body go through the TLS session
+    /// TLS response path the head and body go through the TLS session
     /// (encrypted); the ciphertext lands in the send buffer and flushes like
     /// the plaintext path. Sendfile is disabled over TLS — file bodies are
     /// read into memory (the static content cache covers small files).
@@ -1499,7 +1499,7 @@ pub const Reactor = struct {
         const session = self.http_sessions.getPtr(fd) orelse return;
         const tc = &session.tls.?;
 
-        // File bodies: read into memory (no sendfile over TLS in M18).
+        // File bodies: read into memory (no sendfile through TLS).
         if (session.resp.body_from_file) {
             const file_len: usize = @intCast(session.resp.file_len);
             const fbuf = self.allocator.alloc(u8, file_len) catch {
@@ -1576,7 +1576,7 @@ pub const Reactor = struct {
         }
     }
 
-    /// Drive the TLS 1.3 session for `fd` (M18): feed the buffered ciphertext,
+    /// Drive the TLS 1.3 session for `fd` feed the buffered ciphertext,
     /// drain produced records to the socket, and once the handshake is done,
     /// feed the decrypted plaintext into the HTTP parser (or the h2 session
     /// when ALPN negotiated h2). The response path routes through
@@ -1818,7 +1818,7 @@ pub const Reactor = struct {
         if (out.items.len == 0) return;
         const session = self.http_sessions.getPtr(fd) orelse return;
         if (session.tls != null) {
-            // h2 over TLS (M18): the frames must be encrypted. The caller
+            // h2 over TLS the frames must be encrypted. The caller
             // (processHttp2Slice) drains + flushes afterwards.
             session.tls.?.write(out.items) catch {
                 self.removeConnection(fd);
@@ -1850,7 +1850,7 @@ pub const Reactor = struct {
     fn respondAndClose(self: *Reactor, fd: posix.fd_t, status: http_response.Status) void {
         const conn = self.connections.get(fd) orelse return;
         const session = self.http_sessions.getPtr(fd) orelse return;
-        // Milestone 13: error-log line for errors the pipeline never sees
+        // Error-log line for errors the pipeline never sees
         // (parse failures). Pipeline-visible errors are logged by the
         // error_log module when bound.
         {
@@ -1882,7 +1882,7 @@ pub const Reactor = struct {
         self.flushHttp(fd);
     }
 
-    /// Accept from the per-reactor listener (SO_REUSEPORT, Milestone 14) and
+    /// Accept from the per-reactor listener (SO_REUSEPORT) and
     /// register each connection directly — no accept loop, no dispatcher, no
     /// eventfd wakeup. While draining (reload-hard handoff) connections
     /// already queued in the accept backlog are still served: dropping them
@@ -1967,7 +1967,7 @@ pub const Reactor = struct {
         }
     }
 
-    /// Echo semantics identical to the Milestone 1 server: whatever was read is
+    /// Echo semantics identical to the standalone single-threaded server: whatever was read is
     /// copied into the send buffer and the fd is armed for writability.
     fn onMessage(self: *Reactor, conn: *connection.Connection) !void {
         const data = conn.recv_buf.peek();
@@ -2760,7 +2760,7 @@ test "reactor HEAD responds with head only and correct Content-Length" {
     r.join();
 }
 
-// M11: a module-less response-template route is served from pre-serialised
+// A module-less response-template route is served from pre-serialised
 // bytes, byte-identical to the pipeline equivalent.
 test "reactor serves a comptime template route from pre-serialised bytes" {
     const allocator = testing.allocator;
@@ -2909,7 +2909,7 @@ test "reactor serves a chunked response when the route opts in" {
 // nominal second (the loop re-advances the wheel before every epoll_wait,
 // timeout 100 ms). Sleeps below leave generous margins on both sides of every
 // deadline.
-// M5: idle timeout. A 1 s timeout is used so the tests finish quickly; the
+// Idle timeout. A 1 s timeout is used so the tests finish quickly; the
 // wheel's tick granularity is 100 ms, so deadlines land within ~100 ms of the
 // nominal second (the loop re-advances the wheel before every epoll_wait,
 // timeout 100 ms). Sleeps below leave generous margins on both sides of every

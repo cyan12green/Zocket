@@ -1,8 +1,8 @@
-//! Certificate and ECDSA private-key loading for the TLS server (M17:
+//! Certificate and ECDSA private-key loading for the TLS server (ECDSA only:
 //! ECDSA P-256 / P-384 only — std.crypto has no RSA). Reads PEM files,
 //! parses the DER structures needed to extract the signing key:
 //! - "CERTIFICATE": passed through verbatim (the client verifies the chain;
-//!   M17 sends the first certificate).
+//!   only the first certificate is sent).
 //! - "EC PRIVATE KEY": SEC1 ECPrivateKey (RFC 5915).
 //! - "PRIVATE KEY": PKCS#8 PrivateKeyInfo wrapping the SEC1 structure.
 

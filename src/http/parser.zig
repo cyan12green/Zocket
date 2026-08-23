@@ -37,7 +37,7 @@ pub const Method = enum {
     }
 };
 
-/// FNV-1a (32-bit) over lower-cased bytes (Milestone 8). Header names and
+/// FNV-1a (32-bit) over lower-cased bytes. Header names and
 /// values hash case-insensitively, so a comptime-known name's hash is a
 /// compile-time constant and slot matching reduces to an integer compare.
 /// `known` is the header-name set whose hashes must be collision-free; the
@@ -101,7 +101,7 @@ pub const header_hasher = struct {
 /// Identity of a known header name, produced by the comptime header DFA
 /// (`header_dfa`). The wire name is classified once during parsing and the
 /// tag is stored in the slot, so special handling and lookups reduce to an
-/// integer compare — the state-machine form of the Milestone-8 hash lookup.
+/// integer compare — the state-machine form of the hash lookup.
 pub const HeaderTag = enum(u16) {
     unknown = 0,
     host,
@@ -350,7 +350,7 @@ pub const Request = struct {
 
 /// True if a Transfer-Encoding value lists `chunked` (comma-separated;
 /// `;`-parameters on a token are tolerated). Token matching is a hash
-/// compare against the comptime `chunked` hash (Milestone 8).
+/// compare against the comptime `chunked` hash.
 fn valueHasChunked(value: []const u8) bool {
     var tokens = mem.tokenizeAny(u8, value, ",");
     while (tokens.next()) |t| {
@@ -724,7 +724,7 @@ fn finalizeKeepAlive(req: *Request) void {
     var keep = false;
     for (0..req.headerCount()) |i| {
         const h = req.headerAt(i);
-        // Hash compare for the name, then for each comma token (Milestone 8).
+        // Hash compare for the name, then for each comma token.
         if (header_hasher.hash(h.name) != comptime header_hasher.hash("connection")) continue;
         var tokens = mem.tokenizeAny(u8, h.value, ",");
         while (tokens.next()) |t| {
@@ -1098,7 +1098,7 @@ test "chunked body spanning recv boundaries" {
     try testing.expectEqualStrings("hello", req.body);
 }
 
-// ---- Milestone 8: comptime header-name hashing ----
+// ---- Header-name hash dispatch ----
 
 test "header hasher is case-insensitive and distinguishes names" {
     try testing.expectEqual(

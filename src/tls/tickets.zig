@@ -1,4 +1,4 @@
-//! TLS 1.3 session tickets (M18, RFC 8446 §4.6.1): stateless
+//! TLS 1.3 session tickets (RFC 8446 §4.6.1): stateless
 //! NewSessionTicket issuance and PSK resumption. The ticket payload is the
 //! connection's master secret, AES-128-GCM encrypted under a per-process
 //! random key (the reactor never stores session state — any of its workers

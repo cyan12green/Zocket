@@ -4,7 +4,7 @@ const registry = @import("../registry.zig");
 pub const Context = registry.Context;
 pub const Action = registry.Action;
 
-/// Conditional-GET handling (Milestone 9 Part C). Bound to the `preaccess`
+/// Conditional-GET handling. Bound to the `preaccess`
 /// phase: when the content metadata (`ctx.etag` / `ctx.last_modified`, set
 /// before content, e.g. by a post_read stat) matches `If-None-Match` /
 /// `If-Modified-Since`, the request is answered with 304 Not Modified and the
@@ -15,7 +15,7 @@ pub const conditional_get = registry.Module{
     .run = conditionalRun,
 };
 
-/// Cache-header emission (Milestone 9 Part C). Bound to the `post_access`
+/// Cache-header emission. Bound to the `post_access`
 /// phase: writes `Cache-Control` (from the route's `max_age_seconds`; 0 →
 /// no-cache) and, when the content metadata is known, `ETag` and
 /// `Last-Modified`.

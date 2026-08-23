@@ -17,7 +17,7 @@ pub const LogFormat = vars.LogFormat;
 ///   constants and must never be deinit'd;
 /// - `fromConfComptime`/`fromConfEmbedded` parse at compile time into
 ///   .rodata tables and must never be deinit'd.
-/// TLS listener settings (M18): certificate and key file paths. The files
+/// TLS listener settings certificate and key file paths. The files
 /// are read once at startup (like nginx's `ssl_certificate`); the module
 /// layer uses them via the native TLS 1.3 server in `src/tls/`.
 pub const TlsConfig = struct {
@@ -34,7 +34,7 @@ pub const Config = struct {
     /// Runtime-tunable server limits (the `limits` JSON section). The
     /// reactor applies them to buffers, parsers, caches and pools.
     limits: dsl_limits.Limits = .{},
-    /// TLS listener settings (M18): certificate + key PEM files.
+    /// TLS listener settings certificate + key PEM files.
     tls: TlsConfig = .{},
     /// Listen port from the conf `listen` directive; null = CLI `--port`
     /// default (8080). CLI wins when both are present.
@@ -44,7 +44,7 @@ pub const Config = struct {
     log_formats: []const LogFormat = &.{},
 
     /// Comptime default: a single catch-all prefix route attaching the echo
-    /// module to the content phase — the pre-pipeline M3 behavior, reproduced
+    /// module to the content phase — the pre-pipeline behavior, reproduced
     /// as config. A plain struct literal: no parse at all.
     pub fn default() Config {
         return .{

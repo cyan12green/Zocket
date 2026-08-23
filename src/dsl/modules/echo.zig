@@ -2,14 +2,14 @@ const std = @import("std");
 const registry = @import("../registry.zig");
 const http_response = @import("../../http/response.zig");
 
-/// Largest request body the echo module echoes. Since Milestone 14 the body
+/// Largest request body the echo module echoes. Buffers grow on demand, so
 /// goes out via writev (never through the send buffer), so the limit is the
 /// receive buffer's growth cap (`connection.Connection.max_recv_buffer`):
 /// anything the reactor can buffer can be echoed zero-copy.
 pub const max_echo_body = 16 * 1024 * 1024;
 
 /// The echo content module: responds 200 OK with the request body echoed,
-/// byte-identical to the Milestone 3 hardcoded HTTP handler. Bodies larger
+/// byte-identical to the original hardcoded HTTP handler. Bodies larger
 /// than the echo cap get a 413 and ask the connection to close, exactly like
 /// the pre-pipeline reactor path.
 pub const echo: registry.Module = .{

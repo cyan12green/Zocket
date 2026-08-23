@@ -1,7 +1,7 @@
 //! RFC 6455 websocket support: the server side of the HTTP/1.1 Upgrade
 //! handshake and the frame codec used once the connection has switched.
 //!
-//! Scope (M18): handshake digest (§4.2.2), client-frame decoding (§5.2)
+//! Scope: handshake digest (§4.2.2), client-frame decoding (§5.2)
 //! with mandatory client masking, server-frame encoding, and the 101
 //! Switching Protocols head. Fragmentation (§5.4) is rejected rather than
 //! reassembled — allowed for endpoints — and control-frame payloads are

@@ -12,7 +12,7 @@ const runtime_server = @import("../runtime/server.zig");
 const max_events = 1024;
 
 /// Multi-reactor server: one epoll loop per core, each running on its own
-/// reactor thread that exclusively owns its connections. Since Milestone 14
+/// reactor thread that exclusively owns its connections. Each reactor binds
 /// every reactor binds its own SO_REUSEPORT listener on the same port: the
 /// kernel load-balances inbound connections across reactors and each reactor
 /// accepts directly — no accept loop, no dispatcher, no eventfd wakeup per
@@ -88,7 +88,7 @@ pub const Server = struct {
             }
             try reactors_list.ensureTotalCapacity(allocator, n);
             try listeners.ensureTotalCapacity(allocator, n);
-            // Milestone 14: one SO_REUSEPORT listener per reactor; the kernel
+            // One SO_REUSEPORT listener per reactor; the kernel
             // distributes inbound connections across them.
             var shared_accepted = std.atomic.Value(usize).init(0);
             for (0..n) |i| {

@@ -4,7 +4,7 @@ const registry = @import("../registry.zig");
 pub const Context = registry.Context;
 pub const Action = registry.Action;
 
-/// Error logging (Milestone 13). Bound to the `log` phase: writes one line
+/// Error logging. Bound to the `log` phase: writes one line
 /// per failed request to stderr, with a severity derived from the response
 /// status (error >= 500, warn 400-499, info otherwise). Severity filtering
 /// is a runtime check against this comptime threshold: raising it to

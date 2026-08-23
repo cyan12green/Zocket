@@ -3,7 +3,7 @@ const testing = std.testing;
 const zocket = @import("zocket");
 const build_options = @import("build_options");
 
-/// DM2: comptime config as the primary path. When built with
+/// Comptime config is the primary path. When built with
 /// `zig build -Dconfig=<file>`, the conf file is embedded at compile time
 /// and parsed by the comptime conf parser; the server below is built with
 /// `Server.comptimeInit`, so the route trie, dispatch functions,
@@ -50,7 +50,7 @@ fn printUsage() void {
         \\  --port <n>           listen port (default 8080; a conf `listen`
         \\                       directive is overridden by this flag)
         \\  --threads <n>        reactor threads (default: CPU count)
-        \\  --single             Milestone 1 single-threaded echo server
+        \\  --single             single-threaded echo server (A/B baseline)
         \\  --echo               raw byte-echo protocol
         \\  --http               HTTP/1.1 + h2c prior-knowledge (default)
         \\  --idle-timeout <s>   connection idle timeout, 0 disables
@@ -102,7 +102,7 @@ fn runServer(
     ready_ctx: ?*anyopaque,
 ) !void {
     if (opts.single) {
-        // Milestone 1 single-threaded echo server, kept for A/B comparison.
+        // Single-threaded echo server, kept for A/B comparison.
         var s = try zocket.server.Server.init(allocator, opts.port);
         defer s.deinit();
         std.debug.print("Starting single-threaded TCP echo server on port {}\n", .{opts.port});
@@ -110,14 +110,14 @@ fn runServer(
         return;
     }
 
-    // HTTP mode runs through the config-driven pipeline (Milestone 4). The
+    // HTTP mode runs through the config-driven pipeline. The
     // config source is, in priority order:
-    //   1. DM2: the config embedded at build time (`-Dconfig=<file>`); the
+    //   1. The config embedded at build time (`-Dconfig=<file>`); the
     //      server is built at compile time (trie + dispatch specialisation),
     //      everything in .rodata;
     //   2. the comptime default (echo on every path), as `Server.default()`.
     var http_srv: zocket.runtime.server.Server = if (embedded_cfg) |cfg| blk: {
-        // DM2: registry membership is validated at compile time (comptime
+        // Registry membership is validated at compile time (comptime
         // conf parser checks structure/registry via comptimeValidate).
         // Static roots are resolved at startup too (realpath + O_PATH fd per
         // rooted route), mirroring the old JSON load path.
@@ -460,7 +460,7 @@ fn resolveProjectRoot(allocator: std.mem.Allocator) ?[]const u8 {
     }
 }
 
-/// Rebuild the binary with the config embedded at compile time (DM2). Runs
+/// Rebuild the binary with the config embedded at compile time. Runs
 /// `zig build` in `project_root` with the recorded optimization mode (zig
 /// from PATH; compile errors go to the terminal). The config is validated
 /// by the comptime JSON parser: compile errors are config errors and abort

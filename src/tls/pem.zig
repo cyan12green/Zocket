@@ -1,7 +1,7 @@
 //! Minimal PEM decoding: RFC 7468 blocks (`-----BEGIN X-----` / base64 /
 //! `-----END X-----`). The server needs this for certificate and private-key
 //! files. Only the first block of a given label is returned (cert files may
-//! hold chains — M17 sends the first certificate only).
+//! hold chains — only the first certificate is sent).
 
 const std = @import("std");
 

@@ -31,7 +31,7 @@ pub const Outcome = enum {
     not_handled,
 };
 
-/// A comptime-specialised per-route dispatch function (Milestone 7): directly
+/// A comptime-specialised per-route dispatch function: directly
 /// calls the modules bound to a route's phases — no phase loop, no moduleFor
 /// scans, no Registry.resolve at runtime. Stored on `Route.dispatch` for
 /// struct-literal configs; null for JSON-loaded routes (loop-walk fallback).
@@ -75,17 +75,17 @@ pub const Context = struct {
     /// Set by the reactor; null where allocation is unsupported.
     allocator: ?std.mem.Allocator = null,
     /// Entity metadata a content module exposes before the content phase runs
-    /// (Milestone 9): consumed by the conditional-GET and cache-header
+    /// Consumed by the conditional-GET and cache-header
     /// modules. Set by e.g. a post_read-phase stat.
     etag: ?[]const u8 = null,
     last_modified: ?[]const u8 = null,
     /// IPv4 address of the client (network byte order), for proxy headers
-    /// (Milestone 12). Zeroes when unknown (socketpair tests).
+    /// Zeroes when unknown (socketpair tests).
     client_ip: [4]u8 = .{ 0, 0, 0, 0 },
-    /// Shared server counters for the stub status page (Milestone 13),
+    /// Shared server counters for the stub status page,
     /// updated atomically by the reactors.
     stats: ?*const ServerStats = null,
-    /// Static-file fd cache (Milestone 14 follow-up, nginx open_file_cache
+    /// Static-file fd cache (nginx open_file_cache
     /// equivalent). Owned by the reactor (per-reactor, no locks); null in
     /// tests and module-level invocation.
     static_cache: ?*static_cache.StaticCache = null,
@@ -146,7 +146,7 @@ pub const Context = struct {
     }
 };
 
-/// Shared connection/request counters (Milestone 13): updated atomically by
+/// Shared connection/request counters: updated atomically by
 /// the reactors, rendered by the stub_status module. Defined here so the
 /// Context can reference it without an import cycle; the runtime Server
 /// re-exports it.

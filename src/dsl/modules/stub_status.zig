@@ -4,7 +4,7 @@ const registry = @import("../registry.zig");
 pub const Context = registry.Context;
 pub const Action = registry.Action;
 
-/// nginx_status-style stub status page (Milestone 13). Bound to the `content`
+/// nginx_status-style stub status page. Bound to the `content`
 /// phase: renders active/reading/writing/waiting/accepted/requests from the
 /// shared server counters (`ctx.stats`, updated atomically by the reactors)
 /// into the comptime HTML/plain-text skeleton.
@@ -24,7 +24,7 @@ fn run(ctx: *Context) anyerror!Action {
     const accepted = stats.accepted.load(.monotonic);
     const requests = stats.requests.load(.monotonic);
 
-    // The skeleton is a comptime literal (M11-style); only the numbers are
+    // The skeleton is a comptime literal; only the numbers are
     // formatted at runtime. The body lives in the shared request memory —
     // the server reclaims it when the response is done.
     const body = ctx.sharedFmt("Active connections: {d}\n" ++

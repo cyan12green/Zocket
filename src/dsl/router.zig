@@ -46,14 +46,14 @@ pub const Route = struct {
     path: []const u8,
     match: Match = .prefix,
     modules: []const ModuleBinding = &.{},
-    /// Comptime-specialised dispatch function (Milestone 7). Set for
+    /// Comptime-specialised dispatch function. Set for
     /// struct-literal configs, where the whole route table is comptime-known;
     /// null for JSON-loaded routes, which use the loop-walk fallback.
     dispatch: ?registry.DispatchFn = null,
-    /// Default cache lifetime in seconds (Milestone 9): the cache-header
+    /// Default cache lifetime in seconds: the cache-header
     /// module emits `Cache-Control: max-age=N` from this. 0 = no-cache.
     max_age_seconds: u32 = 0,
-    /// Static-file serving (Milestone 10): root directory on disk; optional
+    /// Static-file serving: root directory on disk; optional
     /// `index` file for directories; `autoindex` to list them. `embed` names
     /// a file baked into .rodata at compile time (`embed_bytes`).
     root: ?[]const u8 = null,
@@ -63,7 +63,7 @@ pub const Route = struct {
     /// root; the static module falls back to a per-request realpath then.
     root_real: ?[]const u8 = null,
     /// O_PATH|O_DIRECTORY fd of `root`, opened once at JSON config load
-    /// (Milestone 14 follow-up): the static module resolves targets against
+    /// Opened once at startup: the static module resolves targets against
     /// it with openat2(RESOLVE_BENEATH), one syscall with kernel-enforced
     /// containment instead of a per-request open + realpath pair. -1 when
     /// unset; the legacy per-request path is used then.
@@ -72,13 +72,13 @@ pub const Route = struct {
     autoindex: bool = false,
     embed: ?[]const u8 = null,
     embed_bytes: []const u8 = &.{},
-    /// Fixed-response template (Milestone 11): a route with `response` (and
+    /// Fixed-response template: a route with `response` (and
     /// no modules) is served from the pre-serialised `response_bytes` — no
     /// pipeline, no response builder. Routes with modules keep the pipeline;
     /// the template is applied when nothing claims the request.
     response: ?ResponseTemplate = null,
     response_bytes: ?FastResponse = null,
-    /// Reverse proxy (Milestone 12): upstream backends, load-balance
+    /// Reverse proxy: upstream backends, load-balance
     /// strategy and passive health-check parameters.
     upstreams: []const Upstream = &.{},
     balance: Balance = .round_robin,
@@ -204,7 +204,7 @@ pub const no_route = std.math.maxInt(u32);
 /// One header of a fixed-response template.
 pub const TemplateHeader = struct { name: []const u8, value: []const u8 };
 
-/// Load-balance strategy for a proxy route (Milestone 12). The dispatch is a
+/// Load-balance strategy for a proxy route. The dispatch is a
 /// comptime switch: dead strategies are eliminated from the binary.
 pub const Balance = enum {
     round_robin,
@@ -230,7 +230,7 @@ pub const Balance = enum {
     }
 };
 
-/// One proxy backend (Milestone 12). The `sockaddr` is pre-computed: at
+/// One proxy backend. The `sockaddr` is pre-computed: at
 /// compile time for struct-literal configs (host is a comptime IP literal —
 /// no DNS, no runtime byte-swapping), at startup for JSON configs.
 pub const Upstream = struct {
@@ -261,13 +261,13 @@ pub const Upstream = struct {
     }
 };
 
-/// A fixed response served from pre-serialised bytes (Milestone 11):
+/// A fixed response served from pre-serialised bytes:
 /// redirects, healthchecks, error pages.
 pub const ResponseTemplate = struct {
     status: u16 = 200,
     headers: []const TemplateHeader = &.{},
     body: []const u8 = &.{},
-    /// Comptime pre-compression (M9 Part B) is DEFERRED: the runtime flate
+    /// Comptime pre-compression is DEFERRED: the runtime flate
     /// compressor's dynamic-Huffman path hits a stdlib type-inference bug
     /// under comptime evaluation, and a deterministic comptime encoder
     /// cannot be byte-identical to it. Setting this is a compile error.
@@ -291,7 +291,7 @@ pub fn serializeResponseTemplate(comptime t: ResponseTemplate) FastResponse {
         if (t.compress) {
             @compileError("template 'compress' (comptime pre-compression) is deferred: " ++
                 "the stdlib flate dynamic-Huffman path breaks at comptime in this Zig snapshot; " ++
-                "see docs/ROADMAP.md M9 Part B");
+                "see docs/ROADMAP.md (comptime pre-compression)");
         }
         const body = t.body;
 
@@ -481,7 +481,7 @@ pub fn buildTrie(comptime routes: []const Route) Trie {
 
 fn buildTrieImpl(comptime routes: []const Route) Trie {
     // The trie build walks every route plus one node/edge pass per
-    // trie-node; large configs (DM2 embedded configs) exceed the default
+    // trie-node; large configs (large embedded configs) exceed the default
     // 1000-backward-branch comptime budget.
     @setEvalBranchQuota(100000);
     comptimeCheckAmbiguous(routes);
@@ -667,7 +667,7 @@ test "moduleFor returns the bound module for a phase" {
     try testing.expectEqual(@as(?[]const u8, null), r.moduleFor(.log));
 }
 
-// ---- Milestone 7: comptime route trie ----
+// ---- Comptime route trie ----
 
 const trie_routes = [_]Route{
     .{ .path = "/", .match = .prefix },
@@ -769,7 +769,7 @@ test "Router.match falls back to the linear matcher without a trie" {
     try testing.expectEqual(@as(?*const Route, null), with_trie.match("", null));
 }
 
-// ---- Milestone 11: comptime response templates ----
+// ---- Comptime response templates ----
 
 test "template serialisation is byte-identical to the response builder" {
     const t = ResponseTemplate{

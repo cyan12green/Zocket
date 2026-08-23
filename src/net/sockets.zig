@@ -13,7 +13,7 @@ const SOL_SOCKET: u32 = 1;
 const SO_REUSEADDR: u32 = 2;
 
 /// Linux native (no BSD `sin_len`) internet socket address, 16 bytes. The
-/// Milestone 1 code defined the BSD-layout struct with a leading `sin_len`
+/// The stdlib's older code defined the BSD-layout struct with a leading `sin_len`
 /// byte which shifted the family field and broke `bind` on Linux.
 const sockaddr_in = extern struct {
     sin_family: u16,
@@ -33,7 +33,7 @@ pub fn createListeningSocket(port: u16, backlog: usize) !posix.fd_t {
     return createListeningSocketFlags(port, backlog, false);
 }
 
-/// Like `createListeningSocket`, but with SO_REUSEPORT (Milestone 14): the
+/// Like `createListeningSocket`, but with SO_REUSEPORT the
 /// kernel load-balances inbound connections across every listener on the
 /// port, letting each reactor accept directly.
 pub fn createListeningSocketReusePort(port: u16, backlog: usize) !posix.fd_t {
@@ -133,7 +133,7 @@ pub fn pinToCpu(cpu: usize) void {
     linux.sched_setaffinity(0, &set) catch {};
 }
 /// IPv4 address of the peer (network byte order), or zeroes for non-INET
-/// peers (socketpairs in tests). Used for proxy headers (Milestone 12).
+/// peers (socketpairs in tests). Used for proxy headers.
 pub fn peerIp(fd: posix.fd_t) [4]u8 {
     var addr: sockaddr_in = undefined;
     var len: posix.socklen_t = @sizeOf(sockaddr_in);

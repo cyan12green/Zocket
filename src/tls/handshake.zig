@@ -20,7 +20,7 @@ pub const Error = error{
 
 pub const handshake_header_len = 4;
 
-/// Key-exchange group supported by the server (M17: X25519 only; the std
+/// Key-exchange group supported by the server (X25519 only; the std
 /// client and curl both offer it, so HRR is the fallback for the rest).
 pub const x25519_group: u16 = 0x001d;
 
@@ -62,7 +62,7 @@ pub const ClientHello = struct {
     alpn: []const u8 = &.{},
     has_supported_versions_13: bool = false,
     random: [32]u8 = undefined,
-    /// PSK resumption (M18): the session-ticket identity and the binder, as
+    /// PSK resumption: the session-ticket identity and the binder, as
     /// well as the psk_key_exchange_modes list. Empty when the client sent
     /// no pre_shared_key.
     psk_identity: []const u8 = &.{},
@@ -338,7 +338,7 @@ pub fn buildEncryptedExtensions(out: []u8, alpn: ?[]const u8) !usize {
     return pos;
 }
 
-/// Certificate message with a single certificate entry (the leaf; M17 sends
+/// Certificate message with a single certificate entry (the leaf; we send
 /// no chain and no extensions).
 pub fn buildCertificate(out: []u8, cert_der: []const u8) !usize {
     var pos: usize = 0;
