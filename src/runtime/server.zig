@@ -302,9 +302,9 @@ test "headers module applies ops through the comptime dispatch" {
         \\server {
         \\    location /h {
         \\        content echo;
-        \\        header_set X-A "1";
-        \\        header_add X-A "2";
-        \\        header_remove X-Drop;
+        \\        set_header X-A "1";
+        \\        add_header X-A "2";
+        \\        remove_header X-Drop;
         \\    }
         \\}
     );

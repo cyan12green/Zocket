@@ -81,9 +81,8 @@ const H_max_age = keyHash("max_age");
 const H_chunked = keyHash("chunked");
 const H_return = keyHash("return");
 const H_add_header = keyHash("add_header");
-const H_header_set = keyHash("header_set");
-const H_header_add = keyHash("header_add");
-const H_header_remove = keyHash("header_remove");
+const H_set_header = keyHash("set_header");
+const H_remove_header = keyHash("remove_header");
 const H_set = keyHash("set");
 const H_proxy_pass = keyHash("proxy_pass");
 const H_upstream = keyHash("upstream");
@@ -187,6 +186,7 @@ const HeaderSpec = struct {
     kind: vars.HeaderOpKind,
     name: Str = .{ .src = "" },
     value: Str = .{ .src = "" },
+    always: bool = false,
 };
 
 /// A response-template section as parsed.
@@ -214,6 +214,10 @@ const Builder = struct {
     set_vars: ct_pool.CtPool(SetSpec, 1024) = .{},
     proxy_headers: ct_pool.CtPool(ProxySpec, 1024) = .{},
     header_ops: ct_pool.CtPool(HeaderSpec, 256) = .{},
+    /// Server-scope header ops: locations without their own inherit these
+    /// (nginx add_header inheritance semantics).
+    server_header_ops: ct_pool.CtPool(HeaderSpec, 64) = .{},
+    server_header_ops_len: usize = 0,
     limits: Limits = .{},
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
@@ -224,16 +228,54 @@ const Builder = struct {
     cost: usize = 0,
 };
 
-/// Bind the headers module to the location unless already bound: declaring
-/// any `header_set`/`header_add`/`header_remove` activates the filter
-/// (nginx-style directive-presence activation, no manual `log headers;`).
-fn ensureHeadersModule(b: *Builder, spec: *LocationSpec) void {
+/// Bind a module to the location unless already bound: directive-presence
+/// activation, nginx-filter style (declaring `header_set ...;` runs the
+/// headers filter without a manual `<phase> headers;`). Shared by every
+/// directive-driven module so activation stays one call, not a copy-paste.
+fn ensureModuleBound(b: *Builder, spec: *LocationSpec, phase: Phase, comptime module_name: []const u8) void {
     for (b.modules.items[spec.modules_start..][0..spec.modules_len]) |mb| {
-        if (std.mem.eql(u8, mb.module, "headers")) return;
+        if (std.mem.eql(u8, mb.module, module_name)) return;
     }
     if (spec.modules_len == 0) spec.modules_start = b.modules.len;
-    _ = b.modules.create(.{ .phase = .log, .module = "headers" });
+    _ = b.modules.create(.{ .phase = phase, .module = module_name });
     spec.modules_len += 1;
+}
+
+/// Parse one response-header op directive (nginx `add_header`, plus this
+/// config's `set_header`/`remove_header` companions): one or two value
+/// tokens, an optional trailing `always` flag for add/set. Shared by the
+/// location scope and the server-scope inheritance stash.
+fn parseHeaderOpDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) HeaderSpec {
+    const h = keyHash(name);
+    const kind: vars.HeaderOpKind = switch (h) {
+        H_add_header => .add,
+        H_set_header => .set,
+        else => .remove,
+    };
+    const hname = lx.value(b, name);
+    var hvalue = Str{ .src = "" };
+    if (kind != .remove) {
+        hvalue = lx.value(b, name);
+    }
+    var always = false;
+    if (kind != .remove and lx.peek() != ';' and lx.peek() != '}') {
+        const flag = lx.token() orelse lx.fail(name ++ ": expected a flag or ';'");
+        const fs = flag.srcOf(name ++ ": flag cannot contain escapes");
+        if (!std.mem.eql(u8, fs, "always")) lx.fail(name ++ ": unknown flag '" ++ "'");
+        always = true;
+    }
+    lx.expectTerminator(name);
+    return .{ .kind = kind, .name = hname, .value = hvalue, .always = always };
+}
+
+/// Store a parsed header op on a location and activate the headers filter
+/// (directive-presence binding).
+fn appendHeaderOp(b: *Builder, spec: *LocationSpec, hs: HeaderSpec) void {
+    ensureModuleBound(b, spec, .log, "headers");
+    if (spec.header_ops_len == 0) spec.header_ops_start = b.header_ops.len;
+    _ = b.header_ops.create(hs);
+    spec.header_ops_len += 1;
+    b.cost += 8;
 }
 
 fn resolve(str: Str, strings: []const u8) []const u8 {
@@ -594,15 +636,24 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             b.cost += 8;
         },
         H_add_header => {
-            const hname = lx.value(b, "add_header");
-            const hvalue = lx.value(b, "add_header");
-            lx.expectTerminator("add_header");
-            const n = resolve(hname, b.strings.items[0..]);
-            const v = resolve(hvalue, b.strings.items[0..]);
-            if (spec.return_headers_len == 0) spec.return_headers_start = b.headers.len;
-            _ = b.headers.create(.{ .name = n, .value = v });
-            spec.return_headers_len += 1;
-            b.cost += 8;
+            // `add_header` is nginx's universal response-header directive:
+            // on fixed-response (`return`) routes it decorates the
+            // pre-serialised template (historical behavior); on module
+            // routes it feeds the headers filter like set_header does.
+            if (spec.return_status != 0) {
+                const hname = lx.value(b, "add_header");
+                const hvalue = lx.value(b, "add_header");
+                lx.expectTerminator("add_header");
+                const n = resolve(hname, b.strings.items[0..]);
+                const v = resolve(hvalue, b.strings.items[0..]);
+                if (spec.return_headers_len == 0) spec.return_headers_start = b.headers.len;
+                _ = b.headers.create(.{ .name = n, .value = v });
+                spec.return_headers_len += 1;
+                b.cost += 8;
+                return;
+            }
+            const hs = parseHeaderOpDirective(lx, b, name);
+            appendHeaderOp(b, spec, hs);
         },
         H_set => {
             // `set $name "<cv>";` — the name must be a valid identifier
@@ -710,29 +761,9 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             spec.proxy_headers_len += 1;
             b.cost += 8;
         },
-        H_header_set, H_header_add => {
-            // `header_set <name> "<cv>";` / `header_add <name> "<cv>";` —
-            // response-header manipulation for the headers module.
-            const kind: vars.HeaderOpKind = if (keyHash(name) == H_header_set) .set else .add;
-            const dir: []const u8 = if (keyHash(name) == H_header_set) "header_set" else "header_add";
-            const hname = lx.value(b, dir);
-            const hvalue = lx.value(b, dir);
-            lx.expectTerminator(dir);
-            ensureHeadersModule(b, spec);
-            if (spec.header_ops_len == 0) spec.header_ops_start = b.header_ops.len;
-            _ = b.header_ops.create(.{ .kind = kind, .name = hname, .value = hvalue });
-            spec.header_ops_len += 1;
-            b.cost += 8;
-        },
-        H_header_remove => {
-            // `header_remove <name>;`
-            const hname = lx.value(b, "header_remove");
-            lx.expectTerminator("header_remove");
-            ensureHeadersModule(b, spec);
-            if (spec.header_ops_len == 0) spec.header_ops_start = b.header_ops.len;
-            _ = b.header_ops.create(.{ .kind = .remove, .name = hname });
-            spec.header_ops_len += 1;
-            b.cost += 8;
+        H_set_header, H_remove_header => {
+            const hs = parseHeaderOpDirective(lx, b, name);
+            appendHeaderOp(b, spec, hs);
         },
         H_access_log => {
             const t = lx.token() orelse lx.fail("access_log: expected a format name or off");
@@ -790,6 +821,13 @@ fn parseLocation(lx: *Lexer, b: *Builder) void {
         const dn = t.srcOf("location: directive cannot contain escapes");
         parseLocationDirective(lx, b, &spec, dn);
     }
+    // nginx inheritance: a location that declares no header ops of its own
+    // inherits the server-level ones (all-or-nothing, like nginx).
+    if (spec.header_ops_len == 0 and b.server_header_ops_len > 0) {
+        for (b.server_header_ops.items[0..b.server_header_ops_len]) |hs| {
+            appendHeaderOp(b, &spec, hs);
+        }
+    }
     _ = b.routes.create(spec);
     b.cost += 16 + 32;
 }
@@ -807,6 +845,20 @@ fn parseServer(lx: *Lexer, b: *Builder) void {
         const dn = t.srcOf("server: directive cannot contain escapes");
         if (std.mem.eql(u8, dn, "location")) {
             parseLocation(lx, b);
+            continue;
+        }
+        // Server-scope response-header ops: inherited by locations without
+        // their own (nginx add_header inheritance).
+        if (keyHash(dn) == H_add_header or keyHash(dn) == H_set_header or keyHash(dn) == H_remove_header) {
+            const hs = parseHeaderOpDirective(lx, b, dn);
+            if (hs.kind == .remove) {
+                _ = b.server_header_ops.create(hs);
+                b.server_header_ops_len += 1;
+            } else {
+                _ = b.server_header_ops.create(hs);
+                b.server_header_ops_len += 1;
+            }
+            b.cost += 8;
             continue;
         }
         if (parseGlobalDirective(lx, b, dn)) continue;
@@ -1218,14 +1270,14 @@ test "conf: phase directives bind modules" {
     try testing.expectEqual(@as(usize, 4), r.modules.len);
 }
 
-test "conf: header_set/add/remove ops parse into declaration-order ops" {
+test "conf: add/set/remove_header ops parse into declaration-order ops" {
     const cfg = parse(
         \\server {
         \\    location / {
         \\        content echo;
-        \\        header_set X-Frame-Options "DENY";
-        \\        header_add X-Debug "$remote_addr";
-        \\        header_remove Server;
+        \\        set_header X-Frame-Options "DENY";
+        \\        add_header X-Debug "$remote_addr";
+        \\        remove_header X-Powered-By;
         \\    }
         \\}
     );
@@ -1234,12 +1286,35 @@ test "conf: header_set/add/remove ops parse into declaration-order ops" {
     // Directive presence auto-bound the headers module (deduped).
     try testing.expectEqualStrings("headers", cfg.routes[0].moduleFor(.log).?);
     try testing.expectEqual(vars.HeaderOpKind.set, ops[0].kind);
+    try testing.expect(!ops[0].always);
     try testing.expectEqualStrings("X-Frame-Options", ops[0].name);
     try testing.expectEqual(vars.HeaderOpKind.add, ops[1].kind);
     // The $remote_addr value compiled into a variable fragment list.
     try testing.expect(ops[1].value.len > 0);
     try testing.expectEqual(vars.HeaderOpKind.remove, ops[2].kind);
     try testing.expectEqual(@as(usize, 0), ops[2].value.len);
+}
+
+test "conf: server-level header ops are inherited by bare locations" {
+    const cfg = parse(
+        \\server {
+        \\    add_header X-Server-Wide "yes";
+        \\    location /own {
+        \\        content echo;
+        \\        add_header X-Own "1";
+        \\    }
+        \\    location /bare {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    // /own declared its own op: all-or-nothing inheritance, nothing added.
+    try testing.expectEqual(@as(usize, 1), cfg.routes[0].headers_ops.len);
+    try testing.expectEqualStrings("X-Own", cfg.routes[0].headers_ops[0].name);
+    // /bare inherited the server-level op.
+    try testing.expectEqual(@as(usize, 1), cfg.routes[1].headers_ops.len);
+    try testing.expectEqualStrings("X-Server-Wide", cfg.routes[1].headers_ops[0].name);
+    try testing.expectEqualStrings("headers", cfg.routes[1].moduleFor(.log).?);
 }
 
 test "conf: multiple modules per phase form a declaration-order chain" {

@@ -81,6 +81,9 @@ pub const HeaderOp = struct {
     kind: HeaderOpKind,
     name: []const u8,
     value: []const Frag = &.{},
+    /// nginx `always`: without it the op applies only to the standard
+    /// success/redirect statuses (200/201/204/206/301/302/303/304/307/308).
+    always: bool = false,
 };
 
 /// Dynamic (variable-capable) response template (M-B). Parallel to

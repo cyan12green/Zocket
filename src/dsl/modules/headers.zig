@@ -19,6 +19,7 @@ pub const Context = registry.Context;
 pub const Request = registry.Request;
 pub const Response = registry.Response;
 pub const Route = registry.Route;
+pub const Status = registry.Status;
 pub const Action = registry.Action;
 
 pub const headers = registry.Module{
@@ -32,6 +33,7 @@ fn run(ctx: *Context) anyerror!Action {
     if (route.headers_ops.len == 0) return .pass;
 
     for (route.headers_ops) |op| {
+        if (!op.always and !statusCarriesHeaders(ctx.resp.status)) continue;
         switch (op.kind) {
             .remove => _ = ctx.resp.removeHeader(op.name),
             .set, .add => {
@@ -46,6 +48,15 @@ fn run(ctx: *Context) anyerror!Action {
         }
     }
     return .pass;
+}
+
+/// Statuses that carry application headers by nginx's rule (add_header
+/// without `always` applies to exactly these).
+fn statusCarriesHeaders(status: Status) bool {
+    return switch (@intFromEnum(status)) {
+        200, 201, 204, 206, 301, 302, 303, 304, 307, 308 => true,
+        else => false,
+    };
 }
 
 const testing = std.testing;
