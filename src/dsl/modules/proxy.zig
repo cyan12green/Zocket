@@ -840,17 +840,11 @@ pub const UpstreamReader = struct {
     }
 
     fn fill(self: *UpstreamReader, fd: posix_fd) !usize {
-        while (true) {
-            const n = std.posix.read(fd, self.buf[self.used..]) catch |e| switch (e) {
-                error.WouldBlock => {
-                    if (!waitReadable(fd, upstream_connect_timeout_ms)) return error.UpstreamTimeout;
-                    continue;
-                },
-                else => return e,
-            };
-            self.used += n;
-            return n;
-        }
+        // WouldBlock propagates: the caller yields back to the event loop
+        // and level-triggered readability re-fires this exact spot.
+        const n = try std.posix.read(fd, self.buf[self.used..]);
+        self.used += n;
+        return n;
     }
 };
 
