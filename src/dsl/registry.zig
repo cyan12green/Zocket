@@ -5,6 +5,7 @@ const http_parser = @import("../http/parser.zig");
 const http_response = @import("../http/response.zig");
 const static_cache = @import("static_cache.zig");
 const limits_mod = @import("limits.zig");
+const arena_mod = @import("../http/arena.zig");
 
 pub const Phase = phase_mod.Phase;
 pub const ModuleBinding = router.ModuleBinding;
@@ -108,6 +109,35 @@ pub const Context = struct {
     /// Monotonic request timestamp in ns (reactor clock; 0 when unset, e.g.
     /// unit tests set it explicitly). Rate buckets and LB timing read this.
     now_ns: u64 = 0,
+    /// Module-private per-request scratch (opaque): whichever module claims
+    /// it first during a walk may park a pointer/id here for its own later
+    /// phases to read (limit_conn's acquire/release pair, proxy_cache's
+    /// pending record). Convention, not ownership — modules must tolerate
+    /// finding it null and must not free what they did not allocate.
+    mod_state: ?*anyopaque = null,
+
+    /// Shared request memory (the framework's module allocation facility):
+    /// every byte a module allocates here is reclaimed wholesale by the
+    /// server at the end of the request/response cycle — the arena rewinds
+    /// between keep-alive requests on the same connection and dies with the
+    /// connection. Allocate per-request intermediate state (keys, rendered
+    /// values, records); NEVER store these slices beyond the response.
+    ///
+    /// The typed helpers below are the supported surface; they fall back to
+    /// null when no request arena exists (bare Contexts in unit tests).
+    pub fn sharedAlloc(ctx: *Context, n: usize) ?[]u8 {
+        return ctx.req.arena.alloc(n);
+    }
+
+    pub fn sharedDupe(ctx: *Context, bytes: []const u8) ?[]u8 {
+        const out = ctx.req.arena.alloc(bytes.len) orelse return null;
+        @memcpy(out, bytes);
+        return out;
+    }
+
+    pub fn sharedFmt(ctx: *Context, comptime fmt: []const u8, args: anytype) ?[]const u8 {
+        return std.fmt.allocPrint(ctx.req.arena.asAllocator(), fmt, args) catch null;
+    }
 };
 
 /// Shared connection/request counters (Milestone 13): updated atomically by
@@ -188,6 +218,9 @@ pub const default_registry = Registry(.{
     @import("modules/stub_status.zig").stub_status,
     @import("modules/headers.zig").headers,
     @import("modules/auth_basic.zig").auth_basic,
+    @import("modules/limit.zig").limit_req,
+    @import("modules/limit.zig").limit_conn,
+    @import("modules/limit.zig").limit_conn_release,
 });
 
 const testing = std.testing;

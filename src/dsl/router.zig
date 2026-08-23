@@ -111,6 +111,13 @@ pub const Route = struct {
     /// module to engage; either directive auto-binds the module.
     auth_basic_realm: ?[]const u8 = null,
     auth_basic_users: []const htpasswd_mod.Entry = &.{},
+    /// Rate limiting (limit_req module): sustained requests-per-second plus
+    /// burst depth of the leaky bucket. rate == 0 disables.
+    limit_req_rate: u32 = 0,
+    limit_req_burst: u32 = 0,
+    /// Concurrency cap (limit_conn module): max simultaneous in-flight
+    /// requests per client key. 0 disables.
+    limit_conn_max: u32 = 0,
     /// Index into Config.log_formats; null = none (off). The access_log
     /// module reads it; defaults to index 0 (the `combined` default) when
     /// the route binds `log access_log;` and no `access_log` directive is

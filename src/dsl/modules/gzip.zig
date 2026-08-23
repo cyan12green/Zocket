@@ -33,15 +33,12 @@ fn run(ctx: *Context) anyerror!Action {
     if (ctx.resp.status == .not_modified) return .pass;
     if (hasHeader(ctx.resp, "content-encoding")) return .pass;
 
-    const allocator = ctx.allocator orelse return .pass;
-    const compressed = try gzipCompress(allocator, body);
-    if (compressed.len >= body.len) {
-        // A non-shrinking body is sent raw.
-        allocator.free(compressed);
-        return .pass;
-    }
+    // Compression output goes into the shared request memory: the server
+    // reclaims it with the rest of the request at response end (no
+    // body_owned handoff, no free on the non-shrinking path).
+    const compressed = try gzipCompressShared(ctx, body);
+    if (compressed.len >= body.len) return .pass; // sent raw
     ctx.resp.body = compressed;
-    ctx.resp.body_owned = true;
     ctx.resp.setHeader("Content-Encoding", "gzip");
     ctx.resp.setHeader("Vary", "Accept-Encoding");
     return .pass;
@@ -68,7 +65,33 @@ fn acceptsToken(value: []const u8, comptime token: []const u8) bool {
     return false;
 }
 
-/// Compress `input` into a fresh allocation using the gzip container.
+/// Compress into the context's shared request memory (arena-backed; the
+/// server reclaims it when the response completes).
+pub fn gzipCompressShared(ctx: *Context, input: []const u8) ![]const u8 {
+    const arena = ctx.req.arena.asAllocator();
+    var list = std.ArrayList(u8).empty;
+    // Pre-size so the allocating writer's buffer is non-empty at init.
+    try list.ensureTotalCapacity(arena, 1024);
+    var out = Io.Writer.Allocating.fromArrayList(arena, &list);
+
+    const window = flate.max_window_len;
+    var deflate_buf: [window * 2]u8 = undefined;
+    const usable = window + @min(input.len, window);
+    var deflate_w = try flate.Compress.init(
+        &out.writer,
+        deflate_buf[0..usable],
+        .gzip,
+        flate.Compress.Options.fastest,
+    );
+    try deflate_w.writer.writeAll(input);
+    try deflate_w.writer.flush();
+    const written = out.written();
+    const copy = ctx.sharedAlloc(written.len) orelse return error.OutOfMemory;
+    @memcpy(copy, written);
+    return copy;
+}
+
+/// Compress `input` into a fresh allocator-owned allocation (test helper).
 pub fn gzipCompress(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var list = std.ArrayList(u8).empty;
     // Pre-size so the allocating writer's buffer is non-empty at init.
@@ -139,9 +162,10 @@ test "gzip compresses a compressible body and round-trips" {
     var ctx = Context{ .req = &ctx_state.req, .resp = &resp, .allocator = allocator };
 
     try testing.expectEqual(Action.pass, try run(&ctx));
-    try testing.expect(resp.body_owned);
+    // The compressed body lives in the shared request memory (arena-backed,
+    // reclaimed by the server) — nothing to free here.
+    try testing.expect(!resp.body_owned);
     try testing.expect(resp.body.len < body.len);
-    defer allocator.free(resp.body);
 
     var found_encoding = false;
     for (resp.headers[0..resp.header_count]) |h| {

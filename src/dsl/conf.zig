@@ -87,6 +87,8 @@ const H_set_header = keyHash("set_header");
 const H_remove_header = keyHash("remove_header");
 const H_auth_basic = keyHash("auth_basic");
 const H_auth_basic_user_file = keyHash("auth_basic_user_file");
+const H_limit_req = keyHash("limit_req");
+const H_limit_conn = keyHash("limit_conn");
 const H_set = keyHash("set");
 const H_proxy_pass = keyHash("proxy_pass");
 const H_upstream = keyHash("upstream");
@@ -175,6 +177,10 @@ const LocationSpec = struct {
     /// of either binds the access-phase auth_basic module.
     auth_realm: ?Str = null,
     auth_file: ?Str = null,
+    /// `limit_req rate=N burst=M;` / `limit_conn N;`
+    limit_rate: u32 = 0,
+    limit_burst: u32 = 0,
+    limit_conn_max: u32 = 0,
 };
 
 /// A `set` declaration as parsed (value unresolved until build).
@@ -773,6 +779,43 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const hs = parseHeaderOpDirective(lx, b, name);
             appendHeaderOp(b, spec, hs);
         },
+        H_limit_req => {
+            // `limit_req rate=N burst=M;` (burst defaults to rate).
+            var rate: u32 = 0;
+            var burst: u32 = 0;
+            var seen_burst = false;
+            while (lx.peek() != ';') {
+                const t = lx.token() orelse lx.fail("limit_req: expected a parameter");
+                const kv = t.srcOf("limit_req: parameter cannot contain escapes");
+                if (std.mem.startsWith(u8, kv, "rate=")) {
+                    rate = std.fmt.parseInt(u32, kv["rate=".len..], 10) catch
+                        lx.fail("limit_req: bad rate");
+                } else if (std.mem.startsWith(u8, kv, "burst=")) {
+                    burst = std.fmt.parseInt(u32, kv["burst=".len..], 10) catch
+                        lx.fail("limit_req: bad burst");
+                    seen_burst = true;
+                } else lx.fail("limit_req: unknown parameter");
+            }
+            lx.expectTerminator("limit_req");
+            if (rate == 0) lx.fail("limit_req: rate must be >= 1");
+            spec.limit_rate = rate;
+            spec.limit_burst = if (seen_burst) burst else rate;
+            ensureModuleBound(b, spec, .access, "limit_req");
+            b.cost += 8;
+        },
+        H_limit_conn => {
+            // `limit_conn N;`
+            const t = lx.token() orelse lx.fail("limit_conn: expected a count");
+            const vs = t.srcOf("limit_conn: value cannot contain escapes");
+            const n = std.fmt.parseInt(u32, vs, 10) catch
+                lx.fail("limit_conn: count must be an integer");
+            if (n == 0) lx.fail("limit_conn: count must be >= 1");
+            lx.expectTerminator("limit_conn");
+            spec.limit_conn_max = n;
+            ensureModuleBound(b, spec, .access, "limit_conn");
+            ensureModuleBound(b, spec, .log, "limit_conn_release");
+            b.cost += 8;
+        },
         H_auth_basic => {
             // `auth_basic "<realm>";` — realm may not contain a quote (it
             // goes verbatim into WWW-Authenticate).
@@ -1147,6 +1190,9 @@ fn build(b: *const Builder) Config {
                     htpasswd_mod.parse(embeds_mod.embed(resolve(f, strings)))
                 else
                     &.{},
+                .limit_req_rate = spec.limit_rate,
+                .limit_req_burst = spec.limit_burst,
+                .limit_conn_max = spec.limit_conn_max,
                 .upstreams = up_table.items[ur.start..][0..ur.len],
                 .balance = spec.balance,
                 .max_fails = spec.max_fails,
