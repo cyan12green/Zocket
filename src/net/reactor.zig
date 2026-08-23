@@ -889,19 +889,22 @@ pub const Reactor = struct {
         };
         session.up = tx;
         try self.upstream_conns.put(plan.fd, fd);
-        // Level-triggered on purpose: the origin may have answered between
-        // connect and this registration, so an edge could already be gone.
-        self.ep.add(plan.fd, epoll.Events.In, plan.fd) catch |e| {
+        // Level-triggered, armed IN|OUT: the request has NOT been sent yet,
+        // so writability is what kicks off the transaction; after the full
+        // send the driver drops back to IN-only. LT (not ET) on purpose —
+        // the origin may answer between connect and this registration.
+        self.ep.add(plan.fd, epoll.Events.In | epoll.Events.Out, plan.fd) catch |e| {
             _ = self.upstream_conns.remove(plan.fd);
             session.up = null;
             self.allocator.destroy(tx);
             return e;
         };
         _ = conn;
-        // The response may have fully arrived before registration (LT would
-        // also catch it, but an immediate pump keeps fast origins on the
-        // same-thread fast path).
-        self.handleUpstreamEvent(plan.fd, fd);
+        // NO eager pump here: completing inside park would rewind the
+        // request arena (finalizeFlush -> req.reset) while outer frames
+        // still hold ParkedPlan/request slices. Level-triggered IN reports
+        // already-ready upstreams on the next epoll_wait, costing one
+        // loop cycle at most.
     }
 
     /// Drop a parked transaction (error paths / connection teardown).
@@ -954,15 +957,18 @@ pub const Reactor = struct {
                 }
                 self.pumpOnce(client_fd, up_fd, session, tx);
             },
-            .reading => self.pumpOnce(client_fd, up_fd, session, tx),
+            .reading => {
+                self.pumpOnce(client_fd, up_fd, session, tx);
+            },
         }
     }
 
     fn pumpOnce(self: *Reactor, client_fd: posix.fd_t, up_fd: posix.fd_t, session: *HttpSession, tx: *UpTx) void {
         const res = tx.reader.read(up_fd) catch |e| switch (e) {
-            // Yield: LT IN re-fires when more response bytes arrive.
             error.WouldBlock => return,
-            else => return self.failUpstream(client_fd),
+            else => {
+                return self.failUpstream(client_fd);
+            },
         };
         session.resp = http_response.Response.init(@enumFromInt(res.status));
         // Ownership contract: every string stored on the response must
@@ -1594,11 +1600,9 @@ pub const Reactor = struct {
             .limits = &self.limits,
             .formats = handler.formats(),
             .subrequest = .{ .impl = handler, .call = runtime_server.Server.subrequestImpl },
-            // Parking implemented + driver unit-tested, but DISABLED:
-            // neither async variant beat the synchronous driver yet
-            // (inline-poll 40k/stable, yield 30k/unstable vs sync 67k).
-            // Needs batched completion processing before enabling.
-            .async_supported = false,
+            // Parking available on the epoll HTTP path; ring/TLS fronts
+            // keep the synchronous upstream driver.
+            .async_supported = self.io_mode == .epoll,
             .started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
             .now_ns = blk: {
                 const t = std.time.Instant.now() catch break :blk 0;
@@ -1648,11 +1652,12 @@ pub const Reactor = struct {
             }
             break :blk handler.handleRequest(&ctx) catch |e| switch (e) {
                 error.AsyncPending => {
+                    std.debug.print("[r] AsyncPending caught\n", .{});
                     self.parkUpstream(fd, &ctx) catch {
                         self.respondAndClose(fd, .internal_error);
                         return false;
                     };
-                    return false; // stop processing until completion
+                    return false;
                 },
                 else => {
                     self.respondAndClose(fd, .internal_error);
