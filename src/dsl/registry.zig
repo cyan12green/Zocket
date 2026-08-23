@@ -221,6 +221,7 @@ pub const default_registry = Registry(.{
     @import("modules/limit.zig").limit_req,
     @import("modules/limit.zig").limit_conn,
     @import("modules/limit.zig").limit_conn_release,
+    @import("modules/precompressed.zig").precompressed,
 });
 
 const testing = std.testing;

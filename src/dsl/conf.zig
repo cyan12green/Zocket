@@ -91,6 +91,7 @@ const H_random = keyHash("random");
 const H_consistent_hash = keyHash("consistent_hash");
 const H_least_time = keyHash("least_time");
 const H_sticky_cookie = keyHash("sticky_cookie");
+const H_precompressed = keyHash("precompressed");
 const H_limit_req = keyHash("limit_req");
 const H_limit_conn = keyHash("limit_conn");
 const H_set = keyHash("set");
@@ -183,6 +184,8 @@ const LocationSpec = struct {
     auth_file: ?Str = null,
     /// `sticky_cookie name;` (cookie-based backend affinity)
     sticky: ?Str = null,
+    /// `precompressed gz;` — serve .gz twins when the client accepts them.
+    precompressed_gz: bool = false,
     /// `limit_req rate=N burst=M;` / `limit_conn N;`
     limit_rate: u32 = 0,
     limit_burst: u32 = 0,
@@ -788,6 +791,16 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const hs = parseHeaderOpDirective(lx, b, name);
             appendHeaderOp(b, spec, hs);
         },
+        H_precompressed => {
+            // `precompressed gz;` (only gz is supported today)
+            const t = lx.token() orelse lx.fail("precompressed: expected a codec");
+            const cs = t.srcOf("precompressed: codec cannot contain escapes");
+            if (!std.mem.eql(u8, cs, "gz")) lx.fail("precompressed: only 'gz' is supported");
+            lx.expectTerminator("precompressed");
+            spec.precompressed_gz = true;
+            ensureModuleBound(b, spec, .content, "precompressed");
+            b.cost += 8;
+        },
         H_sticky_cookie => {
             const t = lx.value(b, "sticky_cookie");
             lx.expectTerminator("sticky_cookie");
@@ -1205,6 +1218,7 @@ fn build(b: *const Builder) Config {
                     htpasswd_mod.parse(embeds_mod.embed(resolve(f, strings)))
                 else
                     &.{},
+                .precompressed = spec.precompressed_gz,
                 .sticky_cookie = if (spec.sticky) |sc| resolve(sc, strings) else null,
                 .limit_req_rate = spec.limit_rate,
                 .limit_req_burst = spec.limit_burst,

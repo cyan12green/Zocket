@@ -118,6 +118,9 @@ pub const Route = struct {
     /// Concurrency cap (limit_conn module): max simultaneous in-flight
     /// requests per client key. 0 disables.
     limit_conn_max: u32 = 0,
+    /// Precompressed serving (precompressed module): look for a `.gz`
+    /// sibling of the requested file and serve it with Content-Encoding.
+    precompressed: bool = false,
     /// Sticky sessions (cookie-based affinity): when set, the proxy module
     /// reads this cookie for a previously-assigned backend tag and answers
     /// new clients with a Set-Cookie binding them to their backend.
