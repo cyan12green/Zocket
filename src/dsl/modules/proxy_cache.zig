@@ -30,32 +30,39 @@ pub const Action = registry.Action;
 /// across every cached route. Follow-up: plumb Limits overrides here.
 const max_entries = 256;
 
-var store_mutex: std.Thread.Mutex = .{};
-var store_initialized: bool = false;
-var store: shmem.LruStore(max_entries) = undefined;
-var store_budget: usize = 0;
+const default_entries: usize = 256;
 
-fn getStore(budget: usize) *shmem.LruStore(max_entries) {
+var store_mutex: std.Thread.Mutex = .{};
+var store: ?shmem.LruStore = null;
+var store_budget: usize = 0;
+var store_entries_cap: usize = 0;
+
+/// Zone sizing comes from the config `limits` (runtime knobs): byte budget
+/// plus entry count. Changing either re-creates the zone (contents are
+/// dropped — a cache, so failing open into misses is correct).
+fn getStore(budget: usize, max_entries_override: usize) !*shmem.LruStore {
+    const cap = if (max_entries_override != 0) max_entries_override else default_entries;
     store_mutex.lock();
     defer store_mutex.unlock();
-    if (!store_initialized or budget != store_budget) {
-        // Re-init (first use or budget change): drop prior contents.
-        if (store_initialized) {
-            for (&store.entries) |*e| {
-                if (e.used) store.allocator.free(e.bytes);
-            }
-        }
-        store = shmem.LruStore(max_entries).init(std.heap.page_allocator, budget);
-        store_initialized = true;
+    if (store == null or budget != store_budget or cap != store_entries_cap) {
+        if (store != null) store.?.deinit();
+        // Entry-count ceiling stays bounded even on absurd configs.
+        store = try shmem.LruStore.init(std.heap.page_allocator, budget, @min(cap, 1 << 20));
         store_budget = budget;
+        store_entries_cap = cap;
     }
-    return &store;
+    return &store.?;
 }
 
-fn budgetFor(ctx: *Context) usize {
-    const default: usize = 32 * 1024 * 1024;
-    const limits = ctx.limits orelse return default;
-    return if (limits.proxy_cache_max_bytes != 0) limits.proxy_cache_max_bytes else default;
+fn budgetFor(ctx: *Context) struct { bytes: usize, entries: usize } {
+    const def_bytes: usize = 32 * 1024 * 1024;
+    if (ctx.limits) |lim| {
+        return .{
+            .bytes = if (lim.proxy_cache_max_bytes != 0) lim.proxy_cache_max_bytes else def_bytes,
+            .entries = lim.proxy_cache_max_entries,
+        };
+    }
+    return .{ .bytes = def_bytes, .entries = default_entries };
 }
 
 const Header = extern struct {
@@ -155,7 +162,8 @@ fn runLookup(ctx: *Context) anyerror!Action {
 
     const key = cacheKey(ctx);
     const now = ctx.now_ns;
-    const st = getStore(budgetFor(ctx));
+    const z = budgetFor(ctx);
+    const st = getStore(z.bytes, z.entries) catch return error.OutOfMemory;
     const e = st.lookup(key) orelse return .pass; // MISS: proxy takes over
     // Copy into the request arena immediately: the store entry can be
     // evicted (freed) by another reactor thread the moment we drop the
@@ -188,6 +196,7 @@ fn runLookup(ctx: *Context) anyerror!Action {
 fn runStore(ctx: *Context) anyerror!Action {
     const route = enabled(ctx) orelse return .pass;
     _ = route;
+    const z = budgetFor(ctx);
     if (!cacheableRequest(ctx)) return .pass;
     // Cache-served responses (HIT/STALE) reach here too — the log phase
     // runs after every outcome. Re-storing them replaces the live blob
@@ -203,13 +212,15 @@ fn runStore(ctx: *Context) anyerror!Action {
     if (ctx.resp.status == .not_modified) {
         // Upstream confirmed our validator: refresh freshness of the stored
         // representation and answer the CLIENT from the store (200).
-        if (getStore(budgetFor(ctx)).getCopy(key, ctx.req.arena.asAllocator())) |got| {
+        const st304 = try getStore(z.bytes, z.entries);
+        if (st304.getCopy(key, ctx.req.arena.asAllocator())) |got| {
             if (deserialize(got.bytes)) |old| {
                 applyStored(ctx, old, "REVALIDATED");
                 // Refresh stored_at_ns by re-putting the ARENA copy; the
                 // old store bytes were released inside put() safely (we
                 // hold our own duplicate).
-                _ = getStore(budgetFor(ctx)).put(key, got.bytes, now, 0);
+                const st_put = try getStore(z.bytes, z.entries);
+                _ = st_put.put(key, got.bytes, now, 0);
             }
         }
         return .pass;
@@ -234,7 +245,7 @@ fn runStore(ctx: *Context) anyerror!Action {
         .body = ctx.resp.body,
     }) orelse return .pass;
 
-    const st = getStore(budgetFor(ctx));
+    const st = getStore(z.bytes, z.entries) catch return error.OutOfMemory;
     _ = st.put(key, buf[0..written], now, 0); // meta = stored_at_ns
     return .pass;
 }
@@ -248,12 +259,10 @@ const T0: u64 = 1_000_000_000_000;
 
 fn resetZone() void {
     store_mutex.lock();
-    if (store_initialized) {
-        for (&store.entries) |*e| {
-            if (e.used) store.allocator.free(e.bytes);
-        }
-        store_initialized = false;
-    }
+    if (store) |*st| st.deinit();
+    store = null;
+    store_budget = 0;
+    store_entries_cap = 0;
     store_mutex.unlock();
 }
 
@@ -419,8 +428,12 @@ test "HIT responses are not re-stored (benchmark-suite segfault regression)" {
 
     // The stored blob's identity BEFORE the hit.
     var before: [*]u8 = undefined;
-    for (&store.entries) |*e| {
-        if (e.used and e.key == cacheKey(&seed.ctx)) before = e.bytes.ptr;
+    {
+        store_mutex.lock();
+        defer store_mutex.unlock();
+        for (store.?.entries) |*e| {
+            if (e.used and e.key == cacheKey(&seed.ctx)) before = e.bytes.ptr;
+        }
     }
 
     // A HIT serves from the store; the storer then sees X-Cache and skips.
@@ -434,12 +447,10 @@ test "HIT responses are not re-stored (benchmark-suite segfault regression)" {
 
     // The original blob was NOT freed/replaced underneath anyone reading it.
     var after_same = false;
-    var n_entries: usize = 0;
-    for (&store.entries) |*e| {
-        if (e.used) {
-            n_entries += 1;
-            if (e.key == cacheKey(&hit.ctx)) after_same = e.bytes.ptr == before;
-        }
+    store_mutex.lock();
+    defer store_mutex.unlock();
+    for (store.?.entries) |*e| {
+        if (e.used and e.key == cacheKey(&hit.ctx)) after_same = e.bytes.ptr == before;
     }
     try testing.expect(after_same);
 }

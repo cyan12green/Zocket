@@ -91,6 +91,7 @@ const H_random = keyHash("random");
 const H_consistent_hash = keyHash("consistent_hash");
 const H_least_time = keyHash("least_time");
 const H_sticky_cookie = keyHash("sticky_cookie");
+const H_health_check = keyHash("health_check");
 const H_precompressed = keyHash("precompressed");
 const H_auth_request = keyHash("auth_request");
 const H_proxy_cache = keyHash("proxy_cache");
@@ -190,6 +191,12 @@ const LocationSpec = struct {
     auth_file: ?Str = null,
     /// `sticky_cookie name;` (cookie-based backend affinity)
     sticky: ?Str = null,
+    /// `health_check path=... interval=N rise=N fall=N timeout=N;`
+    hc_path: ?Str = null,
+    hc_interval: u32 = 0,
+    hc_rise: u32 = 0,
+    hc_fall: u32 = 0,
+    hc_timeout: u32 = 0,
     /// `precompressed gz;` — serve .gz twins when the client accepts them.
     precompressed_gz: bool = false,
     /// `auth_request <uri>;`
@@ -867,6 +874,41 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             ensureModuleBound(b, spec, .content, "precompressed");
             b.cost += 8;
         },
+        H_health_check => {
+            // `health_check path=/hz interval=5 rise=2 fall=3 timeout=1;`
+            var pth = Str{ .src = "" };
+            var interval: u32 = 0;
+            var rise: u32 = 0;
+            var fall: u32 = 0;
+            var tmo: u32 = 0;
+            while (lx.peek() != ';') {
+                const t = lx.token() orelse lx.fail("health_check: expected a parameter");
+                const kv = t.srcOf("health_check: parameter cannot contain escapes");
+                if (std.mem.startsWith(u8, kv, "path=")) {
+                    pth = lx.value(b, "health_check");
+                } else if (std.mem.startsWith(u8, kv, "interval=")) {
+                    interval = std.fmt.parseInt(u32, kv["interval=".len..], 10) catch
+                        lx.fail("health_check: bad interval");
+                } else if (std.mem.startsWith(u8, kv, "rise=")) {
+                    rise = std.fmt.parseInt(u32, kv["rise=".len..], 10) catch
+                        lx.fail("health_check: bad rise");
+                } else if (std.mem.startsWith(u8, kv, "fall=")) {
+                    fall = std.fmt.parseInt(u32, kv["fall=".len..], 10) catch
+                        lx.fail("health_check: bad fall");
+                } else if (std.mem.startsWith(u8, kv, "timeout=")) {
+                    tmo = std.fmt.parseInt(u32, kv["timeout=".len..], 10) catch
+                        lx.fail("health_check: bad timeout");
+                } else lx.fail("health_check: unknown parameter");
+            }
+            lx.expectTerminator("health_check");
+            if (pth.src.len == 0 and pth.pool == null) lx.fail("health_check: path= is required");
+            spec.hc_path = pth;
+            spec.hc_interval = interval;
+            spec.hc_rise = rise;
+            spec.hc_fall = fall;
+            spec.hc_timeout = tmo;
+            b.cost += 8;
+        },
         H_sticky_cookie => {
             const t = lx.value(b, "sticky_cookie");
             lx.expectTerminator("sticky_cookie");
@@ -1289,6 +1331,11 @@ fn build(b: *const Builder) Config {
                 .proxy_cache_enabled = spec.cache_enabled,
                 .cache_ttl_seconds = spec.cache_ttl,
                 .cache_swr_seconds = spec.cache_swr,
+                .health_check_path = if (spec.hc_path) |hp| resolve(hp, strings) else null,
+                .health_check_interval_s = spec.hc_interval,
+                .health_check_rise = spec.hc_rise,
+                .health_check_fall = spec.hc_fall,
+                .health_check_timeout_s = spec.hc_timeout,
                 .sticky_cookie = if (spec.sticky) |sc| resolve(sc, strings) else null,
                 .limit_req_rate = spec.limit_rate,
                 .limit_req_burst = spec.limit_burst,

@@ -75,9 +75,18 @@ byte-budgeted LRU stores; nothing grows under load):
 - DONE Response caching: `proxy_cache` on bounded shmem zones — HIT/STALE/
   conditional revalidation converting upstream 304s back to stored 200s.
 - DONE Load balancing: `random`, `consistent_hash`, `least_time` (EWMA);
-  sticky sessions via cookie affinity. Active health checks remain open.
-- Open leftovers: active health checks, brotli/zstd codecs, runtime zone
-  size knobs beyond `proxy_cache_max_bytes`.
+  sticky sessions via cookie affinity.
+- DONE Active health checks: shared backend-health shmem zone (visible to
+  every reactor), a module-owned prober thread (TCP connect, optional HEAD
+  path probe) applying rise/fall thresholds, `health_check path=... interval=
+  rise= fall= timeout=` directive. Passive failures trip the circuit;
+  probes revive it after `rise` successes.
+- DONE Runtime zone-size knobs: `limits.proxy_cache_max_bytes` /
+  `proxy_cache_max_entries` size the response zone at startup; the LruStore
+  is runtime-sized with a chained hash directory (O(1) HIT lookups).
+- BLOCKED ON VENDORING Brotli + zstd compression: std.zig has no encoders
+  for either (zstd is decompress-only); needs a vendored codec decision
+  (C dependency vs pure-Zig port) before pickup.
 - Traffic mirroring (nginx `mirror`).
 - Prometheus `/metrics` endpoint and structured JSON access logs.
 - OpenTelemetry trace spans.

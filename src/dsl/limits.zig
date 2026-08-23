@@ -7,6 +7,8 @@ const std = @import("std");
 pub const Limits = struct {
     /// Byte budget for the proxy_cache response zone (0 = built-in default).
     proxy_cache_max_bytes: usize = 0,
+    /// Entry ceiling for the proxy_cache zone (0 = built-in default 256).
+    proxy_cache_max_entries: usize = 0,
     /// Total wall time allowed for the request line + headers, regardless
     /// of activity — the anti-slowloris teeth (dribbling bytes resets the
     /// idle timer but not this deadline). nginx's client_header_timeout is

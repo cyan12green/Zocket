@@ -96,169 +96,227 @@ pub fn KeyedTable(comptime V: type, comptime cap: usize) type {
     };
 }
 
-/// A byte-budgeted LRU store for opaque blobs (proxy_cache bodies). Total
-/// bytes across entries never exceeds `max_bytes`, entry count never
-/// exceeds `max_entries`; inserting a value that cannot fit after evicting
-/// every older entry is refused (returns null). This is the second half of
-/// the bounded-memory contract: caching degrades to pass-through under
-/// pressure instead of eating the box.
-pub fn LruStore(comptime max_entries: usize) type {
-    return struct {
-        const Self = @This();
+/// A byte-budgeted LRU store for opaque blobs (proxy_cache bodies). Sized
+/// once at init (hard ceiling for the process lifetime): entry count and
+/// total bytes never exceed the configured limits, so load cannot grow the
+/// zone. A chained hash directory gives O(1) lookups; inserting a value
+/// that cannot fit after evicting every older entry is refused (returns
+/// null). This is the second half of the bounded-memory contract: caching
+/// degrades to pass-through under pressure instead of eating the box.
+pub const LruStore = struct {
+    const Entry = struct {
+        key: u64 = 0,
+        bytes: []u8 = &.{}, // points into backing
+        used: bool = false,
+        tick: u64 = 0, // LRU clock
+        meta: u64 = 0, // consumer-owned (expiry ns, status, ...)
+        meta2: u64 = 0,
+        next: i32 = -1, // hash-chain link (index into entries)
+    };
 
-        pub const Entry = struct {
-            key: u64 = 0,
-            bytes: []u8 = &.{}, // points into backing
-            used: bool = false,
-            tick: u64 = 0, // LRU clock
-            meta: u64 = 0, // consumer-owned (expiry ns, status, ...)
-            meta2: u64 = 0,
+    pub const Found = struct {
+        meta: u64,
+        meta2: u64,
+        bytes: []u8,
+    };
+
+    mutex: std.Thread.Mutex = .{},
+    allocator: std.mem.Allocator,
+    max_bytes: usize,
+    entries: []Entry,
+    /// Chained hash directory: -1 = empty head. Size is the next power of
+    /// two at or above the entry count, so average chains stay ~1 long.
+    buckets: []i32,
+    used_count: usize = 0,
+    used_bytes: usize = 0,
+    clock: u64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, max_bytes: usize, max_entries: usize) !LruStore {
+        const n = @max(max_entries, 1);
+        var buckets_len: usize = 1;
+        while (buckets_len < n) buckets_len <<= 1;
+        const entries = try allocator.alloc(Entry, n);
+        errdefer allocator.free(entries);
+        @memset(entries, .{});
+        const buckets = try allocator.alloc(i32, buckets_len);
+        errdefer allocator.free(buckets);
+        @memset(buckets, -1);
+        return .{
+            .allocator = allocator,
+            .max_bytes = max_bytes,
+            .entries = entries,
+            .buckets = buckets,
         };
+    }
 
-        mutex: std.Thread.Mutex = .{},
-        allocator: std.mem.Allocator,
-        max_bytes: usize,
-        entries: [max_entries]Entry = [_]Entry{.{}} ** max_entries,
-        used_count: usize = 0,
-        used_bytes: usize = 0,
-        clock: u64 = 0,
-
-        pub fn init(allocator: std.mem.Allocator, max_bytes: usize) Self {
-            return .{ .allocator = allocator, .max_bytes = max_bytes };
+    pub fn deinit(self: *LruStore) void {
+        self.mutex.lock();
+        for (self.entries) |e| {
+            if (e.used) self.allocator.free(e.bytes);
         }
+        self.allocator.free(self.entries);
+        self.allocator.free(self.buckets);
+        self.mutex.unlock();
+    }
 
-        fn lruIndex(self: *Self) usize {
-            var best: usize = 0;
-            for (&self.entries, 0..) |*e, i| {
-                if (!e.used) return i; // free slot beats everything
-                if (e.tick < self.entries[best].tick or !self.entries[best].used) best = i;
-            }
-            return best;
+    fn bucketOf(self: *const LruStore, key: u64) usize {
+        // Fibonacci hashing over the bucket count (power of two).
+        const h = key *% 0x9E3779B97F4A7C15;
+        return @intCast((h >> 32) & (@as(u64, self.buckets.len) - 1));
+    }
+
+    /// Walk the chain for `key`; returns the slot index or null.
+    fn findSlot(self: *const LruStore, key: u64) ?usize {
+        var i = self.buckets[self.bucketOf(key)];
+        while (i >= 0) {
+            const e = &self.entries[@intCast(i)];
+            if (e.used and e.key == key) return @intCast(i);
+            i = e.next;
         }
+        return null;
+    }
 
-        pub fn lookup(self: *Self, key: u64) ?Entry {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            for (&self.entries) |*e| {
-                if (e.used and e.key == key) {
-                    self.clock += 1;
-                    e.tick = self.clock;
-                    return e.*;
+    /// Unlink slot `idx` from its key's chain (caller holds the mutex and
+    /// guarantees the slot is linked, i.e. used).
+    fn unlink(self: *LruStore, idx: usize) void {
+        const e = &self.entries[idx];
+        var cur = self.buckets[self.bucketOf(e.key)];
+        var prev: i32 = -1;
+        while (cur >= 0) : (cur = self.entries[@intCast(cur)].next) {
+            if (cur == idx) {
+                if (prev < 0) {
+                    self.buckets[self.bucketOf(e.key)] = e.next;
+                } else {
+                    self.entries[@intCast(prev)].next = e.next;
                 }
+                return;
             }
-            return null;
+            prev = cur;
         }
+    }
 
-        /// Insert `bytes` (copied into the zone). Evicts LRU entries until
-        /// it fits; returns null (storing nothing) when the value can never
-        /// fit within the byte budget even empty-handed.
-        pub fn put(self: *Self, key: u64, bytes: []const u8, meta: u64, meta2: u64) ?void {
-            if (bytes.len > self.max_bytes) return null;
-            self.mutex.lock();
-            defer self.mutex.unlock();
+    fn link(self: *LruStore, idx: usize) void {
+        const b = self.bucketOf(self.entries[idx].key);
+        self.entries[idx].next = self.buckets[b];
+        self.buckets[b] = @intCast(idx);
+    }
 
-            // Claim a slot: same-key replace or the LRU/free choice. Either
-            // way the previous occupant's bytes are released up front, so
-            // the accounting below sees one uniform "empty" slot.
-            var idx: usize = self.used_count;
-            for (&self.entries, 0..) |*e, i| {
-                if (e.used and e.key == key) {
-                    idx = i;
+    /// Free an occupied slot (evict or pre-replace release).
+    fn dropSlot(self: *LruStore, idx: usize) void {
+        const e = &self.entries[idx];
+        self.unlink(idx);
+        self.used_bytes -= e.bytes.len;
+        self.allocator.free(e.bytes);
+        e.used = false;
+        e.bytes = &.{};
+        self.used_count -= 1;
+    }
+
+    /// Read-only lookup (locks; returns a copy of the metadata only — use
+    /// getCopy for safe access to blob bytes across threads).
+    pub fn lookup(self: *LruStore, key: u64) ?Entry {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const idx = self.findSlot(key) orelse return null;
+        const e = &self.entries[idx];
+        self.clock += 1;
+        e.tick = self.clock;
+        return e.*;
+    }
+
+    /// Lookup with the blob copied out UNDER the zone mutex: callers get
+    /// allocator-owned bytes they can read without racing a concurrent
+    /// evict-or-replace on another reactor thread.
+    pub fn getCopy(self: *LruStore, key: u64, alloc: std.mem.Allocator) ?Found {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const idx = self.findSlot(key) orelse return null;
+        const e = &self.entries[idx];
+        const copy = alloc.dupe(u8, e.bytes) catch return null;
+        self.clock += 1;
+        e.tick = self.clock;
+        return .{ .meta = e.meta, .meta2 = e.meta2, .bytes = copy };
+    }
+
+    /// Insert `bytes` (copied into the zone). Evicts LRU entries until it
+    /// fits; returns null (storing nothing) when the value can never fit
+    /// within the byte budget even empty-handed.
+    pub fn put(self: *LruStore, key: u64, bytes: []const u8, meta: u64, meta2: u64) ?void {
+        if (bytes.len > self.max_bytes) return null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Resolve the slot: an existing key keeps its slot (its old bytes
+        // are released now); otherwise prefer a free slot and fall back to
+        // evicting the least-recently-used entry.
+        var preferred: usize = undefined;
+        if (self.findSlot(key)) |i| {
+            self.dropSlot(i);
+            preferred = i;
+        } else {
+            var found_free = false;
+            for (self.entries, 0..) |*e, i| {
+                if (!e.used) {
+                    preferred = i;
+                    found_free = true;
                     break;
                 }
-            } else {
-                idx = blk: {
-                    const li = self.lruIndex();
-                    break :blk li;
-                };
             }
-            {
-                const chosen = &self.entries[idx];
-                if (chosen.used) {
-                    self.used_bytes -= chosen.bytes.len;
-                    self.allocator.free(chosen.bytes);
-                    chosen.used = false;
-                    chosen.bytes = &.{};
-                    self.used_count -= 1;
-                }
-            }
-
-            // Make room among the REMAINING entries.
-            while (self.used_bytes + bytes.len > self.max_bytes) {
-                var victim: usize = std.math.maxInt(usize);
-                var oldest: u64 = std.math.maxInt(u64);
-                for (&self.entries, 0..) |*e, i| {
-                    if (e.used and (victim == std.math.maxInt(usize) or e.tick < oldest)) {
-                        victim = i;
-                        oldest = e.tick;
-                    }
-                }
-                if (victim == std.math.maxInt(usize)) return null;
-                const v = &self.entries[victim];
-                self.used_bytes -= v.bytes.len;
-                self.allocator.free(v.bytes);
-                v.used = false;
-                v.bytes = &.{};
-                self.used_count -= 1;
-            }
-
-            const copy = self.allocator.dupe(u8, bytes) catch return null;
-            const e = &self.entries[idx];
-            e.key = key;
-            e.bytes = copy;
-            e.used = true;
-            e.meta = meta;
-            e.meta2 = meta2;
-            self.used_bytes += copy.len;
-            self.clock += 1;
-            e.tick = self.clock;
-            self.used_count += 1;
-            return {};
-        }
-
-        /// Lookup with the blob copied out UNDER the zone mutex: callers
-        /// get arena/allocator-owned bytes they can read without racing a
-        /// concurrent evict-or-replace on another reactor thread.
-        pub fn getCopy(self: *Self, key: u64, alloc: std.mem.Allocator) ?struct {
-            meta: u64,
-            meta2: u64,
-            bytes: []u8,
-        } {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            for (&self.entries) |*e| {
-                if (e.used and e.key == key) {
-                    const copy = alloc.dupe(u8, e.bytes) catch return null;
-                    self.clock += 1;
-                    e.tick = self.clock;
-                    return .{ .meta = e.meta, .meta2 = e.meta2, .bytes = copy };
-                }
-            }
-            return null;
-        }
-
-        /// Invalidate one key (revalidation that must forget stale data).
-        pub fn remove(self: *Self, key: u64) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            for (&self.entries) |*e| {
-                if (e.used and e.key == key) {
-                    self.used_bytes -= e.bytes.len;
-                    self.allocator.free(e.bytes);
-                    e.used = false;
-                    e.bytes = &.{};
-                    self.used_count -= 1;
-                }
+            if (!found_free) {
+                preferred = self.lruIndexLocked() orelse return null;
+                self.dropSlot(preferred);
             }
         }
 
-        pub fn stats(self: *Self) struct { entries: usize, bytes: usize } {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            return .{ .entries = self.used_count, .bytes = self.used_bytes };
+        // Make room among the remaining occupied slots.
+        while (self.used_bytes + bytes.len > self.max_bytes) {
+            const victim = self.lruIndexLocked() orelse return null;
+            self.dropSlot(victim);
         }
-    };
-}
+
+        const copy = self.allocator.dupe(u8, bytes) catch return null;
+        self.entries[preferred] = .{
+            .key = key,
+            .bytes = copy,
+            .used = true,
+            .meta = meta,
+            .meta2 = meta2,
+            .next = -1,
+        };
+        self.link(preferred);
+        self.used_count += 1;
+        self.used_bytes += copy.len;
+        self.clock += 1;
+        self.entries[preferred].tick = self.clock;
+        return {};
+    }
+
+    /// Least-recently-used occupied slot (caller holds the mutex).
+    fn lruIndexLocked(self: *LruStore) ?usize {
+        var best: ?usize = null;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (self.entries, 0..) |*e, i| {
+            if (e.used and e.tick < oldest) {
+                oldest = e.tick;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    /// Invalidate one key (revalidation that must forget stale data).
+    pub fn remove(self: *LruStore, key: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.findSlot(key)) |idx| self.dropSlot(idx);
+    }
+
+    pub fn stats(self: *LruStore) struct { entries: usize, bytes: usize } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{ .entries = self.used_count, .bytes = self.used_bytes };
+    }
+};
 
 test "KeyedTable upsert/get round-trips and refuses when full" {
     var t = KeyedTable(u32, 4){};
@@ -284,12 +342,8 @@ test "KeyedTable upsert/get round-trips and refuses when full" {
 }
 
 test "LruStore evicts least-recently-used and honors the byte budget" {
-    var store = LruStore(4).init(testing.allocator, 300);
-    defer {
-        for (&store.entries) |*e| {
-            if (e.used) store.allocator.free(e.bytes);
-        }
-    }
+    var store = try LruStore.init(testing.allocator, 300, 4);
+    defer store.deinit();
 
     _ = store.put(1, "aa", 0, 0);
     _ = store.put(2, "bbb", 0, 0);
@@ -323,12 +377,8 @@ test "LruStore evicts least-recently-used and honors the byte budget" {
 }
 
 test "LruStore remove invalidates exactly one key" {
-    var store = LruStore(4).init(testing.allocator, 100);
-    defer {
-        for (&store.entries) |*e| {
-            if (e.used) store.allocator.free(e.bytes);
-        }
-    }
+    var store = try LruStore.init(testing.allocator, 100, 4);
+    defer store.deinit();
     _ = store.put(7, "x", 0, 0);
     _ = store.put(8, "yy", 0, 0);
     store.remove(7);

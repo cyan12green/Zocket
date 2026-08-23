@@ -49,13 +49,36 @@ const PoolEntry = struct {
     fd: posix_fd = -1,
     last_used_ns: u64 = 0,
 };
+const posix = std.posix;
 const posix_fd = std.posix.fd_t;
 
 // Per-reactor state (thread-local: each reactor owns its upstream sockets).
 threadlocal var pool: [max_backends]PoolEntry = [_]PoolEntry{.{}} ** max_backends;
 threadlocal var active: [max_backends]u32 = [_]u32{0} ** max_backends;
-threadlocal var consecutive_fails: [max_backends]u32 = [_]u32{0} ** max_backends;
-threadlocal var failed_at_ns: [max_backends]u64 = [_]u64{0} ** max_backends;
+/// Per-backend liveness, SHARED across reactors (and with the active
+/// health-checker thread) via a shmem zone. Keyed by (route pointer,
+/// backend index); routes are compile-time immortal pointers.
+const BackendState = struct {
+    fails: u32 = 0, // consecutive request failures (passive)
+    alive: bool = true,
+    probe_ok: u32 = 0, // consecutive successful probes (rise threshold)
+    probe_fails: u32 = 0, // consecutive failed probes (fall threshold)
+    last_fail_ns: u64 = 0,
+    probe_next_due_ns: u64 = 0,
+};
+var health_zone = @import("../shmem.zig").KeyedTable(BackendState, 4096){};
+
+fn backendKey(route: *const registry.Route, idx: usize) u64 {
+    return @intFromPtr(route) ^ (@as(u64, idx) << 4);
+}
+
+/// Injected in tests; default probes a backend over TCP (+ optional HEAD).
+var probeFn: *const fn (up: *const router.Upstream, path: []const u8, timeout_s: u32) bool = tcpProbe;
+
+/// Registered health-checked routes (process-immortal route pointers).
+var hc_mutex: std.Thread.Mutex = .{};
+var hc_routes: std.ArrayList(*const registry.Route) = .empty;
+var hc_thread_started: bool = false;
 threadlocal var rr_counter: usize = 0;
 /// least_time: exponential weighted moving average of upstream response
 /// latency per backend, in ns (1/8 weight per sample).
@@ -119,6 +142,7 @@ fn forward(
     started_ns: u64,
     offer_sticky: bool,
 ) anyerror!Action {
+    ensureHealthChecker(route);
     const up = &upstreams[pick];
     var fd = acquirePooled(pick, started_ns);
     if (fd < 0) {
@@ -149,8 +173,12 @@ fn forward(
         return badGateway(ctx);
     }
 
-    // Success: EWMA latency sample, then copy the response into ctx.resp.
-    consecutive_fails[pick] = 0;
+    // Success: clear passive failures, refresh the EWMA latency sample,
+    // then copy the response into ctx.resp.
+    if (health_zone.upsertLocked(backendKey(route, pick))) |r| {
+        r.slot.fails = 0;
+        r.slot.last_fail_ns = 0;
+    }
     active[pick] -|= 1;
     pool[pick] = .{ .fd = fd, .last_used_ns = started_ns };
     const elapsed = nowNs() -% started_ns;
@@ -286,22 +314,155 @@ fn pickBackend(route: *const registry.Route, upstreams: []const router.Upstream,
 }
 
 fn backendUsable(route: *const registry.Route, idx: usize, now_ns: u64) bool {
-    const fails = consecutive_fails[idx];
-    if (fails < route.max_fails) return true;
-    const retry_at = failed_at_ns[idx] + @as(u64, route.fail_timeout_seconds) * std.time.ns_per_s;
-    if (now_ns >= retry_at) {
-        // Retry window open: probe the backend again.
-        consecutive_fails[idx] = 0;
+    const key = backendKey(route, idx);
+    health_zone.mutex.lock();
+    defer health_zone.mutex.unlock();
+    const r = health_zone.upsertLocked(key) orelse return false;
+    if (!r.existed) r.slot.* = .{}; // assume alive until proven otherwise
+    if (!r.slot.alive) return false; // only the active checker revives
+    if (r.slot.fails < route.max_fails) return true;
+    if (route.health_check_path != null) return false; // wait for rise
+    // No active checker: honor the passive retry window.
+    if (now_ns >= r.slot.last_fail_ns +% @as(u64, route.fail_timeout_seconds) * std.time.ns_per_s) {
+        r.slot.fails = 0;
         return true;
     }
     return false;
 }
 
 fn markFailure(idx: usize, route: *const registry.Route, now_ns: u64) void {
-    consecutive_fails[idx] += 1;
-    if (consecutive_fails[idx] >= route.max_fails) {
-        failed_at_ns[idx] = now_ns;
+    if (health_zone.upsertLocked(backendKey(route, idx))) |r| {
+        r.slot.fails += 1;
+        r.slot.last_fail_ns = now_ns;
+        if (r.slot.fails >= route.max_fails) r.slot.alive = false;
     }
+}
+
+// ---- active health checks ----
+
+/// One sweep across every registered health-checked route: probes each
+/// backend whose interval elapsed and applies rise/fall thresholds. Also
+/// called directly by tests with an injected probeFn.
+pub fn runHealthChecksOnce(now_ns: u64) void {
+    hc_mutex.lock();
+    const snapshot = hc_routes.items;
+    hc_mutex.unlock();
+    for (snapshot) |route| {
+        const path = route.health_check_path orelse continue;
+        const timeout: u32 = if (route.health_check_timeout_s != 0) route.health_check_timeout_s else 1;
+        for (route.upstreams, 0..) |*up, i| {
+            const key = backendKey(route, i);
+            var next_due: u64 = 0;
+            {
+                health_zone.mutex.lock();
+                defer health_zone.mutex.unlock();
+                const r = health_zone.upsertLocked(key) orelse continue;
+                if (!r.existed) r.slot.* = .{}; // assume alive until proven otherwise
+                next_due = r.slot.probe_next_due_ns;
+                if (now_ns < next_due) continue;
+            }
+            const ok = probeFn(up, path, timeout);
+            const interval = @as(u64, if (route.health_check_interval_s != 0) route.health_check_interval_s else 5) * std.time.ns_per_s;
+            health_zone.mutex.lock();
+            defer health_zone.mutex.unlock();
+            const r = health_zone.upsertLocked(key) orelse continue;
+            r.slot.probe_next_due_ns = now_ns + interval;
+            if (ok) {
+                r.slot.probe_ok += 1;
+                r.slot.probe_fails = 0;
+                const rise: u32 = if (route.health_check_rise != 0) route.health_check_rise else 2;
+                if (r.slot.probe_ok >= rise) {
+                    r.slot.alive = true;
+                    r.slot.fails = 0;
+                    r.slot.probe_ok = 0;
+                }
+            } else {
+                r.slot.probe_ok = 0;
+                r.slot.probe_fails += 1;
+                const fall: u32 = if (route.health_check_fall != 0) route.health_check_fall else 3;
+                if (r.slot.probe_fails >= fall) r.slot.alive = false;
+            }
+        }
+    }
+}
+
+/// Register a route for background checking and start the checker thread
+/// once. Called from forward() on the first proxied request per route.
+/// Register a route for periodic checking (idempotent). Returns true when
+/// the route was newly added.
+fn registerHealthRoute(route: *const registry.Route) bool {
+    if (route.health_check_path == null) return false;
+    hc_mutex.lock();
+    defer hc_mutex.unlock();
+    for (hc_routes.items) |r| {
+        if (r == route) return false;
+    }
+    hc_routes.append(std.heap.page_allocator, route) catch return false;
+    return true;
+}
+
+fn ensureHealthChecker(route: *const registry.Route) void {
+    if (!registerHealthRoute(route)) {
+        // Already registered (or not health-checked): thread is running.
+        return;
+    }
+    hc_mutex.lock();
+    const already = hc_thread_started;
+    hc_thread_started = true;
+    hc_mutex.unlock();
+    if (already) return;
+    const t = std.Thread.spawn(.{}, healthThread, .{}) catch {
+        hc_mutex.lock();
+        hc_thread_started = false;
+        hc_mutex.unlock();
+        return;
+    };
+    t.detach();
+}
+
+var epoch_zero: std.time.Instant = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+
+fn healthThread() void {
+    while (true) {
+        const t = std.time.Instant.now() catch {
+            std.posix.nanosleep(1, 0);
+            continue;
+        };
+        runHealthChecksOnce(t.since(epoch_zero));
+        std.posix.nanosleep(0, 250 * std.time.ns_per_ms);
+    }
+}
+
+/// Default probe: TCP connect; with a `path`, upgrade to a minimal HEAD and
+/// require a 2xx/3xx status line.
+fn tcpProbe(up: *const router.Upstream, path: []const u8, timeout_s: u32) bool {
+    const fd = connectUpstream(up) catch return false;
+    defer posix_close(fd);
+    setRecvTimeout(fd);
+    if (path.len == 0 or std.mem.eql(u8, path, "/")) return true; // connect-only
+    var req_buf: [512]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "HEAD {s} HTTP/1.1\r\nHost: zocket-hc\r\nConnection: close\r\n\r\n", .{path}) catch return false;
+    var sent: usize = 0;
+    while (sent < req.len) {
+        sent += std.posix.write(fd, req[sent..]) catch return false;
+    }
+    var buf: [128]u8 = undefined;
+    var got: usize = 0;
+    const timeout_ns: u64 = @as(u64, if (timeout_s == 0) 1 else timeout_s) * std.time.ns_per_s;
+    const deadline = std.time.Instant.now() catch return false;
+    while (got < 12) {
+        const n = std.posix.read(fd, buf[got..]) catch return false;
+        if (n == 0) break;
+        got += n;
+        const now = std.time.Instant.now() catch return false;
+        if (now.since(deadline) > timeout_ns) return false;
+    }
+    if (got < 12) return false;
+    if (!std.mem.startsWith(u8, &buf, "HTTP/1.")) return false;
+    const sp = std.mem.indexOfScalar(u8, buf[0..got], ' ') orelse return false;
+    if (sp + 3 > got) return false;
+    const code = std.fmt.parseInt(u16, buf[sp + 1 .. sp + 3 + 1], 10) catch return false;
+    return code >= 200 and code < 400;
 }
 
 // ---- upstream connection lifecycle ----
@@ -646,3 +807,136 @@ test "sticky cookie routes back to the tagged backend" {
     var junk_ctx = Context{ .req = &junk, .resp = &junk_resp };
     try testing.expect(stickyBackendFromCookie(&junk_ctx, "zsid", route.upstreams, &route, nowNs()) == null);
 }
+
+
+// ---- active health check tests ----
+
+fn mkUp(host: []const u8, port: u16) router.Upstream {
+    return .{ .host = host, .port = port, .sockaddr = router.Upstream.makeSockaddr(host, port).? };
+}
+
+const hc_test_upstreams = [_]router.Upstream{
+    mkUp("127.0.0.1", 1), // nothing listens here
+    mkUp("127.0.0.1", 2),
+};
+
+test "passive failures trip the shared circuit; success clears it" {
+    const route = registry.Route{
+        .path = "/hc-passive",
+        .max_fails = 2,
+        .upstreams = &hc_test_upstreams,
+    };
+    const key = backendKey(&route, 0);
+    // Fresh state (tests share the zone): clear any prior entry.
+    health_zone.mutex.lock();
+    if (health_zone.upsertLocked(key)) |r| r.slot.* = .{};
+    health_zone.mutex.unlock();
+
+    try testing.expect(backendUsable(&route, 0, 0));
+    markFailure(0, &route, 100);
+    try testing.expect(backendUsable(&route, 0, 0)); // one failure < max_fails
+    markFailure(0, &route, 200);
+    try testing.expect(!backendUsable(&route, 0, std.time.ns_per_s)); // tripped
+
+    // A successful request clears the passive counter (retry window open).
+    if (health_zone.upsertLocked(key)) |r| {
+        r.slot.fails = 0;
+        r.slot.alive = true;
+    }
+    try testing.expect(backendUsable(&route, 0, 0));
+}
+
+test "active checks apply fall and rise thresholds" {
+    const route = registry.Route{
+        .path = "/hc-active",
+        .max_fails = 3,
+        .health_check_path = "/hz",
+        .health_check_interval_s = 1000000, // due immediately on first sweep
+        .health_check_rise = 2,
+        .health_check_fall = 3,
+        .upstreams = &hc_test_upstreams,
+    };
+    _ = registerHealthRoute(&route);
+
+    var fake_ok = true;
+    const saved = probeFn;
+    defer probeFn = saved;
+    probeFn = struct {
+        fn probe(up: *const router.Upstream, path: []const u8, t: u32) bool {
+            _ = up;
+            _ = path;
+            _ = t;
+            return fake_ok_global;
+        }
+    }.probe;
+    _ = &fake_ok;
+
+    // Three failed probes (fall=3) take the backend down. The interval is
+    // huge so every sweep finds the backend due immediately.
+    fake_ok = false;
+    fake_ok_global = false;
+    var sweep_now: u64 = nowForHc();
+    const step = intervalNsFor(&route);
+    for (0..3) |_| {
+        runHealthChecksOnce(sweep_now);
+        sweep_now += step;
+    }
+    try testing.expect(!backendUsable(&route, 1, 0));
+
+    // Two good probes (rise=2) revive it.
+    fake_ok = true;
+    fake_ok_global = true;
+    runHealthChecksOnce(sweep_now); sweep_now += step;
+    try testing.expect(!backendUsable(&route, 1, 0)); // one OK < rise
+    runHealthChecksOnce(sweep_now);
+    try testing.expect(backendUsable(&route, 1, 0));
+}
+
+var fake_ok_global: bool = true;
+
+fn intervalNsFor(route: *const registry.Route) u64 {
+    return @as(u64, if (route.health_check_interval_s != 0) route.health_check_interval_s else 5) * std.time.ns_per_s + 10;
+}
+
+fn nowForHc() u64 {
+    const t = std.time.Instant.now() catch return 0;
+    return t.since(epoch_zero);
+}
+
+test "tcpProbe distinguishes a live listener from a dead port" {
+    const sockets_mod = @import("../../net/sockets.zig");
+    const listener = try sockets_mod.createListeningSocket(18933, 4);
+    defer posix.close(listener);
+    // Accept the probe connection on a side thread (connect-only probe
+    // sends nothing and closes).
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn run(lfd: std.posix.fd_t) void {
+            var fds = [_]std.posix.pollfd{.{ .fd = lfd, .events = std.posix.POLL.IN, .revents = 0 }};
+            _ = std.posix.poll(&fds, 2000) catch return;
+            if (fds[0].revents & std.posix.POLL.IN != 0) {
+                const c = sockets_mod.acceptNonBlock(lfd) catch return;
+                posix.close(c);
+            }
+        }
+    }.run, .{listener});
+    defer accept_thread.join();
+
+    const live = mkUp("127.0.0.1", 18933);
+    try testing.expect(tcpProbe(&live, "", 1)); // connect-only succeeds
+    // Claim-then-release a port so nothing local listens on it, then
+    // verify closedness with retries (another process may briefly grab the
+    // ephemeral port).
+    var dead_ok_checked = false;
+    for (0..4) |_| {
+        const tmp_listener = try sockets_mod.createListeningSocket(0, 4);
+        const dead_port = try sockets_mod.boundPort(tmp_listener);
+        posix.close(tmp_listener);
+        const dead = mkUp("127.0.0.1", dead_port);
+        if (!tcpProbe(&dead, "", 1)) {
+            dead_ok_checked = true;
+            break;
+        }
+    }
+    try testing.expect(dead_ok_checked);
+}
+

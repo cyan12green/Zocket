@@ -129,6 +129,14 @@ pub const Route = struct {
     /// Subrequest authorization (auth_request module): forward this URI
     /// through an internal subrequest; 2xx admits, anything else copies.
     auth_request_uri: ?[]const u8 = null,
+    /// Active health checks (proxy module): when `health_check_path` is
+    /// set a module-owned checker thread probes every backend on the
+    /// interval and applies rise/fall thresholds to flip liveness.
+    health_check_path: ?[]const u8 = null,
+    health_check_interval_s: u32 = 5,
+    health_check_rise: u32 = 2,
+    health_check_fall: u32 = 3,
+    health_check_timeout_s: u32 = 1,
     /// Sticky sessions (cookie-based affinity): when set, the proxy module
     /// reads this cookie for a previously-assigned backend tag and answers
     /// new clients with a Set-Cookie binding them to their backend.

@@ -460,6 +460,22 @@ Context: main
 TOTAL wall time allowed for the request line + headers from first byte,
 regardless of activity (anti-slowloris). 0 disables.
 
+### health_check
+
+Syntax: `health_check path=<uri> [interval=<s>] [rise=<n>] [fall=<n>]
+[timeout=<s>]`
+
+Default: —
+
+Context: location (proxy routes)
+
+Active probing of every upstream on the route by a background checker:
+TCP connect, plus a HEAD `<path>` request when `path` is set (2xx/3xx
+counts as healthy). A backend goes down after `fall` failed probes
+(passive request failures also trip it) and returns after `rise`
+successes — visible to all reactors through shared memory. Defaults:
+interval 5 s, rise 2, fall 3, timeout 1 s.
+
 ### limit_conn
 
 Syntax: `limit_conn <n>;`
@@ -528,6 +544,10 @@ Default: `60`
 Context: location
 
 Fresh window of cached responses.
+
+Zone sizing (runtime knobs, `limits` section): `proxy_cache_max_bytes`
+(default 32 MiB) and `proxy_cache_max_entries` (default 256) bound the
+cache; changing either recreates the zone on startup.
 
 ### set_header / remove_header
 
