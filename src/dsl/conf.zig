@@ -92,6 +92,7 @@ const H_consistent_hash = keyHash("consistent_hash");
 const H_least_time = keyHash("least_time");
 const H_sticky_cookie = keyHash("sticky_cookie");
 const H_precompressed = keyHash("precompressed");
+const H_auth_request = keyHash("auth_request");
 const H_limit_req = keyHash("limit_req");
 const H_limit_conn = keyHash("limit_conn");
 const H_set = keyHash("set");
@@ -186,6 +187,8 @@ const LocationSpec = struct {
     sticky: ?Str = null,
     /// `precompressed gz;` — serve .gz twins when the client accepts them.
     precompressed_gz: bool = false,
+    /// `auth_request <uri>;`
+    auth_request: ?Str = null,
     /// `limit_req rate=N burst=M;` / `limit_conn N;`
     limit_rate: u32 = 0,
     limit_burst: u32 = 0,
@@ -791,6 +794,13 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const hs = parseHeaderOpDirective(lx, b, name);
             appendHeaderOp(b, spec, hs);
         },
+        H_auth_request => {
+            const t = lx.value(b, "auth_request");
+            lx.expectTerminator("auth_request");
+            spec.auth_request = t;
+            ensureModuleBound(b, spec, .access, "auth_request");
+            b.cost += 8;
+        },
         H_precompressed => {
             // `precompressed gz;` (only gz is supported today)
             const t = lx.token() orelse lx.fail("precompressed: expected a codec");
@@ -1219,6 +1229,7 @@ fn build(b: *const Builder) Config {
                 else
                     &.{},
                 .precompressed = spec.precompressed_gz,
+                .auth_request_uri = if (spec.auth_request) |u| resolve(u, strings) else null,
                 .sticky_cookie = if (spec.sticky) |sc| resolve(sc, strings) else null,
                 .limit_req_rate = spec.limit_rate,
                 .limit_req_burst = spec.limit_burst,

@@ -93,6 +93,7 @@ comptime {
     _ = @import("dsl/modules/limit.zig");
     _ = @import("dsl/shmem.zig");
     _ = @import("dsl/modules/precompressed.zig");
+    _ = @import("dsl/modules/auth_request.zig");
     _ = @import("dsl/htpasswd.zig");
     _ = @import("http/arena.zig");
     _ = @import("http2/hpack.zig");

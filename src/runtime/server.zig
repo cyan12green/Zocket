@@ -148,6 +148,32 @@ pub const Server = struct {
     /// write them straight to the wire — no pipeline, no response builder,
     /// no function call through the phase chain. Returns null when any
     /// module could still act on the request.
+    /// Subrequest hook installed into every request Context by the
+    /// reactors: runs `target` through THIS server's full pipeline as a
+    /// fresh GET carrying the original Authorization header.
+    pub fn subrequestImpl(
+        impl: *const anyopaque,
+        src_req: *const pipeline.Request,
+        target: []const u8,
+        out_status: *u16,
+    ) anyerror!void {
+        const srv: *const Server = @ptrCast(@alignCast(impl));
+        var req = pipeline.Request.init(std.heap.page_allocator);
+        defer req.deinit();
+        req.method = .get;
+        req.target = target;
+        req.decoded_target = target;
+        if (src_req.header("authorization")) |a| {
+            req.addHeaderParsed("Authorization", a) catch {};
+        }
+        var resp = pipeline.Response.init(.ok);
+        var sctx = pipeline.Context{ .req = &req, .resp = &resp };
+        const outcome = try srv.handleRequest(&sctx);
+        // Mirror the reactor's default-404 semantics for unmatched targets.
+        if (outcome == .not_handled) resp.status = .not_found;
+        out_status.* = @intFromEnum(resp.status);
+    }
+
     pub fn matchFast(self: *const Server, ctx: *pipeline.Context) ?router_mod.FastResponse {
         var caps = router_mod.MatchCaps{ .subject = ctx.req.decoded_target };
         const route = self.router.match(ctx.req.decoded_target, &caps) orelse return null;

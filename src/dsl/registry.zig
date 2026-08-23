@@ -116,6 +116,12 @@ pub const Context = struct {
     /// finding it null and must not free what they did not allocate.
     mod_state: ?*anyopaque = null,
 
+    /// Internal-subrequest hook (auth_request): installed by the reactor,
+    /// implemented by the runtime Server so modules can run a request
+    /// through the full pipeline without touching transport internals.
+    /// The subrequest inherits only the Authorization header.
+    subrequest: ?SubrequestHook = null,
+
     /// Shared request memory (the framework's module allocation facility):
     /// every byte a module allocates here is reclaimed wholesale by the
     /// server at the end of the request/response cycle — the arena rewinds
@@ -144,6 +150,16 @@ pub const Context = struct {
 /// the reactors, rendered by the stub_status module. Defined here so the
 /// Context can reference it without an import cycle; the runtime Server
 /// re-exports it.
+pub const SubrequestHook = struct {
+    impl: *const anyopaque,
+    call: *const fn (
+        impl: *const anyopaque,
+        src_req: *const Request,
+        target: []const u8,
+        out_status: *u16,
+    ) anyerror!void,
+};
+
 pub const ServerStats = struct {
     accepted: std.atomic.Value(u64) = .init(0),
     active: std.atomic.Value(u64) = .init(0),
@@ -222,6 +238,7 @@ pub const default_registry = Registry(.{
     @import("modules/limit.zig").limit_conn,
     @import("modules/limit.zig").limit_conn_release,
     @import("modules/precompressed.zig").precompressed,
+    @import("modules/auth_request.zig").auth_request,
 });
 
 const testing = std.testing;

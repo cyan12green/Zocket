@@ -121,6 +121,9 @@ pub const Route = struct {
     /// Precompressed serving (precompressed module): look for a `.gz`
     /// sibling of the requested file and serve it with Content-Encoding.
     precompressed: bool = false,
+    /// Subrequest authorization (auth_request module): forward this URI
+    /// through an internal subrequest; 2xx admits, anything else copies.
+    auth_request_uri: ?[]const u8 = null,
     /// Sticky sessions (cookie-based affinity): when set, the proxy module
     /// reads this cookie for a previously-assigned backend tag and answers
     /// new clients with a Set-Cookie binding them to their backend.

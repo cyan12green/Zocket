@@ -1299,6 +1299,7 @@ pub const Reactor = struct {
             .static_cache = &self.static_cache,
             .limits = &self.limits,
             .formats = handler.formats(),
+            .subrequest = .{ .impl = handler, .call = runtime_server.Server.subrequestImpl },
             .started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
             .now_ns = blk: {
                 const t = std.time.Instant.now() catch break :blk 0;
