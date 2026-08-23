@@ -103,7 +103,7 @@ Refer to `bench/BENCH.md` for details on benchmark generation and methodology.
 
 ## Tests and benchmarks
 
-- `zig build test` — unit + concurrency + fuzz-smoke tests (280 passing).
+- `zig build test` — unit + concurrency + fuzz-smoke tests (320 passing).
 - `bench/bench.sh`, `bench/bench2.sh`, `bench/summarize.py` — reproducible
   benchmark harness; results and methodology in `bench/BENCH.md`.
 - `bench/compare-servers.sh` — cross-language comparison against actix-web,

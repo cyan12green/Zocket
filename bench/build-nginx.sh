@@ -22,6 +22,7 @@ cd "$NGINX_SRC"
     --with-cc-opt="-O3" \
     --without-http_rewrite_module \
     --without-http_gzip_module \
+    --with-http_gzip_static_module \
     --add-module="$ECHO_MOD" >/dev/null
 make -j"$(nproc)" >/dev/null
 make install >/dev/null

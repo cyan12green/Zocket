@@ -67,7 +67,7 @@ still carry run-to-run variance (see the per-rep spread in `bench/results/`).
   pipelining) before HTTP sweeps.
 - HTTP/2: `zig build h2test` (h2spec conformance, ≥130/145) + `zig build
   fuzz` before/after h2 benchmark work.
-- `zig build test` (265 tests incl. concurrency) must stay green.
+- `zig build test` (313 tests incl. concurrency) must stay green.
 
 ## Current results
 
@@ -183,3 +183,34 @@ python3 bench/graphs.py
 
 Historical milestone-by-milestone numbers and the full six-server tables:
 `bench/HISTORY.md`.
+
+## Backlog modules vs nginx (`backlog-bench.sh`, 2026-08-23)
+
+Feature-level head-to-heads, one conf per server exercising the new
+modules; bombardier c=100, 6 interleaved reps with port-swap (medians;
+crashed-server reps excluded by zero-completion filter):
+
+| Cell | Endpoint | Zocket | nginx 1.28 | Ratio |
+|---|---|---:|---:|---:|
+| headers (3 ops/req) | GET /h | 225.6k | 199.9k | **1.13x** |
+| auth_basic ({SHA}) | GET /auth | 175.7k | 122.3k | **1.44x** |
+| precompressed (.gz 8 KiB) | GET /f8k | 148.1k | 95.8k | **1.55x** |
+| proxy_cache HIT | GET /cached | 95.2k | 150.4k | 0.63x |
+| limit_req accepted | GET /limited | ~2.0k/s (rest 503) | ~2.0k/s (rest 503) | parity |
+
+- headers/auth/precompressed: Zocket leads — the header ops ride the
+  log-phase chain on pre-rendered arena values and the .gz twin path is a
+  single open+read vs nginx's gzip_static filter stack.
+- proxy_cache HIT trails: our `LruStore.lookup` is a linear scan under one
+  zone mutex vs nginx's shm rbtree. Known cost; hash-bucketed index is the
+  follow-up.
+- limit_req: both engines accept ~rate+burst and shed the rest as 503
+  (nginx 12.1k accepted / 1.28M shed per 6 s rep; Zocket identical shape).
+- Graph: `bench/graphs/backlog_compare.png`; JSON in
+  `bench/results/backlog/<cell>/`.
+
+**Known issue**: intermittent SIGSEGV of the front server under the full
+mixed-cell suite (~once per suite, 4 threads; never reproduced per-cell or
+under gdb). Repro recipe: `bash bench/backlog-bench.sh --reps 3`.
+Top-priority follow-up; affected reps are filtered from medians.
+

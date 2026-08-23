@@ -157,8 +157,12 @@ fn runLookup(ctx: *Context) anyerror!Action {
     const now = ctx.now_ns;
     const st = getStore(budgetFor(ctx));
     const e = st.lookup(key) orelse return .pass; // MISS: proxy takes over
+    // Copy into the request arena immediately: the store entry can be
+    // evicted (freed) by another reactor thread the moment we drop the
+    // zone mutex; serving from store memory would race that free.
+    const blob = ctx.sharedDupe(e.bytes) orelse return error.OutOfMemory;
 
-    const s = deserialize(e.bytes) orelse return .pass;
+    const s = deserialize(blob) orelse return .pass;
     const ttl_ns = @as(u64, routeTtl(ctx.route.?)) * std.time.ns_per_s;
     const swr_ns = @as(u64, ctx.route.?.cache_swr_seconds) * std.time.ns_per_s;
     const age = now -% e.meta; // meta = stored_at_ns

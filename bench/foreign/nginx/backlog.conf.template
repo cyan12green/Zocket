@@ -1,0 +1,62 @@
+# nginx counterpart for the backlog benchmark (same five endpoints).
+worker_processes 4;
+daemon off;
+error_log @@ERRLOG@@ crit;
+pid @@PREFIX@@/nginx.pid;
+
+events {
+    worker_connections 16384;
+}
+
+http {
+    access_log off;
+    server_tokens off;
+    keepalive_timeout 65;
+    keepalive_requests 100000;
+    sendfile on;
+    sendfile_max_chunk 1m;
+
+    # cache_hit cell: proxy_cache in front of an origin echo endpoint
+    proxy_cache_path @@CACHEDIR@@ levels=1:2 keys_zone=backlog:16m max_size=64m inactive=600s;
+
+    upstream origin {
+        server 127.0.0.1:@@ORIGIN@@;
+        keepalive 64;
+    }
+
+    limit_req_zone $binary_remote_addr zone=lim:16m rate=2000r/s;
+
+    server {
+        listen 127.0.0.1:@@PORT@@;
+
+        location = /h {
+            add_header X-A "1" always;
+            add_header X-B $remote_addr always;
+            echo -n "";
+        }
+
+        location = /auth {
+            auth_basic "bench";
+            auth_basic_user_file @@HTPASSWD@@;
+            echo -n "";
+        }
+
+        location / {
+            gzip_static on;
+            root @@STATICDIR@@;
+        }
+
+        location = /cached {
+            proxy_pass http://origin;
+            proxy_cache backlog;
+            proxy_cache_valid 200 3600s;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+
+        location = /limited {
+            limit_req zone=lim burst=100 nodelay;
+            echo -n "";
+        }
+    }
+}
