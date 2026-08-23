@@ -5,6 +5,7 @@ const registry = @import("registry.zig");
 const response_mod = @import("../http/response.zig");
 const ct_pool = @import("../ct_pool.zig");
 const vars = @import("vars.zig");
+const htpasswd_mod = @import("htpasswd.zig");
 const regex_mod = @import("regex.zig");
 
 pub const Phase = phase_mod.Phase;
@@ -105,6 +106,11 @@ pub const Route = struct {
     /// post-processing): set / add / remove applied in declaration order to
     /// the final module-produced header set.
     headers_ops: []const HeaderOp = &.{},
+    /// Basic-auth challenge (auth_basic module): realm string plus the
+    /// comptime-embedded htpasswd table. Both must be present for the
+    /// module to engage; either directive auto-binds the module.
+    auth_basic_realm: ?[]const u8 = null,
+    auth_basic_users: []const htpasswd_mod.Entry = &.{},
     /// Index into Config.log_formats; null = none (off). The access_log
     /// module reads it; defaults to index 0 (the `combined` default) when
     /// the route binds `log access_log;` and no `access_log` directive is

@@ -7,6 +7,8 @@ const registry_mod = @import("registry.zig");
 const ct_pool = @import("../ct_pool.zig");
 const vars = @import("vars.zig");
 const regex_mod = @import("regex.zig");
+const htpasswd_mod = @import("htpasswd.zig");
+const embeds_mod = @import("embeds");
 
 const Config = config_mod.Config;
 const TlsConfig = config_mod.TlsConfig;
@@ -83,6 +85,8 @@ const H_return = keyHash("return");
 const H_add_header = keyHash("add_header");
 const H_set_header = keyHash("set_header");
 const H_remove_header = keyHash("remove_header");
+const H_auth_basic = keyHash("auth_basic");
+const H_auth_basic_user_file = keyHash("auth_basic_user_file");
 const H_set = keyHash("set");
 const H_proxy_pass = keyHash("proxy_pass");
 const H_upstream = keyHash("upstream");
@@ -167,6 +171,10 @@ const LocationSpec = struct {
     /// builder's header-op pool (headers module, post_access).
     header_ops_start: usize = 0,
     header_ops_len: usize = 0,
+    /// `auth_basic "<realm>";` / `auth_basic_user_file <path>;` — presence
+    /// of either binds the access-phase auth_basic module.
+    auth_realm: ?Str = null,
+    auth_file: ?Str = null,
 };
 
 /// A `set` declaration as parsed (value unresolved until build).
@@ -765,6 +773,29 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const hs = parseHeaderOpDirective(lx, b, name);
             appendHeaderOp(b, spec, hs);
         },
+        H_auth_basic => {
+            // `auth_basic "<realm>";` — realm may not contain a quote (it
+            // goes verbatim into WWW-Authenticate).
+            const r = lx.value(b, "auth_basic");
+            lx.expectTerminator("auth_basic");
+            const realm = resolve(r, b.strings.items[0..]);
+            if (std.mem.indexOfScalar(u8, realm, '"') != null) {
+                lx.fail("auth_basic: realm may not contain a double quote");
+            }
+            spec.auth_realm = r;
+            ensureModuleBound(b, spec, .access, "auth_basic");
+            b.cost += 8;
+        },
+        H_auth_basic_user_file => {
+            // `auth_basic_user_file <path>;` — root-relative, embedded at
+            // comptime like static `embed` paths (missing file = compile
+            // error from @embedFile naming the path).
+            const f = lx.value(b, "auth_basic_user_file");
+            lx.expectTerminator("auth_basic_user_file");
+            spec.auth_file = f;
+            ensureModuleBound(b, spec, .access, "auth_basic");
+            b.cost += 8;
+        },
         H_access_log => {
             const t = lx.token() orelse lx.fail("access_log: expected a format name or off");
             const s = t.srcOf("access_log: value cannot contain escapes");
@@ -1111,6 +1142,11 @@ fn build(b: *const Builder) Config {
                 .set_vars = route_sets,
                 .proxy_headers = proxy_table.items[pr.start..][0..pr.len],
                 .headers_ops = header_op_table.items[header_op_table.ranges[ri].start..][0..header_op_table.ranges[ri].len],
+                .auth_basic_realm = if (spec.auth_realm) |r| resolve(r, strings) else null,
+                .auth_basic_users = if (spec.auth_file) |f|
+                    htpasswd_mod.parse(embeds_mod.embed(resolve(f, strings)))
+                else
+                    &.{},
                 .upstreams = up_table.items[ur.start..][0..ur.len],
                 .balance = spec.balance,
                 .max_fails = spec.max_fails,

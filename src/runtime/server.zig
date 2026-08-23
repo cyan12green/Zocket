@@ -297,6 +297,41 @@ test "comptime server dispatches a route with multiple phases via the dispatch f
     try testing.expectEqual(pipeline.Outcome.not_handled, try srv.handleRequest(&ctx2));
 }
 
+test "auth_basic guards a conf route end to end" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /private {
+        \\        content echo;
+        \\        auth_basic "Private";
+        \\        auth_basic_user_file "testdata/htpasswd";
+        \\    }
+        \\}
+    );
+    const srv = Server.comptimeInit(cfg);
+
+    // No credentials -> 401 challenge.
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/private";
+    req.decoded_target = "/private";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+    try testing.expectEqual(registry.Status.unauthorized, resp.status);
+
+    // bob:bobpw (base64) passes the htpasswd table and reaches echo.
+    var ok = registry.Request.init(testing.allocator);
+    defer ok.deinit();
+    ok.target = "/private";
+    ok.decoded_target = "/private";
+    ok.body = "hi";
+    _ = ok.addHeaderParsed("Authorization", "Basic Ym9iOmJvYnB3") catch unreachable;
+    var ok_resp = registry.Response.init(.ok);
+    var ok_ctx = pipeline.Context{ .req = &ok, .resp = &ok_resp };
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ok_ctx));
+    try testing.expectEqualStrings("hi", ok_resp.body);
+}
+
 test "headers module applies ops through the comptime dispatch" {
     const cfg = comptime Config.fromConfComptime(
         \\server {

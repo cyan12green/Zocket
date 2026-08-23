@@ -187,6 +187,7 @@ pub const default_registry = Registry(.{
     @import("modules/error_log.zig").error_log,
     @import("modules/stub_status.zig").stub_status,
     @import("modules/headers.zig").headers,
+    @import("modules/auth_basic.zig").auth_basic,
 });
 
 const testing = std.testing;

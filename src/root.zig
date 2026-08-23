@@ -88,6 +88,8 @@ comptime {
     _ = @import("http/header_dfa.zig");
     _ = @import("http/websocket.zig");
     _ = @import("dsl/modules/headers.zig");
+    _ = @import("dsl/modules/auth_basic.zig");
+    _ = @import("dsl/htpasswd.zig");
     _ = @import("http/arena.zig");
     _ = @import("http2/hpack.zig");
     _ = @import("http2/frames.zig");
