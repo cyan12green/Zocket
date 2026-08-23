@@ -780,24 +780,32 @@ receive path -> QUIC handshake -> HTTP/3 framing -> ALPN `h3`.
 
 ## Planned after protocol completeness
 
-Lower-priority backlog (nginx module parity, proxy, observability,
-robustness) tracked here; formal milestone numbers are assigned when each
-is picked up.
+Most of this backlog SHIPPED as registry modules (2026-08-23), built on
+two framework additions — the shared request memory
+(`ctx.sharedAlloc/sharedDupe/sharedFmt`, reclaimed per response) and
+bounded shared-memory zones (`dsl/shmem.zig`: capped key tables +
+byte-budgeted LRU stores; nothing grows under load):
 
-- Rate limiting: `limit_req` (leaky bucket per key) + `limit_conn`
-  (per-IP concurrency cap).
-- Brotli + zstd compression, and serving precompressed `.gz`/`.br`
-  (comptime precompression — the deferred M9 Part B).
-- Request/response header manipulation module (`headers_filter`/`map`
-  equivalent): add/remove/rewrite headers per route.
-- `auth_basic` (htpasswd) and `auth_request` (subrequest auth).
-- Per-request timeouts: `client_header_timeout`, `client_body_timeout`
-  (slowloris defense beyond the existing idle timeout).
-- HTTP response caching (`proxy_cache`-style) with LRU +
-  stale-while-revalidate on the existing ETag/304 infrastructure.
-- Load balancing: `random`, consistent-hash (`upstream_hash`),
-  `least_time` (per-backend latency EWMA); active health checks.
-- Sticky sessions (cookie-based).
+- DONE Rate limiting: `limit_req` (leaky bucket per client key, full-burst
+  start) + `limit_conn` (per-key in-flight cap) with an always-run log-phase
+  release half.
+- PARTIAL Precompressed serving: `precompressed gz;` serves .gz twins
+  (nginx gzip_static). Runtime brotli/zstd need vendored codecs; comptime
+  precompression stays deferred (M9 Part B).
+- DONE Header manipulation: `add_header` (universal now) / `set_header` /
+  `remove_header` with nginx `always` gating and server→location
+  inheritance.
+- DONE `auth_basic` (comptime htpasswd: plaintext/{SHA}/bcrypt) and
+  `auth_request` (internal subrequests via a typed Context hook).
+- DONE Per-request timeouts: `client_header_timeout` (TOTAL-from-first-byte,
+  anti-slowloris) + `client_body_timeout` (inactivity gap); reactor-level by
+  nature.
+- DONE Response caching: `proxy_cache` on bounded shmem zones — HIT/STALE/
+  conditional revalidation converting upstream 304s back to stored 200s.
+- DONE Load balancing: `random`, `consistent_hash`, `least_time` (EWMA);
+  sticky sessions via cookie affinity. Active health checks remain open.
+- Open leftovers: active health checks, brotli/zstd codecs, runtime zone
+  size knobs beyond `proxy_cache_max_bytes`.
 - Traffic mirroring (nginx `mirror`).
 - Prometheus `/metrics` endpoint and structured JSON access logs.
 - OpenTelemetry trace spans.

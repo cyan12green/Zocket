@@ -381,6 +381,180 @@ Registered modules:
 | `gzip` | log | compresses the final body when the client sent `Accept-Encoding: gzip` and it shrinks (min 20 bytes) |
 | `access_log` | log | writes an access line per request (named `log_format` or `combined`) |
 | `error_log` | log | error logging |
+| `headers` | log | applies the route's `set_header` / `add_header` / `remove_header` ops to the final header set (auto-bound when any is declared) |
+| `auth_basic` | access | Basic auth against a comptime-embedded htpasswd table; 401 + challenge on failure |
+| `auth_request` | access | forwards `auth_request <uri>` through an internal subrequest; 2xx admits, failures copy status |
+| `limit_req` | access | leaky-bucket rate limit per client key (`limit_req rate=N burst=M`), excess → 503 |
+| `limit_conn` | access | per-key in-flight cap (`limit_conn N`) |
+| `limit_conn_release` | log | releases the limit_conn slot for this request (auto-bound pair) |
+| `precompressed` | content | serves `.gz` siblings with Content-Encoding when the client accepts gzip |
+| `proxy_cache` | rewrite | response cache lookup: HIT / STALE within grace, conditional revalidation on expiry |
+| `proxy_cache_store` | log | stores origin 200s; converts upstream 304 back to the stored 200 |
+
+### auth_basic
+
+Syntax: `auth_basic "<realm>";`
+
+Default: —
+
+Context: location
+
+Enables HTTP Basic authentication for the location. Pairs with
+[auth_basic_user_file](#auth_basic_user_file); either directive binds the
+module. Failures answer 401 with a `WWW-Authenticate` challenge and stop
+the chain before content runs.
+
+### auth_basic_user_file
+
+Syntax: `auth_basic_user_file <path>;`
+
+Default: —
+
+Context: location
+
+Path (root-relative, embedded at comptime like [embed](#embed)) of an
+htpasswd file: `user:secret` lines, `#` comments. Secret formats:
+plaintext, `{SHA}base64(sha1)` and bcrypt (`$2a$`/`$2b$`/`$2y$`). A missing
+file is a compile error.
+
+### auth_request
+
+Syntax: `auth_request <uri>;`
+
+Default: —
+
+Context: location
+
+Runs `<uri>` as an internal subrequest (full pipeline, Authorization
+header inherited). A 2xx verdict admits the request; anything else is
+copied as the client-facing status. Nested auth_request locations answer
+500 instead of recursing.
+
+### balance (extended)
+
+`balance random|consistent_hash|least_time` join round_robin /
+least_connections / ip_hash: random picks uniformly among usable
+backends; consistent_hash maps the client IP deterministically to one
+backend while it stays usable; least_time prefers the lowest EWMA of
+upstream latency.
+
+### client_body_timeout
+
+Syntax: `client_body_timeout <seconds>;`
+
+Default: `30`
+
+Context: main
+
+Inactivity gap tolerated between request-body bytes. 0 leaves the idle
+timeout as the only guard.
+
+### client_header_timeout
+
+Syntax: `client_header_timeout <seconds>;`
+
+Default: `10`
+
+Context: main
+
+TOTAL wall time allowed for the request line + headers from first byte,
+regardless of activity (anti-slowloris). 0 disables.
+
+### limit_conn
+
+Syntax: `limit_conn <n>;`
+
+Default: —
+
+Context: location
+
+Max simultaneous in-flight requests per client key; excess answers 503.
+Binds `limit_conn` + its release half automatically.
+
+### limit_req
+
+Syntax: `limit_req rate=<r> burst=<b>;`
+
+Default: —
+
+Context: location
+
+Leaky bucket per client key: sustained `r` requests/second with room for
+`b` burst (defaults to `rate`). Fresh keys start with a full bucket.
+Excess answers 503.
+
+### precompressed
+
+Syntax: `precompressed gz;`
+
+Default: —
+
+Context: location
+
+Serve a `.gz` sibling file (same path + `.gz`) with
+`Content-Encoding: gzip` when the client accepts it; otherwise falls
+through to the next module.
+
+### proxy_cache
+
+Syntax: `proxy_cache on|off;`
+
+Default: `off`
+
+Context: location
+
+Response caching for proxied routes. Binds the lookup + store halves.
+Place before `rewrite proxy;`. Fresh entries serve as HIT; expired ones
+revalidate conditionally via If-None-Match; see also
+[proxy_cache_valid](#proxy_cache_valid).
+
+### proxy_cache_stale_while_revalidate
+
+Syntax: `proxy_cache_stale_while_revalidate <seconds>;`
+
+Default: `0`
+
+Context: location
+
+Grace past expiry during which the stale representation is served
+immediately (`X-Cache: STALE`).
+
+### proxy_cache_valid
+
+Syntax: `proxy_cache_valid <seconds>;`
+
+Default: `60`
+
+Context: location
+
+Fresh window of cached responses.
+
+### set_header / remove_header
+
+Syntax: `set_header <name> "<value>";` / `remove_header <name>;`
+
+Default: —
+
+Context: location, server
+
+Response-header manipulation applied by the auto-bound `headers` module:
+`add_header` appends (or decorates fixed-response templates), `set_header`
+replaces-or-appends, `remove_header` drops every header of that name.
+`add_header`/`set_header` accept nginx's trailing `always` flag; without
+it they apply only to 200/201/204/206/301/302/303/304/307/308.
+Server-scope declarations are inherited by locations that declare none.
+
+### sticky_cookie
+
+Syntax: `sticky_cookie <name>;`
+
+Default: —
+
+Context: location (proxy routes)
+
+Cookie-based backend affinity: clients presenting `<name>=s<idx>` are
+pinned to that backend while usable; new clients receive
+`Set-Cookie: <name>=s<pick>; Path=/`.
 
 ### proxy_pass
 
