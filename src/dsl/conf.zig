@@ -94,6 +94,8 @@ const H_sticky_cookie = keyHash("sticky_cookie");
 const H_precompressed = keyHash("precompressed");
 const H_auth_request = keyHash("auth_request");
 const H_proxy_cache = keyHash("proxy_cache");
+const H_client_header_timeout = keyHash("client_header_timeout");
+const H_client_body_timeout = keyHash("client_body_timeout");
 const H_proxy_cache_valid = keyHash("proxy_cache_valid");
 const H_proxy_cache_swr = keyHash("proxy_cache_stale_while_revalidate");
 const H_limit_req = keyHash("limit_req");
@@ -527,6 +529,22 @@ const Lexer = struct {
 /// the directive was a block (which consumed its closing brace).
 fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool {
     switch (keyHash(name)) {
+        H_client_header_timeout => {
+            const t = lx.token() orelse lx.fail("client_header_timeout: expected seconds");
+            const vs = t.srcOf("client_header_timeout: value cannot contain escapes");
+            b.limits.client_header_timeout_s = std.fmt.parseInt(u64, vs, 10) catch
+                lx.fail("client_header_timeout: bad seconds");
+            lx.expectTerminator("client_header_timeout");
+            b.cost += 4;
+        },
+        H_client_body_timeout => {
+            const t = lx.token() orelse lx.fail("client_body_timeout: expected seconds");
+            const vs = t.srcOf("client_body_timeout: value cannot contain escapes");
+            b.limits.client_body_timeout_s = std.fmt.parseInt(u64, vs, 10) catch
+                lx.fail("client_body_timeout: bad seconds");
+            lx.expectTerminator("client_body_timeout");
+            b.cost += 4;
+        },
         H_recv_buffer_size => {
             b.limits.recv_buffer_size = lx.size(name);
             lx.expectTerminator(name);

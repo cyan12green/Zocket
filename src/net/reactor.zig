@@ -111,6 +111,10 @@ const HttpSession = struct {
     /// M18: true once a 101 Switching Protocols handshake has been sent and
     /// the connection left HTTP behind (websocket byte-pipe mode).
     upgraded: bool = false,
+    /// Request-timeout bookkeeping (slowloris defense): when the first byte
+    /// of this request arrived and when the last successful recv happened.
+    first_byte_at: ?std.time.Instant = null,
+    last_rx_at: ?std.time.Instant = null,
     /// Scratch for the 101 handshake head (upgradeConnection); 160 covers
     /// the websocket head with digest plus slack.
     upgrade_head_scratch: [160]u8 = undefined,
@@ -196,6 +200,8 @@ pub const Reactor = struct {
     listener: posix.fd_t = -1,
     /// Total accepted counter shared with the server (bumped per accept).
     accepted_counter: ?*std.atomic.Value(usize) = null,
+    /// Last wall tick the request-timeout sweep ran (1 Hz gating).
+    last_timeout_sweep_tick: u64 = 0,
     /// Graceful-drain mode (Milestone 13): stop accepting new connections
     /// and exit the loop once the connection map empties (or a timeout).
     draining: std.atomic.Value(bool) = .init(false),
@@ -438,6 +444,7 @@ pub const Reactor = struct {
                 if (now.since(self.drain_started) > drain_timeout_ns) break;
             }
             self.advanceTimers();
+            self.enforceRequestTimeouts();
             const n = self.ep.wait(&events, 100) catch continue;
             // Refresh the cached Date after the wait: a request that just
             // woke the loop is handled with a fresh second (stale by the µs
@@ -490,6 +497,53 @@ pub const Reactor = struct {
     fn onExpired(self: *Reactor, entry: *timer_wheel.TimerEntry) void {
         const conn: *connection.Connection = @fieldParentPtr("timer", entry);
         self.expired_fds.append(self.allocator, conn.fd) catch {};
+    }
+
+    /// Per-request deadlines (slowloris defense; runs at most once per
+    /// second): headers must COMPLETE within client_header_timeout_s of the
+    /// first byte regardless of activity (dribbling resets the idle timer,
+    /// not this); body reads may pause at most client_body_timeout_s.
+    fn enforceRequestTimeouts(self: *Reactor) void {
+        const hdr_s = self.limits.client_header_timeout_s;
+        const body_s = self.limits.client_body_timeout_s;
+        if (hdr_s == 0 and body_s == 0) return;
+        const now = std.time.Instant.now() catch return;
+
+        // At-most-once-per-second gate (wheel ticks are 1s apart).
+        const tick = self.nowTick();
+        if (tick == self.last_timeout_sweep_tick) return;
+        self.last_timeout_sweep_tick = tick;
+
+        var expired: [64]posix.fd_t = undefined;
+        var n_expired: usize = 0;
+        var it = self.http_sessions.iterator();
+        outer: while (it.next()) |kv| {
+            const fd = kv.key_ptr.*;
+            const sess = kv.value_ptr.*;
+            if (sess.upgraded or sess.h2 != null or sess.tls != null or sess.writing) continue;
+            const first = sess.first_byte_at orelse continue;
+            const header_phase = switch (sess.parser.state) {
+                .request_line, .headers => true,
+                else => false,
+            };
+            if (header_phase) {
+                if (hdr_s == 0) continue;
+                if (now.since(first) < hdr_s * std.time.ns_per_s) continue;
+            } else {
+                if (body_s == 0) continue;
+                const last = sess.last_rx_at orelse continue;
+                if (now.since(last) < body_s * std.time.ns_per_s) continue;
+            }
+            if (n_expired < expired.len) {
+                expired[n_expired] = fd;
+                n_expired += 1;
+                continue :outer;
+            }
+            break;
+        }
+        for (expired[0..n_expired]) |fd| {
+            self.removeConnection(fd);
+        }
     }
 
     /// Stub-status accounting: the session moved from reading to writing
@@ -603,18 +657,23 @@ pub const Reactor = struct {
                 }
                 got_data = true;
             }
+            const now_inst = std.time.Instant.now() catch null;
             if (got_data) {
                 self.rearmTimer(conn);
                 if (self.stats) |s| {
-                    const session = self.http_sessions.getPtr(fd) orelse return;
-                    if (session.stat_state == .waiting) {
-                        session.stat_state = .reading;
+                    const session0 = self.http_sessions.getPtr(fd) orelse return;
+                    if (session0.stat_state == .waiting) {
+                        session0.stat_state = .reading;
                         _ = s.waiting.fetchSub(1, .monotonic);
                         _ = s.reading.fetchAdd(1, .monotonic);
                     }
                 }
             }
             const session = self.http_sessions.getPtr(fd) orelse return;
+            if (now_inst) |t| {
+                if (session.first_byte_at == null) session.first_byte_at = t;
+                session.last_rx_at = t;
+            }
             if (!session.writing or session.h2 != null) self.processHttp(fd);
         }
 
@@ -2248,6 +2307,70 @@ fn wsMaskedFrame(buf: []u8, opcode: websocket_mod.Opcode, payload: []const u8) [
     pos += 4;
     for (payload, 0..) |c, i| buf[pos + i] = c ^ mask[i % 4];
     return buf[0 .. pos + payload.len];
+}
+
+test "slowloris: dribbling headers still dies at the header deadline" {
+    // The idle timer resets on every byte; the HEADER deadline does not.
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    r.limits.client_header_timeout_s = 1;
+    r.limits.client_body_timeout_s = 0;
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Dribble one byte every 200ms for ~1.2s: activity keeps the idle
+    // timer happy, but headers must complete within 1s total.
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        try writeAll(pair[0], "G");
+        std.posix.nanosleep(0, 200 * std.time.ns_per_ms);
+        if (i >= 4) {
+            // By now the deadline has passed; expect the server to hang up.
+            var buf: [64]u8 = undefined;
+            if (readUntil(pair[0], &buf, 1, 400)) |n| {
+                try testing.expectEqual(@as(usize, 0), n); // EOF == closed
+            } else |e| {
+                try testing.expectEqual(error.Eof, e);
+            }
+            return; // deadline enforced: test complete
+        }
+    }
+    return error.HeaderDeadlineNotEnforced;
+}
+
+test "body inactivity gap closes the connection (client_body_timeout)" {
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    r.limits.client_header_timeout_s = 0;
+    r.limits.client_body_timeout_s = 1;
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Headers complete, body stalls mid-stream.
+    try writeAll(pair[0], "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 100\r\n\r\nab");
+    var buf: [64]u8 = undefined;
+    const res = readUntil(pair[0], &buf, 1, 2500);
+    try testing.expectError(error.Eof, res);
 }
 
 test "reactor upgrades to websocket and echoes frames after the 101" {

@@ -7,6 +7,14 @@ const std = @import("std");
 pub const Limits = struct {
     /// Byte budget for the proxy_cache response zone (0 = built-in default).
     proxy_cache_max_bytes: usize = 0,
+    /// Total wall time allowed for the request line + headers, regardless
+    /// of activity — the anti-slowloris teeth (dribbling bytes resets the
+    /// idle timer but not this deadline). nginx's client_header_timeout is
+    /// inactivity-based; this is deliberately stricter. 0 disables.
+    client_header_timeout_s: u64 = 10,
+    /// Inactivity gap tolerated between request-body bytes (nginx
+    /// client_body_timeout semantics). 0 leaves the idle timeout only.
+    client_body_timeout_s: u64 = 30,
     /// Initial per-connection receive buffer size.
     recv_buffer_size: usize = 16384,
     /// Initial per-connection send buffer size.
