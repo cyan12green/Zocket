@@ -18,6 +18,7 @@ pub const http = struct {
     pub const parser = @import("http/parser.zig");
     pub const response = @import("http/response.zig");
     pub const header_dfa = @import("http/header_dfa.zig");
+    pub const websocket = @import("http/websocket.zig");
     pub const arena = @import("http/arena.zig");
 };
 
@@ -85,6 +86,7 @@ comptime {
     _ = @import("http/response.zig");
     _ = @import("http/mime.zig");
     _ = @import("http/header_dfa.zig");
+    _ = @import("http/websocket.zig");
     _ = @import("http/arena.zig");
     _ = @import("http2/hpack.zig");
     _ = @import("http2/frames.zig");

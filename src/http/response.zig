@@ -19,6 +19,7 @@ pub const Status = enum(u16) {
     internal_error = 500,
     not_implemented = 501,
     bad_gateway = 502,
+    switching_protocols = 101,
 
     pub fn reasonPhrase(self: Status) []const u8 {
         return switch (self) {
@@ -36,6 +37,7 @@ pub const Status = enum(u16) {
             .internal_error => "Internal Server Error",
             .not_implemented => "Not Implemented",
             .bad_gateway => "Bad Gateway",
+            .switching_protocols => "Switching Protocols",
         };
     }
 };

@@ -69,6 +69,7 @@ pub const header_hasher = struct {
         "authorization",
         "referer",
         "upgrade",
+        "sec-websocket-key",
         "expect",
     };
 
@@ -118,6 +119,7 @@ pub const HeaderTag = enum(u16) {
     authorization,
     referer,
     upgrade,
+    sec_websocket_key,
     expect,
 
     /// Tag for a comptime-known header name (compile-time constant used in
@@ -145,6 +147,7 @@ pub const header_dfa = header_dfa_mod.build(&.{
     .{ .name = "authorization", .tag = @intFromEnum(HeaderTag.authorization) },
     .{ .name = "referer", .tag = @intFromEnum(HeaderTag.referer) },
     .{ .name = "upgrade", .tag = @intFromEnum(HeaderTag.upgrade) },
+    .{ .name = "sec-websocket-key", .tag = @intFromEnum(HeaderTag.sec_websocket_key) },
     .{ .name = "expect", .tag = @intFromEnum(HeaderTag.expect) },
 });
 

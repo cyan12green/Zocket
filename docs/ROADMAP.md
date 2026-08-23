@@ -715,19 +715,31 @@ over the h2c numbers, documented in `bench/BENCH.md`).
 
 ### M18 — WebSocket and connection upgrade
 
-**Status: PLANNED**. The parser already classifies `upgrade`; implement
-protocol switching: on `Connection: upgrade` + `Upgrade: <proto>` return
-101 and hand the connection over (the reactor stops HTTP parsing and the
-session becomes a raw byte pipe, or a websocket content module owns the
-connection). RFC 6455 framing (FIN/opcode/mask/length) for a native
-websocket echo module; upstream passthrough for proxied `ws://`.
+**Status: DONE** (2026-08-23). `src/http/websocket.zig` (RFC 6455): the
+§4.2.2 handshake digest (`acceptKey` = base64(SHA-1(key || GUID)), verified
+against the RFC §1.3 example vector) and a frame codec — client-frame decode
+with mandatory masking enforced in place, RSV=0, control frames ≤ 125 B and
+FIN-only, 7/16/64-bit lengths; server-frame head encode. The reactor detects
+`Connection: upgrade` + `Upgrade: <proto>` on complete GET requests with
+`Sec-WebSocket-Version: 13`, answers `101 Switching Protocols`
+(`Sec-WebSocket-Accept` included for websocket) and flips the session to a
+byte pipe: HTTP parsing stops and `processWebsocket` answers frames from the
+receive buffer (text/binary echo unmasked, ping→pong, close→close echo +
+teardown, fragmentation and reserved opcodes rejected per §5.4). Non-RFC
+upgrade attempts (wrong version/method) stay plain HTTP. The 101 carries no
+Content-Length/body framing (RFC 9110 §9.4.2). Gates met: 8 websocket codec
+tests + 2 reactor e2e tests over socketpairs (handshake vector, masked text
+echo, ping→pong, close→EOF; rejection paths), `zig build test` 280/280.
+Upstream `ws://` passthrough for the proxy module remains open (backlog).
 
-(Note: the M18 session-ticket work originally planned under M17 was
-delivered there — TLS reactor integration, config `tls`, resumption
-tickets and HTTPS benchmarks landed with M17/M18's TLS scope.)
+> **Note**: the M18 session-ticket work originally planned under M17 was
+> delivered there — TLS reactor integration, config `tls`, resumption
+> tickets and HTTPS benchmarks landed with M17/M18's TLS scope.
 
-**Verification**: ws clients (e.g. `websocat`), the existing socketpair
-reactor tests extended for the post-101 raw phase.
+**Verification**: the socketpair reactor tests extended for the post-101 raw
+phase (masked client frames from the RFC §5.7 example, exact wire bytes on
+echoes), plus `websocat`-style hand-rolled clients against
+`zig build run -- --http`.
 
 ---
 
@@ -868,7 +880,8 @@ budget check), M-B/M-C (complex values, variables, `set` —
 `src/dsl/vars.zig`: `Frag`/`VarId`, getters, `parseComplexValue`,
 `renderComplex`, complex-value `return`/`add_header`/`log_format`, the
 `access_log` rewrite on `LogFormat`), M-D (regex engine + router
-integration) and M-E (`proxy_set_header`). Remaining candidates: the
-WebSocket track (M18), HTTP/3 (M19), or the planned-after-protocol backlog
+integration) and M-E (`proxy_set_header`). M18 (WebSocket + connection
+upgrade) has since shipped. Remaining candidates: HTTP/3 (M19), the proxy
+`ws://` passthrough left open by M18, or the planned-after-protocol backlog
 (rate limiting, header manipulation, auth, per-request timeouts,
 `proxy_cache`, IPv6 listeners).

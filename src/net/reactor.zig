@@ -18,6 +18,7 @@ const http2_session = @import("../http2/session.zig");
 const tls_conn = @import("../tls/conn.zig");
 const buffer_mod = @import("buffer.zig");
 const http2_frames = @import("../http2/frames.zig");
+const websocket_mod = @import("../http/websocket.zig");
 
 /// I/O backend selection. Default: epoll (measured at parity with the ring
 /// on the keep-alive workloads and more robust at high connection counts).
@@ -107,6 +108,12 @@ const HttpSession = struct {
     /// until the op is processed, so it must outlive flushHttp's stack).
     write_iovs: [3]posix.iovec_const = undefined,
     write_iov_count: usize = 0,
+    /// M18: true once a 101 Switching Protocols handshake has been sent and
+    /// the connection left HTTP behind (websocket byte-pipe mode).
+    upgraded: bool = false,
+    /// Scratch for the 101 handshake head (upgradeConnection); 160 covers
+    /// the websocket head with digest plus slack.
+    upgrade_head_scratch: [160]u8 = undefined,
 };
 
 /// A single-reactor worker: its own thread, its own epoll instance and its own
@@ -633,6 +640,13 @@ pub const Reactor = struct {
             if (session.writing and session.h2 == null and
                 (session.tls == null or session.tls.?.stage() == .application)) return;
 
+            // M18: upgraded connections left HTTP behind — their bytes are
+            // websocket frames now.
+            if (session.upgraded) {
+                self.processWebsocket(fd);
+                return;
+            }
+
             // TLS detection (M18): a connection whose first record is a
             // ClientHello (handshake record type 22, legacy version 3.x,
             // handshake type 1) switches to the TLS 1.3 session.
@@ -700,11 +714,138 @@ pub const Reactor = struct {
                     return;
                 },
                 .complete => {
+                    // M18: connection upgrade (RFC 6455 §4.2 and friends): on
+                    // `Connection: upgrade` + `Upgrade: <proto>` reply
+                    // 101 Switching Protocols and hand the connection over —
+                    // HTTP parsing stops and the session becomes a byte pipe
+                    // driven by the websocket framing path.
+                    var wants_upgrade = false;
+                    var upgrade_proto: []const u8 = "";
+                    var ws_key: []const u8 = "";
+                    for (session.req.slots[0..session.req.header_count]) |slot| {
+                        switch (slot.tag) {
+                            .upgrade => upgrade_proto = slot.value,
+                            .sec_websocket_key => ws_key = slot.value,
+                            .connection => {
+                                if (std.ascii.indexOfIgnoreCase(slot.value, "upgrade") != null) {
+                                    wants_upgrade = true;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    // RFC 6455 §4.2.1: only a GET asking for version 13 may
+                    // switch protocols; anything else is handled as plain HTTP.
+                    const ws_version_ok = blk: {
+                        const v = session.req.header("sec-websocket-version") orelse break :blk false;
+                        break :blk std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "13");
+                    };
+                    if (wants_upgrade and !session.upgraded and
+                        session.req.method == .get and ws_version_ok)
+                    {
+                        self.upgradeConnection(fd, upgrade_proto, ws_key);
+                        return;
+                    }
                     if (self.handleHttpRequest(fd, false)) continue;
                     return;
                 },
             }
         }
+    }
+
+    /// Send the 101 Switching Protocols handshake and flip the session into
+    /// upgraded (byte-pipe) mode. `ws_key` is the client's Sec-WebSocket-Key;
+    /// when the protocol is websocket the RFC 6455 §4.2.2 Sec-WebSocket-Accept
+    /// digest is appended so real ws clients accept the handshake.
+    fn upgradeConnection(self: *Reactor, fd: posix.fd_t, proto: []const u8, ws_key: []const u8) void {
+        const conn = self.connections.get(fd) orelse return;
+        const session = self.http_sessions.getPtr(fd) orelse return;
+        const head = websocket_mod.upgradeHead(proto, ws_key, &session.upgrade_head_scratch) orelse {
+            self.removeConnection(fd);
+            return;
+        };
+        conn.send_buf.compact();
+        _ = conn.send_buf.writeSlice(head);
+        session.close_after_write = false;
+        session.writing = true;
+        session.upgraded = true;
+        if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
+        self.markWriting(fd);
+        self.flushHttp(fd);
+    }
+
+    /// Post-101 traffic: parse RFC 6455 frames straight out of the receive
+    /// buffer (no HTTP parsing anymore) and answer them. Text/binary frames
+    /// echo back unmasked, ping gets pong, close gets a close echo and ends
+    /// the connection.
+    fn processWebsocket(self: *Reactor, fd: posix.fd_t) void {
+        while (true) {
+            // Re-fetched every frame: answering one may flush synchronously
+            // and tear the connection down (close frames), so nothing may be
+            // held across an iteration.
+            const conn = self.connections.get(fd) orelse return;
+            const session = self.http_sessions.getPtr(fd) orelse return;
+            if (session.writing) return; // flush first; bytes stay buffered
+            if (conn.recv_buf.availableRead() == 0) return;
+            var frame = websocket_mod.Frame{};
+            switch (websocket_mod.decode(conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos], &frame)) {
+                .incomplete => return,
+                .malformed => {
+                    self.removeConnection(fd);
+                    return;
+                },
+                .ok => {},
+            }
+            // Consume the whole frame up front: everything below either borrows
+            // the payload slice or drops it. No recv happens until the response
+            // has flushed, so the borrow stays valid (same invariant as the
+            // zero-copy Content-Length bodies).
+            conn.recv_buf.read_pos += frame.total_len;
+
+            switch (frame.opcode) {
+                .ping => self.websocketSendFrame(fd, session, .pong, frame.payload),
+                .pong => {}, // unsolicited pongs are dropped
+                .close => {
+                    self.websocketSendFrame(fd, session, .close, frame.payload);
+                    session.close_after_write = true;
+                    if (!session.writing) {
+                        // The echo flushed inline: tear down right away.
+                        self.removeConnection(fd);
+                    }
+                    // Either way this connection is done: the close reply is
+                    // the last thing it ever sends.
+                    return;
+                },
+                .text, .binary => self.websocketSendFrame(fd, session, frame.opcode, frame.payload),
+                .continuation => {
+                    // Fragmented messages are rejected outright (RFC 6455 §5.4
+                    // allows endpoints to fail on them): no reassembly state.
+                    self.removeConnection(fd);
+                    return;
+                },
+                else => {
+                    // Reserved/unknown opcode: protocol error, tear down.
+                    self.removeConnection(fd);
+                    return;
+                },
+            }
+        }
+    }
+
+    /// Queue one outbound websocket frame (head into the send buffer, payload
+    /// borrowed as the pending writev body).
+    fn websocketSendFrame(self: *Reactor, fd: posix.fd_t, session: *HttpSession, opcode: websocket_mod.Opcode, payload: []const u8) void {
+        const conn = self.connections.get(fd) orelse return;
+        var head_buf: [10]u8 = undefined;
+        const head = websocket_mod.encodeHead(opcode, payload.len, &head_buf);
+        conn.send_buf.compact();
+        _ = conn.send_buf.writeSlice(head);
+        session.pending_body = payload;
+        session.pending_body_owned = false;
+        session.pending_tail = &.{};
+        session.writing = true;
+        self.markWriting(fd);
+        self.flushHttp(fd);
     }
 
     /// Drain the ring's completions (called when the ring fd is epoll-ready)
@@ -2083,6 +2224,106 @@ fn testDateLine(buf: []u8) []const u8 {
     const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
     const date = cache_mod.formatHttpDate(@intCast(ts.sec), buf) orelse unreachable;
     return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Zocket/" ++ version_mod.version ++ "\r\n", .{date}) catch unreachable;
+}
+
+/// Build one masked client-to-server websocket frame (RFC 6455 §5.3): the
+/// client MUST mask; the key is fixed here so tests are deterministic.
+fn wsMaskedFrame(buf: []u8, opcode: websocket_mod.Opcode, payload: []const u8) []const u8 {
+    const mask = [_]u8{ 0x37, 0xfa, 0x21, 0x3d };
+    buf[0] = 0x80 | @as(u8, @intFromEnum(opcode));
+    var pos: usize = 2;
+    if (payload.len < 126) {
+        buf[1] = 0x80 | @as(u8, @intCast(payload.len));
+    } else {
+        buf[1] = 0x80 | 126;
+        std.mem.writeInt(u16, buf[2..4], @intCast(payload.len), .big);
+        pos = 4;
+    }
+    @memcpy(buf[pos..][0..4], &mask);
+    pos += 4;
+    for (payload, 0..) |c, i| buf[pos + i] = c ^ mask[i % 4];
+    return buf[0 .. pos + payload.len];
+}
+
+test "reactor upgrades to websocket and echoes frames after the 101" {
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Handshake: the RFC 6455 §1.3 example key.
+    try writeAll(pair[0], "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    const want_101 = "HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "\r\n";
+    var buf: [512]u8 = undefined;
+    const n1 = try readUntil(pair[0], &buf, want_101.len, 3000);
+    try testing.expectEqualStrings(want_101, buf[0..n1]);
+
+    // Post-101 raw phase: a masked text frame echoes back as an unmasked
+    // text frame (server frames are never masked).
+    var wire: [64]u8 = undefined;
+    try writeAll(pair[0], wsMaskedFrame(&wire, .text, "Hello"));
+    const n2 = try readUntil(pair[0], &buf, 7, 3000);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x05 } ++ "Hello".*, buf[0..n2]);
+
+    // Ping -> pong with the payload preserved.
+    try writeAll(pair[0], wsMaskedFrame(&wire, .ping, "pi"));
+    const n3 = try readUntil(pair[0], &buf, 4, 3000);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x8A, 0x02, 'p', 'i' }, buf[0..n3]);
+
+    // Close -> close echo, then the server tears the connection down (EOF).
+    try writeAll(pair[0], wsMaskedFrame(&wire, .close, ""));
+    const n4 = try readUntil(pair[0], &buf, 2, 3000);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x00 }, buf[0..n4]);
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+}
+
+test "reactor leaves non-RFC upgrade requests as plain HTTP" {
+    // RFC 6455 §4.2.1: missing/wrong Sec-WebSocket-Version or a non-GET
+    // method must not switch protocols.
+    const cases = [_][]const u8{
+        // Version absent.
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        // Wrong version.
+        "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n",
+        // POST cannot upgrade.
+        "POST /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n",
+    };
+    for (cases) |wire| {
+        const allocator = testing.allocator;
+        var r = try Reactor.init(allocator, 0, .http);
+        defer r.deinit();
+        try r.start();
+        defer r.join();
+        defer r.stop();
+
+        const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer posix.close(pair[0]);
+        try sockets.setNonBlock(pair[0]);
+        try sockets.setNonBlock(pair[1]);
+
+        const conn = try connection.Connection.create(allocator, pair[1]);
+        r.attach(conn);
+
+        try writeAll(pair[0], wire);
+        var buf: [512]u8 = undefined;
+        const n = try readUntil(pair[0], &buf, "HTTP/1.1 ".len + 3, 3000);
+        // A normal HTTP status came back — never a protocol switch.
+        try testing.expect(!std.mem.startsWith(u8, buf[0..n], "HTTP/1.1 101"));
+    }
 }
 
 test "reactor serves HTTP with keep-alive and body echo" {
