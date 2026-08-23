@@ -94,6 +94,7 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
                     .pass => continue,
                     .handled => break :blk Outcome.handled,
                     .short_circuit => break :blk Outcome.not_handled,
+                    .async => return error.AsyncPending,
                 }
             }
         }
@@ -192,6 +193,7 @@ pub fn dispatchForRoute(comptime Registry: type, comptime route: router.Route) D
                         const run_fn = Registry.resolve(b.module).?;
                         switch (try run_fn(ctx)) {
                             .pass => {},
+                            .async => return error.AsyncPending,
                             .handled => {
                                 outcome = .handled;
                                 break :phases;

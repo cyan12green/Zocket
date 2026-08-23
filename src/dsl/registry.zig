@@ -76,8 +76,11 @@ pub const Module = struct {
     directives: []const []const u8 = &.{},
 };
 
-/// What a module run decided for the current request.
-pub const Action = enum {
+/// What a module run decided for the current request. `.async` parks the
+/// request: the reactor registers `ctx.async_fd` with the connection's
+/// event set and dispatches completions back into the module's stored
+/// state machine (upstream modules only).
+pub const Action = union(enum) {
     /// Do nothing; keep walking the phase chain.
     pass,
     /// A response is ready in `ctx.resp`; stop the chain.
@@ -85,6 +88,9 @@ pub const Action = enum {
     /// Stop the chain without producing a response (the caller sends the
     /// default response). Any phase may short-circuit this way.
     short_circuit,
+    /// Park until `ctx.async_fd` is ready (direction carried by the
+    /// module's own state machine).
+    async,
 };
 
 /// The mutable per-request state the pipeline passes to every module: the
@@ -141,6 +147,12 @@ pub const Context = struct {
     /// (compile-time checked via `state`/`setState`). Each module owns its
     /// slot for the duration of one walk — no cross-module collisions.
     module_states: [max_module_states]?*anyopaque = [_]?*anyopaque{null} ** max_module_states,
+    /// .async payload: upstream handle parked for reactor registration.
+    async_fd: std.posix.fd_t = -1,
+    /// Whether the running I/O backend can park requests (epoll yes;
+    /// io_uring/TLS fronts keep the synchronous driver). Set by the
+    /// runtime; modules check before returning .async.
+    async_supported: bool = false,
 
     /// Internal-subrequest hook (auth_request): installed by the reactor,
     /// implemented by the runtime Server so modules can run a request

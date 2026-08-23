@@ -25,6 +25,84 @@ pub const proxy = registry.Module{
     .run = run,
 };
 
+/// Set by the runtime when the io_uring backend is active: that loop has
+/// its own completion model, so upstreams fall back to the synchronous
+/// driver there.
+pub var force_sync_upstreams: bool = false;
+
+/// Everything the reactor needs to drive one parked upstream transaction.
+/// Lives in the request arena; the reactor reads it right after the walk
+/// returns .async and before anything resets the request.
+pub const ParkedPlan = struct {
+    fd: posix_fd,
+    backend_idx: usize,
+    route: *const registry.Route,
+    request: []const u8, // arena slice, fully built
+    offer_sticky: bool,
+    sticky_name: []const u8,
+    started_ns: u64,
+};
+
+/// Resolve the parked plan for the reactor (null when this walk was not a
+/// proxy park).
+pub fn takeParked(ctx: *Context) ?*ParkedPlan {
+    const p = ctx.getState("proxy") orelse return null;
+    return @ptrCast(@alignCast(p));
+}
+
+/// Build + connect + SEND nothing yet: returns a ParkedPlan with the
+/// connected non-blocking fd; the reactor registers it and drives
+/// send->read through driveUpstream().
+fn park(ctx: *Context) anyerror!Action {
+    const route = ctx.route orelse return .pass;
+    const upstreams = route.upstreams;
+    if (upstreams.len == 0 or upstreams.len > max_backends) return .pass;
+
+    const now_ns = nowNs();
+    if (route.sticky_cookie) |name| {
+        if (stickyBackendFromCookie(ctx, name, upstreams, route, now_ns)) |idx|
+            return parkAt(ctx, route, upstreams, idx, now_ns, false);
+    }
+    const pick = try pickBackend(route, upstreams, ctx, now_ns) orelse
+        return badGateway(ctx);
+    return parkAt(ctx, route, upstreams, pick, now_ns, route.sticky_cookie != null);
+}
+
+fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router.Upstream, pick: usize, started_ns: u64, offer_sticky: bool) anyerror!Action {
+    ensureHealthChecker(route);
+    const up = &upstreams[pick];
+    var fd = acquirePooled(pick, started_ns);
+    if (fd < 0) {
+        fd = connectUpstream(up) catch {
+            markFailure(pick, route, started_ns);
+            return badGateway(ctx);
+        };
+        setRecvTimeout(fd);
+    }
+    // Serialize fully NOW (arena-backed) so the reactor never touches the
+    // parser again while the transaction is parked.
+    const request = buildUpstreamRequest(ctx, up) catch {
+        posix_close(fd);
+        active[pick] -|= 1;
+        markFailure(pick, route, started_ns);
+        return badGateway(ctx);
+    };
+    const plan = ctx.sharedAlloc(@sizeOf(ParkedPlan)) orelse return error.OutOfMemory;
+    const plan_typed: *ParkedPlan = @ptrCast(@alignCast(plan));
+    plan_typed.* = .{
+        .fd = fd,
+        .backend_idx = pick,
+        .request = request,
+        .route = route,
+        .offer_sticky = offer_sticky,
+        .sticky_name = route.sticky_cookie orelse "",
+        .started_ns = started_ns,
+    };
+    ctx.setState("proxy", @ptrCast(plan_typed));
+    ctx.async_fd = fd;
+    return .async;
+}
+
 const max_backends = 8;
 
 threadlocal var epoch: std.time.Instant = undefined;
@@ -32,6 +110,11 @@ threadlocal var epoch_set = false;
 
 /// Monotonic nanoseconds since this thread's first proxy use (the retry
 /// windows and pool idle times only need relative comparisons).
+/// Public clock for reactor-side transaction deadlines (same epoch).
+pub fn currentNs() u64 {
+    return nowNs();
+}
+
 fn nowNs() u64 {
     if (!epoch_set) {
         epoch = std.time.Instant.now() catch return 0;
@@ -116,6 +199,9 @@ fn run(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
     const upstreams = route.upstreams;
     if (upstreams.len == 0 or upstreams.len > max_backends) return .pass;
+    // Ring backend + TLS fronts keep the synchronous driver: their loops
+    // have different completion models than the epoll seam.
+    if (!force_sync_upstreams and ctx.async_supported) return park(ctx);
 
     const now_ns = nowNs();
     // Sticky sessions (cookie-based): a valid previously-assigned tag pins
@@ -485,6 +571,18 @@ fn tcpProbe(up: *const router.Upstream, path: []const u8, timeout_s: u32) bool {
     return code >= 200 and code < 400;
 }
 
+/// Reactor-side success bookkeeping (same threadlocals the sync path uses;
+/// completions run on the client's reactor thread).
+pub fn upstreamSuccess(idx: usize, fd: posix_fd, now_ns: u64) void {
+    active[idx] -|= 1;
+    pool[idx] = .{ .fd = fd, .last_used_ns = now_ns };
+}
+
+pub fn upstreamFail(idx: usize, route: *const registry.Route, now_ns: u64) void {
+    active[idx] -|= 1;
+    markFailure(idx, route, now_ns);
+}
+
 // ---- upstream connection lifecycle ----
 
 fn acquirePooled(idx: usize, now_ns: u64) posix_fd {
@@ -542,7 +640,26 @@ fn posix_close(fd: posix_fd) void {
 
 // ---- upstream request forwarding ----
 
+pub var async_supported: bool = false;
+
 fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) !void {
+    const req = try buildUpstreamRequest(ctx, up);
+    var remaining = req;
+    while (remaining.len > 0) {
+        const n = std.posix.write(fd, remaining) catch |e| switch (e) {
+            error.WouldBlock => {
+                var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+                const ready = std.posix.poll(&pfds, upstream_connect_timeout_ms) catch return error.UpstreamWriteFailed;
+                if (ready == 0) return error.UpstreamWriteFailed;
+                continue;
+            },
+            else => return e,
+        };
+        remaining = remaining[n..];
+    }
+}
+
+fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
     // The shared request memory is a bump arena: building here costs no
     // malloc/free pairs and everything dies with the response (page_allocator
     // here meant an mmap+munmap pair PER REQUEST).
@@ -621,20 +738,7 @@ fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) 
     try out.appendSlice(allocator, "Content-Length: ");
     try out.appendSlice(allocator, std.fmt.bufPrint(&cl_buf, "{d}\r\n\r\n", .{ctx.req.body.len}) catch return error.OutOfMemory);
     try out.appendSlice(allocator, ctx.req.body);
-
-    var remaining = out.items;
-    while (remaining.len > 0) {
-        const n = std.posix.write(fd, remaining) catch |e| switch (e) {
-            error.WouldBlock => {
-                var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-                const ready = std.posix.poll(&pfds, upstream_connect_timeout_ms) catch return error.UpstreamWriteFailed;
-                if (ready == 0) return error.UpstreamWriteFailed;
-                continue;
-            },
-            else => return e,
-        };
-        remaining = remaining[n..];
-    }
+    return out.items;
 }
 
 fn methodName(m: http_parser.Method) []const u8 {
@@ -655,7 +759,7 @@ fn methodName(m: http_parser.Method) []const u8 {
 const max_upstream_headers = 16;
 const UpstreamHeader = struct { name: []const u8, value: []const u8 };
 
-const UpstreamReader = struct {
+pub const UpstreamReader = struct {
     buf: [16 * 1024]u8 = undefined,
     used: usize = 0,
     pos: usize = 0,
@@ -668,7 +772,7 @@ const UpstreamReader = struct {
         return .{};
     }
 
-    fn read(self: *UpstreamReader, fd: posix_fd) !struct { status: u16, headers: []const UpstreamHeader, body: []const u8 } {
+    pub fn read(self: *UpstreamReader, fd: posix_fd) !struct { status: u16, headers: []const UpstreamHeader, body: []const u8 } {
         // Status line.
         const status_line = try self.readLine(fd);
         var it = std.mem.tokenizeAny(u8, status_line, " ");
