@@ -121,6 +121,11 @@ pub const Route = struct {
     /// Precompressed serving (precompressed module): look for a `.gz`
     /// sibling of the requested file and serve it with Content-Encoding.
     precompressed: bool = false,
+    /// Response caching (proxy_cache modules): enable + fresh window and
+    /// stale-while-revalidate grace, both in seconds.
+    proxy_cache_enabled: bool = false,
+    cache_ttl_seconds: u32 = 0,
+    cache_swr_seconds: u32 = 0,
     /// Subrequest authorization (auth_request module): forward this URI
     /// through an internal subrequest; 2xx admits, anything else copies.
     auth_request_uri: ?[]const u8 = null,

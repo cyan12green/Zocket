@@ -93,6 +93,9 @@ const H_least_time = keyHash("least_time");
 const H_sticky_cookie = keyHash("sticky_cookie");
 const H_precompressed = keyHash("precompressed");
 const H_auth_request = keyHash("auth_request");
+const H_proxy_cache = keyHash("proxy_cache");
+const H_proxy_cache_valid = keyHash("proxy_cache_valid");
+const H_proxy_cache_swr = keyHash("proxy_cache_stale_while_revalidate");
 const H_limit_req = keyHash("limit_req");
 const H_limit_conn = keyHash("limit_conn");
 const H_set = keyHash("set");
@@ -189,6 +192,10 @@ const LocationSpec = struct {
     precompressed_gz: bool = false,
     /// `auth_request <uri>;`
     auth_request: ?Str = null,
+    /// `proxy_cache on;` / valid / stale-while-revalidate
+    cache_enabled: bool = false,
+    cache_ttl: u32 = 0,
+    cache_swr: u32 = 0,
     /// `limit_req rate=N burst=M;` / `limit_conn N;`
     limit_rate: u32 = 0,
     limit_burst: u32 = 0,
@@ -794,6 +801,37 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const hs = parseHeaderOpDirective(lx, b, name);
             appendHeaderOp(b, spec, hs);
         },
+        H_proxy_cache => {
+            const t = lx.token() orelse lx.fail("proxy_cache: expected on|off");
+            const vs = t.srcOf("proxy_cache: value cannot contain escapes");
+            if (std.mem.eql(u8, vs, "on")) {
+                spec.cache_enabled = true;
+            } else if (!std.mem.eql(u8, vs, "off")) {
+                lx.fail("proxy_cache: expected on|off");
+            }
+            lx.expectTerminator("proxy_cache");
+            if (spec.cache_enabled) {
+                ensureModuleBound(b, spec, .rewrite, "proxy_cache");
+                ensureModuleBound(b, spec, .log, "proxy_cache_store");
+            }
+            b.cost += 8;
+        },
+        H_proxy_cache_valid => {
+            const t = lx.token() orelse lx.fail("proxy_cache_valid: expected seconds");
+            const vs = t.srcOf("proxy_cache_valid: value cannot contain escapes");
+            spec.cache_ttl = std.fmt.parseInt(u32, vs, 10) catch
+                lx.fail("proxy_cache_valid: bad seconds");
+            lx.expectTerminator("proxy_cache_valid");
+            b.cost += 8;
+        },
+        H_proxy_cache_swr => {
+            const t = lx.token() orelse lx.fail("proxy_cache_stale_while_revalidate: expected seconds");
+            const vs = t.srcOf("proxy_cache_stale_while_revalidate: value cannot contain escapes");
+            spec.cache_swr = std.fmt.parseInt(u32, vs, 10) catch
+                lx.fail("proxy_cache_stale_while_revalidate: bad seconds");
+            lx.expectTerminator("proxy_cache_stale_while_revalidate");
+            b.cost += 8;
+        },
         H_auth_request => {
             const t = lx.value(b, "auth_request");
             lx.expectTerminator("auth_request");
@@ -1230,6 +1268,9 @@ fn build(b: *const Builder) Config {
                     &.{},
                 .precompressed = spec.precompressed_gz,
                 .auth_request_uri = if (spec.auth_request) |u| resolve(u, strings) else null,
+                .proxy_cache_enabled = spec.cache_enabled,
+                .cache_ttl_seconds = spec.cache_ttl,
+                .cache_swr_seconds = spec.cache_swr,
                 .sticky_cookie = if (spec.sticky) |sc| resolve(sc, strings) else null,
                 .limit_req_rate = spec.limit_rate,
                 .limit_req_burst = spec.limit_burst,

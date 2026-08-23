@@ -5,6 +5,8 @@ const std = @import("std");
 /// the reactor applies them to connections, parsers, caches and pools.
 /// The values below are the compiled defaults (nginx also ships defaults).
 pub const Limits = struct {
+    /// Byte budget for the proxy_cache response zone (0 = built-in default).
+    proxy_cache_max_bytes: usize = 0,
     /// Initial per-connection receive buffer size.
     recv_buffer_size: usize = 16384,
     /// Initial per-connection send buffer size.

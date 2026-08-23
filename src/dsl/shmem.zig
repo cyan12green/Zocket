@@ -106,7 +106,7 @@ pub fn LruStore(comptime max_entries: usize) type {
     return struct {
         const Self = @This();
 
-        const Entry = struct {
+        pub const Entry = struct {
             key: u64 = 0,
             bytes: []u8 = &.{}, // points into backing
             used: bool = false,
