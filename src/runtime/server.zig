@@ -297,6 +297,44 @@ test "comptime server dispatches a route with multiple phases via the dispatch f
     try testing.expectEqual(pipeline.Outcome.not_handled, try srv.handleRequest(&ctx2));
 }
 
+test "headers module applies ops through the comptime dispatch" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /h {
+        \\        content echo;
+        \\        header_set X-A "1";
+        \\        header_add X-A "2";
+        \\        header_remove X-Drop;
+        \\    }
+        \\}
+    );
+    const srv = Server.comptimeInit(cfg);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/h";
+    req.decoded_target = "/h";
+    req.body = "x";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    _ = try srv.handleRequest(&ctx);
+
+    var a_values: [4][]const u8 = undefined;
+    var a_count: usize = 0;
+    for (resp.headers[0..resp.header_count]) |h| {
+        if (std.mem.eql(u8, h.name, "X-A")) {
+            a_values[a_count] = h.value;
+            a_count += 1;
+        }
+    }
+    // set replaced nothing (name was new -> append), add appended: two values.
+    try testing.expectEqual(@as(usize, 2), a_count);
+    try testing.expectEqualStrings("1", a_values[0]);
+    try testing.expectEqualStrings("2", a_values[1]);
+    // Note: Connection/Date/Server are transport-owned and appended after
+    // the pipeline; header ops govern module-produced headers only.
+}
+
 /// Runs one chain-e2e case through the real comptime-dispatch server and
 /// asserts the expected claim (`want` present, `want_absent` absent). Mirrors
 /// the curl checks in the testdata/chain-e2e.conf fixture.

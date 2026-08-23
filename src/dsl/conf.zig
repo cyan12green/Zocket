@@ -19,6 +19,7 @@ const ResponseTemplate = router.ResponseTemplate;
 const ResponseTemplateCV = router.ResponseTemplateCV;
 const CVHeader = router.CVHeader;
 const SetVar = router.SetVar;
+const HeaderOp = router.HeaderOp;
 const ProxyHeader = router.ProxyHeader;
 const Regex = router.Regex;
 const Upstream = router.Upstream;
@@ -80,6 +81,9 @@ const H_max_age = keyHash("max_age");
 const H_chunked = keyHash("chunked");
 const H_return = keyHash("return");
 const H_add_header = keyHash("add_header");
+const H_header_set = keyHash("header_set");
+const H_header_add = keyHash("header_add");
+const H_header_remove = keyHash("header_remove");
 const H_set = keyHash("set");
 const H_proxy_pass = keyHash("proxy_pass");
 const H_upstream = keyHash("upstream");
@@ -160,6 +164,10 @@ const LocationSpec = struct {
     /// (M-C). Slots are assigned in declaration order (0..max_user_vars-1).
     set_start: usize = 0,
     set_len: usize = 0,
+    /// `header_set`/`header_add`/`header_remove` ops: range into the
+    /// builder's header-op pool (headers module, post_access).
+    header_ops_start: usize = 0,
+    header_ops_len: usize = 0,
 };
 
 /// A `set` declaration as parsed (value unresolved until build).
@@ -170,6 +178,13 @@ const SetSpec = struct {
 
 /// A `proxy_set_header` declaration as parsed (value unresolved until build).
 const ProxySpec = struct {
+    name: Str = .{ .src = "" },
+    value: Str = .{ .src = "" },
+};
+
+/// A `header_set`/`header_add`/`header_remove` declaration as parsed.
+const HeaderSpec = struct {
+    kind: vars.HeaderOpKind,
     name: Str = .{ .src = "" },
     value: Str = .{ .src = "" },
 };
@@ -198,6 +213,7 @@ const Builder = struct {
     log_formats: ct_pool.CtPool(LogFormatSpec, 16) = .{},
     set_vars: ct_pool.CtPool(SetSpec, 1024) = .{},
     proxy_headers: ct_pool.CtPool(ProxySpec, 1024) = .{},
+    header_ops: ct_pool.CtPool(HeaderSpec, 256) = .{},
     limits: Limits = .{},
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
@@ -207,6 +223,18 @@ const Builder = struct {
     /// Parse cost in §9 units (recomputed from the built Config at the end).
     cost: usize = 0,
 };
+
+/// Bind the headers module to the location unless already bound: declaring
+/// any `header_set`/`header_add`/`header_remove` activates the filter
+/// (nginx-style directive-presence activation, no manual `log headers;`).
+fn ensureHeadersModule(b: *Builder, spec: *LocationSpec) void {
+    for (b.modules.items[spec.modules_start..][0..spec.modules_len]) |mb| {
+        if (std.mem.eql(u8, mb.module, "headers")) return;
+    }
+    if (spec.modules_len == 0) spec.modules_start = b.modules.len;
+    _ = b.modules.create(.{ .phase = .log, .module = "headers" });
+    spec.modules_len += 1;
+}
 
 fn resolve(str: Str, strings: []const u8) []const u8 {
     return switch (str) {
@@ -682,6 +710,30 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             spec.proxy_headers_len += 1;
             b.cost += 8;
         },
+        H_header_set, H_header_add => {
+            // `header_set <name> "<cv>";` / `header_add <name> "<cv>";` —
+            // response-header manipulation for the headers module.
+            const kind: vars.HeaderOpKind = if (keyHash(name) == H_header_set) .set else .add;
+            const dir: []const u8 = if (keyHash(name) == H_header_set) "header_set" else "header_add";
+            const hname = lx.value(b, dir);
+            const hvalue = lx.value(b, dir);
+            lx.expectTerminator(dir);
+            ensureHeadersModule(b, spec);
+            if (spec.header_ops_len == 0) spec.header_ops_start = b.header_ops.len;
+            _ = b.header_ops.create(.{ .kind = kind, .name = hname, .value = hvalue });
+            spec.header_ops_len += 1;
+            b.cost += 8;
+        },
+        H_header_remove => {
+            // `header_remove <name>;`
+            const hname = lx.value(b, "header_remove");
+            lx.expectTerminator("header_remove");
+            ensureHeadersModule(b, spec);
+            if (spec.header_ops_len == 0) spec.header_ops_start = b.header_ops.len;
+            _ = b.header_ops.create(.{ .kind = .remove, .name = hname });
+            spec.header_ops_len += 1;
+            b.cost += 8;
+        },
         H_access_log => {
             const t = lx.token() orelse lx.fail("access_log: expected a format name or off");
             const s = t.srcOf("access_log: value cannot contain escapes");
@@ -909,6 +961,30 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .ranges = ranges };
     };
 
+    // Header-manipulation ops per route (headers module): names resolve to
+    // strings, values parse into complex-value fragment lists.
+    const HeaderOpTable = struct { items: [256]HeaderOp, ranges: [route_cap]Range };
+    const header_op_table: HeaderOpTable = comptime blk: {
+        var items: [256]HeaderOp = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.header_ops_len };
+            for (b.header_ops.items[spec.header_ops_start..][0..spec.header_ops_len]) |hs| {
+                items[pos] = .{
+                    .kind = hs.kind,
+                    .name = resolve(hs.name, strings),
+                    .value = if (hs.kind == .remove)
+                        &.{}
+                    else
+                        vars.parseComplexValue(resolve(hs.value, strings), set_table.items[set_table.ranges[ri].start..][0..set_table.ranges[ri].len]),
+                };
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
     const Routes = struct { items: [route_cap]Route, len: usize };
     const routes_built: Routes = comptime blk: {
         var items: [route_cap]Route = undefined;
@@ -982,6 +1058,7 @@ fn build(b: *const Builder) Config {
                 .response_cv = resp_cv,
                 .set_vars = route_sets,
                 .proxy_headers = proxy_table.items[pr.start..][0..pr.len],
+                .headers_ops = header_op_table.items[header_op_table.ranges[ri].start..][0..header_op_table.ranges[ri].len],
                 .upstreams = up_table.items[ur.start..][0..ur.len],
                 .balance = spec.balance,
                 .max_fails = spec.max_fails,
@@ -1139,6 +1216,30 @@ test "conf: phase directives bind modules" {
     try testing.expectEqualStrings("cache_headers", r.moduleFor(.post_access).?);
     try testing.expectEqualStrings("gzip", r.moduleFor(.log).?);
     try testing.expectEqual(@as(usize, 4), r.modules.len);
+}
+
+test "conf: header_set/add/remove ops parse into declaration-order ops" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        header_set X-Frame-Options "DENY";
+        \\        header_add X-Debug "$remote_addr";
+        \\        header_remove Server;
+        \\    }
+        \\}
+    );
+    const ops = cfg.routes[0].headers_ops;
+    try testing.expectEqual(@as(usize, 3), ops.len);
+    // Directive presence auto-bound the headers module (deduped).
+    try testing.expectEqualStrings("headers", cfg.routes[0].moduleFor(.log).?);
+    try testing.expectEqual(vars.HeaderOpKind.set, ops[0].kind);
+    try testing.expectEqualStrings("X-Frame-Options", ops[0].name);
+    try testing.expectEqual(vars.HeaderOpKind.add, ops[1].kind);
+    // The $remote_addr value compiled into a variable fragment list.
+    try testing.expect(ops[1].value.len > 0);
+    try testing.expectEqual(vars.HeaderOpKind.remove, ops[2].kind);
+    try testing.expectEqual(@as(usize, 0), ops[2].value.len);
 }
 
 test "conf: multiple modules per phase form a declaration-order chain" {

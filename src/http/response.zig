@@ -1,4 +1,5 @@
 const std = @import("std");
+const ascii = std.ascii;
 const buffer_mod = @import("../net/buffer.zig");
 
 const posix = std.posix;
@@ -19,6 +20,7 @@ pub const Status = enum(u16) {
     internal_error = 500,
     not_implemented = 501,
     bad_gateway = 502,
+    service_unavailable = 503,
     switching_protocols = 101,
 
     pub fn reasonPhrase(self: Status) []const u8 {
@@ -37,6 +39,7 @@ pub const Status = enum(u16) {
             .internal_error => "Internal Server Error",
             .not_implemented => "Not Implemented",
             .bad_gateway => "Bad Gateway",
+            .service_unavailable => "Service Unavailable",
             .switching_protocols => "Switching Protocols",
         };
     }
@@ -219,6 +222,39 @@ pub const Response = struct {
     /// Set a header whose value is formatted into the response's scratch
     /// space (safe: the response outlives the write). Drops the header if the
     /// scratch is exhausted.
+    /// Replace the value of the FIRST header with this name; append when no
+    /// header of that name exists yet (used by the headers module's `set`).
+    pub fn replaceHeader(self: *Response, name: []const u8, value: []const u8) void {
+        for (self.headers[0..self.header_count]) |*h| {
+            if (ascii.eqlIgnoreCase(h.name, name)) {
+                h.value = value;
+                return;
+            }
+        }
+        self.setHeader(name, value);
+    }
+
+    /// Drop every header with this name (case-insensitive); returns how many
+    /// were removed (used by the headers module's `remove`).
+    pub fn removeHeader(self: *Response, name: []const u8) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.header_count) {
+            if (ascii.eqlIgnoreCase(self.headers[i].name, name)) {
+                // Shift the tail down one slot.
+                var j = i;
+                while (j + 1 < self.header_count) : (j += 1) {
+                    self.headers[j] = self.headers[j + 1];
+                }
+                self.header_count -= 1;
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        return removed;
+    }
+
     pub fn setHeaderFmt(self: *Response, comptime name: []const u8, comptime fmt: []const u8, args: anytype) void {
         const value = std.fmt.bufPrint(self.scratch[self.scratch_used..], fmt, args) catch return;
         self.scratch_used += value.len;

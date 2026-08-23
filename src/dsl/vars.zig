@@ -72,6 +72,17 @@ pub const ProxyHeader = struct { name: []const u8, value: []const Frag };
 /// A dynamic response template header (M-B).
 pub const CVHeader = struct { name: []const u8, value: []const Frag };
 
+/// One header-manipulation operation (headers module, backlog item):
+/// `set` replaces the first header of that name or appends, `add` appends,
+/// `remove` drops every header of that name. Values are complex values and
+/// may reference $variables; they render into the request arena per request.
+pub const HeaderOpKind = enum { set, add, remove };
+pub const HeaderOp = struct {
+    kind: HeaderOpKind,
+    name: []const u8,
+    value: []const Frag = &.{},
+};
+
 /// Dynamic (variable-capable) response template (M-B). Parallel to
 /// `ResponseTemplate`; the literal fast path stays untouched.
 pub const ResponseTemplateCV = struct {

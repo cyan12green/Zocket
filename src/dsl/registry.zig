@@ -105,6 +105,9 @@ pub const Context = struct {
     formats: ?[]const LogFormat = null,
     /// Per-request start instant for `$request_time`.
     started: std.time.Instant = undefined,
+    /// Monotonic request timestamp in ns (reactor clock; 0 when unset, e.g.
+    /// unit tests set it explicitly). Rate buckets and LB timing read this.
+    now_ns: u64 = 0,
 };
 
 /// Shared connection/request counters (Milestone 13): updated atomically by
@@ -183,13 +186,14 @@ pub const default_registry = Registry(.{
     @import("modules/access_log.zig").access_log,
     @import("modules/error_log.zig").error_log,
     @import("modules/stub_status.zig").stub_status,
+    @import("modules/headers.zig").headers,
 });
 
 const testing = std.testing;
 
 test "modules register themselves with a name and a phase" {
     const infos = default_registry.infos();
-    try testing.expectEqual(@as(usize, 9), infos.len);
+    try testing.expectEqual(@as(usize, 10), infos.len);
     try testing.expectEqualStrings("echo", infos[0].name);
     try testing.expectEqual(Phase.content, infos[0].phase);
 }

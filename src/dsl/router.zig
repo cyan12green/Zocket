@@ -14,6 +14,7 @@ pub const SetVar = vars.SetVar;
 pub const LogFormat = vars.LogFormat;
 pub const ProxyHeader = vars.ProxyHeader;
 pub const CVHeader = vars.CVHeader;
+pub const HeaderOp = vars.HeaderOp;
 pub const ResponseTemplateCV = vars.ResponseTemplateCV;
 pub const CaptureRange = vars.CaptureRange;
 pub const Regex = vars.Regex;
@@ -100,6 +101,10 @@ pub const Route = struct {
     response_cv: ?ResponseTemplateCV = null,
     /// proxy_set_header overrides (M-E).
     proxy_headers: []const ProxyHeader = &.{},
+    /// Header-manipulation ops for the `headers` module (log phase =
+    /// post-processing): set / add / remove applied in declaration order to
+    /// the final module-produced header set.
+    headers_ops: []const HeaderOp = &.{},
     /// Index into Config.log_formats; null = none (off). The access_log
     /// module reads it; defaults to index 0 (the `combined` default) when
     /// the route binds `log access_log;` and no `access_log` directive is

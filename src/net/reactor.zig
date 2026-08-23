@@ -1300,6 +1300,10 @@ pub const Reactor = struct {
             .limits = &self.limits,
             .formats = handler.formats(),
             .started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
+            .now_ns = blk: {
+                const t = std.time.Instant.now() catch break :blk 0;
+                break :blk @intCast(t.since(self.epoch));
+            },
         };
 
         if (!tls_mode) {
