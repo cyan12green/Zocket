@@ -357,7 +357,7 @@ pub fn Registry(comptime modules: anytype) type {
             }
             lifecycle_init_gate.store(false, .release);
         }
-};
+    };
 }
 
 /// The registry used by the server: enumerate every built-in module here. Each
@@ -387,7 +387,7 @@ const testing = std.testing;
 
 test "modules register themselves with a name and a phase" {
     const infos = default_registry.infos();
-        // Count derives from the registry itself: adding a module must not
+    // Count derives from the registry itself: adding a module must not
     // require touching this test (uniqueness below is the real invariant).
     try testing.expect(infos.len >= 9);
     try testing.expectEqualStrings("echo", infos[0].name);

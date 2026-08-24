@@ -381,7 +381,7 @@ pub const Reactor = struct {
                 self.connections.deinit();
                 self.http_sessions.deinit();
                 self.upstream_conns.deinit();
-            self.upstream_conns.deinit();
+                self.upstream_conns.deinit();
                 self.pending.deinit(self.allocator);
                 return error.ListenerRegisterFailed;
             };
@@ -908,7 +908,6 @@ pub const Reactor = struct {
     }
 
     /// Drop a parked transaction (error paths / connection teardown).
-
     fn dropUpstream(self: *Reactor, session: *HttpSession) void {
         const tx = session.up orelse return;
         session.up = null;
@@ -3289,7 +3288,6 @@ test "idle timeout of zero disables reaping" {
     r.join();
     try testing.expectEqual(@as(usize, 1), r.countConnections());
 }
-
 
 // ---- framework v2 driver unit tests (deterministic socketpair origin) ----
 

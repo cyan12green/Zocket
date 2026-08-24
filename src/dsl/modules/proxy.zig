@@ -127,8 +127,12 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
         const n = std.posix.write(fd, request[sent..]) catch |e| switch (e) {
             error.WouldBlock => {
                 return parkRemainder(ctx, route, .{
-                    .fd = fd, .backend_idx = pick, .route = route, .request = request,
-                    .sent = sent, .awaiting_out = true,
+                    .fd = fd,
+                    .backend_idx = pick,
+                    .route = route,
+                    .request = request,
+                    .sent = sent,
+                    .awaiting_out = true,
                     .offer_sticky = offer_sticky,
                     .sticky_name = route.sticky_cookie orelse "",
                     .started_ns = started_ns,
@@ -165,8 +169,12 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
                 const hr_t: *UpstreamReader = @ptrCast(@alignCast(hr));
                 hr_t.* = reader;
                 return parkRemainder(ctx, route, .{
-                    .fd = fd, .backend_idx = pick, .route = route, .request = request,
-                    .sent = sent, .awaiting_out = false,
+                    .fd = fd,
+                    .backend_idx = pick,
+                    .route = route,
+                    .request = request,
+                    .sent = sent,
+                    .awaiting_out = false,
                     .offer_sticky = offer_sticky,
                     .sticky_name = route.sticky_cookie orelse "",
                     .started_ns = started_ns,
@@ -1106,7 +1114,6 @@ test "sticky cookie routes back to the tagged backend" {
     try testing.expect(stickyBackendFromCookie(&junk_ctx, "zsid", route.upstreams, &route, nowNs()) == null);
 }
 
-
 // ---- active health check tests ----
 
 fn mkUp(host: []const u8, port: u16) router.Upstream {
@@ -1184,7 +1191,8 @@ test "active checks apply fall and rise thresholds" {
     // Two good probes (rise=2) revive it.
     fake_ok = true;
     fake_ok_global = true;
-    runHealthChecksOnce(sweep_now); sweep_now += step;
+    runHealthChecksOnce(sweep_now);
+    sweep_now += step;
     try testing.expect(!backendUsable(&route, 1, 0)); // one OK < rise
     runHealthChecksOnce(sweep_now);
     try testing.expect(backendUsable(&route, 1, 0));
@@ -1202,7 +1210,6 @@ fn nowForHc() u64 {
 }
 
 test "tcpProbe distinguishes a live listener from a dead port" {
-
     const listener = try sockets.createListeningSocket(18933, 4);
     defer posix.close(listener);
     // Accept the probe connection on a side thread (connect-only probe
@@ -1237,4 +1244,3 @@ test "tcpProbe distinguishes a live listener from a dead port" {
     }
     try testing.expect(dead_ok_checked);
 }
-

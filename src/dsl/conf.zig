@@ -945,9 +945,7 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
         H_gzip => {
             const t = lx.token() orelse lx.fail("gzip: expected on|off");
             const vs = t.srcOf("gzip: value cannot contain escapes");
-            const on = if (std.mem.eql(u8, vs, "on")) true
-            else if (std.mem.eql(u8, vs, "off")) false
-            else lx.fail("gzip: expected on|off");
+            const on = if (std.mem.eql(u8, vs, "on")) true else if (std.mem.eql(u8, vs, "off")) false else lx.fail("gzip: expected on|off");
             lx.expectTerminator("gzip");
             if (on) ensureFilterBound(b, spec, "gzip");
             b.cost += 8;

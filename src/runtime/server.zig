@@ -482,17 +482,13 @@ test "chain e2e regression: same-phase modules chain through the comptime dispat
     var stats = registry.ServerStats.init();
 
     // stub_status claims first: echo must never run.
-    try runChainCase(&srv, testing.allocator, "/chain/stub-first", "STUB-MUST-NOT-APPEAR", &stats,
-        "Active connections:", "STUB-MUST-NOT-APPEAR");
+    try runChainCase(&srv, testing.allocator, "/chain/stub-first", "STUB-MUST-NOT-APPEAR", &stats, "Active connections:", "STUB-MUST-NOT-APPEAR");
     // echo claims first: stub_status must never run.
-    try runChainCase(&srv, testing.allocator, "/chain/echo-first", "ECHO-BODY-FIRST", &stats,
-        "ECHO-BODY-FIRST", "Active connections:");
+    try runChainCase(&srv, testing.allocator, "/chain/echo-first", "ECHO-BODY-FIRST", &stats, "ECHO-BODY-FIRST", "Active connections:");
     // static passes (no root): echo falls through to.
-    try runChainCase(&srv, testing.allocator, "/chain/fallback", "FALLBACK-CHAIN", &stats,
-        "FALLBACK-CHAIN", "Active connections:");
+    try runChainCase(&srv, testing.allocator, "/chain/fallback", "FALLBACK-CHAIN", &stats, "FALLBACK-CHAIN", "Active connections:");
     // static passes: stub_status claims, echo (later) must never run.
-    try runChainCase(&srv, testing.allocator, "/chain/static-then-stub", "STUB-AFTER-PASS", &stats,
-        "Active connections:", "STUB-AFTER-PASS");
+    try runChainCase(&srv, testing.allocator, "/chain/static-then-stub", "STUB-AFTER-PASS", &stats, "Active connections:", "STUB-AFTER-PASS");
 }
 
 test "conf-config server with a comptime trie routes identically to the plain server" {

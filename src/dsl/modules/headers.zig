@@ -25,7 +25,7 @@ pub const Action = registry.Action;
 pub const headers = registry.Module{
     .name = "headers",
     .kind = .filter,
-    .run = run,    // Legacy marker only: filters run after the walk.
+    .run = run, // Legacy marker only: filters run after the walk.
     .phase = .log,
 };
 

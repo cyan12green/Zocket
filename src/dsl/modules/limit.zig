@@ -54,7 +54,6 @@ fn hashKey(ctx: *Context) u64 {
     return h;
 }
 
-
 pub const limit_req = registry.Module{
     .name = "limit_req",
     .phase = .access,
