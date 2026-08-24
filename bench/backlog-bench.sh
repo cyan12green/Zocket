@@ -37,7 +37,7 @@ NGINX_BIN="$ROOT/bench/.cache/nginx-build/sbin/nginx"
 BOMB=~/go/bin/bombardier
 RES="$ROOT/bench/results/backlog"
 STATIC_DIR="$ROOT/bench/static"
-AUTH_HEADER="Authorization: Basic YmVuY2g6cHc="   # bench:password
+AUTH_HEADER="Authorization: Basic YmVuY2g6cGFzc3dvcmQ="   # bench:password
 
 echo "== ensuring builds =="
 # Origin runs the DEFAULT config (plain echo) as a separate binary: the

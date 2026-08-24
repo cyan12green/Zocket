@@ -99,7 +99,7 @@ byte-budgeted LRU stores; nothing grows under load):
 
 ---
 
-## Module framework v2 — handler / filter / upstream (Stage 1 DONE; Stage 2 next)
+## Module framework v2 — handler / filter / upstream (Stage 1 + 2 DONE)
 
 The pipeline currently has one module kind bound to phases, with the `log`
 phase doubling as the response-transform slot and the proxy doing blocking
