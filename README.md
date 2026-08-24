@@ -26,6 +26,13 @@ High-performance TCP/HTTP server in Zig.
   preface vs HTTP/1.1)
 
 **Config & modules (nginx-style)**
+- Module framework v2: three module kinds — phase **handlers** (first
+  claim wins), response **filters** (reverse-order chains composed at
+  comptime), and async **upstreams** (non-blocking state machines driven by
+  reactor events); filters bind at http/server/location scopes with
+  all-or-nothing inheritance; shared request memory + bounded shmem zones;
+  subrequests, internal redirects, active health checks, streaming
+  capability flag
 - Config-driven phase pipeline: 10 nginx phases (post_read … log), prefix/
   exact/regex routing, comptime route trie + per-route dispatch
   specialisation
@@ -53,7 +60,10 @@ High-performance TCP/HTTP server in Zig.
 **Engineering**
 - Performance: beats nginx on every measured workload — HTTP/2 echo 3.0x
   (100 streams/conn) and 1.2x (serialized), chunked transfer 1.4-2.0x,
-  static 1.7x, h1 echo/matrix 1.1-1.8x (see Benchmarks below)
+  static 1.7x, h1 echo/matrix 1.1-1.8x, and on the feature-level suite:
+  headers 1.15x, auth_basic 1.23x, precompressed .gz 1.54x, reverse proxy
+  1.65x (async upstreams), proxy_cache HIT 1.41x, limit_req 1.05x (see
+  Benchmarks below)
 - Comptime-first: route trie, header DFA, MIME table, HPACK tables, conf
   parser and protocol decode tables are all compile-time built
 - Fuzz harness + h2spec conformance gate (`zig build fuzz`, `zig build h2test`)
@@ -100,6 +110,8 @@ Refer to `bench/BENCH.md` for details on benchmark generation and methodology.
 ![HTTP/1.1 chunked transfer — Zocket vs nginx, POST echo](bench/graphs/chunked_compare.png)
 
 ![HTTP/2 over TLS — Zocket vs nginx, h2load](bench/graphs/tls_compare.png)
+
+![Backlog modules vs nginx — headers/auth/precompressed/proxy/cache/limit](bench/graphs/backlog_compare.png)
 
 ## Tests and benchmarks
 
