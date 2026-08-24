@@ -94,6 +94,7 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
                     .pass => continue,
                     .handled => break :blk Outcome.handled,
                     .short_circuit => break :blk Outcome.not_handled,
+                    .async => return error.AsyncPending,
                 }
             }
         }
@@ -130,6 +131,11 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
 /// filters see the finished module-produced response. Filter actions are
 /// ignored — filters transform, they do not claim.
 fn applyFilters(comptime Registry: type, route: *const router.Route, ctx: *Context) !void {
+    // Streaming escape hatch: routes claimed by a streaming handler bypass
+    // response filters entirely (v1 constraint: all of them).
+    for (route.modules) |b| {
+        if (Registry.streamsResponse(b.module)) return;
+    }
     var i: usize = route.filters.len;
     while (i > 0) {
         i -= 1;
@@ -192,6 +198,7 @@ pub fn dispatchForRoute(comptime Registry: type, comptime route: router.Route) D
                         const run_fn = Registry.resolve(b.module).?;
                         switch (try run_fn(ctx)) {
                             .pass => {},
+                            .async => return error.AsyncPending,
                             .handled => {
                                 outcome = .handled;
                                 break :phases;
@@ -269,6 +276,7 @@ const testing = std.testing;
 /// (real context mutation, no global state) and returns the action its variant
 /// stands for.
 const pass_mod = struct {
+    streams_response: bool = false,
     name: []const u8,
     phase: Phase,
     run: *const fn (*Context) anyerror!Action,
@@ -280,11 +288,12 @@ const pass_mod = struct {
                 return .pass;
             }
         };
-        return .{ .name = n, .phase = p, .run = Impl.run };
+        return .{ .name = n, .phase = p, .run = Impl.run, .streams_response = false };
     }
 };
 
 const claim_mod = struct {
+    streams_response: bool = false,
     name: []const u8,
     phase: Phase,
     run: *const fn (*Context) anyerror!Action,
@@ -298,11 +307,12 @@ const claim_mod = struct {
                 return .handled;
             }
         };
-        return .{ .name = n, .phase = p, .run = Impl.run };
+        return .{ .name = n, .phase = p, .run = Impl.run, .streams_response = false };
     }
 };
 
 const short_mod = struct {
+    streams_response: bool = false,
     name: []const u8,
     phase: Phase,
     run: *const fn (*Context) anyerror!Action,
@@ -314,7 +324,7 @@ const short_mod = struct {
                 return .short_circuit;
             }
         };
-        return .{ .name = n, .phase = p, .run = Impl.run };
+        return .{ .name = n, .phase = p, .run = Impl.run, .streams_response = false };
     }
 };
 

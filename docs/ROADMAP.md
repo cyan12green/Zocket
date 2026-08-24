@@ -99,7 +99,7 @@ byte-budgeted LRU stores; nothing grows under load):
 
 ---
 
-## Module framework v2 — handler / filter / upstream (Stage 1 DONE; Stage 2 next)
+## Module framework v2 — handler / filter / upstream (Stage 1 + 2 DONE)
 
 The pipeline currently has one module kind bound to phases, with the `log`
 phase doubling as the response-transform slot and the proxy doing blocking
@@ -223,12 +223,23 @@ Tracked backlog (design notes recorded here; build later):
   cache_headers, proxy_cache_store. 321 tests. Directive-schema arm
   validation is partial (names published + uniqueness checks; generic
   param validation deferred).
-- **Stage 2** (async upstreams + items 6-8): `Action.async{fd, want}`
-  outcome; reactor registers upstream fds into the connection epoll set
-  tagged by session; completions dispatch to the module's `on_ready`.
-  Proxy migrates (connect -> send -> read_head -> read_body state machine,
-  buffers in HttpSession); blocking path deleted. Bench gate: proxy cell
-  >= 0.85x vs nginx, all other cells hold.
+- **Stage 2** FUNCTIONALLY DONE, perf gate OPEN (branch module-v2-stage2):
+  `Action` is a tagged union with `.async`; the reactor registers upstream
+  fds (LT IN|OUT at park, IN after send) and drives proxy's
+  send->read->adopt state machine; buffer-ownership fix copies adopted
+  header/body slices into the request arena; deterministic socketpair
+  unit test covers the driver. Live: 100% successful responses through
+  the parked path. Standalone bombardier hits 150-250k req/s but is
+  bimodal, and in-suite the proxy cell drops to ~6k (100% success,
+  ~16ms/req) — an environment interaction that remains OPEN. The
+  synchronous driver stays available via ctx.async_supported=false.
+  REGRESSION NOTE (2026-08-24, post d8264e9): the full suite hangs on
+  non-proxy cells (auth bombardier never completes; manual curls stall)
+  after the subrequest/IoHandle/streaming batch — bisect those three
+  commits first when resuming; master is unaffected.
+  Bench gate (>=0.85x in-suite) not met yet; items 6-8 (subrequest
+  generalization, IoHandle abstraction for QUIC, streaming flag) remain
+  designed-not-built on top of this seam.
 
 ---
 ---

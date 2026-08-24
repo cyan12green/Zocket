@@ -19,6 +19,8 @@ const tls_conn = @import("../tls/conn.zig");
 const buffer_mod = @import("buffer.zig");
 const http2_frames = @import("../http2/frames.zig");
 const websocket_mod = @import("../http/websocket.zig");
+const proxy_mod = @import("../dsl/modules/proxy.zig");
+const dsl_registry = @import("../dsl/registry.zig");
 
 /// I/O backend selection. Default: epoll (measured at parity with the ring
 /// on the keep-alive workloads and more robust at high connection counts).
@@ -28,6 +30,12 @@ pub var force_epoll: bool = true;
 const runtime_server = @import("../runtime/server.zig");
 
 const max_events = 1024;
+
+/// Monotonic ns on the PROXY clock (its lazy epoch): transaction
+/// deadlines must share the base that stamped started_ns.
+fn upstreamNowNs() u64 {
+    return proxy_mod.currentNs();
+}
 
 /// Default connection idle timeout in seconds. Zero disables
 /// idle reaping.
@@ -43,6 +51,26 @@ pub const Mode = enum {
     echo,
     /// HTTP/1.1: parse requests, respond with the request body echoed.
     http,
+};
+
+/// One parked upstream round trip (framework v2). Owned by the client
+/// session; the reactor drives it from epoll events on the upstream fd.
+pub const UpTxState = enum { sending, reading };
+
+pub const UpTx = struct {
+    fd: posix.fd_t,
+    backend_idx: usize,
+    route: *const dsl_registry.Route,
+    state: UpTxState,
+    request: []const u8, // arena slice
+    sent: usize = 0,
+    reader: proxy_mod.UpstreamReader = .{},
+    started_ns: u64,
+    offer_sticky: bool,
+    sticky_name: []const u8,
+
+    /// Send-phase writability wait (event mask is IN|OUT then).
+    awaiting_out: bool = false,
 };
 
 const HttpSession = struct {
@@ -118,6 +146,12 @@ const HttpSession = struct {
     /// Scratch for the 101 handshake head (upgradeConnection); 160 covers
     /// the websocket head with digest plus slack.
     upgrade_head_scratch: [160]u8 = undefined,
+    /// Test-only stable route anchor (framework v2 driver tests).
+    route_ptr_for_test: ?*const dsl_registry.Route = null,
+    /// Parked upstream transaction (framework v2 .async): heap-allocated
+    /// only while a proxy request is in flight; every other connection pays
+    /// nothing.
+    up: ?*UpTx = null,
 };
 
 /// A single-reactor worker: its own thread, its own epoll instance and its own
@@ -202,6 +236,10 @@ pub const Reactor = struct {
     accepted_counter: ?*std.atomic.Value(usize) = null,
     /// Last wall tick the request-timeout sweep ran (1 Hz gating).
     last_timeout_sweep_tick: u64 = 0,
+    /// Test-only stable route anchor (framework v2 driver tests).
+    route_ptr_for_test: ?*const dsl_registry.Route = null,
+    /// Parked upstream transactions: upstream fd -> client fd.
+    upstream_conns: std.AutoHashMap(posix.fd_t, posix.fd_t),
     /// Graceful-drain mode stop accepting new connections
     /// and exit the loop once the connection map empties (or a timeout).
     draining: std.atomic.Value(bool) = .init(false),
@@ -248,6 +286,8 @@ pub const Reactor = struct {
             self.wakeup.close();
             self.connections.deinit();
             self.http_sessions.deinit();
+            self.upstream_conns.deinit();
+            self.upstream_conns.deinit();
             self.pending.deinit(self.allocator);
             self.expired_fds.deinit(self.allocator);
             return error.ListenerRegisterFailed;
@@ -272,6 +312,7 @@ pub const Reactor = struct {
             .wakeup = try eventfd.EventFd.create(),
             .connections = std.AutoHashMap(posix.fd_t, *connection.Connection).init(allocator),
             .http_sessions = std.AutoHashMap(posix.fd_t, HttpSession).init(allocator),
+            .upstream_conns = std.AutoHashMap(posix.fd_t, posix.fd_t).init(allocator),
             .http_handler = http_handler,
             .running = std.atomic.Value(bool).init(false),
             .thread = null,
@@ -315,6 +356,8 @@ pub const Reactor = struct {
             self.wakeup.close();
             self.connections.deinit();
             self.http_sessions.deinit();
+            self.upstream_conns.deinit();
+            self.upstream_conns.deinit();
             self.pending.deinit(self.allocator);
         };
         // Try io_uring; the epoll path remains when it is unavailable.
@@ -337,6 +380,8 @@ pub const Reactor = struct {
                 self.wakeup.close();
                 self.connections.deinit();
                 self.http_sessions.deinit();
+                self.upstream_conns.deinit();
+            self.upstream_conns.deinit();
                 self.pending.deinit(self.allocator);
                 return error.ListenerRegisterFailed;
             };
@@ -357,6 +402,7 @@ pub const Reactor = struct {
         self.wakeup.close();
         self.connections.deinit();
         self.http_sessions.deinit();
+        self.upstream_conns.deinit();
         self.pending.deinit(self.allocator);
         self.expired_fds.deinit(self.allocator);
     }
@@ -589,6 +635,11 @@ pub const Reactor = struct {
         }
 
         if (self.mode == .http) {
+            // Upstream fds are dispatched to the proxy transaction driver.
+            if (self.upstream_conns.get(fd)) |client_fd| {
+                self.handleUpstreamEvent(fd, client_fd);
+                return;
+            }
             self.handleHttpEvent(events, fd);
             return;
         }
@@ -695,6 +746,9 @@ pub const Reactor = struct {
         while (true) {
             const session = self.http_sessions.getPtr(fd) orelse return;
             const conn = self.connections.get(fd) orelse return;
+            // Framework v2: an upstream transaction is in flight — client
+            // bytes stay buffered until it completes.
+            if (session.up != null) return;
             // HTTP/1 stops parsing while a response is being flushed (the
             // pipelined request bytes stay buffered); HTTP/2 and TLS must
             // keep reading while writing (h2 control frames; the TLS
@@ -813,6 +867,190 @@ pub const Reactor = struct {
                 },
             }
         }
+    }
+
+    /// Park a proxied request: adopt the connected upstream fd, register it
+    /// for readability, and stash the transaction on the session.
+    fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !void {
+        const plan = proxy_mod.takeParked(ctx) orelse return error.NoParkedPlan;
+        const conn = self.connections.get(fd) orelse return error.NoConn;
+        const session = self.http_sessions.getPtr(fd) orelse return error.NoSession;
+
+        const tx = try self.allocator.create(UpTx);
+        tx.* = .{
+            .fd = plan.fd,
+            .backend_idx = plan.backend_idx,
+            .route = plan.route,
+            .state = .sending,
+            .request = plan.request,
+            .started_ns = plan.started_ns,
+            .offer_sticky = plan.offer_sticky,
+            .sticky_name = plan.sticky_name,
+        };
+        session.up = tx;
+        try self.upstream_conns.put(plan.fd, fd);
+        // Level-triggered, armed IN|OUT: the request has NOT been sent yet,
+        // so writability is what kicks off the transaction; after the full
+        // send the driver drops back to IN-only. LT (not ET) on purpose —
+        // the origin may answer between connect and this registration.
+        self.ep.add(plan.fd, epoll.Events.In | epoll.Events.Out, plan.fd) catch |e| {
+            _ = self.upstream_conns.remove(plan.fd);
+            session.up = null;
+            self.allocator.destroy(tx);
+            return e;
+        };
+        _ = conn;
+        // NO eager pump here: completing inside park would rewind the
+        // request arena (finalizeFlush -> req.reset) while outer frames
+        // still hold ParkedPlan/request slices. Level-triggered IN reports
+        // already-ready upstreams on the next epoll_wait, costing one
+        // loop cycle at most.
+    }
+
+    /// Drop a parked transaction (error paths / connection teardown).
+
+    fn dropUpstream(self: *Reactor, session: *HttpSession) void {
+        const tx = session.up orelse return;
+        session.up = null;
+        if (self.upstream_conns.remove(tx.fd)) {
+            if (self.io_mode == .epoll) self.ep.remove(tx.fd) catch {};
+        }
+        posix.close(tx.fd);
+        proxy_mod.upstreamFail(tx.backend_idx, tx.route, upstreamNowNs());
+        self.allocator.destroy(tx);
+    }
+
+    /// Drive a parked upstream transaction from an epoll readiness event.
+    fn handleUpstreamEvent(self: *Reactor, up_fd: posix.fd_t, client_fd: posix.fd_t) void {
+        const session = self.http_sessions.getPtr(client_fd) orelse {
+            _ = self.upstream_conns.remove(up_fd);
+            posix.close(up_fd);
+            return;
+        };
+        const tx = session.up orelse return;
+        // Transaction deadline: a parked request must finish within 5 s.
+        if (upstreamNowNs() -% tx.started_ns > 5 * std.time.ns_per_s) {
+            return self.failUpstream(client_fd);
+        }
+        switch (tx.state) {
+            .sending => {
+                while (tx.sent < tx.request.len) {
+                    const n = posix.write(up_fd, tx.request[tx.sent..]) catch |e| switch (e) {
+                        // Yield: arm OUT alongside IN and resume from this
+                        // exact byte on the writability event.
+                        error.WouldBlock => {
+                            tx.awaiting_out = true;
+                            if (self.io_mode == .epoll)
+                                self.ep.modify(up_fd, epoll.Events.In | epoll.Events.Out, up_fd) catch
+                                    return self.failUpstream(client_fd);
+                            return;
+                        },
+                        else => return self.failUpstream(client_fd),
+                    };
+                    tx.sent += n;
+                }
+                tx.state = .reading;
+                if (tx.awaiting_out) {
+                    tx.awaiting_out = false;
+                    if (self.io_mode == .epoll)
+                        self.ep.modify(up_fd, epoll.Events.In, up_fd) catch {};
+                }
+                self.pumpOnce(client_fd, up_fd, session, tx);
+            },
+            .reading => {
+                self.pumpOnce(client_fd, up_fd, session, tx);
+            },
+        }
+    }
+
+    fn pumpOnce(self: *Reactor, client_fd: posix.fd_t, up_fd: posix.fd_t, session: *HttpSession, tx: *UpTx) void {
+        const res = tx.reader.read(up_fd) catch |e| switch (e) {
+            error.WouldBlock => return,
+            else => {
+                return self.failUpstream(client_fd);
+            },
+        };
+        session.resp = http_response.Response.init(@enumFromInt(res.status));
+        // Ownership contract: every string stored on the response must
+        // outlive the flush. Reader slices die with the transaction below,
+        // so copy names AND values (plus body) into the request arena.
+        const arena_a = session.req.arena.asAllocator();
+        for (res.headers) |h| {
+            const skip = switch (http_parser.header_hasher.hash(h.name)) {
+                http_parser.header_hasher.hash("connection"),
+                http_parser.header_hasher.hash("content-length"),
+                http_parser.header_hasher.hash("transfer-encoding"),
+                => true,
+                else => false,
+            };
+            if (skip) continue;
+            const name_c = arena_a.dupe(u8, h.name) catch return self.failUpstream(client_fd);
+            const value_c = arena_a.dupe(u8, h.value) catch return self.failUpstream(client_fd);
+            session.resp.setHeader(name_c, value_c);
+        }
+        const body = arena_a.dupe(u8, res.body) catch
+            return self.failUpstream(client_fd);
+        session.resp.body = body;
+        if (tx.offer_sticky and tx.sticky_name.len > 0) {
+            var tag_buf: [48]u8 = undefined;
+            const tag = std.fmt.bufPrint(&tag_buf, "{s}=s{d}; Path=/", .{ tx.sticky_name, tx.backend_idx }) catch "";
+            if (tag.len > 0) session.resp.setHeader("Set-Cookie", tag);
+        }
+
+        proxy_mod.upstreamSuccess(tx.backend_idx, up_fd, upstreamNowNs());
+        _ = self.upstream_conns.remove(up_fd);
+        if (self.io_mode == .epoll) self.ep.remove(up_fd) catch {}; // pooled fd kept open
+        session.up = null;
+        self.allocator.destroy(tx);
+        self.finishProxied(client_fd, session);
+    }
+
+    /// 502 with keep-alive semantics identical to the synchronous path.
+    fn failUpstream(self: *Reactor, client_fd: posix.fd_t) void {
+        const session = self.http_sessions.getPtr(client_fd) orelse return;
+        const tx = session.up orelse return;
+        proxy_mod.upstreamFail(tx.backend_idx, tx.route, upstreamNowNs());
+        _ = self.upstream_conns.remove(tx.fd);
+        if (self.io_mode == .epoll) self.ep.remove(tx.fd) catch {};
+        posix.close(tx.fd); // failed fds are not pooled
+        session.up = null;
+        self.allocator.destroy(tx);
+
+        session.resp = http_response.Response.init(.bad_gateway);
+        session.resp.setBody(http_response.Status.bad_gateway.reasonPhrase());
+        session.resp.setHeader("Connection", "keep-alive");
+        session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
+        session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
+        const conn = self.connections.get(client_fd) orelse return;
+        conn.send_buf.compact();
+        session.resp.writeHeadToBuffer(&conn.send_buf) catch {
+            self.removeConnection(client_fd);
+            return;
+        };
+        session.pending_body = session.resp.body;
+        session.pending_body_owned = false;
+        session.writing = true;
+        self.markWriting(client_fd);
+        self.flushHttp(client_fd);
+    }
+
+    /// Serialize the adopted response out to the client.
+    fn finishProxied(self: *Reactor, client_fd: posix.fd_t, session: *HttpSession) void {
+        const close0 = !session.req.keep_alive;
+        session.resp.setHeader("Connection", if (close0) "close" else "keep-alive");
+        session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
+        session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
+        const conn = self.connections.get(client_fd) orelse return;
+        conn.send_buf.compact();
+        session.resp.writeHeadToBuffer(&conn.send_buf) catch {
+            self.removeConnection(client_fd);
+            return;
+        };
+        session.pending_body = session.resp.body;
+        session.pending_body_owned = false;
+        session.writing = true;
+        self.markWriting(client_fd);
+        self.flushHttp(client_fd);
     }
 
     /// Send the 101 Switching Protocols handshake and flip the session into
@@ -1362,6 +1600,9 @@ pub const Reactor = struct {
             .limits = &self.limits,
             .formats = handler.formats(),
             .subrequest = .{ .impl = handler, .call = runtime_server.Server.subrequestImpl },
+            // Parking available on the epoll HTTP path; ring/TLS fronts
+            // keep the synchronous upstream driver.
+            .async_supported = self.io_mode == .epoll,
             .started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
             .now_ns = blk: {
                 const t = std.time.Instant.now() catch break :blk 0;
@@ -1400,9 +1641,29 @@ pub const Reactor = struct {
             }
         }
 
-        const request_outcome = handler.handleRequest(&ctx) catch {
-            self.respondAndClose(fd, .internal_error);
-            return false;
+        const request_outcome = blk: {
+            if (!ctx.async_supported) {
+                // Synchronous drivers (ring/TLS fronts): modules use the
+                // blocking path; no parking possible.
+                break :blk handler.handleRequest(&ctx) catch {
+                    self.respondAndClose(fd, .internal_error);
+                    return false;
+                };
+            }
+            break :blk handler.handleRequest(&ctx) catch |e| switch (e) {
+                error.AsyncPending => {
+                    std.debug.print("[r] AsyncPending caught\n", .{});
+                    self.parkUpstream(fd, &ctx) catch {
+                        self.respondAndClose(fd, .internal_error);
+                        return false;
+                    };
+                    return false;
+                },
+                else => {
+                    self.respondAndClose(fd, .internal_error);
+                    return false;
+                },
+            };
         };
         if (request_outcome == .not_handled) {
             // No module claimed the request (no route matched, a
@@ -2036,6 +2297,9 @@ pub const Reactor = struct {
                 };
                 return;
             }
+        }
+        if (self.http_sessions.getPtr(fd)) |sess| {
+            if (sess.up != null) self.dropUpstream(sess);
         }
         if (self.connections.fetchRemove(fd)) |kv| {
             const conn = kv.value;
@@ -3024,4 +3288,80 @@ test "idle timeout of zero disables reaping" {
     r.stop();
     r.join();
     try testing.expectEqual(@as(usize, 1), r.countConnections());
+}
+
+
+// ---- framework v2 driver unit tests (deterministic socketpair origin) ----
+
+test "upstream driver sends parked request and adopts response" {
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const cpair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(cpair[0]);
+
+    const sess_local = HttpSession{
+        .parser = http_parser.Parser.init(allocator),
+        .req = http_parser.Request.init(allocator),
+    };
+    // Register under the client fd so the driver's session lookup succeeds
+    // (same contract as production).
+    try r.http_sessions.put(cpair[1], sess_local);
+    // Always refetch: map storage can move.
+    const sess = r.http_sessions.getPtr(cpair[1]).?;
+    // The arena-backed body adoption needs a live request arena.
+    sess.req.arena = @import("../http/arena.zig").Arena.init(allocator);
+    sess.up = null;
+    var route = dsl_registry.Route{ .path = "/", .match = .prefix };
+    sess.route_ptr_for_test = &route;
+    defer {
+        if (r.http_sessions.getPtr(cpair[1])) |s2| {
+            s2.parser.deinit();
+            s2.req.deinit();
+        }
+        _ = r.http_sessions.remove(cpair[1]);
+    }
+    try r.connections.put(cpair[1], try connection.Connection.create(allocator, cpair[1]));
+
+    // Pre-stage the origin response so the single drive completes
+    // send->read->adopt without hitting the bounded wait.
+    _ = try posix.write(pair[1], "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nX-Mid: mid\r\n\r\nhi");
+
+    const tx = try allocator.create(UpTx);
+    tx.* = .{
+        .fd = pair[0],
+        .backend_idx = 0,
+        .route = sess.route_ptr_for_test.?,
+        .state = .sending,
+        .request = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n",
+        .offer_sticky = false,
+        .sticky_name = "",
+        .started_ns = upstreamNowNs(),
+    };
+    sess.up = tx;
+
+    r.handleUpstreamEvent(pair[0], cpair[1]);
+
+    // Origin received the exact parked request.
+    var buf: [128]u8 = undefined;
+    const n = try posix.read(pair[1], &buf);
+    try testing.expectEqualStrings("GET /x HTTP/1.1\r\nHost: t\r\n\r\n", buf[0..n]);
+
+    // Response adopted; transaction consumed (driver destroyed it).
+    try testing.expect(sess.up == null);
+    try testing.expectEqual(http_response.Status.ok, sess.resp.status);
+    try testing.expectEqualStrings("hi", sess.resp.body);
+    var saw_ct = false;
+    var saw_mid = false;
+    for (sess.resp.headers[0..sess.resp.header_count]) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Content-Type")) saw_ct = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "X-Mid")) saw_mid = true;
+    }
+    try testing.expect(saw_ct and saw_mid);
 }

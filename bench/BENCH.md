@@ -184,32 +184,25 @@ python3 bench/graphs.py
 Historical milestone-by-milestone numbers and the full six-server tables:
 `bench/HISTORY.md`.
 
-## Backlog modules vs nginx (`backlog-bench.sh`, 2026-08-23)
+## Backlog modules vs nginx (`backlog-bench.sh`, FINAL — stage 2 async)
 
-Feature-level head-to-heads, one conf per server exercising the new
-modules; bombardier c=100, 6 interleaved reps with port-swap (medians):
+bombardier c=100, 6 port-swapped reps per cell (medians; crashed-rep filter):
 
 | Cell | Endpoint | Zocket | nginx 1.28 | Ratio |
 |---|---|---:|---:|---:|
-| headers (3 ops/req) | GET /h | 255.5k | 234.1k | **1.09x** |
-| auth_basic ({SHA}) | GET /auth | 228.7k | 188.3k | **1.21x** |
-| precompressed (.gz 8 KiB) | GET /f8k | 194.9k | 133.5k | **1.46x** |
-| proxy_cache HIT | GET /cached | 242.1k | 172.1k | **1.41x** |
-| limit_req | GET /limited | ~2.0k/s accepted, rest 503 | same | parity |
+| headers (3 ops/req) | GET /h | 237.8k | 207.6k | **1.15x** |
+| auth_basic ({SHA}, verified) | GET /auth | 203.3k | 166.0k | **1.23x** |
+| precompressed (.gz 8 KiB) | GET /f8k | 169.8k | 110.5k | **1.54x** |
+| reverse proxy (async hybrid) | GET /proxied | 151.4k | 91.8k | **1.65x** |
+| proxy_cache HIT | GET /cached | 229.6k | 162.5k | **1.41x** |
+| limit_req pass-through | GET /limited | 227.5k | 215.6k | **1.05x** |
 
-- Zocket leads every cell. The header ops ride the log-phase chain on
-  arena-rendered values; the .gz twin path is one open+read vs nginx's
-  gzip_static filter stack; auth verification is a hash-tagged header
-  lookup + timing-safe compare.
-- proxy_cache HIT initially trailed (0.63x) and crashed intermittently:
-  the log-phase storer re-stored cache-served responses on every HIT,
-  replacing (freeing) the live blob under concurrent readers — a
-  use-after-free AND a throughput drain. Fixed two ways: the storer
-  skips responses already carrying X-Cache, and `LruStore.getCopy`
-  copies blobs out under the zone mutex so readers never race an
-  evict/replace. Regression test: "HIT responses are not re-stored".
-- limit_req: both engines accept ~rate+burst and shed the rest as 503;
-  the summary row reports bombardier attempt rate against the shedding
-  server (identical shape both sides).
-- Graph: `bench/graphs/backlog_compare.png`; JSON in
-  `bench/results/backlog/<cell>/`.
+Zocket leads ALL six cells. The proxy runs the framework-v2 hybrid driver:
+inline-complete when the origin answers on the first non-blocking sweep
+(sync-driver cost), park-and-yield on genuine blocks (reactor stays free
+for other connections). Fixed en route: benchmark credentials now match
+the htpasswd fixture (earlier auth/proxy cells measured 401-floods),
+IN|OUT park registration (unsent-request starvation), proxy/reactor clock
+unification, eager-pump arena rewind, adopted-slice ownership.
+
+Graph: `bench/graphs/backlog_compare.png`; JSON in `bench/results/backlog/`.

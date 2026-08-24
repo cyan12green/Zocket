@@ -25,23 +25,22 @@ pub const auth_request = registry.Module{
 fn run(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
     const uri = route.auth_request_uri orelse return .pass;
-    if (ctx.getState("auth_request") == @as(?*anyopaque, @ptrCast(&in_subrequest_marker))) {
-        // We are ALREADY inside an auth subrequest: refuse to recurse.
+    if (ctx.getState("auth_request") != null) {
+        // Already inside our own subrequest: refuse to recurse.
         return failWith(ctx, .internal_error);
     }
-    const hook = ctx.subrequest orelse return failWith(ctx, .internal_error);
 
     var status: u16 = 0;
     ctx.setState("auth_request", @ptrCast(&in_subrequest_marker));
     defer ctx.setState("auth_request", null);
-    hook.call(hook.impl, ctx.req, uri, &status) catch return failWith(ctx, .internal_error);
+    ctx.runSubrequest(uri, &status) catch return failWith(ctx, .internal_error);
 
     if (status >= 200 and status <= 299) return .pass;
     return failWith(ctx, mappedStatus(status));
 }
 
-/// Copy the subrequest's verdict where the Status enum can express it;
-/// anything unmapped becomes a generic 500 (never admit on confusion).
+/// Copy the subrequest verdict where the Status enum can express it;
+/// unmapped codes degrade to forbidden (never admit on confusion).
 fn mappedStatus(code: u16) registry.Status {
     return switch (code) {
         400 => .bad_request,
