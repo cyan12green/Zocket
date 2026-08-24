@@ -1,5 +1,6 @@
 const std = @import("std");
 const registry = @import("../registry.zig");
+const sockets = @import("../../net/sockets.zig");
 const router = @import("../router.zig");
 const http_parser = @import("../../http/parser.zig");
 const vars = @import("../vars.zig");
@@ -37,7 +38,10 @@ pub const ParkedPlan = struct {
     fd: posix_fd,
     backend_idx: usize,
     route: *const registry.Route,
-    request: []const u8, // arena slice, fully built
+    request: []const u8,
+    sent: usize = 0,
+    awaiting_out: bool = false,
+    reader_ptr: ?*UpstreamReader = null, // heap copy surviving the frame
     offer_sticky: bool,
     sticky_name: []const u8,
     started_ns: u64,
@@ -68,6 +72,34 @@ fn park(ctx: *Context) anyerror!Action {
     return parkAt(ctx, route, upstreams, pick, now_ns, route.sticky_cookie != null);
 }
 
+/// Adopt an upstream response into the context (buffer-ownership contract:
+/// every slice copied into the request arena — reader memory dies with the
+/// transaction). Shared by the inline fast path and the reactor driver.
+pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_name: []const u8, backend_idx: usize) !void {
+    ctx.resp.status = @enumFromInt(res.status);
+    const arena_a = ctx.req.arena.asAllocator();
+    for (res.headers) |h| {
+        const skip = switch (http_parser.header_hasher.hash(h.name)) {
+            http_parser.header_hasher.hash("connection"),
+            http_parser.header_hasher.hash("content-length"),
+            http_parser.header_hasher.hash("transfer-encoding"),
+            => true,
+            else => false,
+        };
+        if (skip) continue;
+        const name_c = arena_a.dupe(u8, h.name) catch return error.OutOfMemory;
+        const value_c = arena_a.dupe(u8, h.value) catch return error.OutOfMemory;
+        ctx.resp.setHeader(name_c, value_c);
+    }
+    const body = arena_a.dupe(u8, res.body) catch return error.OutOfMemory;
+    ctx.resp.body = body;
+    if (offer_sticky and sticky_name.len > 0) {
+        var tag_buf: [48]u8 = undefined;
+        const tag = std.fmt.bufPrint(&tag_buf, "{s}=s{d}; Path=/", .{ sticky_name, backend_idx }) catch "";
+        if (tag.len > 0) ctx.resp.setHeader("Set-Cookie", tag);
+    }
+}
+
 fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router.Upstream, pick: usize, started_ns: u64, offer_sticky: bool) anyerror!Action {
     ensureHealthChecker(route);
     const up = &upstreams[pick];
@@ -79,27 +111,98 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
         };
         setRecvTimeout(fd);
     }
-    // Serialize fully NOW (arena-backed) so the reactor never touches the
-    // parser again while the transaction is parked.
+    // Serialize fully NOW (arena-backed) so a parked transaction never
+    // touches the parser again.
     const request = buildUpstreamRequest(ctx, up) catch {
         posix_close(fd);
         active[pick] -|= 1;
         markFailure(pick, route, started_ns);
         return badGateway(ctx);
     };
+
+    // HYBRID: try the whole round-trip inline. Fast origins finish right
+    // here at sync-driver cost; only real blocks park.
+    var sent: usize = 0;
+    while (sent < request.len) {
+        const n = std.posix.write(fd, request[sent..]) catch |e| switch (e) {
+            error.WouldBlock => {
+                return parkRemainder(ctx, route, .{
+                    .fd = fd, .backend_idx = pick, .route = route, .request = request,
+                    .sent = sent, .awaiting_out = true,
+                    .offer_sticky = offer_sticky,
+                    .sticky_name = route.sticky_cookie orelse "",
+                    .started_ns = started_ns,
+                }, null);
+            },
+            else => {
+                posix_close(fd);
+                active[pick] -|= 1;
+                markFailure(pick, route, started_ns);
+                return badGateway(ctx);
+            },
+        };
+        sent += n;
+    }
+
+    var reader = UpstreamReader{};
+    while (true) {
+        if (reader.tryParse()) |res| {
+            try adoptUpstream(ctx, res, offer_sticky, route.sticky_cookie orelse "", pick);
+            upstreamSuccess(pick, fd, nowNs());
+            return .handled; // normal serialization follows; NO event hop
+        } else |e| switch (e) {
+            error.Incomplete => {},
+            else => {
+                posix_close(fd);
+                active[pick] -|= 1;
+                markFailure(pick, route, started_ns);
+                return badGateway(ctx);
+            },
+        }
+        const got = reader.fill(fd) catch |fe| switch (fe) {
+            error.WouldBlock => {
+                const hr = ctx.sharedAlloc(@sizeOf(UpstreamReader)) orelse return error.OutOfMemory;
+                const hr_t: *UpstreamReader = @ptrCast(@alignCast(hr));
+                hr_t.* = reader;
+                return parkRemainder(ctx, route, .{
+                    .fd = fd, .backend_idx = pick, .route = route, .request = request,
+                    .sent = sent, .awaiting_out = false,
+                    .offer_sticky = offer_sticky,
+                    .sticky_name = route.sticky_cookie orelse "",
+                    .started_ns = started_ns,
+                    .reader_ptr = hr_t,
+                }, hr_t);
+            },
+            else => {
+                posix_close(fd);
+                active[pick] -|= 1;
+                markFailure(pick, route, started_ns);
+                return badGateway(ctx);
+            },
+        };
+        if (got == 0) {
+            posix_close(fd);
+            active[pick] -|= 1;
+            markFailure(pick, route, started_ns);
+            return badGateway(ctx);
+        }
+    }
+}
+
+/// Stash the remainder of a blocked transaction and hand it to the reactor.
+fn parkRemainder(
+    ctx: *Context,
+    route: *const registry.Route,
+    plan_fields: ParkedPlan,
+    heap_reader: ?*UpstreamReader,
+) anyerror!Action {
+    _ = route;
     const plan = ctx.sharedAlloc(@sizeOf(ParkedPlan)) orelse return error.OutOfMemory;
-    const plan_typed: *ParkedPlan = @ptrCast(@alignCast(plan));
-    plan_typed.* = .{
-        .fd = fd,
-        .backend_idx = pick,
-        .request = request,
-        .route = route,
-        .offer_sticky = offer_sticky,
-        .sticky_name = route.sticky_cookie orelse "",
-        .started_ns = started_ns,
-    };
-    ctx.setState("proxy", @ptrCast(plan_typed));
-    ctx.async_fd = fd;
+    const pt: *ParkedPlan = @ptrCast(@alignCast(plan));
+    pt.* = plan_fields;
+    pt.reader_ptr = heap_reader;
+    ctx.setState("proxy", @ptrCast(pt));
+    ctx.async_fd = pt.fd;
     return .async;
 }
 
@@ -609,6 +712,7 @@ fn connectUpstream(up: *const router.Upstream) !posix_fd {
     // of parking the reactor thread on a slow backend.
     const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
     errdefer posix_close(fd);
+    sockets.setTcpNoDelay(fd);
     std.posix.connect(fd, &up.sockaddr, 16) catch |e| switch (e) {
         error.WouldBlock => {}, // EINPROGRESS: finish under poll below
         else => return e,
@@ -772,17 +876,28 @@ pub const UpstreamReader = struct {
         return .{};
     }
 
-    pub fn read(self: *UpstreamReader, fd: posix_fd) !struct { status: u16, headers: []const UpstreamHeader, body: []const u8 } {
-        // Status line.
-        const status_line = try self.readLine(fd);
+    pub const Parsed = struct { status: u16, headers: []const UpstreamHeader, body: []const u8 };
+
+    /// One CRLF line straight from the buffer (no socket access).
+    fn lineFromBuffer(self: *UpstreamReader) ?[]const u8 {
+        const idx = std.mem.indexOfScalar(u8, self.buf[self.pos..self.used], '\n') orelse return null;
+        var line = self.buf[self.pos .. self.pos + idx];
+        self.pos += idx + 1;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        return line;
+    }
+
+    /// Parse strictly from the buffer; error.Incomplete when more bytes are
+    /// needed (caller fills and retries). Never touches the socket.
+    pub fn tryParse(self: *UpstreamReader) !Parsed {
+        const status_line = self.lineFromBuffer() orelse return error.Incomplete;
         var it = std.mem.tokenizeAny(u8, status_line, " ");
-        _ = it.next(); // HTTP/1.1
+        _ = it.next(); // HTTP/1.x
         const code_tok = it.next() orelse return error.BadUpstreamResponse;
         self.status = std.fmt.parseInt(u16, code_tok, 10) catch return error.BadUpstreamResponse;
 
-        // Headers.
         while (true) {
-            const line = try self.readLine(fd);
+            const line = self.lineFromBuffer() orelse return error.Incomplete;
             if (line.len == 0) break;
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadUpstreamResponse;
             if (self.header_count >= max_upstream_headers) return error.BadUpstreamResponse;
@@ -793,18 +908,39 @@ pub const UpstreamReader = struct {
             self.header_count += 1;
         }
 
-        // Body: consume per Content-Length (the upstream is our own server,
-        // which always sets it).
         var content_length: usize = 0;
         for (self.headers[0..self.header_count]) |h| {
             if (http_parser.header_hasher.hash(h.name) == comptime http_parser.header_hasher.hash("content-length")) {
                 content_length = std.fmt.parseInt(usize, h.value, 10) catch return error.BadUpstreamResponse;
             }
         }
-        self.ensureAvailable(fd, content_length) catch return error.BadUpstreamResponse;
-        self.body = self.buf[self.pos .. self.pos + content_length];
+        if (self.used - self.pos < content_length) {
+            // Compact so the next fill appends at a sane offset.
+            if (self.pos > 0) {
+                const remaining = self.buf[self.pos..self.used];
+                std.mem.copyForwards(u8, self.buf[0..remaining.len], remaining);
+                self.used -= self.pos;
+                self.pos = 0;
+            }
+            return error.Incomplete;
+        }
+        const body = self.buf[self.pos .. self.pos + content_length];
         self.pos += content_length;
-        return .{ .status = self.status, .headers = self.headers[0..self.header_count], .body = self.body };
+        return .{ .status = self.status, .headers = self.headers[0..self.header_count], .body = body };
+    }
+
+    pub fn read(self: *UpstreamReader, fd: posix_fd) !Parsed {
+        while (true) {
+            const res = self.tryParse() catch |e| switch (e) {
+                error.Incomplete => {
+                    const got = try self.fill(fd);
+                    if (got == 0) return error.UpstreamClosed;
+                    continue;
+                },
+                else => return e,
+            };
+            return res;
+        }
     }
 
     fn readLine(self: *UpstreamReader, fd: posix_fd) ![]const u8 {
@@ -1066,8 +1202,8 @@ fn nowForHc() u64 {
 }
 
 test "tcpProbe distinguishes a live listener from a dead port" {
-    const sockets_mod = @import("../../net/sockets.zig");
-    const listener = try sockets_mod.createListeningSocket(18933, 4);
+
+    const listener = try sockets.createListeningSocket(18933, 4);
     defer posix.close(listener);
     // Accept the probe connection on a side thread (connect-only probe
     // sends nothing and closes).
@@ -1076,7 +1212,7 @@ test "tcpProbe distinguishes a live listener from a dead port" {
             var fds = [_]std.posix.pollfd{.{ .fd = lfd, .events = std.posix.POLL.IN, .revents = 0 }};
             _ = std.posix.poll(&fds, 2000) catch return;
             if (fds[0].revents & std.posix.POLL.IN != 0) {
-                const c = sockets_mod.acceptNonBlock(lfd) catch return;
+                const c = sockets.acceptNonBlock(lfd) catch return;
                 posix.close(c);
             }
         }
@@ -1090,8 +1226,8 @@ test "tcpProbe distinguishes a live listener from a dead port" {
     // ephemeral port).
     var dead_ok_checked = false;
     for (0..4) |_| {
-        const tmp_listener = try sockets_mod.createListeningSocket(0, 4);
-        const dead_port = try sockets_mod.boundPort(tmp_listener);
+        const tmp_listener = try sockets.createListeningSocket(0, 4);
+        const dead_port = try sockets.boundPort(tmp_listener);
         posix.close(tmp_listener);
         const dead = mkUp("127.0.0.1", dead_port);
         if (!tcpProbe(&dead, "", 1)) {
