@@ -233,6 +233,10 @@ Tracked backlog (design notes recorded here; build later):
   bimodal, and in-suite the proxy cell drops to ~6k (100% success,
   ~16ms/req) — an environment interaction that remains OPEN. The
   synchronous driver stays available via ctx.async_supported=false.
+  REGRESSION NOTE (2026-08-24, post d8264e9): the full suite hangs on
+  non-proxy cells (auth bombardier never completes; manual curls stall)
+  after the subrequest/IoHandle/streaming batch — bisect those three
+  commits first when resuming; master is unaffected.
   Bench gate (>=0.85x in-suite) not met yet; items 6-8 (subrequest
   generalization, IoHandle abstraction for QUIC, streaming flag) remain
   designed-not-built on top of this seam.
