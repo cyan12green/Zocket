@@ -206,3 +206,26 @@ IN|OUT park registration (unsent-request starvation), proxy/reactor clock
 unification, eager-pump arena rewind, adopted-slice ownership.
 
 Graph: `bench/graphs/backlog_compare.png`; JSON in `bench/results/backlog/`.
+
+## Unified suite (official, 6 port-swapped reps — 2026-08-24)
+
+Group A webserver/fileserver + LB cell, all servers on identical endpoints
+(`bench/unified.sh`, c=100, medians; p50/p99 in µs):
+
+| Cell | Zocket | nginx | HAProxy |
+|---|---:|---:|---:|
+| h1_echo | **217.3k** / 291 | 144.1k / 366 | — |
+| headers_ops | **227.2k** / 278 | 215.5k / 333 | — |
+| auth_basic ({SHA}) | **222.9k** / 287 | 176.4k / 474 | — |
+| static_small | **185.9k** / 344 | 123.3k / 665 | — |
+| precompressed (.gz) | **180.1k** / 343 | 124.0k / 646 | — |
+| lb_rr (4-origin pool) | **227.1k** / 277 | 77.4k / 1060 | 77.8k / 1116 |
+| proxy_cache HIT | **225.3k** / 294 | 162.7k / 512 | — |
+| static_large (1 MiB) | 9.7k / 8089 | 9.6k / 8647 | — |
+
+Zocket leads every applicable cell; static_large is loopback-wire
+saturated (~9.7 GB/s both). The rep-loop restart stall was eliminated by
+driving each labeled rep as its own process (`--rep-label`), which is now
+the official methodology.
+
+Graph: `bench/graphs/unified_web.png`; JSON in `bench/results/unified/`.

@@ -11,6 +11,8 @@ REPS=3 DURATION=6s CONNS=100
 QUICK=0
 [ "${1:-}" = "--quick" ] && { QUICK=1; REPS=1; shift; }
 [ "${1:-}" = "--reps" ] && { REPS="$2"; shift 2; }
+REP_LABEL=""
+[ "${1:-}" = "--rep-label" ] && { REP_LABEL="$2"; shift 2; }
 
 TCP_BIN="$ROOT/zig-out/bin/zocket"
 NGINX_BIN="$ROOT/bench/.cache/nginx-build/sbin/nginx"
@@ -92,7 +94,8 @@ stop_all() {
 }
 trap stop_all EXIT
 
-for rep in $(seq 1 "$REPS"); do
+REP_LIST=$(seq 1 "$REPS"); [ -n "$REP_LABEL" ] && REP_LIST="$REP_LABEL"
+for rep in $REP_LIST; do
     echo "== rep $rep/$REPS =="
     OPIDS=(); NPIDS=()
     HPIDS=()
