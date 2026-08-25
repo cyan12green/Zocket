@@ -1,0 +1,74 @@
+worker_processes 4;
+daemon off;
+error_log @@ERRLOG@@ crit;
+pid @@PREFIX@@/nginx.pid;
+
+events {
+    worker_connections 16384;
+}
+
+http {
+    access_log off;
+    server_tokens off;
+    keepalive_timeout 65;
+    keepalive_requests 100000;
+    sendfile on;
+    sendfile_max_chunk 1m;
+    gzip_static on;
+
+    proxy_cache_path @@CACHEDIR@@ keys_zone=uni:16m max_size=64m inactive=600s;
+
+    upstream origins {
+        server 127.0.0.1:@@ORIGIN0@@;
+        server 127.0.0.1:@@ORIGIN1@@;
+        server 127.0.0.1:@@ORIGIN2@@;
+        server 127.0.0.1:@@ORIGIN3@@;
+        keepalive 64;
+    }
+
+    limit_req_zone $binary_remote_addr zone=lim:16m rate=1000000r/s;
+
+    server {
+        listen 127.0.0.1:@@PORT@@;
+
+        location = /echo {
+            echo_read_request_body;
+            echo_request_body;
+        }
+
+        location = /auth {
+            auth_basic "bench";
+            auth_basic_user_file @@HTPASSWD@@;
+            echo -n "";
+        }
+
+        location = /limited {
+            limit_req zone=lim burst=10000 nodelay;
+            echo -n "";
+        }
+
+        location = /h {
+            add_header X-A "1" always;
+            add_header X-B $remote_addr always;
+            echo -n "";
+        }
+
+        location = /cached {
+            proxy_pass http://origins;
+            proxy_cache uni;
+            proxy_cache_valid 200 3600s;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+
+        location = /proxied {
+            proxy_pass http://origins;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+
+        location / {
+            root @@STATICDIR@@;
+        }
+    }
+}

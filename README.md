@@ -93,23 +93,14 @@ zig build run -- --help                all flags, including daemon control:
 
 ## Benchmark graphs
 
-Refer to `bench/BENCH.md` for details on benchmark generation and methodology.
+Unified suite (webserver / fileserver / load-balancer cells vs nginx and
+HAProxy — methodology in `bench/BENCH.md` and `bench/UNIFIED.md`):
 
-![POST /echo 1 KB — req/s and latency](bench/graphs/matrix_1024.png)
+![Unified benchmark — all cells](bench/graphs/unified_web.png)
 
-![POST /echo 8 KB — req/s and latency](bench/graphs/matrix_8192.png)
-
-![POST /echo 64 KB — req/s and latency](bench/graphs/matrix_65536.png)
-
-![Static file serving — req/s](bench/graphs/static.png)
-
-![Zocket vs nginx — req/s and per-request cost](bench/graphs/nginx_compare.png)
-
-![HTTP/2 (h2c) — Zocket vs nginx, h2load](bench/graphs/h2_compare.png)
-
-![HTTP/1.1 chunked transfer — Zocket vs nginx, POST echo](bench/graphs/chunked_compare.png)
-
-![HTTP/2 over TLS — Zocket vs nginx, h2load](bench/graphs/tls_compare.png)
+Protocol-deep comparisons: `bench/graphs/h2_compare.png` (HTTP/2 h2load),
+`bench/graphs/tls_compare.png` (TLS), `bench/graphs/nginx_compare.png`
+(per-request cost). Full details: `bench/BENCH.md`.
 
 ![Backlog modules vs nginx — headers/auth/precompressed/proxy/cache/limit](bench/graphs/backlog_compare.png)
 

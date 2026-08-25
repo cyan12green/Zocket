@@ -46,12 +46,31 @@ start_origins() {
 
 start_zocket() { "$TCP_BIN" --port "$ZP" --threads 4 >/dev/null 2>&1 & ZPID=$!; }
 
+start_haproxy() {
+    [ -x "$HAPROXY_BIN" ] || return 0
+    local servers=""
+    for i in 0 1 2 3; do
+        servers="${servers}        server o$i 127.0.0.1:$((ORIGIN_BASE+i))\n"
+    done
+    sed -e "s/@@THREADS@@/4/" -e "s/@@PORT@@/$HP/" \
+        -e "s|@@SERVERS@@|${servers%\\n}|" \
+        "$ROOT/bench/haproxy-lb.cfg.template" > "$ROOT/bench/.cache/haproxy-uni.cfg"
+    "$HAPROXY_BIN" -f "$ROOT/bench/.cache/haproxy-uni.cfg" >/dev/null 2>&1 &
+    HPIDS+=($!)
+}
+
 start_nginx() {
     local prefix="$ROOT/bench/.cache/nginx-uni-p$NP"
-    mkdir -p "$prefix"
+    mkdir -p "$prefix" "$ROOT/bench/.cache/unified-cache"
     sed -e "s/@@PORT@@/$NP/" -e "s|@@ERRLOG@@|$ROOT/bench/.cache/nginx-uni.err|" \
         -e "s|@@PREFIX@@|$prefix|" -e "s|@@STATICDIR@@|$STATIC_DIR|" \
-        "$ROOT/bench/foreign/nginx/nginx.conf.template" > "$ROOT/bench/.cache/nginx-uni.conf"
+        -e "s|@@HTPASSWD@@|$ROOT/testdata/bench-htpasswd|" \
+        -e "s|@@CACHEDIR@@|$ROOT/bench/.cache/unified-cache|" \
+        -e "s/@@ORIGIN0@@/$ORIGIN_BASE/" \
+        -e "s/@@ORIGIN1@@/$((ORIGIN_BASE+1))/" \
+        -e "s/@@ORIGIN2@@/$((ORIGIN_BASE+2))/" \
+        -e "s/@@ORIGIN3@@/$((ORIGIN_BASE+3))/" \
+        "$ROOT/bench/foreign/nginx/unified.conf.template" > "$ROOT/bench/.cache/nginx-uni.conf"
     "$NGINX_BIN" -p "$prefix" -c "$ROOT/bench/.cache/nginx-uni.conf" >/dev/null 2>&1 &
     NPIDS+=($!)
 }
@@ -68,6 +87,7 @@ stop_all() {
     kill "${ZPID:-0}" 2>/dev/null || true
     for p in ${NPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
     for p in ${OPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
+    for p in ${HPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
     wait 2>/dev/null || true
 }
 trap stop_all EXIT
@@ -75,7 +95,8 @@ trap stop_all EXIT
 for rep in $(seq 1 "$REPS"); do
     echo "== rep $rep/$REPS =="
     OPIDS=(); NPIDS=()
-    start_origins; start_zocket; start_nginx
+    HPIDS=()
+    start_origins; start_zocket; start_nginx; start_haproxy
     sleep 1.5
     curl -s -o /dev/null "http://127.0.0.1:$ZP/cached" || true
     curl -s -o /dev/null "http://127.0.0.1:$NP/cached" || true
@@ -86,6 +107,9 @@ for rep in $(seq 1 "$REPS"); do
         case "$path" in /echo) m=(-m POST -b "$(python3 -c "print('x'*1024)")");; *) m=();; esac
         run_cell "$cell" "$ZP" zocket "$rep" "$path" ${m[@]+"${m[@]}"} ${extra[@]+"${extra[@]}"}
         run_cell "$cell" "$NP" nginx "$rep" "$path" ${m[@]+"${m[@]}"} ${extra[@]+"${extra[@]}"}
+        if [ "$cell" = lb_rr ]; then
+            run_cell "$cell" "$HP" haproxy "$rep" "$path"
+        fi
     done
     stop_all
 done
