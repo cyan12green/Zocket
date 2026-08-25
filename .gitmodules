@@ -22,3 +22,8 @@
 [submodule "third_party/haproxy"]
 	path = third_party/haproxy
 	url = https://github.com/haproxy/haproxy.git
+
+[submodule "third_party/envoy"]
+	path = third_party/envoy
+	url = https://github.com/envoyproxy/envoy.git
+	branch = release/v1.39
