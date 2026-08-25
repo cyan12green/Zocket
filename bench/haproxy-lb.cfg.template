@@ -1,0 +1,21 @@
+# HAProxy load-balancer benchmark config (template).
+global
+    stats socket /tmp/haproxystat mode 600 level admin
+    nbthread @@THREADS@@
+
+defaults
+    mode http
+    log global
+    timeout connect 5s
+    timeout client 60s
+    timeout server 60s
+
+backend origins
+    balance roundrobin
+    option http-keep-alive
+@@SERVERS@@
+
+listen lb
+    bind 127.0.0.1:@@PORT@@
+    option http-keep-alive
+    default_backend origins
