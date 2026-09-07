@@ -17,6 +17,7 @@ pub const Action = registry.Action;
 var in_subrequest_marker: u8 = 0;
 
 pub const auth_request = registry.Module{
+    .touches_headers = true,
     .name = "auth_request",
     .phase = .access,
     .run = run,

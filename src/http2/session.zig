@@ -497,7 +497,7 @@ pub const Session = struct {
         // fields allocate bump-style, no per-field syscalls. Freed when the
         // Request is pooled and its arena reset on reuse.
         if (st.request == null) {
-            var r = self.request_pool.pop() orelse parser.Request.initWithLimits(self.allocator, self.max_headers);
+            var r = self.request_pool.pop() orelse parser.Request.initWithLimits(self.allocator, self.max_headers, (limits_mod.Limits{}).max_body_spool);
             r.reset(); // clear the previous stream's arena before reuse
             st.request = r;
         }

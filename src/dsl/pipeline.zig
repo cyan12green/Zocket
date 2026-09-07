@@ -2,6 +2,7 @@ const std = @import("std");
 const phase_mod = @import("phase.zig");
 const router = @import("router.zig");
 const registry = @import("registry.zig");
+const default_registry = @import("registry.zig").default_registry;
 
 pub const Phase = phase_mod.Phase;
 pub const Context = registry.Context;
@@ -90,7 +91,13 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
             for (r.modules) |b| {
                 if (b.phase != phase) continue;
                 const run_fn = Registry.resolve(b.module) orelse return error.UnknownModule;
-                switch (try run_fn(ctx)) {
+                const act = run_fn(ctx) catch |e| {
+                    if (e == error.AsyncPending) return e;
+                    std.log.info("module '{s}' failed: {s} -> {d}", .{ b.module, @errorName(e), registry.statusForModuleError(e) });
+                    _ = default_registry.applyModuleError(b.module, e, ctx);
+                    break :blk Outcome.handled;
+                };
+                switch (act) {
                     .pass => continue,
                     .handled => break :blk Outcome.handled,
                     .short_circuit => break :blk Outcome.not_handled,
@@ -196,7 +203,14 @@ pub fn dispatchForRoute(comptime Registry: type, comptime route: router.Route) D
                     inline for (route.modules) |b| {
                         if (b.phase != phase) continue;
                         const run_fn = Registry.resolve(b.module).?;
-                        switch (try run_fn(ctx)) {
+                        const act = run_fn(ctx) catch |e| {
+                            if (e == error.AsyncPending) return e;
+                            std.log.info("module '{s}' failed: {s} -> {d}", .{ b.module, @errorName(e), registry.statusForModuleError(e) });
+                            _ = default_registry.applyModuleError(b.module, e, ctx);
+                            outcome = .handled;
+                            break :phases;
+                        };
+                        switch (act) {
                             .pass => {},
                             .async => return error.AsyncPending,
                             .handled => {
@@ -292,6 +306,22 @@ const pass_mod = struct {
     }
 };
 
+const fail_mod = struct {
+    streams_response: bool = false,
+    name: []const u8,
+    phase: Phase,
+    run: *const fn (*Context) anyerror!Action,
+
+    fn make(comptime n: []const u8, comptime p: Phase) pass_mod {
+        const Impl = struct {
+            fn run(ctx: *Context) !Action {
+                ctx.resp.setHeader("X-Order", n);
+                return error.UpstreamConnectFailed;
+            }
+        };
+        return .{ .name = n, .phase = p, .run = Impl.run, .streams_response = false };
+    }
+};
 const claim_mod = struct {
     streams_response: bool = false,
     name: []const u8,
@@ -363,6 +393,12 @@ const ChainRegistry = registry.Registry(.{
     pass_mod.make("chain_c", .content),
     claim_mod.make("chain_claim", .content),
     pass_mod.make("log_mod", .log),
+});
+
+const FailedRegistry = registry.Registry(.{
+    claim_mod.make("early", .post_read),
+    pass_mod.make("content_mod", .content),
+    fail_mod.make("fail_mod", .content),
 });
 
 fn runWith(comptime R: type, routes: []const router.Route, req: *Request) !struct { outcome: Outcome, resp: Response } {
@@ -789,4 +825,24 @@ test "filters run even when nothing handled (template path)" {
         if (std.mem.eql(u8, h.name, "X-F")) count += 1;
     }
     try testing.expectEqual(@as(usize, 2), count);
+}
+
+test "module failure maps through central taxonomy" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/somewhere";
+    req.decoded_target = "/somewhere";
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp }; // mirror an existing test's ctx setup
+    // route binding failmod in content phase
+    const routes = comptime &[_]router.Route{.{ .path = "/", .modules = &.{.{ .module = "fail_mod", .phase = .content }} }};
+    const dispatched = comptime assignDispatch(FailedRegistry, routes);
+    const trie = router.buildTrie(&dispatched);
+    var rtr = router.Router{ .routes = &dispatched, .trie = trie };
+    _ = runWithRouter(FailedRegistry, &dispatched, &rtr, &ctx) catch |err| switch (err) {
+        else => {},
+    };
+    try testing.expectEqual(registry.Status.bad_gateway, ctx.resp.status);
 }

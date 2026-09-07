@@ -61,6 +61,7 @@ fn keyHash(key: []const u8) u64 {
 
 const H_recv_buffer_size = keyHash("recv_buffer_size");
 const H_send_buffer_size = keyHash("send_buffer_size");
+const H_max_body_spool = keyHash("max_body_spool");
 const H_max_body = keyHash("max_body");
 const H_max_line_bytes = keyHash("max_line_bytes");
 const H_max_headers = keyHash("max_headers");
@@ -608,6 +609,10 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
         },
         H_send_buffer_size => {
             b.limits.send_buffer_size = lx.size(name);
+            lx.expectTerminator(name);
+        },
+        H_max_body_spool => {
+            b.limits.max_body_spool = lx.size(name);
             lx.expectTerminator(name);
         },
         H_max_body => {
@@ -1604,6 +1609,7 @@ const testing = std.testing;
 test "conf: parses globals, tls, server and locations" {
     const cfg = parse(
         \\max_body 16m;
+        \\max_body_spool 2m;
         \\max_headers 64;
         \\listen 8080;
         \\tls {
@@ -1620,6 +1626,7 @@ test "conf: parses globals, tls, server and locations" {
         \\}
     );
     try testing.expectEqual(@as(usize, 16 * 1024 * 1024), cfg.limits.max_body);
+    try testing.expectEqual(@as(usize, 2 * 1024 * 1024), cfg.limits.max_body_spool);
     try testing.expectEqual(@as(usize, 64), cfg.limits.max_headers);
     try testing.expectEqual(@as(?u16, 8080), cfg.listen_port);
     try testing.expect(cfg.tls.enabled());

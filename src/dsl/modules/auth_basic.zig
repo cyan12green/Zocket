@@ -23,6 +23,7 @@ pub const Status = registry.Status;
 const max_credentials = 256;
 
 pub const auth_basic = registry.Module{
+    .touches_headers = true,
     .name = "auth_basic",
     .phase = .access,
     .run = run,

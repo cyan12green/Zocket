@@ -21,6 +21,8 @@ pub const Limits = struct {
     recv_buffer_size: usize = 16384,
     /// Initial per-connection send buffer size.
     send_buffer_size: usize = 16384,
+    /// Bodies larger than these spool to disk
+    max_body_spool: usize = 1024 * 1024,
     /// Largest request body the server buffers (the recv-buffer growth cap;
     /// requests beyond it are rejected with 431). nginx: client_max_body_size.
     max_body: usize = 16 * 1024 * 1024,
@@ -40,3 +42,4 @@ pub const Limits = struct {
     /// Recycled connections held by the per-reactor pool.
     connection_pool_max: usize = 1024,
 };
+

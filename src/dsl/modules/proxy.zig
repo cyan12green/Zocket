@@ -21,6 +21,8 @@ pub const Action = registry.Action;
 /// The upstream I/O is synchronous: a hung upstream stalls its reactor for
 /// the socket receive timeout (5 s) — a documented limitation.
 pub const proxy = registry.Module{
+    .needs_body = true,
+    .touches_headers = true,
     .name = "proxy",
     .phase = .rewrite,
     .run = run,

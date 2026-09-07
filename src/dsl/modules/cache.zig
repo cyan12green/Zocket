@@ -10,6 +10,7 @@ pub const Action = registry.Action;
 /// `If-Modified-Since`, the request is answered with 304 Not Modified and the
 /// pipeline stops. Otherwise passes through to content.
 pub const conditional_get = registry.Module{
+    .touches_headers = true,
     .name = "conditional_get",
     .phase = .preaccess,
     .run = conditionalRun,

@@ -2,6 +2,8 @@ const std = @import("std");
 const arena_mod = @import("arena.zig");
 const buffer_mod = @import("../net/buffer.zig");
 const header_dfa_mod = @import("header_dfa.zig");
+const body_storage_mod = @import("../net/body_storage.zig");
+const limits_mod = @import("../dsl/limits.zig");
 
 const ascii = std.ascii;
 const mem = std.mem;
@@ -218,7 +220,7 @@ pub const Request = struct {
     arena: arena_mod.Arena,
     /// Assembly buffer for chunked request bodies (Content-Length bodies are
     /// zero-copy views into the connection buffer instead).
-    body_storage: std.ArrayList(u8),
+    body_storage: ?body_storage_mod.BodyStorage = null,
     /// Header slots, allocated at the configured limit (per-connection,
     /// freed in deinit; resets keep them).
     slots: []Slot = &.{},
@@ -226,11 +228,11 @@ pub const Request = struct {
     transfer_chunked: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Request {
-        return initWithLimits(allocator, max_headers);
+        return initWithLimits(allocator, max_headers, (limits_mod.Limits{}).max_body_spool);
     }
 
     /// Like `init`, with a configurable header-count cap (config `limits`).
-    pub fn initWithLimits(allocator: std.mem.Allocator, max_headers_limit: usize) Request {
+    pub fn initWithLimits(allocator: std.mem.Allocator, max_headers_limit: usize, max_body_spool_limit: usize) Request {
         return .{
             .method = .unknown,
             .target = "",
@@ -242,7 +244,7 @@ pub const Request = struct {
             .body = &.{},
             .allocator = allocator,
             .arena = arena_mod.Arena.init(allocator),
-            .body_storage = .empty,
+            .body_storage = body_storage_mod.BodyStorage.init(allocator, max_body_spool_limit),
             .slots = allocator.alloc(Slot, max_headers_limit) catch &.{},
             .max_headers = max_headers_limit,
         };
@@ -250,7 +252,7 @@ pub const Request = struct {
 
     pub fn deinit(self: *Request) void {
         self.arena.deinit();
-        self.body_storage.deinit(self.allocator);
+        if (self.body_storage) |*bs| bs.deinit();
         if (self.slots.len > 0) self.allocator.free(self.slots);
     }
 
@@ -265,7 +267,7 @@ pub const Request = struct {
         self.content_length = 0;
         self.body = &.{};
         self.arena.reset();
-        self.body_storage.clearRetainingCapacity();
+        if (self.body_storage) |*bs| bs.reset();
         self.header_count = 0;
         self.transfer_chunked = false;
     }
@@ -483,7 +485,11 @@ pub const Parser = struct {
     }
 
     /// Like `init`, with configurable limits (config `limits`).
-    pub fn initWithLimits(allocator: std.mem.Allocator, line_limit: usize, chunked_limit: usize) Parser {
+    pub fn initWithLimits(
+        allocator: std.mem.Allocator,
+        line_limit: usize,
+        chunked_limit: usize,
+    ) Parser {
         return .{
             .allocator = allocator,
             .max_line_bytes = line_limit,
@@ -586,7 +592,7 @@ pub const Parser = struct {
                             self.state = .chunk_trailers;
                             continue;
                         }
-                        if (size > self.max_chunked_body or req.body_storage.items.len + size > self.max_chunked_body) {
+                        if (size > self.max_chunked_body or req.body_storage.?.size() + size > self.max_chunked_body) {
                             return .payload_too_large;
                         }
                         self.body_remaining = size;
@@ -602,7 +608,7 @@ pub const Parser = struct {
                 const have = buf.availableRead();
                 const take = @min(have, self.body_remaining);
                 if (take > 0) {
-                    req.body_storage.appendSlice(req.allocator, buf.peek()[0..take]) catch return .out_of_memory;
+                    req.body_storage.?.write(buf.peek()[0..take]) catch return .out_of_memory;
                     buf.consume(take);
                     self.body_remaining -= take;
                 }
@@ -626,7 +632,7 @@ pub const Parser = struct {
                         if (l.len == 0) {
                             // Trailer headers are dropped: the request is
                             // complete once the empty trailer line is read.
-                            req.body = req.body_storage.items;
+                            req.body = req.body_storage.?.items();
                             self.line.clearRetainingCapacity();
                             self.reset();
                             return .complete;

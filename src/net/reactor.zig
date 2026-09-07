@@ -21,6 +21,7 @@ const http2_frames = @import("../http2/frames.zig");
 const websocket_mod = @import("../http/websocket.zig");
 const proxy_mod = @import("../dsl/modules/proxy.zig");
 const dsl_registry = @import("../dsl/registry.zig");
+const default_registry = dsl_registry.default_registry;
 
 /// I/O backend selection. Default: epoll (measured at parity with the ring
 /// on the keep-alive workloads and more robust at high connection counts).
@@ -2213,7 +2214,7 @@ pub const Reactor = struct {
         if (self.mode == .http) {
             var session = HttpSession{
                 .parser = http_parser.Parser.initWithLimits(self.allocator, self.limits.max_line_bytes, self.limits.max_chunked_body),
-                .req = http_parser.Request.initWithLimits(self.allocator, self.limits.max_headers),
+                .req = http_parser.Request.initWithLimits(self.allocator, self.limits.max_headers, self.limits.max_body_spool),
             };
             if (self.http_sessions.put(conn.fd, session)) |_| {} else |_| {
                 session.parser.deinit();

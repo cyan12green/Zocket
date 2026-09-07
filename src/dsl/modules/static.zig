@@ -21,6 +21,7 @@ pub const Action = registry.Action;
 ///   baked into .rodata at compile time (`@embedFile`) and served with zero
 ///   disk I/O and an effective infinite cache lifetime.
 pub const static = registry.Module{
+    .touches_headers = true,
     .name = "static",
     .phase = .content,
     .run = run,

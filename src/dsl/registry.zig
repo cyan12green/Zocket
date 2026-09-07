@@ -31,6 +31,36 @@ pub const Outcome = enum {
     not_handled,
 };
 
+/// The canonical error set a module may return. anyerror is still accepted
+/// at the type level (Zig has no closed error sets), but built-in modules
+/// return exactly these, and `statusFor` maps them to client-facing codes
+/// centrally so semantics stay consistent (502 upstream vs 500 module bug
+/// vs 503 policy).
+pub const ModuleError = error{
+    UpstreamConnectFailed, // -> 502
+    UpstreamTimeout, //        -> 504-shaped 502 (gateway did not answer)
+    UpstreamBadResponse, //    -> 502
+    OutOfMemory, //            -> 500
+    Internal, //               -> 500
+    RateLimited, //            -> 503
+    ConfigInvalid, //          -> 500 (never reaches a client in release)
+};
+
+/// Central status mapping for ModuleError.
+/// Mapping applies only before response head serialization; once head
+/// bytes are sent the status cannot change (streaming modules own their
+/// error signaling via trailers/RST).
+pub fn statusForModuleError(e: anyerror) Status {
+    return switch (e) {
+        error.UpstreamConnectFailed,
+        error.UpstreamBadResponse,
+        => .bad_gateway,
+        error.UpstreamTimeout => .bad_gateway, // 504 when Status grows it
+        error.RateLimited => .service_unavailable,
+        else => .internal_error,
+    };
+}
+
 /// A comptime-specialised per-route dispatch function: directly
 /// calls the modules bound to a route's phases — no phase loop, no moduleFor
 /// scans, no Registry.resolve at runtime. Stored on `Route.dispatch` for
@@ -75,6 +105,14 @@ pub const Module = struct {
     /// incrementally (streaming). Routes whose claiming handler sets this
     /// bypass response filters (v1: all of them; documented constraint).
     streams_response: bool = false,
+    /// Capability flags letting the runtime validate bindings and make
+    /// buffering decisions without understanding modules:
+    /// - needs_body: the module reads ctx.req.body (reactor may spool huge
+    ///   uploads to disk instead of holding them in memory).
+    /// - touches_headers: the module reads or writes request/response
+    ///   headers (used by binding validators).
+    needs_body: bool = false,
+    touches_headers: bool = false,
     /// Directives owned by this module (comptime names; used for docs,
     /// uniqueness checks, and kind-aware binding errors).
     directives: []const []const u8 = &.{},
@@ -324,6 +362,16 @@ pub fn Registry(comptime modules: anytype) type {
             return kindOf(name) == .handler;
         }
 
+        /// Apply the central error mapping for a failed module run into
+        /// `ctx.resp`. Used by the pipeline's catch paths.
+        pub fn applyModuleError(name: []const u8, e: anyerror, ctx: *Context) Status {
+            const st = statusForModuleError(e);
+            _ = name;
+            ctx.resp.status = st;
+            ctx.resp.setBody(st.reasonPhrase());
+            return st;
+        }
+
         /// Whether `name` declares streaming responses (its routes bypass
         /// response filters — v1: all of them).
         pub fn streamsResponse(name: []const u8) bool {
@@ -414,6 +462,15 @@ test "config wiring: validateBindings accepts registered names only" {
 
     const bad = [_]ModuleBinding{.{ .phase = .content, .module = "missing_module" }};
     try testing.expectError(error.UnknownModule, default_registry.validateBindings(&bad));
+}
+
+test "module error mapping" {
+    try std.testing.expectEqual(Status.bad_gateway, statusForModuleError(error.UpstreamConnectFailed));
+    try std.testing.expectEqual(Status.bad_gateway, statusForModuleError(error.UpstreamTimeout));
+    try std.testing.expectEqual(Status.service_unavailable, statusForModuleError(error.RateLimited));
+    try std.testing.expectEqual(Status.internal_error, statusForModuleError(error.OutOfMemory));
+    // unknown errors fall to 500, never panic
+    try std.testing.expectEqual(Status.internal_error, statusForModuleError(error.SomethingUnheardOf));
 }
 
 test "resolve runs the echo module to a handled response" {

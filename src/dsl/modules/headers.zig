@@ -23,6 +23,7 @@ pub const Status = registry.Status;
 pub const Action = registry.Action;
 
 pub const headers = registry.Module{
+    .touches_headers = true,
     .name = "headers",
     .kind = .filter,
     .run = run, // Legacy marker only: filters run after the walk.

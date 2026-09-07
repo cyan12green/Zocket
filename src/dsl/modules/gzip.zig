@@ -19,6 +19,7 @@ pub const min_compress_bytes = 20;
 /// Accept-Encoding` are set, and the body is replaced. Skipped when the body
 /// is too small, already encoded, or does not shrink.
 pub const gzip = registry.Module{
+    .touches_headers = true,
     .name = "gzip",
     // Legacy marker only: filters run after the walk, ordered per route.
     .phase = .log,
