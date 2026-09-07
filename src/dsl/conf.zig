@@ -112,6 +112,7 @@ const H_set = keyHash("set");
 const H_proxy_pass = keyHash("proxy_pass");
 const H_upstream = keyHash("upstream");
 const H_balance = keyHash("balance");
+const H_host_select = keyHash("host_select");
 const H_max_fails = keyHash("max_fails");
 const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
@@ -284,6 +285,7 @@ const Builder = struct {
     tls_key: Str = .{ .src = "" },
     tls_seen: bool = false,
     listen_port: ?u16 = null,
+    host_select: bool = true,
     server_seen: bool = false,
     /// Per-server state: accumulated across multiple server blocks.
     server_count: usize = 0,
@@ -660,6 +662,10 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
         },
         H_listen => {
             b.listen_port = lx.number(name, u16);
+            lx.expectTerminator(name);
+        },
+        H_host_select => {
+            b.host_select = lx.onOff(name);
             lx.expectTerminator(name);
         },
         H_tls => {
@@ -1654,6 +1660,7 @@ fn build(b: *const Builder) Config {
         .log_formats = log_table.items[0..log_table.len],
         .servers = servers_built.items[0..servers_built.len],
         .select_fn = select_fn,
+        .host_select = b.host_select,
     };
 }
 

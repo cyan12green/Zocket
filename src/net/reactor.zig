@@ -181,6 +181,13 @@ pub const Reactor = struct {
     /// mode; when null, `default_http_handler` is used. Shared read-only across
     /// reactors, so it is safe to call from the reactor thread.
     http_handler: ?*const runtime_server.Server,
+    /// Optional server group for per-request Host-based server selection.
+    /// When set, `handler` is resolved per-request via `resolveServer`.
+    server_group: ?*const runtime_server.ServerGroup = null,
+    /// The resolved handler for the current request. Updated by
+    /// `resolveServer` when a server_group is present; otherwise stays the
+    /// default or the value from `http_handler`.
+    handler: *const runtime_server.Server = &default_http_handler,
     running: std.atomic.Value(bool),
     thread: ?std.Thread,
     pending: std.ArrayList(*connection.Connection),
@@ -258,7 +265,7 @@ pub const Reactor = struct {
 
     /// Like `init`, with an explicit idle timeout in seconds (zero disables).
     pub fn initWithTimeout(allocator: std.mem.Allocator, id: usize, mode: Mode, idle_timeout_seconds: u32) !Reactor {
-        return initWithHandlerTimeout(allocator, id, mode, null, idle_timeout_seconds);
+        return initWithHandlerTimeout(allocator, id, mode, null, idle_timeout_seconds, null);
     }
 
     /// Like `init`, but with an explicit HTTP request processor (used in HTTP
@@ -269,7 +276,7 @@ pub const Reactor = struct {
         mode: Mode,
         http_handler: ?*const runtime_server.Server,
     ) !Reactor {
-        return initWithHandlerTimeout(allocator, id, mode, http_handler, default_idle_timeout_seconds);
+        return initWithHandlerTimeout(allocator, id, mode, http_handler, default_idle_timeout_seconds, null);
     }
 
     /// Like `initWithHandlerTimeout`, with a per-reactor listener
@@ -282,7 +289,20 @@ pub const Reactor = struct {
         idle_timeout_seconds: u32,
         listener: posix.fd_t,
     ) !Reactor {
-        var self = try initWithHandlerTimeout(allocator, id, mode, http_handler, idle_timeout_seconds);
+        return initWithHandlerGroup(allocator, id, mode, http_handler, null, idle_timeout_seconds, listener);
+    }
+
+    /// Like `initWithHandlerListener`, with a server group for multi-vhost.
+    pub fn initWithHandlerGroup(
+        allocator: std.mem.Allocator,
+        id: usize,
+        mode: Mode,
+        http_handler: ?*const runtime_server.Server,
+        server_group: ?*const runtime_server.ServerGroup,
+        idle_timeout_seconds: u32,
+        listener: posix.fd_t,
+    ) !Reactor {
+        var self = try initWithHandlerTimeout(allocator, id, mode, http_handler, idle_timeout_seconds, server_group);
         self.listener = listener;
         self.ep.add(listener, epoll.Events.In | epoll.Events.EdgeTriggered, listener) catch {
             self.ep.close();
@@ -306,6 +326,7 @@ pub const Reactor = struct {
         mode: Mode,
         http_handler: ?*const runtime_server.Server,
         idle_timeout_seconds: u32,
+        server_group: ?*const runtime_server.ServerGroup,
     ) !Reactor {
         var self = Reactor{
             .allocator = allocator,
@@ -317,6 +338,8 @@ pub const Reactor = struct {
             .http_sessions = std.AutoHashMap(posix.fd_t, HttpSession).init(allocator),
             .upstream_conns = std.AutoHashMap(posix.fd_t, posix.fd_t).init(allocator),
             .http_handler = http_handler,
+            .handler = http_handler orelse &default_http_handler,
+            .server_group = server_group,
             .running = std.atomic.Value(bool).init(false),
             .thread = null,
             .pending = .empty,
@@ -459,6 +482,15 @@ pub const Reactor = struct {
     /// server to join and free drained reactors).
     pub fn isDrained(self: *const Reactor) bool {
         return self.drained.load(.acquire);
+    }
+
+    /// Resolve the active server from the Host header. When server_group is
+    /// null or host_select is off, this is a no-op (handler stays the default).
+    fn resolveServer(self: *Reactor, host: []const u8) void {
+        if (self.server_group) |group| {
+            self.handler = group.selectServer(host, null);
+            self.stats = self.handler.stats;
+        }
     }
 
     /// Hand a new connection to this reactor. Safe to call from any thread.
@@ -1591,7 +1623,12 @@ pub const Reactor = struct {
         const session = self.http_sessions.getPtr(fd) orelse return false;
         const close0 = !session.req.keep_alive;
         session.resp = http_response.Response.init(.ok);
-        const handler = self.http_handler orelse &default_http_handler;
+        // Resolve per-request server from Host header when a server group
+        // is configured.
+        if (session.req.header("host")) |host| {
+            self.resolveServer(host);
+        }
+        const handler = self.handler;
         var ctx = dsl_pipeline.Context{
             .req = &session.req,
             .resp = &session.resp,
@@ -2014,8 +2051,14 @@ pub const Reactor = struct {
         const out = &session_p.h2_out;
         out.clearRetainingCapacity();
 
+        // Resolve per-request server from Host header when a server group
+        // is configured. h2 frames carry a :authority pseudo-header but the
+        // header() API maps it; fall back to the existing handler when absent.
+        if (session_p.req.header("host")) |host| {
+            self.resolveServer(host);
+        }
         var handler = http2_session.Session.Handler{
-            .server = self.http_handler orelse &default_http_handler,
+            .server = self.handler,
             .allocator = self.allocator,
             .client_ip = conn.peer_ip,
             .stats = self.stats,
@@ -3192,7 +3235,7 @@ test "reactor serves a chunked response when the route opts in" {
 // deadline.
 test "reactor closes a connection that goes idle" {
     const allocator = testing.allocator;
-    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1);
+    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1, null);
     defer r.deinit();
     try r.start();
     defer r.join();
@@ -3220,7 +3263,7 @@ test "reactor closes a connection that goes idle" {
 
 test "reactor resets the idle timer on active traffic" {
     const allocator = testing.allocator;
-    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1);
+    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1, null);
     defer r.deinit();
     try r.start();
     defer r.join();
@@ -3271,7 +3314,7 @@ test "reactor resets the idle timer on active traffic" {
 
 test "idle timeout of zero disables reaping" {
     const allocator = testing.allocator;
-    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 0);
+    var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 0, null);
     defer r.deinit();
     try r.start();
     defer r.join();

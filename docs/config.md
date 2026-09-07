@@ -61,9 +61,10 @@ comment  := '#' to end of line (outside quoted strings)
   (`"..."` with `\" \\ \n \r \t` escapes, `'...'` literal).
 - Errors carry `conf:<line>:<col>: <message>`.
 
-The structure is **flat**: top-level directives plus exactly one `server {}`
-block (vhosts are future work) holding `location {}` blocks. There is
-no `http {}` section.
+The structure is **flat**: top-level directives plus one or more `server {}`
+blocks (virtual hosts) holding `location {}` blocks. Each server block can
+declare its own `listen` port and `server_name` for virtual-host routing.
+There is no `http {}` section.
 
 ## Directives
 
@@ -75,6 +76,7 @@ no `http {}` section.
 - [connection_pool_max](#connection_pool_max)
 - [embed](#embed)
 - [fail_timeout](#fail_timeout)
+- [host_select](#host_select)
 - [index](#index)
 - [listen](#listen)
 - [location](#location)
@@ -93,6 +95,7 @@ no `http {}` section.
 - [root](#root)
 - [send_buffer_size](#send_buffer_size)
 - [server](#server)
+- [server_name](#server_name)
 - [set](#set)
 - [static_cache_entries](#static_cache_entries)
 - [static_cache_valid](#static_cache_valid)
@@ -224,7 +227,24 @@ Default: `listen 8080;`
 Context: main, server
 
 Listen port. Absent = the CLI `--port` default (8080); when both are given
-the CLI `--port` flag wins over the conf directive.
+the CLI `--port` flag wins over the conf directive. In a server block, the
+per-server `listen` overrides the global one — each server block can bind
+a different port (the reactor fans out to all unique listen ports).
+
+### host_select
+
+Syntax: `host_select on|off;`
+
+Default: `host_select on;`
+
+Context: main
+
+Enables or disables Host-based virtual-host server selection. When `on`
+(the default), each request's `Host` header is matched against the
+`server_name` directives to select the right server block. When `off`, the
+first server block is always used — the `Host` header is not inspected.
+This is a small optimization for single-server deployments where vhost
+routing is unnecessary.
 
 ### location
 
@@ -681,9 +701,43 @@ Default: —
 
 Context: main
 
-The server block. Exactly one is required (a missing or a second one is a
-compile error; vhosts are a future milestone). Contents: any global directive
-(merged) plus [location](#location) blocks.
+Declares a virtual host. Multiple server blocks are supported (up to 16).
+Each server block gets its own route table and can bind a different port
+via `listen` and a hostname via `server_name` (see below). Contents: any
+global directive (merged) plus [location](#location) blocks. When only
+one server block is present, it serves all requests on all ports.
+
+### server_name
+
+Syntax: `server_name name;`
+
+Default: —
+
+Context: server
+
+Sets the virtual-host hostname for this server block. The reactor matches
+the `Host` header of each request against the server names using a
+comptime-built lookup (exact match first, then `*.domain` wildcard suffix,
+then the default server). When absent, the server block is the catch-all
+default. Examples:
+
+```
+server {
+    server_name example.com;
+    listen 8080;
+    location / { content echo; }
+}
+
+server {
+    server_name *.api.com;
+    listen 8080;
+    location / { rewrite proxy; proxy_pass 127.0.0.1:9000; }
+}
+```
+
+A request with `Host: www.example.com` is routed to the first block; a
+request with `Host: v1.api.com` to the second; anything else to the
+default (first declared) block.
 
 ### set
 
@@ -1003,3 +1057,56 @@ server {
 See `config.example.conf` for the full reference sample, including the
 gzip/conditional-GET/cache-headers pipeline (`log gzip;`,
 `preaccess conditional_get;`, `post_access cache_headers;`).
+
+### Multi-server virtual hosts
+
+Multiple server blocks enable virtual-host routing. Each block declares a
+`server_name` and optionally a `listen` port. Requests are dispatched by
+the `Host` header at the reactor level (comptime-built exact + wildcard
+match, zero-allocation).
+
+```
+# Main site on port 8080.
+server {
+    listen 8080;
+    server_name example.com;
+
+    location / {
+        content static;
+        root /var/www/main;
+        index index.html;
+    }
+
+    location /api {
+        rewrite proxy;
+        proxy_pass 127.0.0.1:9000;
+    }
+}
+
+# API subdomain on a different port.
+server {
+    listen 9090;
+    server_name api.example.com;
+    server_name *.api.example.com;
+
+    location / {
+        rewrite proxy;
+        upstream 10.0.0.1:8000;
+        upstream 10.0.0.2:8000;
+        balance round_robin;
+    }
+}
+
+# Catch-all default (no server_name).
+server {
+    listen 8080;
+    location / {
+        return 404 "not found";
+    }
+}
+```
+
+Requests to `Host: example.com:8080` → main site. Requests to
+`Host: v1.api.example.com:9090` → API proxy. Any unmatched host → catch-all
+404. The matching order is: exact `server_name`, then longest wildcard
+suffix, then the first server block declared (the default).

@@ -646,13 +646,15 @@ test "matchFast returns pre-serialised bytes only for module-less template route
 
 test "embedded comptime config parses via fromConfEmbedded (root-relative path)" {
     const cfg = comptime Config.fromConfEmbedded("src/testdata/config.example.conf");
-    try testing.expectEqual(@as(usize, 6), cfg.routes.len);
+    try testing.expectEqual(@as(usize, 7), cfg.routes.len);
     try testing.expectEqualStrings("/echo", cfg.routes[0].path);
-    try testing.expectEqualStrings("/", cfg.routes[5].path);
 }
 
 test "server from an embedded comptime config routes identically to the struct-literal server" {
-    const embedded = Server.comptimeInit(comptime Config.fromConfEmbedded("src/testdata/config.example.conf"));
+    const group = ServerGroup.comptimeInit(comptime Config.fromConfEmbedded("src/testdata/config.example.conf"));
+
+    // The first server block (example.com) has 6 routes.
+    const embedded = group.servers[0];
 
     const literal = Server.comptimeInit(comptime Config{
         .routes = &.{
@@ -700,7 +702,8 @@ test "server from an embedded comptime config routes identically to the struct-l
 }
 
 test "embedded comptime config gets pre-serialised fast responses (pre-serialised path)" {
-    const srv = Server.comptimeInit(comptime Config.fromConfEmbedded("src/testdata/config.example.conf"));
+    const group = ServerGroup.comptimeInit(comptime Config.fromConfEmbedded("src/testdata/config.example.conf"));
+    const srv = group.servers[0];
 
     // /health and /old are module-less template routes: served from
     // pre-serialised bytes, no pipeline.
@@ -821,22 +824,49 @@ test "access_log runs through the pipeline with a custom format" {
 
 /// A group of virtual-host servers: holds one `Server` per `server {}`
 /// block. The reactor calls `selectServer` with the Host header to pick
-/// the right server, then `handleRequest` on the selected one. When only
-/// one server block exists the group is a thin wrapper.
+/// the right server, then `handleRequest` on the selected one.
 pub const ServerGroup = struct {
     servers: []const Server,
     /// Index of the default server (first block, or the one without
     /// server_name). Used when no Host header matches.
     default_idx: usize = 0,
+    /// Whether Host-based server selection is enabled. When false,
+    /// `selectServer` always returns the first server.
+    host_select: bool = true,
+    /// True when `servers` was heap-allocated (runtime init) and must
+    /// be freed on deinit. False for comptime-built groups (.rodata).
+    servers_owned: bool = false,
 
-    /// Build a ServerGroup from a multi-server Config. Each ServerSpec
-    /// produces its own `Server` instance with its own route table and
-    /// stats. The allocator owns the Server array and per-server stats.
+    /// Comptime build: one `Server` per server block, each from its own
+    /// route slice — routes from different servers may share a path without
+    /// conflict. The select_fn is wired from the config.
+    pub fn comptimeInit(comptime cfg: config_mod.Config) ServerGroup {
+        const servers = comptime blk: {
+            var arr: [cfg.servers.len]Server = undefined;
+            for (cfg.servers, 0..) |spec, i| {
+                const sub_routes = cfg.routes[spec.routes_start..][0..spec.routes_len];
+                const sub_cfg = config_mod.Config{
+                    .routes = sub_routes,
+                    .limits = cfg.limits,
+                    .tls = cfg.tls,
+                    .listen_port = spec.listen_port,
+                    .log_formats = cfg.log_formats,
+                    .server_name = spec.server_name,
+                };
+                arr[i] = Server.comptimeInit(sub_cfg);
+            }
+            break :blk arr;
+        };
+        return .{
+            .servers = &servers,
+            .default_idx = 0,
+            .host_select = cfg.host_select,
+        };
+    }
+
+    /// Build a ServerGroup from a Config. Each ServerSpec produces its
+    /// own `Server` instance with its own route table and stats.
     pub fn init(allocator: std.mem.Allocator, cfg: config_mod.Config) !ServerGroup {
-        if (cfg.servers.len <= 1) {
-            const srv = Server.init(cfg);
-            return .{ .servers = &.{srv}, .default_idx = 0 };
-        }
         const srvs = try allocator.alloc(Server, cfg.servers.len);
         errdefer allocator.free(srvs);
         for (cfg.servers, 0..) |spec, i| {
@@ -855,7 +885,38 @@ pub const ServerGroup = struct {
             srvs[i] = Server.init(sub_cfg);
             srvs[i].stats = stats;
         }
-        return .{ .servers = srvs, .default_idx = 0 };
+        return .{ .servers = srvs, .default_idx = 0, .host_select = cfg.host_select, .servers_owned = true };
+    }
+
+    /// Build a ServerGroup from an embedded comptime config with runtime
+    /// static-root resolution and TLS loading. Each server gets its own
+    /// route copy (for resolved roots) and per-server stats.
+    pub fn embeddedInitGroupWithTls(allocator: std.mem.Allocator, comptime cfg: config_mod.Config) !ServerGroup {
+        if (cfg.servers.len == 0) {
+            var srv = try Server.embeddedInitWithTls(allocator, cfg);
+            const stats = try allocator.create(ServerStats);
+            errdefer allocator.destroy(stats);
+            stats.* = .{};
+            srv.stats = stats;
+            const srvs = try allocator.alloc(Server, 1);
+            srvs[0] = srv;
+            return .{ .servers = srvs, .default_idx = 0, .host_select = cfg.host_select, .servers_owned = true };
+        }
+        const srvs = try allocator.alloc(Server, cfg.servers.len);
+        errdefer allocator.free(srvs);
+        inline for (cfg.servers, 0..) |spec, i| {
+            const sub_routes = cfg.routes[spec.routes_start..][0..spec.routes_len];
+            const sub_cfg = config_mod.Config{
+                .routes = sub_routes,
+                .limits = cfg.limits,
+                .tls = cfg.tls,
+                .listen_port = spec.listen_port,
+                .log_formats = cfg.log_formats,
+                .server_name = spec.server_name,
+            };
+            srvs[i] = try Server.embeddedInitWithTls(allocator, sub_cfg);
+        }
+        return .{ .servers = srvs, .default_idx = 0, .host_select = cfg.host_select, .servers_owned = true };
     }
 
     pub fn deinit(self: *ServerGroup, allocator: std.mem.Allocator) void {
@@ -865,14 +926,15 @@ pub const ServerGroup = struct {
                 srv.stats = &default_stats;
             }
         }
-        if (self.servers.len > 1) allocator.free(self.servers);
+        if (self.servers_owned) allocator.free(self.servers);
     }
 
     /// Select a server by Host header value. Uses the comptime-generated
     /// select_fn when available (O(1) exact match + wildcard scan), falls
     /// back to runtime matching for dynamically-constructed configs.
+    /// When host_select is false, always returns the first server.
     pub fn selectServer(self: *const ServerGroup, host: []const u8, cfg: ?config_mod.Config) *const Server {
-        if (self.servers.len <= 1) return &self.servers[0];
+        if (!self.host_select) return &self.servers[0];
         // Fast path: comptime-generated select function.
         if (cfg) |c| {
             if (c.select_fn) |sel| {

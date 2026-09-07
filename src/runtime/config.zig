@@ -53,6 +53,10 @@ pub const Config = struct {
     /// time from the server_name directives — the function body is a
     /// hash lookup + wildcard scan, all in .rodata. Null when single-server.
     select_fn: ?ServerSelectFn = null,
+    /// Whether Host-based server selection is enabled. When false, the
+    /// reactor always uses the first server block (no Host header extraction).
+    /// Enabled by default; `host_select off;` disables it.
+    host_select: bool = true,
 
     /// Per-server virtual host spec.
     pub const ServerSpec = struct {

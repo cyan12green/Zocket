@@ -115,7 +115,7 @@ Protocol-deep comparisons: `bench/graphs/h2_compare.png` (HTTP/2 h2load),
 
 ## Tests and benchmarks
 
-- `zig build test` — unit + concurrency + fuzz-smoke tests (339 passing).
+- `zig build test` — unit + concurrency + fuzz-smoke tests (342 passing).
 - `bench/bench.sh`, `bench/bench2.sh`, `bench/summarize.py` — reproducible
   benchmark harness; results and methodology in `bench/BENCH.md`.
 - `bench/compare-servers.sh` — cross-language comparison against actix-web,

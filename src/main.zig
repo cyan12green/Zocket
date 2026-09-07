@@ -111,48 +111,92 @@ fn runServer(
         return;
     }
 
-    // HTTP mode runs through the config-driven pipeline. The
-    // config source is, in priority order:
-    //   1. The config embedded at build time (`-Dconfig=<file>`); the
-    //      server is built at compile time (trie + dispatch specialisation),
-    //      everything in .rodata;
-    //   2. the comptime default (echo on every path), as `Server.default()`.
-    var http_srv: zocket.runtime.server.Server = if (embedded_cfg) |cfg| blk: {
-        // Registry membership is validated at compile time (comptime
-        // conf parser checks structure/registry via comptimeValidate).
-        // Static roots are resolved at startup too (realpath + O_PATH fd per
-        // rooted route), mirroring the old JSON load path.
-        comptime zocket.runtime.config.Config.comptimeValidate(cfg, zocket.dsl.registry.default_registry);
-        break :blk try zocket.runtime.server.Server.embeddedInitWithTls(allocator, cfg);
-    } else zocket.runtime.server.Server.default();
-    defer if (embedded_cfg != null) {
-        http_srv.deinitPrepared(allocator);
-    };
-
     const n = opts.threads orelse (std.Thread.getCpuCount() catch 1);
-    // Effective port: an explicit CLI --port wins; otherwise the conf's
-    // `listen` directive applies; otherwise the 8080 default.
-    const port = if (opts.port_set) opts.port else if (embedded_cfg) |cfg|
+
+    // Build the server group: one Server per server {} block, each with its
+    // own route table, trie, dispatch and per-server stats.
+    const embedded = embedded_cfg;
+    var http_group: zocket.runtime.server.ServerGroup = if (embedded) |cfg| blk: {
+        comptime zocket.runtime.config.Config.comptimeValidate(cfg, zocket.dsl.registry.default_registry);
+        break :blk try zocket.runtime.server.ServerGroup.embeddedInitGroupWithTls(allocator, cfg);
+    } else blk: {
+        const srv = zocket.runtime.server.Server.default();
+        break :blk .{ .servers = &[_]zocket.runtime.server.Server{srv}, .default_idx = 0, .host_select = false };
+    };
+    defer {
+        if (embedded != null) {
+            var i: usize = 0;
+            while (i < http_group.servers.len) : (i += 1) {
+                @constCast(&http_group.servers[i]).deinitPrepared(allocator);
+            }
+            if (http_group.servers_owned) allocator.free(http_group.servers);
+        }
+    }
+
+    // Collect unique listen ports from server blocks.
+    const effective_port = if (opts.port_set) opts.port else if (embedded) |cfg|
         (cfg.listen_port orelse opts.port)
     else
         opts.port;
-    var s = try zocket.multireactor.Server.initWithThreadsAndHandlerTimeout(allocator, port, n, opts.mode, &http_srv, opts.idle_timeout);
-    defer s.deinit();
+    var ports_buf: [16]u16 = undefined;
+    const ports: []const u16 = if (opts.port_set or http_group.servers.len <= 1)
+        &.{effective_port}
+    else blk: {
+        var count: usize = 0;
+        for (http_group.servers) |srv| {
+            const p = srv.cfg.listen_port orelse effective_port;
+            var dup = false;
+            for (ports_buf[0..count]) |ep| {
+                if (ep == p) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup and count < 16) {
+                ports_buf[count] = p;
+                count += 1;
+            }
+        }
+        if (count == 0) {
+            ports_buf[0] = effective_port;
+            count = 1;
+        }
+        break :blk ports_buf[0..count];
+    };
 
-    // Signal handlers: SIGTERM/SIGINT graceful stop. SIGHUP is not handled —
-    // configs are comptime-only, so --reload-hard (rebuild + SO_REUSEPORT
-    // swap) is the only reload.
+    // Create one multireactor per unique port.
+    var reactors_buf: [16]zocket.multireactor.Server = undefined;
+    var reactors_len: usize = 0;
+    errdefer for (reactors_buf[0..reactors_len]) |*r| r.deinit();
+    for (ports) |p| {
+        reactors_buf[reactors_len] = try zocket.multireactor.Server.initWithThreadsAndHandlerGroup(
+            allocator,
+            p,
+            n,
+            opts.mode,
+            &http_group.servers[0],
+            &http_group,
+            opts.idle_timeout,
+        );
+        reactors_len += 1;
+    }
+    defer for (reactors_buf[0..reactors_len]) |*r| r.deinit();
+
+    // Signal handlers: SIGTERM/SIGINT graceful stop.
     zocket.multireactor.installSignalHandlers();
 
-    switch (opts.mode) {
-        .echo => std.debug.print("Starting multi-reactor TCP echo server on port {} with {} threads\n", .{ port, n }),
-        .http => {
-            if (embedded_cfg) |cfg| {
-                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (comptime-embedded config: {d} routes)\n", .{ port, n, cfg.routes.len });
-            } else {
-                std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (default config)\n", .{ port, n });
-            }
-        },
+    // Startup messages.
+    for (ports) |p| {
+        switch (opts.mode) {
+            .echo => std.debug.print("Starting multi-reactor TCP echo server on port {} with {} threads\n", .{ p, n }),
+            .http => {
+                if (embedded) |cfg| {
+                    std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (comptime config: {d} routes, {d} servers)\n", .{ p, n, cfg.routes.len, http_group.servers.len });
+                } else {
+                    std.debug.print("Starting multi-reactor HTTP server on port {} with {} threads (default config)\n", .{ p, n });
+                }
+            },
+        }
     }
     if (opts.idle_timeout > 0) {
         std.debug.print("Idle timeout: {}s\n", .{opts.idle_timeout});
@@ -164,7 +208,23 @@ fn runServer(
     // the parent can exit 0, then run.
     if (ready) |cb| cb(ready_ctx.?);
 
-    try s.run();
+    // Run all multireactors. Single port: run directly (blocking).
+    // Multiple ports: one thread per port.
+    if (reactors_len == 1) {
+        try reactors_buf[0].run();
+    } else {
+        var threads: [16]std.Thread = undefined;
+        for (0..reactors_len) |i| {
+            threads[i] = try std.Thread.spawn(.{}, struct {
+                fn runner(r: *zocket.multireactor.Server) void {
+                    r.run() catch {};
+                }
+            }.runner, .{&reactors_buf[i]});
+        }
+        for (0..reactors_len) |i| {
+            threads[i].join();
+        }
+    }
 }
 
 fn writePidfile(path: []const u8, pid: posix_pid_t) !void {

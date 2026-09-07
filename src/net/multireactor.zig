@@ -30,6 +30,9 @@ pub const Server = struct {
     /// Config-driven HTTP request processor shared by the reactors (HTTP mode
     /// only; null falls back to each reactor's default handler).
     http_handler: ?*const runtime_server.Server,
+    /// Virtual-host server group. When set, reactors resolve the correct
+    /// server per-request via the Host header instead of using http_handler.
+    server_group: ?*const runtime_server.ServerGroup = null,
     /// Connection idle timeout in seconds, forwarded to every reactor (zero
     /// disables idle reaping).
     idle_timeout_seconds: u32,
@@ -72,6 +75,20 @@ pub const Server = struct {
         http_handler: ?*const runtime_server.Server,
         idle_timeout_seconds: u32,
     ) !Server {
+        return initWithThreadsAndHandlerGroup(allocator, port, n_threads, mode, http_handler, null, idle_timeout_seconds);
+    }
+
+    /// Full constructor with server group for multi-vhost: reactor count,
+    /// HTTP handler, server group, and idle timeout.
+    pub fn initWithThreadsAndHandlerGroup(
+        allocator: std.mem.Allocator,
+        port: u16,
+        n_threads: usize,
+        mode: reactor.Mode,
+        http_handler: ?*const runtime_server.Server,
+        server_group: ?*const runtime_server.ServerGroup,
+        idle_timeout_seconds: u32,
+    ) !Server {
         const n = @max(n_threads, 1);
 
         const stop_ev = try eventfd.EventFd.create();
@@ -95,7 +112,7 @@ pub const Server = struct {
                 const listener = try sockets.createListeningSocketReusePort(port, 4096);
                 listeners.appendAssumeCapacity(listener);
                 const r = try allocator.create(reactor.Reactor);
-                const init_res = reactor.Reactor.initWithHandlerListener(allocator, i, mode, http_handler, idle_timeout_seconds, listener) catch |e| {
+                const init_res = reactor.Reactor.initWithHandlerGroup(allocator, i, mode, http_handler, server_group, idle_timeout_seconds, listener) catch |e| {
                     allocator.destroy(r);
                     return e;
                 };
@@ -117,6 +134,7 @@ pub const Server = struct {
             .total_accepted = accepted_counter,
             .mode = mode,
             .http_handler = http_handler,
+            .server_group = server_group,
             .idle_timeout_seconds = idle_timeout_seconds,
             .draining = .empty,
         };
