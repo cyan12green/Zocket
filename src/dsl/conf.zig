@@ -1524,6 +1524,18 @@ fn build(b: *const Builder) Config {
                 .chunked = spec.chunked,
                 .log_format = logFormatIndex(spec.log_format, log_table.items[0..log_table.len], strings),
             };
+            // Validate: if a route has header ops AND filters, at least one
+            // filter must touch headers — otherwise the header ops are silently
+            // lost when the filter transforms the response.
+            if (filter_table.ranges[ri].len > 0 and header_op_table.ranges[ri].len > 0) {
+                var any_touches = false;
+                for (filter_table.items[filter_table.ranges[ri].start..][0..filter_table.ranges[ri].len]) |fb| {
+                    if (default_registry.touchesHeaders(fb.module)) any_touches = true;
+                }
+                if (!any_touches) {
+                    @compileError("route has set_header directives but no filter touches headers");
+                }
+            }
             len += 1;
         }
         break :blk .{ .items = items, .len = len };

@@ -6,6 +6,7 @@ const http_response = @import("../http/response.zig");
 const static_cache = @import("static_cache.zig");
 const limits_mod = @import("limits.zig");
 const arena_mod = @import("../http/arena.zig");
+const body_storage_mod = @import("../net/body_storage.zig");
 
 pub const Phase = phase_mod.Phase;
 pub const ModuleBinding = router.ModuleBinding;
@@ -204,6 +205,11 @@ pub const Context = struct {
     /// io_uring/TLS fronts keep the synchronous driver). Set by the
     /// runtime; modules check before returning .async.
     async_supported: bool = false,
+    /// Body storage for the current request (may be memory or spilled to
+    /// memfd). Set by the reactor after the parser completes; modules read
+    /// the full body via this instead of req.body (which is a zero-copy
+    /// slice valid only for Content-Length bodies).
+    body_storage: ?*body_storage_mod.BodyStorage = null,
 
     /// Internal-subrequest hook (auth_request): installed by the reactor,
     /// implemented by the runtime Server so modules can run a request
@@ -377,6 +383,20 @@ pub fn Registry(comptime modules: anytype) type {
         pub fn streamsResponse(name: []const u8) bool {
             inline for (all) |m| {
                 if (std.mem.eql(u8, m.name, name)) return m.streams_response;
+            }
+            return false;
+        }
+
+        pub fn needsBody(name: []const u8) bool {
+            inline for (all) |m| {
+                if (std.mem.eql(u8, m.name, name)) return m.needs_body;
+            }
+            return false;
+        }
+
+        pub fn touchesHeaders(name: []const u8) bool {
+            inline for (all) |m| {
+                if (std.mem.eql(u8, m.name, name)) return m.touches_headers;
             }
             return false;
         }

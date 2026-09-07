@@ -850,8 +850,17 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
     }
     var cl_buf: [24]u8 = undefined;
     try out.appendSlice(allocator, "Content-Length: ");
-    try out.appendSlice(allocator, std.fmt.bufPrint(&cl_buf, "{d}\r\n\r\n", .{ctx.req.body.len}) catch return error.OutOfMemory);
-    try out.appendSlice(allocator, ctx.req.body);
+    // Prefer body_storage for consistency with chunked bodies; fall back
+    // to req.body (zero-copy Content-Length slice).
+    const body = blk: {
+        if (ctx.body_storage) |bs| {
+            const items = bs.items();
+            if (items.len > 0) break :blk items;
+        }
+        break :blk ctx.req.body;
+    };
+    try out.appendSlice(allocator, std.fmt.bufPrint(&cl_buf, "{d}\r\n\r\n", .{body.len}) catch return error.OutOfMemory);
+    try out.appendSlice(allocator, body);
     return out.items;
 }
 

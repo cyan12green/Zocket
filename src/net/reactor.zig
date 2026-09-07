@@ -1603,6 +1603,7 @@ pub const Reactor = struct {
             // Parking available on the epoll HTTP path; ring/TLS fronts
             // keep the synchronous upstream driver.
             .async_supported = self.io_mode == .epoll,
+            .body_storage = if (session.req.body_storage) |*bs| bs else null,
             .started = std.time.Instant.now() catch std.time.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
             .now_ns = blk: {
                 const t = std.time.Instant.now() catch break :blk 0;
@@ -1645,8 +1646,11 @@ pub const Reactor = struct {
             if (!ctx.async_supported) {
                 // Synchronous drivers (ring/TLS fronts): modules use the
                 // blocking path; no parking possible.
-                break :blk handler.handleRequest(&ctx) catch {
-                    self.respondAndClose(fd, .internal_error);
+                break :blk handler.handleRequest(&ctx) catch |e| {
+                    const st = dsl_registry.statusForModuleError(e);
+                    ctx.resp.status = st;
+                    ctx.resp.setBody(st.reasonPhrase());
+                    self.respondAndClose(fd, st);
                     return false;
                 };
             }
@@ -1660,7 +1664,10 @@ pub const Reactor = struct {
                     return false;
                 },
                 else => {
-                    self.respondAndClose(fd, .internal_error);
+                    const st = dsl_registry.statusForModuleError(e);
+                    ctx.resp.status = st;
+                    ctx.resp.setBody(st.reasonPhrase());
+                    self.respondAndClose(fd, st);
                     return false;
                 },
             };
