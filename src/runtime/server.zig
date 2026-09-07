@@ -217,13 +217,13 @@ test "ServerGroup selectServer matches exact and wildcard server_names" {
     const servers = [_]Server{ s1, s2 };
     const group = ServerGroup{ .servers = &servers, .default_idx = 0 };
     // Exact match.
-    try testing.expectEqual(&servers[0], group.selectServer("example.com"));
-    try testing.expectEqual(&servers[0], group.selectServer("example.com:8080"));
+    try testing.expectEqual(&servers[0], group.selectServer("example.com", null));
+    try testing.expectEqual(&servers[0], group.selectServer("example.com:8080", null));
     // Wildcard match.
-    try testing.expectEqual(&servers[1], group.selectServer("v1.api.com"));
-    try testing.expectEqual(&servers[1], group.selectServer("foo.api.com:9000"));
+    try testing.expectEqual(&servers[1], group.selectServer("v1.api.com", null));
+    try testing.expectEqual(&servers[1], group.selectServer("foo.api.com:9000", null));
     // No match -> default.
-    try testing.expectEqual(&servers[0], group.selectServer("other.com"));
+    try testing.expectEqual(&servers[0], group.selectServer("other.com", null));
 }
 
 test "runtime server dispatches an echo request through the pipeline" {
@@ -868,19 +868,25 @@ pub const ServerGroup = struct {
         if (self.servers.len > 1) allocator.free(self.servers);
     }
 
-    /// Select a server by Host header value. Returns the default server
-    /// when no match is found (nginx semantics: first server wins).
-    pub fn selectServer(self: *const ServerGroup, host: []const u8) *const Server {
+    /// Select a server by Host header value. Uses the comptime-generated
+    /// select_fn when available (O(1) exact match + wildcard scan), falls
+    /// back to runtime matching for dynamically-constructed configs.
+    pub fn selectServer(self: *const ServerGroup, host: []const u8, cfg: ?config_mod.Config) *const Server {
         if (self.servers.len <= 1) return &self.servers[0];
-        // Strip port from host header (e.g. "example.com:8080" -> "example.com").
+        // Fast path: comptime-generated select function.
+        if (cfg) |c| {
+            if (c.select_fn) |sel| {
+                const idx = sel(host);
+                return &self.servers[@min(idx, self.servers.len - 1)];
+            }
+        }
+        // Fallback: runtime matching (for JSON-loaded or test configs).
         const h = if (std.mem.lastIndexOfScalar(u8, host, ':')) |pos| host[0..pos] else host;
-        // Exact match first.
         for (self.servers) |*srv| {
             if (srv.cfg.server_name) |name| {
                 if (std.mem.eql(u8, h, name)) return srv;
             }
         }
-        // Wildcard suffix match (*.example.com matches sub.example.com).
         for (self.servers) |*srv| {
             if (srv.cfg.server_name) |name| {
                 if (name.len > 2 and name[0] == '*' and name[1] == '.') {

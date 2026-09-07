@@ -1592,6 +1592,57 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .len = len };
     };
 
+    // Build comptime server selection function from server names.
+    // The function strips the port, FNV-hashes the host, and does an
+    // exact-match scan (comptime-unrolled for small server counts) followed
+    // by wildcard suffix matching (*.domain patterns).
+    const select_fn: ?Config.ServerSelectFn = if (servers_built.len > 1) comptime blk: {
+        // Collect exact names and wildcard patterns at comptime.
+        const SName = struct { name: []const u8, idx: u8 };
+        const SWild = struct { suffix: []const u8, idx: u8 };
+        var exact_arr: [max_servers]SName = [_]SName{.{ .name = "", .idx = 0 }} ** max_servers;
+        var wild_arr: [max_servers]SWild = [_]SWild{.{ .suffix = "", .idx = 0 }} ** max_servers;
+        var exact_n: usize = 0;
+        var wild_n: usize = 0;
+        for (servers_built.items[0..servers_built.len], 0..) |spec, i| {
+            if (spec.server_name) |name| {
+                if (name.len > 2 and name[0] == '*' and name[1] == '.') {
+                    wild_arr[wild_n] = .{ .suffix = name[1..], .idx = @intCast(i) };
+                    wild_n += 1;
+                } else {
+                    exact_arr[exact_n] = .{ .name = name, .idx = @intCast(i) };
+                    exact_n += 1;
+                }
+            }
+        }
+        // Freeze into comptime constants so the closure can reference them.
+        const exact_names = exact_arr;
+        const exact_count = exact_n;
+        const wildcard_pats = wild_arr;
+        const wildcard_count = wild_n;
+        const Impl = struct {
+            fn select(host: []const u8) usize {
+                // Strip port: "example.com:8080" -> "example.com"
+                const h = if (std.mem.lastIndexOfScalar(u8, host, ':')) |pos| host[0..pos] else host;
+                // Exact match: comptime-unrolled scan over known names.
+                inline for (0..max_servers) |i| {
+                    if (i >= exact_count) break;
+                    if (std.mem.eql(u8, h, exact_names[i].name)) return exact_names[i].idx;
+                }
+                // Wildcard suffix match (comptime-unrolled).
+                inline for (0..max_servers) |i| {
+                    if (i >= wildcard_count) break;
+                    if (h.len > wildcard_pats[i].suffix.len and std.mem.endsWith(u8, h, wildcard_pats[i].suffix)) {
+                        return wildcard_pats[i].idx;
+                    }
+                }
+                // Default: first server block (nginx semantics).
+                return 0;
+            }
+        };
+        break :blk Impl.select;
+    } else null;
+
     return .{
         .routes = routes,
         .limits = b.limits,
@@ -1602,6 +1653,7 @@ fn build(b: *const Builder) Config {
         .listen_port = b.listen_port,
         .log_formats = log_table.items[0..log_table.len],
         .servers = servers_built.items[0..servers_built.len],
+        .select_fn = select_fn,
     };
 }
 

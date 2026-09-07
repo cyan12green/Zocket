@@ -48,6 +48,11 @@ pub const Config = struct {
     servers: []const ServerSpec = &.{},
     /// Virtual host name for this server block (null = catch-all default).
     server_name: ?[]const u8 = null,
+    /// Comptime-generated server selection function. Maps a Host header
+    /// value to a server index into the `servers` array. Built at compile
+    /// time from the server_name directives — the function body is a
+    /// hash lookup + wildcard scan, all in .rodata. Null when single-server.
+    select_fn: ?ServerSelectFn = null,
 
     /// Per-server virtual host spec.
     pub const ServerSpec = struct {
@@ -56,6 +61,10 @@ pub const Config = struct {
         routes_start: usize = 0,
         routes_len: usize = 0,
     };
+
+    /// Comptime server selection function type: takes a Host header value
+    /// (may include port), returns the server index into Config.servers.
+    pub const ServerSelectFn = *const fn (host: []const u8) usize;
 
     /// Comptime default: a single catch-all prefix route attaching the echo
     /// module to the content phase — the pre-pipeline behavior, reproduced
