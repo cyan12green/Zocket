@@ -96,9 +96,11 @@ byte-budgeted LRU stores; nothing grows under load):
   9110 §6.3).
 - gRPC proxying (on top of M16).
 - IPv6 listeners (dual-stack).
-- Multi-server blocks: multiple `server {}` blocks with per-block
+- DONE Multi-server blocks: multiple `server {}` blocks with per-block
   `listen` and `server_name` directives; request routing by Host header
-  / SNI to the matching server's route table (blocked on vhost audit).
+  / SNI to the matching server's route table. Comptime `ServerSelectFn`
+  (exact + wildcard match in .rodata), `host_select on|off;` directive,
+  per-port multireactor threads, reactor-level Host resolution.
 
 ---
 

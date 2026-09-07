@@ -2,9 +2,9 @@
 
 The milestone history of Zocket. Current status: M1–M18 complete,
 M18.5 complete, protocol-completeness backlog shipped as modules (B1),
-and reload-surviving zones + vhost readiness audit (B2). M19 (HTTP/3)
-is planned. Forward-looking roadmap: `docs/ROADMAP.md`; benchmarks per
-milestone in `bench/BENCH.md`.
+reload-surviving zones + vhost readiness audit (B2), and multi-server
+vhost pipeline (B3). M19 (HTTP/3) is planned. Forward-looking roadmap:
+`docs/ROADMAP.md`; benchmarks per milestone in `bench/BENCH.md`.
 
 | Milestone | Status | Description |
 |---|---:|---|
@@ -29,6 +29,7 @@ milestone in `bench/BENCH.md`.
 | M18 | DONE | WebSocket / connection upgrade (RFC 6455): handshake digest, frame codec with mandatory client masking, reactor byte-pipe mode (echo/ping-pong/close), non-RFC upgrades stay HTTP. |
 | B1 | DONE | Backlog modules as a batch: headers (add/set/remove + always + inheritance), auth_basic (comptime htpasswd), auth_request (subrequest hook), limit_req/limit_conn (shmem leaky bucket + conn cap), precompressed (.gz twins), proxy_cache (bounded LRU + conditional revalidation), LB random/consistent_hash/least_time + cookie sticky sessions. Framework: shared request memory (`ctx.sharedAlloc/Dupe/Fmt`), bounded shmem zones (`dsl/shmem.zig`), per-request timeouts (client_header/body_timeout), nginx-style directive model. Benchmarks: `bench/BENCH.md` backlog section. |
 | B2 | DONE | Reload-surviving zones + vhost readiness audit: memfd-backed named shmem zones (`src/dsl/memfd.zig`) handed through daemon state file across `--reload-hard`; `MmapKeyedTable` for mmap-backed key tables; `ZoneRegistry` for zone lifecycle; limit.zig lifecycle init from inherited fds; per-server `ServerStats` (allocated in `embeddedInit`, freed in `deinitPrepared`); `ModuleError` enum with status mapping (502/503/500); `needs_body`/`touches_headers`/`streams_response` capability flags; body spooling via memfd (`src/net/body_storage.zig`). |
+| B3 | DONE | Multi-server vhost pipeline: `server_name` directive (exact + `*.domain` wildcard), multiple `server {}` blocks with per-block `listen` port; `host_select on|off;` directive; comptime `ServerSelectFn` (FNV-style exact + wildcard match in .rodata); `ServerGroup` (independent per-server trie/dispatch/stats, no single-server backward compat); `ServerGroup.comptimeInit` + `embeddedInitGroupWithTls`; reactor holds `*ServerGroup` with per-request Host resolution (`resolveServer`); multireactor `initWithThreadsAndHandlerGroup`; main builds `ServerGroup`, collects unique listen ports, spawns one multireactor thread per port. |
 | M19 | PLANNED | HTTP/3 + QUIC (after M16+M17; feasibility revisited). |
 
 The future roadmap is in `docs/ROADMAP.md`.

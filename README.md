@@ -56,6 +56,10 @@ High-performance TCP/HTTP server in Zig.
   per module; body spooling via memfd for chunked/large uploads
 - Per-server stats: each embedded server owns its own `ServerStats`
   (no global contention)
+- Multi-server virtual hosts: multiple `server {}` blocks with
+  `server_name` (exact + `*.domain` wildcard) and per-block `listen`;
+  comptime `ServerSelectFn` for zero-allocation Host matching; per-port
+  multireactor threads; `host_select off;` for single-server optimization
 
 **Operations**
 - Daemon control: `--start` / `--stop` / `--status` (pidfile)
