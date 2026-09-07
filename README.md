@@ -47,6 +47,15 @@ High-performance TCP/HTTP server in Zig.
 - Module registry (echo, gzip, static + sendfile, proxy + load balancing +
   health checks, cache/Conditional-GET, response templates, stub_status,
   access/error logs) — identical behaviour over HTTP/1.1 and HTTP/2
+- Reload-surviving shmem zones: memfd-backed named zones survive
+  `--reload-hard` exec via daemon state file; limit_req/limit_conn
+  buckets persist across reloads
+- Error taxonomy: `ModuleError` enum maps to 502/503/500 in pipeline +
+  reactor catch paths
+- Capability flags: `needs_body`, `touches_headers`, `streams_response`
+  per module; body spooling via memfd for chunked/large uploads
+- Per-server stats: each embedded server owns its own `ServerStats`
+  (no global contention)
 
 **Operations**
 - Daemon control: `--start` / `--stop` / `--status` (pidfile)
@@ -106,7 +115,7 @@ Protocol-deep comparisons: `bench/graphs/h2_compare.png` (HTTP/2 h2load),
 
 ## Tests and benchmarks
 
-- `zig build test` — unit + concurrency + fuzz-smoke tests (320 passing).
+- `zig build test` — unit + concurrency + fuzz-smoke tests (339 passing).
 - `bench/bench.sh`, `bench/bench2.sh`, `bench/summarize.py` — reproducible
   benchmark harness; results and methodology in `bench/BENCH.md`.
 - `bench/compare-servers.sh` — cross-language comparison against actix-web,

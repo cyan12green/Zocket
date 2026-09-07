@@ -96,6 +96,9 @@ byte-budgeted LRU stores; nothing grows under load):
   9110 §6.3).
 - gRPC proxying (on top of M16).
 - IPv6 listeners (dual-stack).
+- Multi-server blocks: multiple `server {}` blocks with per-block
+  `listen` and `server_name` directives; request routing by Host header
+  / SNI to the matching server's route table (blocked on vhost audit).
 
 ---
 
@@ -189,23 +192,25 @@ Folded into Stage 2 (rides the upstream seam):
 
 Tracked backlog (design notes recorded here; build later):
 
-9. **Reload-surviving zones**: `--reload-hard` execs a fresh process today,
-   resetting limit buckets and caches. Direction: back named shmem zones
-   with memfd_create handed through the daemon state file.
+9. DONE Reload-surviving zones: memfd_create zones handed through daemon
+    state file across `--reload-hard`; `src/dsl/memfd.zig` utility,
+    `MmapKeyedTable` in shmem.zig, `ZoneRegistry` for named zone
+    acquire/adopt, limit.zig lifecycle init from inherited fds.
 10. **Metrics/tracing contract**: per-module counters in shmem, request-id
-    propagation, OTel-ready span points (handler entry, filter exit,
-    upstream done).
-11. **Error taxonomy**: `ModuleError` enum with central status mapping
-    (502/500/503 semantics) replacing anyerror guesswork.
-12. **Vhost readiness audit**: globals assuming a single server block
-    (health-route registry, default stats) get keyed by server before
-    vhosts land.
-13. **Capability flags**: `needs_body`, `streams_response`,
-    `touches_headers` declared per module; reactor can spool huge uploads
-    and validate bindings smarter.
-14. **HTTP-version conformance gate**: CI exercises every built-in module
-    over h2 (only some are verified today); enforces protocol-agnostic
-    modules ahead of HTTP/3.
+     propagation, OTel-ready span points (handler entry, filter exit,
+     upstream done).
+11. DONE Error taxonomy: `ModuleError` enum with central status mapping
+     (`statusForModuleError` → 502/503/500); pipeline + reactor catch
+     paths wired.
+12. DONE Vhost readiness audit: `default_stats` is per-Server (allocated
+     in `embeddedInit`, freed in `deinitPrepared`); `default_http_handler`
+     documented as test-only fallback.
+13. DONE Capability flags: `needs_body`, `streams_response`,
+     `touches_headers` declared per module; reactor uses `needsBody` for
+     body spooling, conf validates `touches_headers` + filter bindings.
+14. HTTP-version conformance gate: CI exercises every built-in module
+     over h2 (only some are verified today); enforces protocol-agnostic
+     modules ahead of HTTP/3.
 
 ### Delivery stages and gates
 
