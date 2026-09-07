@@ -44,6 +44,8 @@ pub const default_idle_timeout_seconds: u32 = 60;
 
 /// Fallback HTTP request processor used when a reactor is created without an
 /// explicit handler (e.g. in tests): the default echo-on-everything config.
+/// NOTE(vhost): in multi-server mode every reactor must receive its own
+/// handler pointer; this fallback is test-only.
 const default_http_handler = runtime_server.Server.default();
 
 /// Connection protocol handled by a reactor.

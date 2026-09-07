@@ -19,7 +19,6 @@ pub const http = struct {
     pub const response = @import("http/response.zig");
     pub const header_dfa = @import("http/header_dfa.zig");
     pub const websocket = @import("http/websocket.zig");
-    pub const shmem = @import("dsl/shmem.zig");
     /// Test-only helpers; not part of the server surface.
     pub const testing_kit = @import("dsl/testing.zig");
     pub const arena = @import("http/arena.zig");
@@ -53,6 +52,8 @@ pub const dsl = struct {
     pub const conf = @import("dsl/conf.zig");
     pub const vars = @import("dsl/vars.zig");
     pub const regex = @import("dsl/regex.zig");
+    pub const shmem = @import("dsl/shmem.zig");
+    pub const memfd = @import("dsl/memfd.zig");
     pub const modules = struct {
         pub const echo = @import("dsl/modules/echo.zig");
         pub const gzip = @import("dsl/modules/gzip.zig");
@@ -94,6 +95,7 @@ comptime {
     _ = @import("dsl/modules/auth_basic.zig");
     _ = @import("dsl/modules/limit.zig");
     _ = @import("dsl/shmem.zig");
+    _ = @import("dsl/memfd.zig");
     _ = @import("dsl/testing.zig");
     _ = @import("dsl/modules/precompressed.zig");
     _ = @import("dsl/modules/auth_request.zig");

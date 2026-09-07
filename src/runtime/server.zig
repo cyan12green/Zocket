@@ -119,21 +119,33 @@ pub const Server = struct {
             routes[i] = copy;
             prepared_len += 1;
         }
+        // Per-server stats: each embedded server gets its own counters
+        // instead of sharing the process-global default_stats.
+        const stats = try allocator.create(ServerStats);
+        errdefer allocator.destroy(stats);
+        stats.* = .{};
         var s = base;
         s.cfg = .{ .routes = routes, .limits = base.cfg.limits, .tls = base.cfg.tls, .listen_port = base.cfg.listen_port, .log_formats = base.cfg.log_formats };
         s.router.routes = routes;
+        s.stats = stats;
         return s;
     }
 
     /// Free the allocator-owned route copy created by `embeddedInit` (only
     /// the resolved root fields and the array itself; the comptime strings
-    /// still live in .rodata).
+    /// still live in .rodata). Also frees per-server stats when they are
+    /// not the process-global default.
     pub fn deinitPrepared(self: *Server, allocator: std.mem.Allocator) void {
         for (self.cfg.routes) |r| {
             if (r.root_real) |rr| allocator.free(rr);
             if (r.root_fd >= 0) std.posix.close(r.root_fd);
         }
         allocator.free(self.cfg.routes);
+        // Free per-server stats only if they were allocated (not the global default).
+        if (self.stats != &default_stats) {
+            allocator.destroy(self.stats);
+            self.stats = &default_stats;
+        }
     }
 
     /// Run one fully-parsed request through the phase pipeline. On

@@ -39,8 +39,35 @@ const ConnState = struct {
     active: u32,
 };
 
-var req_zone = shmem.KeyedTable(ReqState, table_len){};
-var conn_zone = shmem.KeyedTable(ConnState, table_len){};
+const ReqZone = shmem.MmapKeyedTable(ReqState, table_len);
+const ConnZone = shmem.MmapKeyedTable(ConnState, table_len);
+
+var req_zone: ReqZone = undefined;
+var conn_zone: ConnZone = undefined;
+var zones_initialised = false;
+
+const zone_name_req = "limit_req_zone";
+const zone_name_conn = "limit_conn_zone";
+
+pub fn lifecycleInit(_: ?*const registry.Limits) anyerror!void {
+    if (zones_initialised) return;
+    zones_initialised = true;
+
+    const reg = try shmem.initGlobalRegistry(std.heap.page_allocator);
+    const req_region = try reg.acquire(zone_name_req, ReqZone.mmapSize());
+    const conn_region = try reg.acquire(zone_name_conn, ConnZone.mmapSize());
+    req_zone = ReqZone.init(req_region);
+    conn_zone = ConnZone.init(conn_region);
+}
+
+pub fn lifecycleDeinit() void {
+    // Zone memory is managed by the global registry; nothing to free here.
+}
+
+const limit_lifecycle = registry.Lifecycle{
+    .init = &lifecycleInit,
+    .deinit = &lifecycleDeinit,
+};
 
 fn hashKey(ctx: *Context) u64 {
     // FNV-1a over the dotted client IP; zero IPs (tests, socketpairs)
@@ -58,6 +85,7 @@ pub const limit_req = registry.Module{
     .name = "limit_req",
     .phase = .access,
     .run = runReq,
+    .lifecycle = &limit_lifecycle,
 };
 
 pub const limit_conn = registry.Module{

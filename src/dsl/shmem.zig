@@ -387,4 +387,250 @@ test "LruStore remove invalidates exactly one key" {
     try testing.expectEqual(@as(usize, 1), store.stats().entries);
 }
 
+/// Mmap-backed variant of KeyedTable: same semantics, but keys/vals/filled
+/// live in a memfd region instead of inline arrays. This allows the zone to
+/// survive exec across --reload-hard (memfds pass through without CLOEXEC).
+///
+/// Memory layout (total = mmapSize(V, cap)):
+///   [cap] u64 keys  |  [cap] V vals  |  u64 filled
+pub fn MmapKeyedTable(comptime V: type, comptime cap: usize) type {
+    const mask = cap - 1;
+    if (cap & mask != 0) @compileError("MmapKeyedTable cap must be a power of two");
+    return struct {
+        const Self = @This();
+
+        const zero_val: V = std.mem.zeroes(V);
+
+        mutex: std.Thread.Mutex = .{},
+        keys: [*]u64,
+        vals: [*]V,
+        filled_ptr: *u64,
+        /// The mmap region; caller must keep it alive.
+        region: []align(std.heap.page_size_min) u8,
+
+        /// Byte size needed for the mmap region.
+        pub fn mmapSize() usize {
+            return @sizeOf([cap]u64) + @sizeOf([cap]V) + @sizeOf(u64);
+        }
+
+        /// Wrap an existing mmap region. The region must be at least
+        /// `mmapSize()` bytes. Ownership of the region is NOT transferred
+        /// (caller manages mmap lifecycle).
+        pub fn init(region: []align(std.heap.page_size_min) u8) Self {
+            const keys_ptr: [*]u64 = @ptrCast(region.ptr);
+            const vals_offset = @sizeOf([cap]u64);
+            const vals_ptr: [*]V = @ptrCast(region.ptr + vals_offset);
+            const filled_offset = vals_offset + @sizeOf([cap]V);
+            const filled_ptr: *u64 = @ptrCast(region.ptr + filled_offset);
+            return .{
+                .keys = keys_ptr,
+                .vals = vals_ptr,
+                .filled_ptr = filled_ptr,
+                .region = region,
+            };
+        }
+
+        fn filled(self: *const Self) *u64 {
+            return self.filled_ptr;
+        }
+
+        fn probe(self: *const Self, key: u64) usize {
+            var i: usize = @intCast(key & mask);
+            var n: usize = 0;
+            while (n < cap and self.keys[i] != 0 and self.keys[i] != key) : ({
+                i = (i + 1) & mask;
+                n += 1;
+            }) {}
+            return i;
+        }
+
+        pub fn upsertLocked(self: *Self, key: u64) ?struct { slot: *V, existed: bool } {
+            const i = self.probe(key);
+            if (self.keys[i] == 0) {
+                if (self.filled().* >= @as(u64, cap)) return null;
+                self.keys[i] = key;
+                self.vals[i] = zero_val;
+                self.filled().* += 1;
+                return .{ .slot = &self.vals[i], .existed = false };
+            }
+            if (self.keys[i] != key) return null;
+            return .{ .slot = &self.vals[i], .existed = true };
+        }
+
+        pub fn upsert(self: *Self, key: u64) ?*V {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const r = self.upsertLocked(key) orelse return null;
+            return r.slot;
+        }
+
+        pub fn get(self: *Self, key: u64) ?V {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const i = self.probe(key);
+            if (self.keys[i] == key) return self.vals[i];
+            return null;
+        }
+
+        pub fn clear(self: *Self) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            @memset(self.keys[0..cap], 0);
+            self.filled().* = 0;
+        }
+
+        pub fn count(self: *Self) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.filled().*;
+        }
+    };
+}
+
+test "MmapKeyedTable upsert/get round-trips and survives init" {
+    const K = MmapKeyedTable(u32, 4);
+    const region = try memfd_mod.map(try memfd_mod.create("test-kv", K.mmapSize()), K.mmapSize());
+    defer std.posix.munmap(region);
+
+    var t = K.init(region);
+    inline for (0..4) |i| {
+        const slot = t.upsert(100 + i) orelse return error.UnexpectedFull;
+        slot.* = @intCast(i * 10);
+    }
+    try testing.expectEqual(@as(usize, 4), t.count());
+    try testing.expectEqual(@as(u32, 20), t.get(102).?);
+    try testing.expect(t.upsert(999) == null);
+
+    // Simulate exec survival: wrap the same mmap region again.
+    var t2 = K.init(region);
+    try testing.expectEqual(@as(u32, 20), t2.get(102).?);
+    const slot = t2.upsert(101) orelse return error.LostSlot;
+    slot.* += 1;
+    try testing.expectEqual(@as(u32, 11), t2.get(101).?);
+}
+
+/// Zone descriptor carried in the state file across --reload-hard.
+pub const ZoneInfo = struct {
+    name: []const u8,
+    fd: i32,
+    size: usize,
+};
+
+/// Named zone registry: maps zone name -> fd + mmap region. Used by
+/// modules (limit.zig, proxy_cache) to acquire mmap-backed zones. On
+/// first start the registry creates fresh memfds; on --reload-hard the
+/// child inherits fds from the state file.
+pub const ZoneRegistry = struct {
+    const Zone = struct {
+        name: []const u8,
+        fd: posix.fd_t,
+        size: usize,
+        region: []align(std.heap.page_size_min) u8,
+    };
+
+    zones: std.StringArrayHashMap(Zone),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) ZoneRegistry {
+        return .{ .zones = std.StringArrayHashMap(Zone).init(allocator), .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ZoneRegistry) void {
+        for (self.zones.values()) |z| {
+            posix.munmap(z.region);
+            posix.close(z.fd);
+            self.allocator.free(z.name);
+        }
+        self.zones.deinit();
+    }
+
+    /// Acquire or create a named zone of `size` bytes. If the zone already
+    /// exists (same name), returns the existing region. Otherwise creates a
+    /// fresh memfd.
+    pub fn acquire(self: *ZoneRegistry, name: []const u8, size: usize) ![]align(std.heap.page_size_min) u8 {
+        if (self.zones.getPtr(name)) |z| return z.region;
+        const fd = try posix.memfd_create(name, 0);
+        try posix.ftruncate(fd, @intCast(size));
+        const region = try posix.mmap(
+            null,
+            size,
+            posix.PROT.READ | posix.PROT.WRITE,
+            posix.MAP{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        const duped_name = try self.allocator.dupe(u8, name);
+        try self.zones.put(duped_name, .{
+            .name = duped_name,
+            .fd = fd,
+            .size = size,
+            .region = region,
+        });
+        return region;
+    }
+
+    /// Adopt an inherited fd (survived exec from the parent daemon). The
+    /// new process mmaps it and registers it under the given name.
+    pub fn adopt(self: *ZoneRegistry, name: []const u8, fd: posix.fd_t, size: usize) ![]align(std.heap.page_size_min) u8 {
+        if (self.zones.getPtr(name)) |z| return z.region;
+        const region = try posix.mmap(
+            null,
+            size,
+            posix.PROT.READ | posix.PROT.WRITE,
+            posix.MAP{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        const duped_name = try self.allocator.dupe(u8, name);
+        try self.zones.put(duped_name, .{
+            .name = duped_name,
+            .fd = fd,
+            .size = size,
+            .region = region,
+        });
+        return region;
+    }
+
+    /// Build zone descriptors for serialisation into the state file.
+    pub fn descriptors(self: *const ZoneRegistry) ![]ZoneInfo {
+        var list = std.ArrayList(ZoneInfo).empty;
+        var it = self.zones.iterator();
+        while (it.next()) |e| {
+            try list.append(self.allocator, .{
+                .name = e.key_ptr.*,
+                .fd = @intCast(e.value_ptr.fd),
+                .size = e.value_ptr.size,
+            });
+        }
+        return list.toOwnedSlice(self.allocator);
+    }
+};
+
+const posix = std.posix;
+const memfd_mod = @import("memfd.zig");
 const testing = std.testing;
+
+/// Process-global zone registry. Created once during module lifecycle init
+/// and read by main.zig when serialising the state file. Not thread-safe
+/// for concurrent writes — lifecycle init is single-threaded (gated).
+pub var global_registry: ?ZoneRegistry = null;
+
+/// Initialise the global registry (called from lifecycle init). Returns
+/// a pointer that modules use to acquire zones.
+pub fn initGlobalRegistry(allocator: std.mem.Allocator) !*ZoneRegistry {
+    if (global_registry) |*r| return r;
+    global_registry = ZoneRegistry.init(allocator);
+    return &global_registry.?;
+}
+
+/// Adopt inherited zone fds from a state file. Called before lifecycle
+/// init so that modules get mmap regions that survived exec. Each
+/// descriptor's fd is still valid (memfd is not CLOEXEC).
+pub fn adoptInherited(allocator: std.mem.Allocator, zone_fds: []const ZoneInfo) !void {
+    if (zone_fds.len == 0) return;
+    const reg = try initGlobalRegistry(allocator);
+    for (zone_fds) |z| {
+        if (z.fd < 0) continue;
+        _ = reg.adopt(z.name, @intCast(z.fd), z.size) catch continue;
+    }
+}

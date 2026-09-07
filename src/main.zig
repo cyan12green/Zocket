@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const zocket = @import("zocket");
 const build_options = @import("build_options");
+const shmem_mod = zocket.dsl.shmem;
 
 /// Comptime config is the primary path. When built with
 /// `zig build -Dconfig=<file>`, the conf file is embedded at compile time
@@ -232,7 +233,15 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
             fn ready(ctx: *anyopaque) void {
                 const d: *@This() = @ptrCast(@alignCast(ctx));
                 writePidfile(d.pidfile, d.pid) catch {};
-                writeStateFile(std.heap.page_allocator, d.pidfile, d.state) catch {};
+                // Attach zone descriptors from the global registry so the
+                // child daemon inherits the memfds across --reload-hard.
+                var state_with_zones = d.state;
+                if (shmem_mod.global_registry) |*reg| {
+                    state_with_zones.zone_fds = reg.descriptors() catch &.{};
+                }
+                writeStateFile(std.heap.page_allocator, d.pidfile, state_with_zones) catch {};
+                if (state_with_zones.zone_fds.len > 0)
+                    std.heap.page_allocator.free(state_with_zones.zone_fds);
                 _ = std.posix.write(d.pipe_fd, "R") catch {};
             }
         };
@@ -242,6 +251,14 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
             .state = state,
             .pid = std.posix.getpid(),
         };
+        // On --reload-hard the new daemon inherits memfd fds from the old
+        // one (memfd_create has no CLOEXEC). Adopt them before module
+        // lifecycle init so zones survive across reloads.
+        var inherited = readStateFile(std.heap.page_allocator, pidfile) catch null;
+        defer if (inherited) |*s| freeStateFile(std.heap.page_allocator, s);
+        if (inherited) |*s| {
+            shmem_mod.adoptInherited(std.heap.page_allocator, s.zone_fds) catch {};
+        }
         runServer(allocator, opts, &Daemon.ready, &daemon) catch {
             std.posix.exit(1);
         };
@@ -385,6 +402,11 @@ fn statusDaemon(allocator: std.mem.Allocator, pidfile: []const u8) !void {
 // ---- state file (--start records; --reload-hard consumes) ----
 
 /// Everything needed to reproduce a daemon's build + start for
+/// Zone descriptor carried in the state file across --reload-hard.
+/// The fd survives exec (memfd_create uses no CLOEXEC); the new daemon
+/// reads the fd number and mmaps the inherited file.
+const ZoneInfo = shmem_mod.ZoneInfo;
+
 /// `--reload-hard`: written by the daemon child at --start next to the
 /// pidfile (`<pidfile>.state`), read back by --reload-hard. The config
 /// path is project-root-relative (same rule as `-Dconfig` at build time).
@@ -402,6 +424,9 @@ const StateFile = struct {
     /// daemons started from a build; --reload-hard is the only reload.
     embedded: bool = false,
     project_root: ?[]const u8 = null,
+    /// Memfd zone descriptors for reload-surviving shared-memory zones.
+    /// The new daemon inherits these fds across exec and mmaps them.
+    zone_fds: []const ZoneInfo = &.{},
 };
 
 fn stateFilePath(allocator: std.mem.Allocator, pidfile: []const u8) ![]const u8 {
@@ -432,6 +457,18 @@ fn readStateFile(allocator: std.mem.Allocator, pidfile: []const u8) !StateFile {
     out.optimize = try allocator.dupe(u8, out.optimize);
     out.mode = try allocator.dupe(u8, out.mode);
     if (out.project_root) |p| out.project_root = try allocator.dupe(u8, p);
+    // Dupe zone descriptor names and the array itself.
+    if (out.zone_fds.len > 0) {
+        const duped = try allocator.alloc(ZoneInfo, out.zone_fds.len);
+        for (out.zone_fds, 0..) |z, i| {
+            duped[i] = .{
+                .name = try allocator.dupe(u8, z.name),
+                .fd = z.fd,
+                .size = z.size,
+            };
+        }
+        out.zone_fds = duped;
+    }
     return out;
 }
 
@@ -440,6 +477,8 @@ fn freeStateFile(allocator: std.mem.Allocator, state: *StateFile) void {
     allocator.free(state.optimize);
     allocator.free(state.mode);
     if (state.project_root) |p| allocator.free(p);
+    for (state.zone_fds) |z| allocator.free(z.name);
+    if (state.zone_fds.len > 0) allocator.free(state.zone_fds);
 }
 
 /// Walk up from the executable until a directory with `build.zig.zon` is
