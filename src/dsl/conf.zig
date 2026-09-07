@@ -46,6 +46,7 @@ fn hasVariables(frags: []const vars.Frag) bool {
 // frozen by actual count, so unused capacity costs nothing at runtime).
 const route_cap = 1024;
 const module_cap = 4096;
+const max_servers = 16;
 const header_cap = 1024;
 const upstream_cap = 4096;
 const string_cap = 65536;
@@ -71,6 +72,7 @@ const H_static_cache_valid = keyHash("static_cache_valid");
 const H_static_content_cache_max = keyHash("static_content_cache_max");
 const H_connection_pool_max = keyHash("connection_pool_max");
 const H_listen = keyHash("listen");
+const H_server_name = keyHash("server_name");
 const H_tls = keyHash("tls");
 const H_cert = keyHash("cert");
 const H_key = keyHash("key");
@@ -217,6 +219,8 @@ const LocationSpec = struct {
     limit_rate: u32 = 0,
     limit_burst: u32 = 0,
     limit_conn_max: u32 = 0,
+    /// Server block index this location belongs to (for multi-server routing).
+    server_idx: u8 = 0,
 };
 
 /// A `set` declaration as parsed (value unresolved until build).
@@ -281,6 +285,13 @@ const Builder = struct {
     tls_seen: bool = false,
     listen_port: ?u16 = null,
     server_seen: bool = false,
+    /// Per-server state: accumulated across multiple server blocks.
+    server_count: usize = 0,
+    server_listen_ports: [max_servers]?u16 = [_]?u16{null} ** max_servers,
+    server_names: [max_servers]?Str = [_]?Str{null} ** max_servers,
+    server_routes_start: [max_servers]usize = [_]usize{0} ** max_servers,
+    /// Current server index being parsed (incremented on each `server {}`).
+    current_server: usize = 0,
     /// Parse cost in §9 units (recomputed from the built Config at the end).
     cost: usize = 0,
 };
@@ -1102,6 +1113,9 @@ fn parseLocation(lx: *Lexer, b: *Builder) void {
         spec.pattern_regex = regex_mod.compileRegex(pat);
     }
 
+    // Tag this location with the current server block index.
+    spec.server_idx = @intCast(b.current_server);
+
     lx.expectOpen("location");
     while (true) {
         if (lx.peek() == '}') {
@@ -1165,8 +1179,11 @@ fn appendServerFilter(b: *Builder, fname: []const u8) void {
 }
 
 fn parseServer(lx: *Lexer, b: *Builder) void {
-    if (b.server_seen) lx.fail("multiple server blocks are not supported yet (vhosts are a future milestone)");
+    if (b.server_count >= max_servers) lx.fail("too many server blocks (max 16)");
     b.server_seen = true;
+    b.current_server = b.server_count;
+    b.server_count += 1;
+    b.server_routes_start[b.current_server] = b.routes.len;
     lx.expectOpen("server");
     while (true) {
         if (lx.peek() == '}') {
@@ -1177,6 +1194,17 @@ fn parseServer(lx: *Lexer, b: *Builder) void {
         const dn = t.srcOf("server: directive cannot contain escapes");
         if (std.mem.eql(u8, dn, "location")) {
             parseLocation(lx, b);
+            continue;
+        }
+        if (keyHash(dn) == H_server_name) {
+            const name = lx.token() orelse lx.fail("server_name: expected a hostname");
+            b.server_names[b.current_server] = name;
+            lx.expectTerminator("server_name");
+            continue;
+        }
+        if (keyHash(dn) == H_listen) {
+            b.server_listen_ports[b.current_server] = lx.number("listen", u16);
+            lx.expectTerminator("listen");
             continue;
         }
         if (keyHash(dn) == H_filter) {
@@ -1542,6 +1570,28 @@ fn build(b: *const Builder) Config {
     };
 
     const routes: []const Route = routes_built.items[0..routes_built.len];
+
+    // Build the multi-server spec array. Each server block gets its own
+    // listen port, server_name, and route range within the flat routes array.
+    const Servers = struct { items: [max_servers]Config.ServerSpec, len: usize };
+    const servers_built: Servers = comptime blk: {
+        var items: [max_servers]Config.ServerSpec = undefined;
+        var len: usize = 0;
+        var i: usize = 0;
+        while (i < b.server_count) : (i += 1) {
+            const start = b.server_routes_start[i];
+            const end = if (i + 1 < b.server_count) b.server_routes_start[i + 1] else routes_built.len;
+            items[len] = .{
+                .listen_port = b.server_listen_ports[i] orelse b.listen_port,
+                .server_name = if (b.server_names[i]) |n| resolve(n, strings) else null,
+                .routes_start = start,
+                .routes_len = end - start,
+            };
+            len += 1;
+        }
+        break :blk .{ .items = items, .len = len };
+    };
+
     return .{
         .routes = routes,
         .limits = b.limits,
@@ -1551,6 +1601,7 @@ fn build(b: *const Builder) Config {
         },
         .listen_port = b.listen_port,
         .log_formats = log_table.items[0..log_table.len],
+        .servers = servers_built.items[0..servers_built.len],
     };
 }
 
@@ -2013,4 +2064,54 @@ test "conf: proxy_set_header parses into the route" {
     try testing.expectEqual(@as(usize, 2), r.proxy_headers[1].value.len);
     try testing.expectEqualStrings("v-", r.proxy_headers[1].value[0].literal);
     try testing.expectEqual(comptime vars.hashFn("x"), r.proxy_headers[1].value[1].arg);
+}
+
+test "conf: multiple server blocks with server_name and listen" {
+    const cfg = parse(
+        \\server {
+        \\    listen 80;
+        \\    server_name example.com;
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+        \\server {
+        \\    listen 8080;
+        \\    server_name api.example.com;
+        \\    location /data {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    // Two routes across two servers.
+    try testing.expectEqual(@as(usize, 2), cfg.routes.len);
+    try testing.expectEqualStrings("/", cfg.routes[0].path);
+    try testing.expectEqualStrings("/data", cfg.routes[1].path);
+    // Two server specs.
+    try testing.expectEqual(@as(usize, 2), cfg.servers.len);
+    // First server: port 80, example.com, 1 route starting at 0.
+    try testing.expectEqual(@as(?u16, 80), cfg.servers[0].listen_port);
+    try testing.expectEqualStrings("example.com", cfg.servers[0].server_name.?);
+    try testing.expectEqual(@as(usize, 0), cfg.servers[0].routes_start);
+    try testing.expectEqual(@as(usize, 1), cfg.servers[0].routes_len);
+    // Second server: port 8080, api.example.com, 1 route starting at 1.
+    try testing.expectEqual(@as(?u16, 8080), cfg.servers[1].listen_port);
+    try testing.expectEqualStrings("api.example.com", cfg.servers[1].server_name.?);
+    try testing.expectEqual(@as(usize, 1), cfg.servers[1].routes_start);
+    try testing.expectEqual(@as(usize, 1), cfg.servers[1].routes_len);
+}
+
+test "conf: single server block with no server_name" {
+    const cfg = parse(
+        \\listen 9000;
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 1), cfg.routes.len);
+    try testing.expectEqual(@as(usize, 1), cfg.servers.len);
+    try testing.expectEqual(@as(?u16, 9000), cfg.servers[0].listen_port);
+    try testing.expect(cfg.servers[0].server_name == null);
 }

@@ -211,6 +211,21 @@ pub const Server = struct {
 
 const testing = std.testing;
 
+test "ServerGroup selectServer matches exact and wildcard server_names" {
+    const s1 = Server.init(.{ .server_name = "example.com" });
+    const s2 = Server.init(.{ .server_name = "*.api.com" });
+    const servers = [_]Server{ s1, s2 };
+    const group = ServerGroup{ .servers = &servers, .default_idx = 0 };
+    // Exact match.
+    try testing.expectEqual(&servers[0], group.selectServer("example.com"));
+    try testing.expectEqual(&servers[0], group.selectServer("example.com:8080"));
+    // Wildcard match.
+    try testing.expectEqual(&servers[1], group.selectServer("v1.api.com"));
+    try testing.expectEqual(&servers[1], group.selectServer("foo.api.com:9000"));
+    // No match -> default.
+    try testing.expectEqual(&servers[0], group.selectServer("other.com"));
+}
+
 test "runtime server dispatches an echo request through the pipeline" {
     const srv = Server.default();
 
@@ -803,3 +818,76 @@ test "access_log runs through the pipeline with a custom format" {
     const out = try srv.handleRequest(&ctx);
     try testing.expectEqual(pipeline.Outcome.handled, out);
 }
+
+/// A group of virtual-host servers: holds one `Server` per `server {}`
+/// block. The reactor calls `selectServer` with the Host header to pick
+/// the right server, then `handleRequest` on the selected one. When only
+/// one server block exists the group is a thin wrapper.
+pub const ServerGroup = struct {
+    servers: []const Server,
+    /// Index of the default server (first block, or the one without
+    /// server_name). Used when no Host header matches.
+    default_idx: usize = 0,
+
+    /// Build a ServerGroup from a multi-server Config. Each ServerSpec
+    /// produces its own `Server` instance with its own route table and
+    /// stats. The allocator owns the Server array and per-server stats.
+    pub fn init(allocator: std.mem.Allocator, cfg: config_mod.Config) !ServerGroup {
+        if (cfg.servers.len <= 1) {
+            const srv = Server.init(cfg);
+            return .{ .servers = &.{srv}, .default_idx = 0 };
+        }
+        const srvs = try allocator.alloc(Server, cfg.servers.len);
+        errdefer allocator.free(srvs);
+        for (cfg.servers, 0..) |spec, i| {
+            const sub_routes = cfg.routes[spec.routes_start..][0..spec.routes_len];
+            const stats = try allocator.create(ServerStats);
+            errdefer allocator.destroy(stats);
+            stats.* = .{};
+            const sub_cfg = config_mod.Config{
+                .routes = sub_routes,
+                .limits = cfg.limits,
+                .tls = cfg.tls,
+                .listen_port = spec.listen_port,
+                .log_formats = cfg.log_formats,
+                .server_name = spec.server_name,
+            };
+            srvs[i] = Server.init(sub_cfg);
+            srvs[i].stats = stats;
+        }
+        return .{ .servers = srvs, .default_idx = 0 };
+    }
+
+    pub fn deinit(self: *ServerGroup, allocator: std.mem.Allocator) void {
+        for (self.servers) |*srv| {
+            if (srv.stats != &default_stats) {
+                allocator.destroy(srv.stats);
+                srv.stats = &default_stats;
+            }
+        }
+        if (self.servers.len > 1) allocator.free(self.servers);
+    }
+
+    /// Select a server by Host header value. Returns the default server
+    /// when no match is found (nginx semantics: first server wins).
+    pub fn selectServer(self: *const ServerGroup, host: []const u8) *const Server {
+        if (self.servers.len <= 1) return &self.servers[0];
+        // Strip port from host header (e.g. "example.com:8080" -> "example.com").
+        const h = if (std.mem.lastIndexOfScalar(u8, host, ':')) |pos| host[0..pos] else host;
+        // Exact match first.
+        for (self.servers) |*srv| {
+            if (srv.cfg.server_name) |name| {
+                if (std.mem.eql(u8, h, name)) return srv;
+            }
+        }
+        // Wildcard suffix match (*.example.com matches sub.example.com).
+        for (self.servers) |*srv| {
+            if (srv.cfg.server_name) |name| {
+                if (name.len > 2 and name[0] == '*' and name[1] == '.') {
+                    if (h.len > name.len - 1 and std.mem.endsWith(u8, h, name[1..])) return srv;
+                }
+            }
+        }
+        return &self.servers[self.default_idx];
+    }
+};

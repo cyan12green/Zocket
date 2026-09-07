@@ -42,6 +42,20 @@ pub const Config = struct {
     /// Named log formats (`log_format` directives); index 0 is the default
     /// `combined` when none is declared.
     log_formats: []const LogFormat = &.{},
+    /// Multi-server specs: each server {} block gets its own listen port,
+    /// server_name, and route range. When empty (single-server), the top-
+    /// level listen_port + routes are used directly.
+    servers: []const ServerSpec = &.{},
+    /// Virtual host name for this server block (null = catch-all default).
+    server_name: ?[]const u8 = null,
+
+    /// Per-server virtual host spec.
+    pub const ServerSpec = struct {
+        listen_port: ?u16 = null,
+        server_name: ?[]const u8 = null,
+        routes_start: usize = 0,
+        routes_len: usize = 0,
+    };
 
     /// Comptime default: a single catch-all prefix route attaching the echo
     /// module to the content phase — the pre-pipeline behavior, reproduced
