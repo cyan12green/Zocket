@@ -1,148 +1,57 @@
 # Zocket
 
-High-performance TCP/HTTP server in Zig.
+High-performance HTTP/TCP server in Zig. Multi-reactor epoll transport,
+HTTP/1.1 + HTTP/2 (h2spec-verified) + native TLS 1.3, WebSocket upgrade,
+nginx-style comptime config, and a 10-phase module pipeline. Beats nginx
+on every measured workload.
 
-## Motivation
-- A compiled routing/configurable web server.
-- Heavily influenced by nginx in terms of config / custom modules / http phases.
-- A high performance TCP/HTTP server that can compete with nginx (the fastest web server that I have worked with).
-- Comptime, Comptime and Comptime!!! Use compile time (Zig's one of the strongest feature IMO) wherever.
+## Features
 
-## Major features
+- **Multi-reactor transport** — one SO_REUSEPORT listener + epoll loop per core, lock-free dispatch, connection pooling, optional io_uring
+- **HTTP/2 + TLS 1.3** — h2c prior-knowledge, HPACK, flow control; native Zig TLS (no OpenSSL), ECDSA, ALPN, session tickets
+- **Comptime config** — nginx-flavored `.conf` compiled entirely at build time; invalid configs are compile errors, not runtime failures
+- **10-phase module pipeline** — handlers, filters, upstreams; comptime dispatch specialisation; prefix/exact/regex routing
+- **Modules** — static files + sendfile, reverse proxy (round-robin / least-conn / ip_hash / consistent_hash / least_time), sticky sessions, response cache, gzip, conditional GET, auth_basic, auth_request, rate limiting, header manipulation, precompressed serving, access/error logs, stub_status
+- **Virtual hosts** — multiple `server {}` blocks with `server_name` (exact + wildcard), per-port multireactor threads, comptime Host matching
+- **Operations** — daemon mode (`--start/--stop/--status`), zero-downtime config reload (`--reload-hard`), graceful shutdown
 
-**Transport & protocols**
-- Multi-reactor epoll transport: one SO_REUSEPORT listener + event loop per
-  physical core, lock-free dispatch, connection pooling, io_uring backend
-  (opt-in)
-- HTTP/1.1: incremental parser (DFA header classification), keep-alive,
-  pipelining, chunked request bodies, HEAD, 400/413/431/501 handling
-- HTTP/2 (h2c prior-knowledge): HPACK (comptime Huffman + static tables),
-  flow control, CONTINUATION, trailers, RST/GOAWAY
-- TLS 1.3 (native Zig, no OpenSSL): ECDSA certs, ALPN h2 + http/1.1,
-  stateless session tickets + PSK resumption, HTTPS end-to-end over h1
-  and h2
-- Chunked transfer responses, per-route opt-in (`chunked on;`)
-- Automatic protocol detection per connection (TLS ClientHello vs h2
-  preface vs HTTP/1.1)
+## Quick start
 
-**Config & modules (nginx-style)**
-- Module framework v2: three module kinds — phase **handlers** (first
-  claim wins), response **filters** (reverse-order chains composed at
-  comptime), and async **upstreams** (non-blocking state machines driven by
-  reactor events); filters bind at http/server/location scopes with
-  all-or-nothing inheritance; shared request memory + bounded shmem zones;
-  subrequests, internal redirects, active health checks, streaming
-  capability flag
-- Config-driven phase pipeline: 10 nginx phases (post_read … log), prefix/
-  exact/regex routing, comptime route trie + per-route dispatch
-  specialisation
-- Nginx-conf-flavored config language (`.conf`), compiled entirely at
-  compile time (`zig build -Dconfig=<file>`): trie, dispatch, regex NFAs,
-  complex-value fragment lists and pre-serialised response templates live
-  in `.rodata`; invalid configs are compile errors — there is no runtime
-  config parse path
-- Complex values (nginx-style): `$variable` references in `log_format`,
-  `return`, `add_header`, `set` and `proxy_set_header`, rendered per
-  request with a comptime-switched getter loop
-- Module registry (echo, gzip, static + sendfile, proxy + load balancing +
-  health checks, cache/Conditional-GET, response templates, stub_status,
-  access/error logs) — identical behaviour over HTTP/1.1 and HTTP/2
-- Reload-surviving shmem zones: memfd-backed named zones survive
-  `--reload-hard` exec via daemon state file; limit_req/limit_conn
-  buckets persist across reloads
-- Error taxonomy: `ModuleError` enum maps to 502/503/500 in pipeline +
-  reactor catch paths
-- Capability flags: `needs_body`, `touches_headers`, `streams_response`
-  per module; body spooling via memfd for chunked/large uploads
-- Per-server stats: each embedded server owns its own `ServerStats`
-  (no global contention)
-- Multi-server virtual hosts: multiple `server {}` blocks with
-  `server_name` (exact + `*.domain` wildcard) and per-block `listen`;
-  comptime `ServerSelectFn` for zero-allocation Host matching; per-port
-  multireactor threads; `host_select off;` for single-server optimization
-
-**Operations**
-- Daemon control: `--start` / `--stop` / `--status` (pidfile)
-- `--reload-hard`: compile-time config reload — rebuild with the config
-  embedded, zero-downtime daemon swap (SO_REUSEPORT handoff, old daemon
-  drains its connections). The only reload (configs are comptime-only)
-- Graceful shutdown: SIGTERM/SIGINT drain connections (30 s cap)
-- `--validate`: print the route table (configs are validated at build time)
-- `--single` (single-threaded A/B baseline), `--echo` (raw protocol), `--uring` (experimental)
-
-**Engineering**
-- Performance: beats nginx on every measured workload — HTTP/2 echo 3.0x
-  (100 streams/conn) and 1.2x (serialized), chunked transfer 1.4-2.0x,
-  static 1.7x, h1 echo/matrix 1.1-1.8x, and on the feature-level suite:
-  headers 1.15x, auth_basic 1.23x, precompressed .gz 1.54x, reverse proxy
-  1.65x (async upstreams), proxy_cache HIT 1.41x, limit_req 1.05x (see
-  Benchmarks below)
-- Comptime-first: route trie, header DFA, MIME table, HPACK tables, conf
-  parser and protocol decode tables are all compile-time built
-- Fuzz harness + h2spec conformance gate (`zig build fuzz`, `zig build h2test`)
-
-## Run modes
-
-```
-zig build run                          HTTP mode (default), port 8080
-zig build run -- --threads N           N reactor threads (default: CPU count)
-zig build run -- --port P              change port
-zig build -Dconfig=config.conf run     HTTP with a comptime-embedded conf
-                                       (nginx-style language; routes, module
-                                       bindings, limits and tls — see
-                                       docs/config.md)
-zig build run -- --echo                raw byte-echo protocol
-zig build run -- --single              single-threaded echo server (A/B baseline)
-zig build run -- --idle-timeout S      idle connection timeout in seconds (0 disables)
-zig build run -- --uring               experimental io_uring batch I/O backend
-                                       (epoll is the default)
-zig build run -- --help                all flags, including daemon control:
-                                       --start/--stop/--status (pidfile),
-                                       --validate (route table),
-                                       --reload-hard (rebuild with the conf
-                                       compiled in + zero-downtime daemon
-                                       swap)
+```sh
+zig build run                                      # default HTTP server, port 8080
+zig build run -- --port 9000                       # custom port
+zig build run -- --threads 4                       # reactor thread count
+zig build -Dconfig=config.example.conf run         # comptime-embedded config
+zig build run -- --help                            # all flags (daemon, echo, uring, etc.)
 ```
 
-## Benchmark graphs
+See [`docs/config.md`](docs/config.md) for the full config reference.
 
-Unified suite (webserver / fileserver / load-balancer cells vs nginx and
-HAProxy — methodology in `bench/BENCH.md` and `bench/UNIFIED.md`):
+## Benchmarks
 
-![Unified benchmark — all cells](bench/graphs/unified_web.png)
+Zocket leads every measured workload — HTTP/2 3.0x, static 1.7x, reverse
+proxy 1.65x, cache 1.41x over nginx. Full methodology: [`bench/BENCH.md`](bench/BENCH.md).
 
-Protocol-deep comparisons: `bench/graphs/h2_compare.png` (HTTP/2 h2load),
-`bench/graphs/tls_compare.png` (TLS), `bench/graphs/nginx_compare.png`
-(per-request cost). Full details: `bench/BENCH.md`.
+![Unified benchmark](bench/graphs/unified_web.png)
 
-![Backlog modules vs nginx — headers/auth/precompressed/proxy/cache/limit](bench/graphs/backlog_compare.png)
+![Backlog modules vs nginx](bench/graphs/backlog_compare.png)
 
-## Tests and benchmarks
+## Development
 
-- `zig build test` — unit + concurrency + fuzz-smoke tests (342 passing).
-- `bench/bench.sh`, `bench/bench2.sh`, `bench/summarize.py` — reproducible
-  benchmark harness; results and methodology in `bench/BENCH.md`.
-- `bench/compare-servers.sh` — cross-language comparison against actix-web,
-  Bun.serve, httpx.zig, nginx and Caddy (pinned third-party submodules);
-  single-cell, payload-size matrix, and `--static` file-serving modes.
-  Zocket leads every measured workload (nginx comparison in
-  `bench/BENCH.md`).
-- `bench/h2bench.sh` — HTTP/2 (h2c) comparison against nginx with `h2load`
-  (built from `third_party/nghttp2`); renders `bench/graphs/h2_compare.png`
-  via `python3 bench/graphs.py`. Zocket beats nginx on h2 echo (3.0x at
-  100 streams/conn, 1.2x serialized) and static (1.7x).
-- `bench/chunked-bench.sh` — HTTP/1.1 chunked-transfer comparison against
-  nginx (POST echo, `chunked on;` route vs nginx `echo_flush`); renders
-  `bench/graphs/chunked_compare.png`. Zocket beats nginx 1.4–2.0x across
-  body sizes and connection counts.
-- `bench/tlsbench.sh` — HTTP/2 over TLS comparison against nginx
-  (`--with-http_ssl_module --with-http_v2_module`, see
-  `bench/build-nginx-tls.sh`) with `h2load`; renders
-  `bench/graphs/tls_compare.png`. Zocket beats nginx 1.1–2.9x on the
-  multiplexed HTTPS workloads (m=1 parity).
-- `bench/http-check.py`, `bench/echo-check.py` — end-to-end correctness checks.
+```sh
+zig build test                                     # 342 tests
+zig build h2test                                   # HTTP/2 conformance (curl + h2spec)
+bash bench/bench.sh <binary> <tag>                 # benchmark
+bash bench/compare-servers.sh                      # vs nginx/actix/Bun/Caddy/httpx
+```
+
+## Docs
+
+- [`docs/config.md`](docs/config.md) — config language reference
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — roadmap and open items
+- [`docs/milestones.md`](docs/milestones.md) — delivery history
+- [`bench/BENCH.md`](bench/BENCH.md) — benchmark methodology and results
 
 ## AI Disclosure
 
-- This project is also a learning opportunity for me for using agentic development, so there is heavy AI/LLM usage in this repo.
-- Mainly the model used is *DeepSeek V4 Flash* with *OpenCode* as the harness.
+This project uses agentic development (DeepSeek V4 Flash via OpenCode).
