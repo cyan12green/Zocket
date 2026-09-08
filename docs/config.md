@@ -286,3 +286,27 @@ server {
 ```
 
 Matching: exact name → longest wildcard → first server (default).
+
+## Examples directory
+
+Detailed, commented configs for each feature live in `examples/`:
+
+| File | Feature |
+|---|---|
+| `examples/01-basics.conf` | Echo, health check, fixed responses |
+| `examples/02-static.conf` | Static file serving, root, index, autoindex |
+| `examples/03-gzip.conf` | Gzip compression, conditional GET, precompressed |
+| `examples/04-proxy.conf` | Upstreams, LB strategies, health checks, sticky |
+| `examples/05-proxy-cache.conf` | Response caching, stale-while-revalidate |
+| `examples/06-auth.conf` | Basic auth (htpasswd) + subrequest auth |
+| `examples/07-rate-limit.conf` | Rate limiting (limit_req) + connection limiting |
+| `examples/08-headers.conf` | Response header manipulation |
+| `examples/09-tls.conf` | TLS 1.3 with ECDSA certificates |
+| `examples/10-vhosts.conf` | Virtual hosts, server_name, host_select |
+| `examples/11-full.conf` | All features combined |
+
+Run any example:
+
+```sh
+zig build -Dconfig=examples/01-basics.conf run
+```
