@@ -342,6 +342,7 @@ const Client = struct {
 };
 
 test "multi-reactor accepts under concurrent connections and echoes correctly" {
+    std.testing.log_level = .err;
     const allocator = std.heap.page_allocator;
     var server = try Server.initWithThreads(allocator, 0, 4, .echo);
     defer server.deinit();
@@ -352,6 +353,10 @@ test "multi-reactor accepts under concurrent connections and echoes correctly" {
             s.run() catch {};
         }
     }.f, .{&server});
+    defer {
+        server.stop();
+        run_thread.join();
+    }
 
     // Give reactors a moment to reach epoll_wait before client traffic.
     std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
@@ -371,8 +376,6 @@ test "multi-reactor accepts under concurrent connections and echoes correctly" {
     try testing.expectEqual(@as(usize, 0), failures.load(.monotonic));
     try testing.expectEqual(@as(usize, clients), server.accepted());
 
-    server.stop();
-    run_thread.join();
     try testing.expectEqual(@as(usize, 4), server.threadCount());
 }
 
@@ -432,6 +435,7 @@ fn testDateLine(buf: []u8) []const u8 {
 }
 
 test "multi-reactor HTTP with conf config echoes via the pipeline" {
+    std.testing.log_level = .err;
     const allocator = std.heap.page_allocator;
     const cfg = comptime runtime_server.Config.fromConfComptime(
         \\server {
@@ -449,6 +453,10 @@ test "multi-reactor HTTP with conf config echoes via the pipeline" {
             s.run() catch {};
         }
     }.f, .{&server});
+    defer {
+        server.stop();
+        run_thread.join();
+    }
 
     // Let reactors reach epoll_wait before the first connection.
     std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
@@ -461,15 +469,15 @@ test "multi-reactor HTTP with conf config echoes via the pipeline" {
     var buf: [512]u8 = undefined;
     var date_buf_want: [96]u8 = undefined;
     var want_buf_want: [512]u8 = undefined;
-    const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 12" ++ "\r\n\r\n" ++ "hello-e2e-ok", .{testDateLine(&date_buf_want)}) catch unreachable;
+    const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "{s}" ++ "Content-Length: 12" ++ "\r\n\r\n" ++ "hello-e2e-ok", .{testDateLine(&date_buf_want)}) catch unreachable;
     const n1 = try httpReadUntil(sock, &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n1]);
 
-    // A second request on the same keep-alive connection.
+    // A second request on the same keep-alive connection: empty body
+    // (echo module) — the server skips Date/Server for zero-length bodies
+    // (the same fast-path optimization nginx uses for its echo module).
     try httpWriteAll(sock, "GET /echo HTTP/1.1\r\n\r\n");
-    var date_buf_want2: [96]u8 = undefined;
-    var want_buf_want2: [512]u8 = undefined;
-    const want2 = std.fmt.bufPrint(&want_buf_want2, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 0" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_want2)}) catch unreachable;
+    const want2 = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     const n2 = try httpReadUntil(sock, &buf, want2.len, 3000);
     try testing.expectEqualStrings(want2, buf[0..n2]);
 
@@ -477,12 +485,9 @@ test "multi-reactor HTTP with conf config echoes via the pipeline" {
     try httpWriteAll(sock, "GET /nope HTTP/1.1\r\n\r\n");
     var date_buf_want_404: [96]u8 = undefined;
     var want_buf_want_404: [512]u8 = undefined;
-    const want_404 = std.fmt.bufPrint(&want_buf_want_404, "HTTP/1.1 404 Not Found\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 9" ++ "\r\n\r\n" ++ "Not Found", .{testDateLine(&date_buf_want_404)}) catch unreachable;
+    const want_404 = std.fmt.bufPrint(&want_buf_want_404, "HTTP/1.1 404 Not Found\r\n" ++ "{s}" ++ "Content-Length: 9" ++ "\r\n\r\n" ++ "Not Found", .{testDateLine(&date_buf_want_404)}) catch unreachable;
     const n3 = try httpReadUntil(sock, &buf, want_404.len, 3000);
     try testing.expectEqualStrings(want_404, buf[0..n3]);
-
-    server.stop();
-    run_thread.join();
 }
 // ---- signal handling ----
 
@@ -570,6 +575,7 @@ fn httpReadUntilEof(sock: posix.fd_t, buf: []u8, timeout_ms: u64) !usize {
 // one keeps serving. Zero client failures across the swap means no request
 // was dropped and every in-flight request completed on the old daemon.
 test "graceful drain hands off to a sibling server under concurrent load" {
+    std.testing.log_level = .err;
     const allocator = std.heap.page_allocator;
 
     // Old daemon on an ephemeral port.

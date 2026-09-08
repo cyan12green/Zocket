@@ -803,6 +803,7 @@ test "embedded server trie matches exact conf routes" {
 }
 
 test "access_log runs through the pipeline with a custom format" {
+    std.testing.log_level = .err;
     const cfg = comptime Config.fromConfComptime(
         \\log_format short "$request $status";
         \\server {

@@ -48,10 +48,7 @@ fn run(ctx: *Context) anyerror!Action {
     try vars.renderComplex(ctx, frags, &sink);
     try line.append(allocator, '\n');
 
-    // Write to stderr per line (thread-local buffer only for the syscall
-    // batching; a per-thread buffer alone never flushed for low request
-    // volumes, since each reactor thread holds its own 4096-byte window).
-    _ = std.posix.write(2, line.items) catch {};
+    std.log.info("{s}", .{std.mem.trimRight(u8, line.items, &.{'\n'})});
     return .pass;
 }
 

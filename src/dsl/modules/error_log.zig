@@ -39,7 +39,13 @@ fn run(ctx: *Context) anyerror!Action {
         code,
         ctx.resp.status.reasonPhrase(),
     }) catch return .pass;
-    _ = std.posix.write(2, line) catch {};
+    if (severity == .err) {
+        std.log.err("{s}", .{std.mem.trimRight(u8, line, &.{'\n'})});
+    } else if (severity == .warn) {
+        std.log.warn("{s}", .{std.mem.trimRight(u8, line, &.{'\n'})});
+    } else {
+        std.log.info("{s}", .{std.mem.trimRight(u8, line, &.{'\n'})});
+    }
     return .pass;
 }
 

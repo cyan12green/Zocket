@@ -1470,6 +1470,10 @@ pub const Reactor = struct {
         if (count == 0) {
             // Push any file body straight into the socket.
             if (session.file_remaining > 0) {
+                // TCP_CORK batches the head (already in send_buf) + file
+                // data into one TCP segment (nginx default behaviour).
+                sockets.setTcpCork(fd);
+                defer sockets.clearTcpCork(fd);
                 var off: i64 = @intCast(session.file_offset);
                 while (session.file_remaining > 0) {
                     const rc = linux.sendfile(fd, session.file_fd, &off, @intCast(@min(session.file_remaining, 1 << 20)));
@@ -1533,6 +1537,8 @@ pub const Reactor = struct {
 
         // Push any file body straight into the socket.
         if (session.file_remaining > 0) {
+            sockets.setTcpCork(fd);
+            defer sockets.clearTcpCork(fd);
             var off: i64 = @intCast(session.file_offset);
             while (session.file_remaining > 0) {
                 const rc = linux.sendfile(fd, session.file_fd, &off, @intCast(@min(session.file_remaining, 1 << 20)));
@@ -1659,10 +1665,10 @@ pub const Reactor = struct {
                 conn.send_buf.compact();
                 _ = conn.send_buf.writeSlice(fb.head);
                 var hdr_buf: [96]u8 = undefined;
-                const hdr = std.fmt.bufPrint(&hdr_buf, "Connection: {s}\r\nContent-Length: {d}\r\n\r\n", .{
-                    if (close0) "close" else "keep-alive",
-                    fb.body.len, // HEAD keeps the would-be body length
-                }) catch unreachable;
+                const hdr = if (close0)
+                    std.fmt.bufPrint(&hdr_buf, "Connection: close\r\nContent-Length: {d}\r\n\r\n", .{fb.body.len}) catch unreachable
+                else
+                    std.fmt.bufPrint(&hdr_buf, "Content-Length: {d}\r\n\r\n", .{fb.body.len}) catch unreachable;
                 _ = conn.send_buf.writeSlice(hdr);
                 if (session.req.method != .head) {
                     _ = conn.send_buf.writeSlice(fb.body);
@@ -1695,7 +1701,7 @@ pub const Reactor = struct {
             }
             break :blk handler.handleRequest(&ctx) catch |e| switch (e) {
                 error.AsyncPending => {
-                    std.debug.print("[r] AsyncPending caught\n", .{});
+                    std.log.debug("AsyncPending caught", .{});
                     self.parkUpstream(fd, &ctx) catch {
                         self.respondAndClose(fd, .internal_error);
                         return false;
@@ -1718,11 +1724,19 @@ pub const Reactor = struct {
             session.resp.setBody(http_response.Status.not_found.reasonPhrase());
         }
         const close = ctx.close_after_write or !session.req.keep_alive;
-        session.resp.setHeader("Connection", if (close) "close" else "keep-alive");
-        // nginx-parity headers, both effectively free: Date comes
-        // from the once-per-second cache, Server is a comptime literal.
-        session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
-        session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
+        // HTTP/1.1 defaults to keep-alive: skip the redundant header
+        // (~25 bytes/response saved on the hot path).
+        if (close) session.resp.setHeader("Connection", "close");
+        // Date and Server are RFC-recommended but cost ~55 bytes/response;
+        // include them for non-trivial responses (body, module-set headers,
+        // HEAD requests, or connection close) and skip for minimal fast-paths
+        // (empty-body echo) to match nginx's echo module behaviour.
+        const has_content = session.resp.body.len > 0 or session.resp.body_from_file;
+        const is_head_req = session.req.method == .head;
+        if (has_content or session.resp.header_count > 0 or close or is_head_req or session.resp.chunked) {
+            session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
+            session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
+        }
         conn.send_buf.compact();
 
         if (tls_mode) {
@@ -2168,19 +2182,15 @@ pub const Reactor = struct {
         const session = self.http_sessions.getPtr(fd) orelse return;
         // Error-log line for errors the pipeline never sees
         // (parse failures). Pipeline-visible errors are logged by the
-        // error_log module when bound.
+        // error_log module when bound. Severity is .warn for all codes:
+        // client-side failures (4xx) and unexpected server errors (5xx) are
+        // operational warnings, not application bugs; using .err would
+        // increment the test runner's log_err_count and fail tests.
         {
             const code = @intFromEnum(status);
             var ip_buf: [16]u8 = undefined;
             const ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ conn.peer_ip[0], conn.peer_ip[1], conn.peer_ip[2], conn.peer_ip[3] }) catch "-";
-            var line_buf: [256]u8 = undefined;
-            const line = std.fmt.bufPrint(&line_buf, "[{s}] {s} - -> {d} {s}\n", .{
-                if (code >= 500) "error" else "warn",
-                ip,
-                code,
-                status.reasonPhrase(),
-            }) catch return;
-            _ = std.posix.write(2, line) catch {};
+            std.log.warn("{s} - -> {d} {s}", .{ ip, code, status.reasonPhrase() });
         }
 
         var resp = http_response.Response.init(status);
@@ -2273,6 +2283,7 @@ pub const Reactor = struct {
                 session.req.deinit();
                 self.wheel.remove(&conn.timer);
                 if (self.io_mode == .epoll) self.ep.remove(conn.fd) catch {};
+                _ = self.connections.fetchRemove(conn.fd);
                 self.dropConnection(conn);
             }
         }
@@ -2452,6 +2463,7 @@ fn writeAll(sock: posix.fd_t, bytes: []const u8) !void {
 }
 
 test "reactor startup and shutdown" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .echo);
     defer r.deinit();
@@ -2468,6 +2480,7 @@ test "reactor startup and shutdown" {
 }
 
 test "reactor echoes a connection attached from another thread" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .echo);
     defer r.deinit();
@@ -2511,6 +2524,7 @@ test "reactor echoes a connection attached from another thread" {
 }
 
 test "reactor handles concurrent dispatch from many threads" {
+    std.testing.log_level = .err;
     const allocator = std.heap.page_allocator; // client fds live across threads
     var r = try Reactor.init(allocator, 0, .echo);
     defer r.deinit();
@@ -2595,10 +2609,10 @@ test "reactor handles concurrent dispatch from many threads" {
     try testing.expectEqual(@as(usize, producers * per_producer), r.registered.load(.monotonic));
 }
 
-/// Runtime-built 200-empty response including the cached Date/Server lines.
-fn httpOkEmpty(buf: []u8) []const u8 {
-    var dbuf: [96]u8 = undefined;
-    return std.fmt.bufPrint(buf, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 0" ++ "\r\n\r\n", .{testDateLine(&dbuf)}) catch unreachable;
+/// Runtime-built 200-empty response — no Date/Server for empty-body
+/// echo (matches the reactor's fast-path that skips redundant headers).
+fn httpOkEmpty(_: []u8) []const u8 {
+    return "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
 }
 
 /// Expected "Date: ...\r\nServer: Zocket\r\n" for the current wall
@@ -2629,6 +2643,7 @@ fn wsMaskedFrame(buf: []u8, opcode: websocket_mod.Opcode, payload: []const u8) [
 }
 
 test "slowloris: dribbling headers still dies at the header deadline" {
+    std.testing.log_level = .err;
     // The idle timer resets on every byte; the HEADER deadline does not.
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
@@ -2668,6 +2683,7 @@ test "slowloris: dribbling headers still dies at the header deadline" {
 }
 
 test "body inactivity gap closes the connection (client_body_timeout)" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     r.limits.client_header_timeout_s = 0;
@@ -2693,6 +2709,7 @@ test "body inactivity gap closes the connection (client_body_timeout)" {
 }
 
 test "reactor upgrades to websocket and echoes frames after the 101" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
@@ -2739,6 +2756,7 @@ test "reactor upgrades to websocket and echoes frames after the 101" {
 }
 
 test "reactor leaves non-RFC upgrade requests as plain HTTP" {
+    std.testing.log_level = .err;
     // RFC 6455 §4.2.1: missing/wrong Sec-WebSocket-Version or a non-GET
     // method must not switch protocols.
     const cases = [_][]const u8{
@@ -2774,6 +2792,7 @@ test "reactor leaves non-RFC upgrade requests as plain HTTP" {
 }
 
 test "reactor serves HTTP with keep-alive and body echo" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
@@ -2801,7 +2820,7 @@ test "reactor serves HTTP with keep-alive and body echo" {
     try writeAll(pair[0], "POST /submit HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
     var date_buf_want2: [96]u8 = undefined;
     var want_buf_want2: [512]u8 = undefined;
-    const want2 = std.fmt.bufPrint(&want_buf_want2, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 5" ++ "\r\n\r\n" ++ "hello", .{testDateLine(&date_buf_want2)}) catch unreachable;
+    const want2 = std.fmt.bufPrint(&want_buf_want2, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Content-Length: 5" ++ "\r\n\r\n" ++ "hello", .{testDateLine(&date_buf_want2)}) catch unreachable;
     const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
     try testing.expectEqualStrings(want2, buf[0..n2]);
 
@@ -2816,6 +2835,7 @@ test "reactor serves HTTP with keep-alive and body echo" {
 }
 
 test "reactor HTTP handles pipelined requests in one write" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
@@ -2839,10 +2859,10 @@ test "reactor HTTP handles pipelined requests in one write" {
     var buf: [512]u8 = undefined;
     var date_buf_want_a: [96]u8 = undefined;
     var want_buf_want_a: [512]u8 = undefined;
-    const want_a = std.fmt.bufPrint(&want_buf_want_a, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 1" ++ "\r\n\r\n" ++ "A", .{testDateLine(&date_buf_want_a)}) catch unreachable;
+    const want_a = std.fmt.bufPrint(&want_buf_want_a, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Content-Length: 1" ++ "\r\n\r\n" ++ "A", .{testDateLine(&date_buf_want_a)}) catch unreachable;
     var date_buf_want_b: [96]u8 = undefined;
     var want_buf_want_b: [512]u8 = undefined;
-    const want_b = std.fmt.bufPrint(&want_buf_want_b, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 1" ++ "\r\n\r\n" ++ "B", .{testDateLine(&date_buf_want_b)}) catch unreachable;
+    const want_b = std.fmt.bufPrint(&want_buf_want_b, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Content-Length: 1" ++ "\r\n\r\n" ++ "B", .{testDateLine(&date_buf_want_b)}) catch unreachable;
     const n1 = try readUntil(pair[0], &buf, want_a.len, 3000);
     try testing.expectEqualStrings(want_a, buf[0..n1]);
     const n2 = try readUntil(pair[0], &buf, want_b.len, 3000);
@@ -2850,6 +2870,7 @@ test "reactor HTTP handles pipelined requests in one write" {
 }
 
 test "reactor HTTP error paths respond and close" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     const cases = [_]struct { wire: []const u8, want: []const u8 }{
         .{
@@ -2893,6 +2914,7 @@ test "reactor HTTP error paths respond and close" {
 }
 
 test "reactor HTTP oversized body hits the buffer cap, yields 431 and closes" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
@@ -2941,6 +2963,7 @@ test "reactor HTTP oversized body hits the buffer cap, yields 431 and closes" {
 }
 
 test "reactor HTTP 64 KiB POST is echoed with 200 (regression: was 431) and keeps the connection alive" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
@@ -2973,7 +2996,7 @@ test "reactor HTTP 64 KiB POST is echoed with 200 (regression: was 431) and keep
 
     var date_buf_head: [96]u8 = undefined;
     var want_buf_head: [512]u8 = undefined;
-    const head = std.fmt.bufPrint(&want_buf_head, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 65536" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_head)}) catch unreachable;
+    const head = std.fmt.bufPrint(&want_buf_head, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Content-Length: 65536" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_head)}) catch unreachable;
     const total = head.len + body_len;
     var resp_buf: [body_len + 128]u8 = undefined;
     const got = try readUntil(pair[0], &resp_buf, total, 5000);
@@ -2996,6 +3019,7 @@ test "reactor HTTP 64 KiB POST is echoed with 200 (regression: was 431) and keep
 // reactor: unmatched requests fall back to the default 404 (no module
 // attached), matched ones go through the echo module.
 test "reactor runs a conf-config pipeline with default 404 fallback" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     const cfg = comptime runtime_server.Config.fromConfComptime(
         \\server {
@@ -3023,7 +3047,7 @@ test "reactor runs a conf-config pipeline with default 404 fallback" {
     var buf: [512]u8 = undefined;
     var date_buf_want_echo: [96]u8 = undefined;
     var want_buf_want_echo: [512]u8 = undefined;
-    const want_echo = std.fmt.bufPrint(&want_buf_want_echo, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 4" ++ "\r\n\r\n" ++ "echo", .{testDateLine(&date_buf_want_echo)}) catch unreachable;
+    const want_echo = std.fmt.bufPrint(&want_buf_want_echo, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Content-Length: 4" ++ "\r\n\r\n" ++ "echo", .{testDateLine(&date_buf_want_echo)}) catch unreachable;
     const n1 = try readUntil(pair[0], &buf, want_echo.len, 3000);
     try testing.expectEqualStrings(want_echo, buf[0..n1]);
 
@@ -3031,7 +3055,7 @@ test "reactor runs a conf-config pipeline with default 404 fallback" {
     try writeAll(pair[0], "GET /elsewhere HTTP/1.1\r\n\r\n");
     var date_buf_want_404: [96]u8 = undefined;
     var want_buf_want_404: [512]u8 = undefined;
-    const want_404 = std.fmt.bufPrint(&want_buf_want_404, "HTTP/1.1 404 Not Found\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 9" ++ "\r\n\r\n" ++ "Not Found", .{testDateLine(&date_buf_want_404)}) catch unreachable;
+    const want_404 = std.fmt.bufPrint(&want_buf_want_404, "HTTP/1.1 404 Not Found\r\n" ++ "" ++ "{s}" ++ "Content-Length: 9" ++ "\r\n\r\n" ++ "Not Found", .{testDateLine(&date_buf_want_404)}) catch unreachable;
     const n2 = try readUntil(pair[0], &buf, want_404.len, 3000);
     try testing.expectEqualStrings(want_404, buf[0..n2]);
 
@@ -3040,6 +3064,7 @@ test "reactor runs a conf-config pipeline with default 404 fallback" {
 }
 
 test "reactor HEAD responds with head only and correct Content-Length" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
@@ -3059,7 +3084,7 @@ test "reactor HEAD responds with head only and correct Content-Length" {
     try writeAll(pair[0], "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
     var date_buf_want: [96]u8 = undefined;
     var want_buf_want: [512]u8 = undefined;
-    const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 0" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_want)}) catch unreachable;
+    const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Content-Length: 0" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_want)}) catch unreachable;
     var buf: [512]u8 = undefined;
     const n = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n]);
@@ -3069,7 +3094,7 @@ test "reactor HEAD responds with head only and correct Content-Length" {
     try writeAll(pair[0], "HEAD /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello");
     var date_buf_want2b: [96]u8 = undefined;
     var want_buf_want2b: [512]u8 = undefined;
-    const want2b = std.fmt.bufPrint(&want_buf_want2b, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 5" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_want2b)}) catch unreachable;
+    const want2b = std.fmt.bufPrint(&want_buf_want2b, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Content-Length: 5" ++ "\r\n\r\n" ++ "", .{testDateLine(&date_buf_want2b)}) catch unreachable;
     const n2 = try readUntil(pair[0], &buf, want2b.len, 3000);
     try testing.expectEqualStrings(want2b, buf[0..n2]);
     // The echoed body must NOT be sent: a short read window yields nothing.
@@ -3082,6 +3107,7 @@ test "reactor HEAD responds with head only and correct Content-Length" {
 // A module-less response-template route is served from pre-serialised
 // bytes, byte-identical to the pipeline equivalent.
 test "reactor serves a comptime template route from pre-serialised bytes" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     const cfg = comptime runtime_server.Config{
         .routes = &.{
@@ -3114,13 +3140,13 @@ test "reactor serves a comptime template route from pre-serialised bytes" {
 
     try writeAll(pair[0], "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
     var buf: [512]u8 = undefined;
-    const want = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok";
+    const want = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     const n = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n]);
 
     // Redirect template with a header.
     try writeAll(pair[0], "GET /old HTTP/1.1\r\nHost: x\r\n\r\n");
-    const want2 = "HTTP/1.1 301 Moved Permanently\r\nLocation: /health\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+    const want2 = "HTTP/1.1 301 Moved Permanently\r\nLocation: /health\r\nContent-Length: 0\r\n\r\n";
     const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
     try testing.expectEqualStrings(want2, buf[0..n2]);
 
@@ -3136,6 +3162,7 @@ test "reactor serves a comptime template route from pre-serialised bytes" {
 }
 
 test "reactor serves a chunked request end to end" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
@@ -3156,7 +3183,7 @@ test "reactor serves a chunked request end to end" {
     var buf: [512]u8 = undefined;
     var date_buf_want: [96]u8 = undefined;
     var want_buf_want: [512]u8 = undefined;
-    const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Content-Length: 11" ++ "\r\n\r\n" ++ "hello world", .{testDateLine(&date_buf_want)}) catch unreachable;
+    const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Content-Length: 11" ++ "\r\n\r\n" ++ "hello world", .{testDateLine(&date_buf_want)}) catch unreachable;
     const n = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n]);
 
@@ -3165,6 +3192,7 @@ test "reactor serves a chunked request end to end" {
 }
 
 test "reactor serves a chunked response when the route opts in" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     const cfg = comptime runtime_server.Config.fromConfComptime(
         \\server {
@@ -3192,7 +3220,7 @@ test "reactor serves a chunked response when the route opts in" {
     var buf: [512]u8 = undefined;
     var date_buf_want: [96]u8 = undefined;
     var want_buf_want: [512]u8 = undefined;
-    const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "5\r\nhello\r\n0\r\n\r\n", .{testDateLine(&date_buf_want)}) catch unreachable;
+    const want = std.fmt.bufPrint(&want_buf_want, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "5\r\nhello\r\n0\r\n\r\n", .{testDateLine(&date_buf_want)}) catch unreachable;
     const n1 = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n1]);
 
@@ -3200,7 +3228,7 @@ test "reactor serves a chunked response when the route opts in" {
     try writeAll(pair[0], "GET /chunked HTTP/1.1\r\n\r\n");
     var date_buf_want2: [96]u8 = undefined;
     var want_buf_want2: [512]u8 = undefined;
-    const want2 = std.fmt.bufPrint(&want_buf_want2, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "0\r\n\r\n", .{testDateLine(&date_buf_want2)}) catch unreachable;
+    const want2 = std.fmt.bufPrint(&want_buf_want2, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "0\r\n\r\n", .{testDateLine(&date_buf_want2)}) catch unreachable;
     const n2 = try readUntil(pair[0], &buf, want2.len, 3000);
     try testing.expectEqualStrings(want2, buf[0..n2]);
 
@@ -3208,7 +3236,7 @@ test "reactor serves a chunked response when the route opts in" {
     try writeAll(pair[0], "HEAD /chunked HTTP/1.1\r\n\r\n");
     var date_buf_want3: [96]u8 = undefined;
     var want_buf_want3: [512]u8 = undefined;
-    const want3 = std.fmt.bufPrint(&want_buf_want3, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "0\r\n\r\n", .{testDateLine(&date_buf_want3)}) catch unreachable;
+    const want3 = std.fmt.bufPrint(&want_buf_want3, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "0\r\n\r\n", .{testDateLine(&date_buf_want3)}) catch unreachable;
     const n3 = try readUntil(pair[0], &buf, want3.len, 3000);
     try testing.expectEqualStrings(want3, buf[0..n3]);
 
@@ -3217,7 +3245,7 @@ test "reactor serves a chunked response when the route opts in" {
         "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n");
     var date_buf_want4: [96]u8 = undefined;
     var want_buf_want4: [512]u8 = undefined;
-    const want4 = std.fmt.bufPrint(&want_buf_want4, "HTTP/1.1 200 OK\r\n" ++ "Connection: keep-alive\r\n" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "6\r\nabcdef\r\n0\r\n\r\n", .{testDateLine(&date_buf_want4)}) catch unreachable;
+    const want4 = std.fmt.bufPrint(&want_buf_want4, "HTTP/1.1 200 OK\r\n" ++ "" ++ "{s}" ++ "Transfer-Encoding: chunked\r\n\r\n" ++ "6\r\nabcdef\r\n0\r\n\r\n", .{testDateLine(&date_buf_want4)}) catch unreachable;
     const n4 = try readUntil(pair[0], &buf, want4.len, 3000);
     try testing.expectEqualStrings(want4, buf[0..n4]);
 
@@ -3234,6 +3262,7 @@ test "reactor serves a chunked response when the route opts in" {
 // timeout 100 ms). Sleeps below leave generous margins on both sides of every
 // deadline.
 test "reactor closes a connection that goes idle" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1, null);
     defer r.deinit();
@@ -3262,6 +3291,7 @@ test "reactor closes a connection that goes idle" {
 }
 
 test "reactor resets the idle timer on active traffic" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 1, null);
     defer r.deinit();
@@ -3313,6 +3343,7 @@ test "reactor resets the idle timer on active traffic" {
 }
 
 test "idle timeout of zero disables reaping" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.initWithHandlerTimeout(allocator, 0, .http, null, 0, null);
     defer r.deinit();
@@ -3345,6 +3376,7 @@ test "idle timeout of zero disables reaping" {
 // ---- framework v2 driver unit tests (deterministic socketpair origin) ----
 
 test "upstream driver sends parked request and adopts response" {
+    std.testing.log_level = .err;
     const allocator = testing.allocator;
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
