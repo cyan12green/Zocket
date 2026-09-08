@@ -71,6 +71,8 @@ const H_static_cache_entries = keyHash("static_cache_entries");
 const H_static_cache_valid = keyHash("static_cache_valid");
 const H_static_content_cache_max = keyHash("static_content_cache_max");
 const H_connection_pool_max = keyHash("connection_pool_max");
+const H_proxy_cache_max_bytes = keyHash("proxy_cache_max_bytes");
+const H_proxy_cache_max_entries = keyHash("proxy_cache_max_entries");
 const H_listen = keyHash("listen");
 const H_server_name = keyHash("server_name");
 const H_tls = keyHash("tls");
@@ -658,6 +660,14 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
         },
         H_connection_pool_max => {
             b.limits.connection_pool_max = lx.number(name, usize);
+            lx.expectTerminator(name);
+        },
+        H_proxy_cache_max_bytes => {
+            b.limits.proxy_cache_max_bytes = lx.size(name);
+            lx.expectTerminator(name);
+        },
+        H_proxy_cache_max_entries => {
+            b.limits.proxy_cache_max_entries = lx.number(name, usize);
             lx.expectTerminator(name);
         },
         H_listen => {

@@ -112,6 +112,8 @@ Zone sizing (in `limits` section): `proxy_cache_max_bytes` (32 MiB),
 | `recv_buffer_size` | `recv_buffer_size size;` | 16k | Per-connection recv buffer. |
 | `send_buffer_size` | `send_buffer_size size;` | 16k | Per-connection send buffer. |
 | `connection_pool_max` | `connection_pool_max number;` | 1024 | Max pooled connections per reactor. |
+| `proxy_cache_max_bytes` | `proxy_cache_max_bytes size;` | 32m | mmap zone size for response cache entries. |
+| `proxy_cache_max_entries` | `proxy_cache_max_entries number;` | 256 | Max distinct URL cache slots. |
 | `client_header_timeout` | `client_header_timeout seconds;` | 10 | Total time for request line + headers (anti-slowloris). 0 disables. |
 | `client_body_timeout` | `client_body_timeout seconds;` | 30 | Inactivity gap between body bytes. |
 
