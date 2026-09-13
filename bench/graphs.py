@@ -339,25 +339,36 @@ def plot_chunked_compare():
     print("chunked_compare.png")
 
 
-def run_suite():
-    print("== running the comparison suite ==")
+def run_suite(reps, duration):
+    print(f"== running the full comparison suite ({reps} reps, {duration}) ==")
     subprocess.run(["bash", "bench/compare-servers.sh",
                     "--matrix", "--bodies", "1024 8192 65536",
                     "--conns-list", "10 100 1000",
-                    "--reps", "3", "--duration", "5s"], cwd=ROOT, check=True)
+                    "--reps", str(reps), "--duration", duration],
+                   cwd=ROOT, check=True)
     subprocess.run(["bash", "bench/compare-servers.sh",
                     "--static", "1024 1048576",
                     "--conns-list", "100 1000",
-                    "--reps", "3", "--duration", "5s"], cwd=ROOT, check=True)
+                    "--reps", str(reps), "--duration", duration],
+                   cwd=ROOT, check=True)
+    subprocess.run(["bash", "bench/modules-bench.sh",
+                    "--reps", str(reps), "--duration", duration],
+                   cwd=ROOT, check=True)
+    subprocess.run(["bash", "bench/unified.sh",
+                    "--reps", str(reps)], cwd=ROOT, check=True)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Run the suite and/or generate graphs")
     ap.add_argument("--run", action="store_true",
-                    help="run the full comparison suite first, then generate graphs")
+                    help="run the full benchmark suite first, then generate graphs")
+    ap.add_argument("--reps", type=int, default=3,
+                    help="reps per cell for --run (default 3; use 8+ for release)")
+    ap.add_argument("--duration", default="5s",
+                    help="bombardier duration per rep for --run (default 5s)")
     args = ap.parse_args()
     if args.run:
-        run_suite()
+        run_suite(args.reps, args.duration)
     os.makedirs(OUT, exist_ok=True)
     plot_matrix()
     plot_static()
@@ -365,6 +376,10 @@ def main():
     plot_h2_compare()
     plot_tls_compare()
     plot_chunked_compare()
+    for script in ("graphs_modules.py", "unified_graphs.py", "graphs_readme.py"):
+        print(f"== {script} ==")
+        subprocess.run([sys.executable, os.path.join(ROOT, "bench", script)],
+                       cwd=ROOT, check=True)
     print("done")
 
 

@@ -5,21 +5,27 @@ Methodology, commands, and results for Zocket performance benchmarks.
 ## Quick start
 
 ```bash
-# Run the full comparison suite and generate graphs
+# Single entry point: run ALL benchmarks (matrix + static + module features +
+# unified) and render every graph referenced by this doc and README.md
 python3 bench/graphs.py --run
 
-# Or run individual benchmarks
+# Use more reps for release-quality numbers (default 3 reps / 5s per cell)
+python3 bench/graphs.py --run --reps 8 --duration 8s
+
+# Individual benchmarks (optional, when you only need one suite)
+zig build -Doptimize=ReleaseFast
 bash bench/compare-servers.sh --matrix              # echo sweep
 bash bench/compare-servers.sh --static "1024 1048576"  # file serving
 bash bench/modules-bench.sh                         # feature-level
 bash bench/unified.sh                               # unified web/file/LB
 
-# Generate graphs from stored results
+# Render graphs from stored results (all PNGs below)
 python3 bench/graphs.py
-python3 bench/graphs_modules.py
-python3 bench/unified_graphs.py
-python3 bench/graphs_readme.py
 ```
+
+`graphs.py --run` runs the four benchmark scripts above (matrix + static +
+module features + unified, 3 reps each) and then regenerates every graph
+embedded in this file and in `README.md`:
 
 ## Methodology
 
@@ -118,19 +124,16 @@ All servers co-resident: Zocket, nginx, HAProxy. 8 workload cells.
 ## Reproduce
 
 ```bash
-# Full suite (matrix + static + graphs)
-python3 bench/graphs.py --run
+# Full suite (all benchmarks + all graphs), single command:
+python3 bench/graphs.py --run --reps 8 --duration 8s
 
-# Individual benchmarks
+# Or step by step:
 zig build -Doptimize=ReleaseFast
 bash bench/compare-servers.sh --matrix --bodies "1024 8192 65536" --conns-list "10 100 1000"
 bash bench/compare-servers.sh --static "1024 1048576" --conns-list "100 1000"
 bash bench/modules-bench.sh
 bash bench/unified.sh
 
-# Generate graphs
+# Generate every graph from stored results (what --run does after the suite):
 python3 bench/graphs.py
-python3 bench/graphs_modules.py
-python3 bench/unified_graphs.py
-python3 bench/graphs_readme.py
 ```

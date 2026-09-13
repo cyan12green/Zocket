@@ -35,11 +35,12 @@ for a hot-reloadable, nginx-style config-driven HTTP server.
 - HTTP/2 benchmarking needs `h2load` from nghttp2, built from `third_party/nghttp2` (clone + `autoreconf -i` + `./configure --enable-app --with-libev --with-libcares` + `make`; the binary lands in `third_party/nghttp2/src/h2load`). System deps for that build: **libev-dev** and **libc-ares-dev** (plus libssl-dev/zlib1g-dev, already present). `h2spec` for conformance: `go install github.com/summerwind/h2spec/cmd/h2spec@latest`.
 - `zig build fuzz` (long deterministic fuzz campaign), `zig build h2test` (curl + h2spec end-to-end). TLS gate: the `src/tls/` tests include a full TLS 1.3 handshake + round trip against `std.crypto.tls.Client` over a socketpair; external oracles: `openssl s_client -tls1_3` (see the AGENTS.md note above for the `src/tls/` constraints: ECDSA-only certs, TLS 1.3 only, handshake traffic secrets derive from hash(ClientHello || ServerHello), record sequence numbers reset per key epoch (RFC 8446 §5.3), CCS record sent before the encrypted flight (middlebox compat), Finished verify_data length = Hash length).
 - Feature benchmark (modules vs nginx): `bash bench/modules-bench.sh [--reps N]` — five head-to-head cells (headers, auth_basic, precompressed .gz, proxy_cache HIT, limit_req shedding); JSON in `bench/results/modules/`, graph via `python3 bench/graphs_modules.py` -> `bench/graphs/modules_compare.png`; numbers + methodology in `bench/BENCH.md`.
-- Graphs: `python3 bench/graphs.py` is the single entry point — it runs the
-  full comparison suite (matrix + static) with `--run` and/or generates all
-  PNGs in `bench/graphs/` (matrix req/s + latency per body size, static
-  bars, Zocket-vs-nginx head-to-head with per-request cost) from
-  `bench/results/servers/`; the README embeds them. For CI:
+- Graphs: `python3 bench/graphs.py` is the single entry point — `--run`
+  executes the full benchmark suite (matrix + static + module features +
+  unified) and then regenerates every PNG in `bench/graphs/` (matrix req/s +
+  latency per body size, static bars, Zocket-vs-nginx head-to-head with
+  per-request cost, module-features bars, unified cells, README header
+  graph). Without `--run` it renders all graphs from stored results. For CI:
   `python3 bench/graphs.py --run`.
 
 ## Layout & conventions
