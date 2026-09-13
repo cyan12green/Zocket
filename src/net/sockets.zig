@@ -151,3 +151,17 @@ pub fn peerIp(fd: posix.fd_t) [4]u8 {
 pub fn setTcpNoDelay(fd: posix.fd_t) void {
     posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
 }
+
+/// Set TCP_CORK (Linux) to batch small writes into one segment.
+/// Used around sendfile to coalesce the HTTP head + file body into a single
+/// TCP segment (equivalent to nginx's tcp_nopush on). Must be cleared
+/// (uncorked) after the sendfile completes to flush any buffered data.
+pub fn setTcpCork(fd: posix.fd_t) void {
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.CORK, &std.mem.toBytes(@as(c_int, 1))) catch {};
+}
+
+/// Clear TCP_CORK to flush any buffered data and revert to normal write
+/// semantics (TCP_NODELAY remains in effect).
+pub fn clearTcpCork(fd: posix.fd_t) void {
+    posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.CORK, &std.mem.toBytes(@as(c_int, 0))) catch {};
+}

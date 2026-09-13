@@ -204,6 +204,10 @@ pub const Response = struct {
     /// with `writeChunkedHeadToBuffer`; ignored by the h2 path (h2 is
     /// frame-based and never uses Transfer-Encoding).
     chunked: bool = false,
+    /// Route opt-in for TCP_CORK (nginx tcp_nopush): batches the HTTP head +
+    /// sendfile body into one TCP segment. Set by the pipeline from the route's
+    /// `tcp_nopush` directive; the reactor reads it to decide whether to cork.
+    tcp_nopush: bool = false,
 
     pub const Header = struct { name: []const u8, value: []const u8 };
 
@@ -354,12 +358,34 @@ pub const Response = struct {
 
     /// Serialize into a connection send buffer. Fails with `error.BufferFull`
     /// (leaving the buffer untouched) if it does not fit; callers should
-    /// compact or grow first. One capacity check for the whole response, then
-    /// raw memcpy writes — no per-segment checks, no format machinery.
+    /// compact or grow first. Uses `reserveWrite` for a single contiguous
+    /// serialisation pass — no per-segment checks, no format machinery.
     pub fn writeToBuffer(self: *const Response, buf: *buffer_mod.Buffer) !void {
         const needed = self.wireSize();
-        if (needed > buf.availableWrite()) return error.BufferFull;
-        try self.write(RawSink{ .buf = buf });
+        const region = buf.reserveWrite(needed) orelse return error.BufferFull;
+        var num: [24]u8 = undefined;
+        var pos: usize = 0;
+        const cp = struct {
+            fn c(dst: []u8, p: *usize, src: []const u8) void {
+                @memcpy(dst[p.*..][0..src.len], src);
+                p.* += src.len;
+            }
+        }.c;
+        cp(region, &pos, "HTTP/1.1 ");
+        cp(region, &pos, num[0..formatUInt(&num, 0, @intFromEnum(self.status))]);
+        cp(region, &pos, " ");
+        cp(region, &pos, self.status.reasonPhrase());
+        cp(region, &pos, "\r\n");
+        for (self.headers[0..self.header_count]) |h| {
+            cp(region, &pos, h.name);
+            cp(region, &pos, ": ");
+            cp(region, &pos, h.value);
+            cp(region, &pos, "\r\n");
+        }
+        cp(region, &pos, "Content-Length: ");
+        cp(region, &pos, num[0..formatUInt(&num, 0, self.body.len)]);
+        cp(region, &pos, "\r\n\r\n");
+        cp(region, &pos, self.body);
     }
 
     /// Serialize only the head (status line + headers + blank line) into a
@@ -371,11 +397,34 @@ pub const Response = struct {
     }
 
     /// Head-only serialisation with an explicit Content-Length (sendfile
-    /// bodies, whose bytes never sit in `body`).
+    /// bodies, whose bytes never sit in `body`). Uses `reserveWrite` to
+    /// get a contiguous region and serialises directly into it — avoids the
+    /// per-segment `writeAll` function-call overhead of the RawSink path.
     pub fn writeHeadToBufferWithLength(self: *const Response, buf: *buffer_mod.Buffer, content_length: usize) !void {
         const needed = self.headWireSize(content_length);
-        if (needed > buf.availableWrite()) return error.BufferFull;
-        try self.writeHeadTo(RawSink{ .buf = buf }, content_length);
+        const region = buf.reserveWrite(needed) orelse return error.BufferFull;
+        var num: [24]u8 = undefined;
+        var pos: usize = 0;
+        const cp = struct {
+            fn c(dst: []u8, p: *usize, src: []const u8) void {
+                @memcpy(dst[p.*..][0..src.len], src);
+                p.* += src.len;
+            }
+        }.c;
+        cp(region, &pos, "HTTP/1.1 ");
+        cp(region, &pos, num[0..formatUInt(&num, 0, @intFromEnum(self.status))]);
+        cp(region, &pos, " ");
+        cp(region, &pos, self.status.reasonPhrase());
+        cp(region, &pos, "\r\n");
+        for (self.headers[0..self.header_count]) |h| {
+            cp(region, &pos, h.name);
+            cp(region, &pos, ": ");
+            cp(region, &pos, h.value);
+            cp(region, &pos, "\r\n");
+        }
+        cp(region, &pos, "Content-Length: ");
+        cp(region, &pos, num[0..formatUInt(&num, 0, content_length)]);
+        cp(region, &pos, "\r\n\r\n");
     }
 
     pub const ChunkedFraming = struct {

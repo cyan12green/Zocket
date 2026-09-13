@@ -87,6 +87,7 @@ const H_autoindex = keyHash("autoindex");
 const H_embed = keyHash("embed");
 const H_max_age = keyHash("max_age");
 const H_chunked = keyHash("chunked");
+const H_tcp_nopush = keyHash("tcp_nopush");
 const H_return = keyHash("return");
 const H_add_header = keyHash("add_header");
 const H_set_header = keyHash("set_header");
@@ -175,6 +176,7 @@ const LocationSpec = struct {
     max_fails: u32 = 3,
     fail_timeout_seconds: u32 = 30,
     chunked: bool = false,
+    tcp_nopush: bool = false,
     /// `access_log <name>|off` → the log_format name (null = off). The
     /// index into Config.log_formats is resolved in `build`.
     log_format: ?Str = null,
@@ -779,6 +781,10 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
         },
         H_chunked => {
             spec.chunked = lx.boolOnOff(name);
+            lx.expectTerminator(name);
+        },
+        H_tcp_nopush => {
+            spec.tcp_nopush = lx.boolOnOff(name);
             lx.expectTerminator(name);
         },
         H_return => {
@@ -1566,6 +1572,7 @@ fn build(b: *const Builder) Config {
                 .max_fails = spec.max_fails,
                 .fail_timeout_seconds = spec.fail_timeout_seconds,
                 .chunked = spec.chunked,
+                .tcp_nopush = spec.tcp_nopush,
                 .log_format = logFormatIndex(spec.log_format, log_table.items[0..log_table.len], strings),
             };
             // Validate: if a route has header ops AND filters, at least one

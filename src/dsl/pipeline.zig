@@ -63,6 +63,7 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
     // the serializer frames this route's response as chunks instead of
     // Content-Length. The flag travels on the response; h2 ignores it.
     if (r.chunked) ctx.resp.chunked = true;
+    if (r.tcp_nopush) ctx.resp.tcp_nopush = true;
 
     // Comptime-specialised dispatch (struct-literal configs).
     // Zero loops, zero moduleFor scans, zero Registry.resolve at runtime.

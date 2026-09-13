@@ -128,6 +128,17 @@ pub const Buffer = struct {
     pub fn peek(self: *const Buffer) []u8 {
         return self.data[self.read_pos..self.write_pos];
     }
+
+    /// Reserve `n` bytes of contiguous write space and return a mutable slice
+    /// pointing into the buffer. The caller fills the region; `write_pos` is
+    /// already advanced so no further bookkeeping is needed. Returns null
+    /// when the buffer lacks space.
+    pub fn reserveWrite(self: *Buffer, n: usize) ?[]u8 {
+        if (self.availableWrite() < n) return null;
+        const start = self.write_pos;
+        self.write_pos += n;
+        return self.data[start..][0..n];
+    }
 };
 
 const testing = std.testing;

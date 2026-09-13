@@ -400,7 +400,9 @@ fn serveFd(ctx: *Context, opts: ServeFdOptions) !Action {
     resp.setHeader("Content-Type", mime.mimeForPath(opts.mime_path));
     resp.setHeaderFmt("ETag", "{s}", .{etag});
     resp.setHeaderFmt("Last-Modified", "{s}", .{lm});
-    resp.setHeader("Accept-Ranges", "bytes");
+    // Skip Accept-Ranges for small cached files (range requests are rare
+    // for tiny assets; saves ~22 bytes/response on the hot path).
+    if (meta.size >= 64 * 1024) resp.setHeader("Accept-Ranges", "bytes");
 
     // Range requests: single satisfiable range -> 206, multiple -> full 200,
     // valid-but-unsatisfiable -> 416.
@@ -655,7 +657,8 @@ test "serves a disk file byte-identical with correct headers" {
     try testing.expectEqual(@as(usize, 0), served.resp.file_offset);
     try testing.expect(served.resp.body_from_file);
     try testing.expectEqualStrings("text/plain", headerValue(&served.resp, "Content-Type").?);
-    try testing.expectEqualStrings("bytes", headerValue(&served.resp, "Accept-Ranges").?);
+    // Small files (< 64KB) skip Accept-Ranges to save wire bytes.
+    try testing.expect(headerValue(&served.resp, "Accept-Ranges") == null);
     try testing.expect(headerValue(&served.resp, "ETag") != null);
     try testing.expect(headerValue(&served.resp, "Last-Modified") != null);
 }

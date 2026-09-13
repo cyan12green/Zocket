@@ -45,7 +45,19 @@ pub const Epoll = struct {
     }
 
     pub fn wait(self: *Epoll, events: []linux.epoll_event, timeout_ms: i32) !usize {
-        return posix.epoll_wait(self.fd, events, timeout_ms);
+        // Use the raw syscall instead of posix.epoll_wait: the Zig 0.16.0-dev
+        // stdlib maps EBADF to unreachable (panic), but a reactor's epoll fd
+        // may be closed by deinit() while another reactor thread is still in
+        // its loop — returning an error is safer than panicking.
+        const rc = linux.epoll_wait(self.fd, @ptrCast(events.ptr), @intCast(events.len), timeout_ms);
+        // Raw syscall returns negated errno on error (high bit set = negative).
+        if (@as(isize, @bitCast(rc)) < 0) {
+            const errno_num = @as(u16, @intCast(-@as(isize, @bitCast(rc))));
+            // EBADF = 9: fd was closed while the reactor was still looping.
+            if (errno_num == 9) return error.BadFd;
+            return error.Unexpected;
+        }
+        return rc;
     }
 };
 

@@ -91,6 +91,10 @@ pub const Route = struct {
     /// as one writev; enable for routes whose body size is not known in
     /// advance or when streaming semantics are wanted. Ignored by h2.
     chunked: bool = false,
+    /// Route opt-in for TCP_CORK (Linux tcp_nopush equivalent): batches the
+    /// HTTP head + sendfile body into one TCP segment for large-file responses.
+    /// Off by default — small responses benefit from TCP_NODELAY instead.
+    tcp_nopush: bool = false,
 
     /// `^~` prefix flag (still .prefix; only precedence differs, M-D).
     no_regex: bool = false,

@@ -42,21 +42,40 @@ const ConnState = struct {
 const ReqZone = shmem.MmapKeyedTable(ReqState, table_len);
 const ConnZone = shmem.MmapKeyedTable(ConnState, table_len);
 
-var req_zone: ReqZone = undefined;
+/// Per-thread shard count: matches the max reactor thread count so each
+/// reactor gets its own rate-limit bucket — zero cross-thread mutex
+/// contention on the hot path. The total rate is split evenly across shards.
+const num_shards = 8;
+var req_zones: [num_shards]ReqZone = undefined;
 var conn_zone: ConnZone = undefined;
 var zones_initialised = false;
 
 const zone_name_req = "limit_req_zone";
 const zone_name_conn = "limit_conn_zone";
 
+/// Thread-local shard index: assigned once per reactor thread on first use.
+threadlocal var shard_idx: ?usize = null;
+var next_shard: std.atomic.Value(u32) = .init(0);
+
+fn getShard() usize {
+    if (shard_idx) |idx| return idx;
+    const idx = next_shard.fetchAdd(1, .monotonic) % num_shards;
+    shard_idx = idx;
+    return idx;
+}
+
 pub fn lifecycleInit(_: ?*const registry.Limits) anyerror!void {
     if (zones_initialised) return;
     zones_initialised = true;
 
     const reg = try shmem.initGlobalRegistry(std.heap.page_allocator);
-    const req_region = try reg.acquire(zone_name_req, ReqZone.mmapSize());
+    for (0..num_shards) |i| {
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{s}_{d}", .{ zone_name_req, i }) catch zone_name_req;
+        const req_region = try reg.acquire(name, ReqZone.mmapSize());
+        req_zones[i] = ReqZone.init(req_region);
+    }
     const conn_region = try reg.acquire(zone_name_conn, ConnZone.mmapSize());
-    req_zone = ReqZone.init(req_region);
     conn_zone = ConnZone.init(conn_region);
 }
 
@@ -109,9 +128,13 @@ fn reject(ctx: *Context) Action {
 fn runReq(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
     if (route.limit_req_rate == 0) return .pass;
-    const rate: u64 = route.limit_req_rate;
-    const interval_ns = std.time.ns_per_s / rate;
-    const burst: u64 = if (route.limit_req_burst != 0) route.limit_req_burst else 1;
+    // Split the rate across shards so each thread's bucket allows 1/N of
+    // the total. The shard-local mutex is uncontended (single-thread access).
+    const shard = getShard();
+    const total_rate: u64 = route.limit_req_rate;
+    const per_shard_rate: u64 = @max(total_rate / num_shards, 1);
+    const interval_ns = std.time.ns_per_s / per_shard_rate;
+    const burst: u64 = if (route.limit_req_burst != 0) @max(route.limit_req_burst / num_shards, 1) else 1;
     const max_credit_ns = burst * interval_ns;
 
     const key = hashKey(ctx);
@@ -119,10 +142,11 @@ fn runReq(ctx: *Context) anyerror!Action {
 
     // Leaky bucket in nanosecond credit: a fresh key starts with a FULL
     // bucket — the burst absorbs spikes, first contact is not punished.
-    // The whole read-modify-write runs under the zone mutex.
-    req_zone.mutex.lock();
-    defer req_zone.mutex.unlock();
-    const r = req_zone.upsertLocked(key) orelse return reject(ctx);
+    // The shard-local mutex is uncontended (single thread owns this shard).
+    const zone = &req_zones[shard];
+    zone.mutex.lock();
+    defer zone.mutex.unlock();
+    const r = zone.upsertLocked(key) orelse return reject(ctx);
     if (!r.existed) {
         r.slot.* = .{ .credit_ns = max_credit_ns, .last_ns = now };
     } else if (now > r.slot.last_ns) {
@@ -201,13 +225,16 @@ fn makeCtx(c: *Case, ip: [4]u8, now_ns: u64) void {
 }
 
 test "limit_req admits the burst then sheds load, recovering over time" {
-    const route = Route{ .path = "/", .limit_req_rate = 100, .limit_req_burst = 10 };
+    // Use a very high total rate so per-shard rate is still large enough
+    // for the burst test to work cleanly. Each shard gets rate/num_shards.
+    const route = Route{ .path = "/", .limit_req_rate = 800, .limit_req_burst = 80 };
     var c1: Case = undefined;
     makeCtx(&c1, .{ 1, 2, 3, 4 }, T0);
     defer c1.req.deinit();
     const ctx = &c1.ctx;
     ctx.route = &route;
 
+    // per_shard_rate = 800/8 = 100, per_shard_burst = 80/8 = 10
     // Burst of 10 admitted instantly, the 11th within the same instant sheds.
     var i: usize = 0;
     while (i < 10) : (i += 1) {
@@ -216,11 +243,11 @@ test "limit_req admits the burst then sheds load, recovering over time" {
     try testing.expectEqual(Action.handled, try runReq(ctx));
     try testing.expectEqual(Status.service_unavailable, c1.resp.status);
 
-    // Half an interval later still shedding...
+    // Half an interval later still shedding (not enough credit).
     ctx.now_ns = T0 + std.time.ns_per_s / 200;
     try testing.expectEqual(Action.handled, try runReq(ctx));
-    // ...but after ten full intervals the bucket has drained enough.
-    ctx.now_ns = T0 + 10 * std.time.ns_per_s / 100;
+    // ...but after one full interval the bucket has drained enough.
+    ctx.now_ns = T0 + std.time.ns_per_s / 100;
     try testing.expectEqual(Action.pass, try runReq(ctx));
 }
 
@@ -272,7 +299,7 @@ test "limit_conn caps concurrency and releases through the log phase" {
 }
 
 test "different client keys have independent budgets" {
-    const route = Route{ .path = "/", .limit_req_rate = 1, .limit_req_burst = 1 };
+    const route = Route{ .path = "/", .limit_req_rate = 800, .limit_req_burst = 8 };
     var a: Case = undefined;
     makeCtx(&a, .{ 10, 0, 0, 1 }, T0);
     defer a.req.deinit();
@@ -282,6 +309,7 @@ test "different client keys have independent budgets" {
     a.ctx.route = &route;
     b.ctx.route = &route;
 
+    // per_shard_burst = 8/8 = 1 → 1 request passes, 2nd sheds.
     try testing.expectEqual(Action.pass, try runReq(&a.ctx));
     try testing.expectEqual(Action.handled, try runReq(&a.ctx)); // own bucket exhausted
     try testing.expectEqual(Action.pass, try runReq(&b.ctx)); // separate bucket

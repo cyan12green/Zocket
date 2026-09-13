@@ -217,6 +217,10 @@ fn parkRemainder(
 }
 
 const max_backends = 8;
+/// Number of pooled keepalive connections per backend per reactor thread.
+/// With N reactors and M backends, total pooled conns = N * M * pool_per_backend.
+/// At 100 concurrent connections, this reduces pool misses dramatically.
+const pool_per_backend = 8;
 
 threadlocal var epoch: std.time.Instant = undefined;
 threadlocal var epoch_set = false;
@@ -249,7 +253,8 @@ const posix = std.posix;
 const posix_fd = std.posix.fd_t;
 
 // Per-reactor state (thread-local: each reactor owns its upstream sockets).
-threadlocal var pool: [max_backends]PoolEntry = [_]PoolEntry{.{}} ** max_backends;
+threadlocal var pool: [max_backends][pool_per_backend]PoolEntry = [_][pool_per_backend]PoolEntry{[_]PoolEntry{.{}} ** pool_per_backend} ** max_backends;
+threadlocal var pool_lens: [max_backends]u32 = [_]u32{0} ** max_backends;
 threadlocal var active: [max_backends]u32 = [_]u32{0} ** max_backends;
 /// Per-backend liveness, SHARED across reactors (and with the active
 /// health-checker thread) via a shmem zone. Keyed by (route pointer,
@@ -405,7 +410,7 @@ fn forward(
         slot.last_fail_ns.store(0, .monotonic);
     }
     active[pick] -|= 1;
-    pool[pick] = .{ .fd = fd, .last_used_ns = started_ns };
+    releasePooled(pick, fd, started_ns);
     const elapsed = nowNs() -% started_ns;
     ewma_ns[pick] = if (ewma_ns[pick] == 0)
         elapsed
@@ -688,7 +693,7 @@ fn tcpProbe(up: *const router.Upstream, path: []const u8, timeout_s: u32) bool {
 /// completions run on the client's reactor thread).
 pub fn upstreamSuccess(idx: usize, fd: posix_fd, now_ns: u64) void {
     active[idx] -|= 1;
-    pool[idx] = .{ .fd = fd, .last_used_ns = now_ns };
+    releasePooled(idx, fd, now_ns);
 }
 
 pub fn upstreamFail(idx: usize, route: *const registry.Route, now_ns: u64) void {
@@ -699,17 +704,56 @@ pub fn upstreamFail(idx: usize, route: *const registry.Route, now_ns: u64) void 
 // ---- upstream connection lifecycle ----
 
 fn acquirePooled(idx: usize, now_ns: u64) posix_fd {
-    const e = &pool[idx];
-    if (e.fd < 0) return -1;
-    if (now_ns -| e.last_used_ns > pool_idle_ns) {
-        // Idle reap.
-        posix_close(e.fd);
-        e.fd = -1;
-        return -1;
+    // Try to acquire from the pool for this backend (most recently used first).
+    const entries = &pool[idx];
+    const len = &pool_lens[idx];
+    var i: usize = len.*;
+    while (i > 0) {
+        i -= 1;
+        const e = &entries[i];
+        if (e.fd < 0) continue;
+        if (now_ns -| e.last_used_ns > pool_idle_ns) {
+            // Idle reap.
+            posix_close(e.fd);
+            e.fd = -1;
+            // Remove this entry by swapping with last.
+            if (i < len.*) {
+                entries[i] = entries[len.* - 1];
+                entries[len.* - 1] = .{};
+            }
+            len.* -= 1;
+            continue;
+        }
+        const fd = e.fd;
+        // Remove from pool.
+        if (i < len.*) {
+            entries[i] = entries[len.* - 1];
+            entries[len.* - 1] = .{};
+        }
+        len.* -= 1;
+        return fd;
     }
-    const fd = e.fd;
-    e.fd = -1;
-    return fd;
+    return -1;
+}
+
+/// Return a connection to the pool (keepalive). Drops the oldest if full.
+fn releasePooled(idx: usize, fd: posix_fd, now_ns: u64) void {
+    const entries = &pool[idx];
+    const len = &pool_lens[idx];
+    if (len.* < pool_per_backend) {
+        entries[len.*] = .{ .fd = fd, .last_used_ns = now_ns };
+        len.* += 1;
+    } else {
+        // Pool full: close the oldest entry to make room.
+        const oldest: usize = 0;
+        if (entries[oldest].fd >= 0) posix_close(entries[oldest].fd);
+        // Shift down and add at end.
+        var j: usize = 0;
+        while (j < len.* - 1) : (j += 1) {
+            entries[j] = entries[j + 1];
+        }
+        entries[len.* - 1] = .{ .fd = fd, .last_used_ns = now_ns };
+    }
 }
 
 /// Connect timeout for upstream sockets (bounded so a half-dead backend
@@ -774,36 +818,30 @@ fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) 
 }
 
 fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
-    // The shared request memory is a bump arena: building here costs no
-    // malloc/free pairs and everything dies with the response (page_allocator
-    // here meant an mmap+munmap pair PER REQUEST).
-    const allocator = ctx.req.arena.asAllocator();
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
+    // Two-pass: compute exact wire size, then serialize into a single
+    // contiguous arena buffer (no ArrayList reallocations, no wasted memory).
+    // Mirrors nginx's ngx_http_proxy_create_request approach.
 
-    try out.appendSlice(allocator, methodName(ctx.req.method));
-    try out.append(allocator, ' ');
-    try out.appendSlice(allocator, ctx.req.target);
-    try out.appendSlice(allocator, " HTTP/1.1\r\n");
+    const method = methodName(ctx.req.method);
+    const body = blk: {
+        if (ctx.body_storage) |bs| {
+            const items = bs.items();
+            if (items.len > 0) break :blk items;
+        }
+        break :blk ctx.req.body;
+    };
 
-    try out.appendSlice(allocator, "Host: ");
-    try out.appendSlice(allocator, up.host);
-    var port_buf: [8]u8 = undefined;
-    try out.appendSlice(allocator, ":");
-    try out.appendSlice(allocator, std.fmt.bufPrint(&port_buf, "{d}\r\n", .{up.port}) catch return error.OutOfMemory);
+    // --- pass 1: compute exact size ---
+    var total: usize = 0;
+    // request line: "METHOD /target HTTP/1.1\r\n"
+    total += method.len + 1 + ctx.req.target.len + 11;
+    // "Host: upstream:port\r\n"
+    total += 6 + up.host.len + 1 + digitCount(up.port) + 2;
+    // "X-Forwarded-For: a.b.c.d\r\nX-Real-IP: a.b.c.d\r\n"
+    var ip_buf: [15]u8 = undefined;
+    const ip = fmtIp(ctx.client_ip, &ip_buf);
+    total += 18 + ip.len + 2 + 11 + ip.len + 2;
 
-    var ip_buf: [16]u8 = undefined;
-    const ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ctx.client_ip[0], ctx.client_ip[1], ctx.client_ip[2], ctx.client_ip[3] }) catch "0.0.0.0";
-    try out.appendSlice(allocator, "X-Forwarded-For: ");
-    try out.appendSlice(allocator, ip);
-    try out.appendSlice(allocator, "\r\nX-Real-IP: ");
-    try out.appendSlice(allocator, ip);
-    try out.appendSlice(allocator, "\r\n");
-
-    // M-E: proxy_set_header overrides — a header whose name appears here is
-    // replaced (the client's value is skipped); others are appended after
-    // the forwarded headers. Values are complex values (rendered per
-    // request).
     const overrides = if (ctx.route) |route| route.proxy_headers else &.{};
     var override_hashes: [8]u32 = undefined;
     var override_count: usize = 0;
@@ -814,16 +852,16 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
         }
     }
 
-    // Forward the client's headers except hop-by-hop ones we manage and
-    // any name overridden by proxy_set_header.
+    // Forwarded client headers.
     for (0..ctx.req.headerCount()) |i| {
         const h = ctx.req.headerAt(i);
         const hh = http_parser.header_hasher.hash(h.name);
         const skip = switch (hh) {
-            http_parser.header_hasher.hash("host") => true,
-            http_parser.header_hasher.hash("connection") => true,
-            http_parser.header_hasher.hash("content-length") => true,
-            http_parser.header_hasher.hash("transfer-encoding") => true,
+            http_parser.header_hasher.hash("host"),
+            http_parser.header_hasher.hash("connection"),
+            http_parser.header_hasher.hash("content-length"),
+            http_parser.header_hasher.hash("transfer-encoding"),
+            => true,
             else => false,
         };
         if (skip) continue;
@@ -835,33 +873,94 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
             }
         }
         if (overridden) continue;
-        try out.appendSlice(allocator, h.name);
-        try out.appendSlice(allocator, ": ");
-        try out.appendSlice(allocator, h.value);
-        try out.appendSlice(allocator, "\r\n");
+        // "name: value\r\n"
+        total += h.name.len + 2 + h.value.len + 2;
     }
-    // The proxy_set_header overrides.
-    var sink = vars.ArrayListSink{ .list = &out, .allocator = allocator };
+
+    // proxy_set_header overrides (rendered values).
+    // We cannot pre-compute rendered sizes without a buffer, so fall
+    // back to ArrayList for this section only (typically 0-2 headers).
+    var override_section = std.ArrayList(u8).empty;
+    defer override_section.deinit(ctx.req.arena.asAllocator());
     for (overrides) |ph| {
-        try out.appendSlice(allocator, ph.name);
-        try out.appendSlice(allocator, ": ");
+        try override_section.appendSlice(ctx.req.arena.asAllocator(), ph.name);
+        try override_section.appendSlice(ctx.req.arena.asAllocator(), ": ");
+        var sink = vars.ArrayListSink{ .list = &override_section, .allocator = ctx.req.arena.asAllocator() };
         try vars.renderComplex(ctx, ph.value, &sink);
-        try out.appendSlice(allocator, "\r\n");
+        try override_section.appendSlice(ctx.req.arena.asAllocator(), "\r\n");
     }
-    var cl_buf: [24]u8 = undefined;
-    try out.appendSlice(allocator, "Content-Length: ");
-    // Prefer body_storage for consistency with chunked bodies; fall back
-    // to req.body (zero-copy Content-Length slice).
-    const body = blk: {
-        if (ctx.body_storage) |bs| {
-            const items = bs.items();
-            if (items.len > 0) break :blk items;
+    total += override_section.items.len;
+
+    // "Content-Length: NNN\r\n\r\n" + body
+    total += 16 + digitCount(body.len) + 4 + body.len;
+
+    // --- pass 2: serialize into a single contiguous buffer ---
+    const buf = ctx.req.arena.alloc(total) orelse return error.OutOfMemory;
+    var pos: usize = 0;
+
+    const write = struct {
+        fn w(dst: []u8, p: *usize, src: []const u8) void {
+            @memcpy(dst[p.* .. p.* + src.len], src);
+            p.* += src.len;
         }
-        break :blk ctx.req.body;
-    };
-    try out.appendSlice(allocator, std.fmt.bufPrint(&cl_buf, "{d}\r\n\r\n", .{body.len}) catch return error.OutOfMemory);
-    try out.appendSlice(allocator, body);
-    return out.items;
+    }.w;
+
+    write(buf, &pos, method);
+    write(buf, &pos, " ");
+    write(buf, &pos, ctx.req.target);
+    write(buf, &pos, " HTTP/1.1\r\n");
+
+    write(buf, &pos, "Host: ");
+    write(buf, &pos, up.host);
+    write(buf, &pos, ":");
+    var port_buf: [8]u8 = undefined;
+    write(buf, &pos, std.fmt.bufPrint(&port_buf, "{d}", .{up.port}) catch return error.OutOfMemory);
+    write(buf, &pos, "\r\n");
+
+    write(buf, &pos, "X-Forwarded-For: ");
+    write(buf, &pos, ip);
+    write(buf, &pos, "\r\nX-Real-IP: ");
+    write(buf, &pos, ip);
+    write(buf, &pos, "\r\n");
+
+    // Forwarded client headers.
+    for (0..ctx.req.headerCount()) |i| {
+        const h = ctx.req.headerAt(i);
+        const hh = http_parser.header_hasher.hash(h.name);
+        const skip = switch (hh) {
+            http_parser.header_hasher.hash("host"),
+            http_parser.header_hasher.hash("connection"),
+            http_parser.header_hasher.hash("content-length"),
+            http_parser.header_hasher.hash("transfer-encoding"),
+            => true,
+            else => false,
+        };
+        if (skip) continue;
+        var overridden = false;
+        for (override_hashes[0..override_count]) |oh| {
+            if (oh == hh) {
+                overridden = true;
+                break;
+            }
+        }
+        if (overridden) continue;
+        write(buf, &pos, h.name);
+        write(buf, &pos, ": ");
+        write(buf, &pos, h.value);
+        write(buf, &pos, "\r\n");
+    }
+
+    // proxy_set_header overrides.
+    write(buf, &pos, override_section.items);
+
+    // Content-Length + blank line + body.
+    write(buf, &pos, "Content-Length: ");
+    var cl_buf: [24]u8 = undefined;
+    write(buf, &pos, std.fmt.bufPrint(&cl_buf, "{d}", .{body.len}) catch return error.OutOfMemory);
+    write(buf, &pos, "\r\n\r\n");
+    write(buf, &pos, body);
+
+    return buf[0..pos];
 }
 
 fn methodName(m: http_parser.Method) []const u8 {
@@ -875,6 +974,40 @@ fn methodName(m: http_parser.Method) []const u8 {
         .patch => "PATCH",
         .unknown => "GET",
     };
+}
+
+fn digitCount(v: anytype) usize {
+    if (v == 0) return 1;
+    var n: usize = 0;
+    var x = v;
+    while (x > 0) : (n += 1) {
+        x /= 10;
+    }
+    return n;
+}
+
+/// Format an IP address into `buf`, returning the used slice.
+fn fmtIp(ip: [4]u8, buf: []u8) []const u8 {
+    var pos: usize = 0;
+    inline for (0..4) |i| {
+        if (i > 0) {
+            buf[pos] = '.';
+            pos += 1;
+        }
+        const d = ip[i];
+        if (d >= 100) {
+            buf[pos] = '0' + d / 100;
+            pos += 1;
+            buf[pos] = '0' + (d / 10) % 10;
+            pos += 1;
+        } else if (d >= 10) {
+            buf[pos] = '0' + d / 10;
+            pos += 1;
+        }
+        buf[pos] = '0' + d % 10;
+        pos += 1;
+    }
+    return buf[0..pos];
 }
 
 // ---- upstream response reading ----
