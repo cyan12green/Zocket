@@ -2,4 +2,4 @@ const std = @import("std");
 
 /// Semantic version of Zocket. Keep in sync with `.version` in
 /// build.zig.zon; release tags are `v{version}`.
-pub const version = "1.0.0";
+pub const version = "1.1.0";
