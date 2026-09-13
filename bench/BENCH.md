@@ -34,9 +34,9 @@ python3 bench/graphs_readme.py
 Six servers: Zocket, actix-web, Bun.serve, httpx.zig, nginx, Caddy.
 Body sizes 1 KB / 8 KB / 64 KB × connections 10 / 100 / 1000.
 
-![Matrix 1 KB](bench/graphs/matrix_1024.png)
-![Matrix 8 KB](bench/graphs/matrix_8192.png)
-![Matrix 64 KB](bench/graphs/matrix_65536.png)
+![Matrix 1 KB](graphs/matrix_1024.png)
+![Matrix 8 KB](graphs/matrix_8192.png)
+![Matrix 64 KB](graphs/matrix_65536.png)
 
 ### Results table (req/s × 1000)
 
@@ -57,7 +57,7 @@ Body sizes 1 KB / 8 KB / 64 KB × connections 10 / 100 / 1000.
 1 KB and 1 MB files, 100 / 1000 connections. `tcp_nopush on` enables TCP_CORK
 to batch the HTTP head + sendfile body into one TCP segment.
 
-![Static serving](bench/graphs/static.png)
+![Static serving](graphs/static.png)
 
 | File | Conns | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
@@ -70,13 +70,13 @@ to batch the HTTP head + sendfile body into one TCP segment.
 
 Head-to-head across every workload: echo, static, and per-request cost.
 
-![Zocket vs nginx](bench/graphs/nginx_compare.png)
+![Zocket vs nginx](graphs/nginx_compare.png)
 
 ## Module features vs nginx
 
 Feature-specific comparison on module endpoints (100 conns, interleaved reps).
 
-![Module features](bench/graphs/modules_compare.png)
+![Module features](graphs/modules_compare.png)
 
 | Cell | Zocket | nginx | Ratio |
 |---|---|---:|---:|
@@ -90,7 +90,7 @@ Feature-specific comparison on module endpoints (100 conns, interleaved reps).
 
 All servers co-resident: Zocket, nginx, HAProxy. 8 workload cells.
 
-![Unified](bench/graphs/unified_web.png)
+![Unified](graphs/unified_web.png)
 
 | Cell | Zocket | nginx | HAProxy |
 |---|---|---:|---:|---:|
@@ -105,15 +105,15 @@ All servers co-resident: Zocket, nginx, HAProxy. 8 workload cells.
 
 ## HTTP/2 (h2c, h2load)
 
-![H2 compare](bench/graphs/h2_compare.png)
+![H2 compare](graphs/h2_compare.png)
 
 ## HTTP/2 over TLS
 
-![TLS compare](bench/graphs/tls_compare.png)
+![TLS compare](graphs/tls_compare.png)
 
 ## Chunked transfer
 
-![Chunked compare](bench/graphs/chunked_compare.png)
+![Chunked compare](graphs/chunked_compare.png)
 
 ## Reproduce
 
