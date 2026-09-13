@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Backlog-features benchmark: Zocket vs nginx on the new module surface.
+# Module-features benchmark: Zocket vs nginx on the module surface.
 #
-#   bench/backlog-bench.sh [--reps N] [--duration s]
+#   bench/modules-bench.sh [--reps N] [--duration s]
 #
 # Cells (identical endpoints on both servers, interleaved reps):
 #   headers      GET /h        — 3 response-header ops per request
@@ -10,8 +10,8 @@
 #   cache_hit    GET /cached   — proxy_cache HIT path (warm origin)
 #   limit_req    GET /limited  — overload shedding at rate=2000/s burst=100
 #
-# Results land in bench/results/backlog/<cell>/{zocket,nginx}_r<N>.json;
-# bench/graphs_backlog.py renders bench/graphs/backlog_compare.png and
+# Results land in bench/results/modules/<cell>/{zocket,nginx}_r<N>.json;
+# bench/graphs_modules.py renders bench/graphs/modules_compare.png and
 # the summary table below prints medians (rps + p50/p99 latency; the
 # limit cell reports accepted rps instead).
 set -euo pipefail
@@ -35,7 +35,7 @@ done
 TCP_BIN="$ROOT/zig-out/bin/zocket"
 NGINX_BIN="$ROOT/bench/.cache/nginx-build/sbin/nginx"
 BOMB=~/go/bin/bombardier
-RES="$ROOT/bench/results/backlog"
+RES="$ROOT/bench/results/modules"
 STATIC_DIR="$ROOT/bench/static"
 AUTH_HEADER="Authorization: Basic YmVuY2g6cGFzc3dvcmQ="   # bench:password
 
@@ -47,7 +47,7 @@ if [ ! -x "$ROOT/bench/.cache/zocket-origin" ] || [ "$ROOT/src/dsl/modules/proxy
     (cd "$ROOT" && zig build -Doptimize=ReleaseFast) 
     cp "$TCP_BIN" "$ROOT/bench/.cache/zocket-origin"
 fi
-(cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=bench/backlog-zocket.conf)
+(cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=bench/modules-zocket.conf)
 [ -x "$NGINX_BIN" ] || bash "$ROOT/bench/build-nginx.sh" >/dev/null
 mkdir -p "$RES"
 ORIGIN_BIN="$ROOT/bench/.cache/zocket-origin"
@@ -66,18 +66,18 @@ start_zocket() {
 }
 
 start_nginx() {
-    local prefix="$ROOT/bench/.cache/nginx-backlog-p$NPORT"
-    mkdir -p "$prefix" "$ROOT/bench/.cache/backlog-cache"
+    local prefix="$ROOT/bench/.cache/nginx-modules-p$NPORT"
+    mkdir -p "$prefix" "$ROOT/bench/.cache/modules-cache"
     sed -e "s/@@PORT@@/$NPORT/" \
-        -e "s|@@ERRLOG@@|$ROOT/bench/.cache/nginx-backlog.err|" \
+        -e "s|@@ERRLOG@@|$ROOT/bench/.cache/nginx-modules.err|" \
         -e "s|@@PREFIX@@|$prefix|" \
         -e "s|@@STATICDIR@@|$STATIC_DIR|" \
         -e "s|@@HTPASSWD@@|$ROOT/testdata/bench-htpasswd|" \
-        -e "s|@@CACHEDIR@@|$ROOT/bench/.cache/backlog-cache|" \
+        -e "s|@@CACHEDIR@@|$ROOT/bench/.cache/modules-cache|" \
         -e "s/@@ORIGIN@@/$ORIGIN/" \
-        "$ROOT/bench/foreign/nginx/backlog.conf.template" \
-        > "$ROOT/bench/.cache/nginx-backlog.conf"
-    "$NGINX_BIN" -p "$prefix" -c "$ROOT/bench/.cache/nginx-backlog.conf" >/dev/null 2>&1 &
+        "$ROOT/bench/foreign/nginx/modules.conf.template" \
+        > "$ROOT/bench/.cache/nginx-modules.conf"
+    "$NGINX_BIN" -p "$prefix" -c "$ROOT/bench/.cache/nginx-modules.conf" >/dev/null 2>&1 &
     NPIDS+=($!)
 }
 
@@ -145,7 +145,7 @@ def load(f):
         return None  # crashed/dead server rep: exclude
     return rps, (good / total * 100 if total else 0)
 
-root = "bench/results/backlog"
+root = "bench/results/modules"
 cells = ["headers", "auth_sha", "precompressed", "cache_hit", "limit_req"]
 print(f"{'cell':<14}{'metric':<16}{'zocket':>12}{'nginx':>12}{'ratio':>8}")
 for cell in cells:
@@ -167,4 +167,4 @@ for cell in cells:
     print(f"{cell:<14}{'req/s':<16}{med['zocket']:>12.0f}{med['nginx']:>12.0f}{ratio:>7.2f}x")
 
 PYEOF
-echo "done - JSON in bench/results/backlog/, render graphs with bench/graphs_backlog.py"
+echo "done - JSON in bench/results/modules/, render graphs with bench/graphs_modules.py"

@@ -1,4 +1,4 @@
-# nginx counterpart for the backlog benchmark (same five endpoints).
+# nginx counterpart for the modules benchmark (same five endpoints).
 worker_processes 4;
 daemon off;
 error_log @@ERRLOG@@ crit;
@@ -17,7 +17,7 @@ http {
     sendfile_max_chunk 1m;
 
     # cache_hit cell: proxy_cache in front of an origin echo endpoint
-    proxy_cache_path @@CACHEDIR@@ levels=1:2 keys_zone=backlog:16m max_size=64m inactive=600s;
+    proxy_cache_path @@CACHEDIR@@ levels=1:2 keys_zone=modules:16m max_size=64m inactive=600s;
 
     upstream origin {
         server 127.0.0.1:@@ORIGIN@@;
@@ -48,7 +48,7 @@ http {
 
         location = /cached {
             proxy_pass http://origin;
-            proxy_cache backlog;
+            proxy_cache modules;
             proxy_cache_valid 200 3600s;
             proxy_http_version 1.1;
             proxy_set_header Connection "";

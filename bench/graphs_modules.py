@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Render the backlog benchmark: grouped bars (Zocket vs nginx req/s) per
-feature cell, from bench/results/backlog/*.json. Output:
-bench/graphs/backlog_compare.png"""
+"""Render the module-features benchmark: grouped bars (Zocket vs nginx req/s) per
+feature cell, from bench/results/modules/*.json. Output:
+bench/graphs/modules_compare.png"""
 import json, glob, statistics, os, sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RES = os.path.join(ROOT, "bench/results/backlog")
-OUT = os.path.join(ROOT, "bench/graphs/backlog_compare.png")
+RES = os.path.join(ROOT, "bench/results/modules")
+OUT = os.path.join(ROOT, "bench/graphs/modules_compare.png")
 
 CELLS = [
     ("headers", "headers\n(3 ops/req)"),
@@ -68,7 +68,7 @@ for i, (z, n) in enumerate(zip(z_vals, n_vals)):
     if notes[i]: ax.text(i, max(z, n) * 1.08, notes[i], ha="center", fontsize=8, color="#555")
 ax.set_xticks(list(x)); ax.set_xticklabels(labels)
 ax.set_ylabel("requests / second (median, c=100)")
-ax.set_title("Zocket backlog modules vs nginx — same endpoint, interleaved reps")
+ax.set_title("Zocket modules vs nginx — same endpoint, interleaved reps")
 ax.legend()
 ax.spines[["top", "right"]].set_visible(False)
 plt.tight_layout()

@@ -11,12 +11,12 @@ python3 bench/graphs.py --run
 # Or run individual benchmarks
 bash bench/compare-servers.sh --matrix              # echo sweep
 bash bench/compare-servers.sh --static "1024 1048576"  # file serving
-bash bench/backlog-bench.sh                         # module-level
+bash bench/modules-bench.sh                         # feature-level
 bash bench/unified.sh                               # unified web/file/LB
 
 # Generate graphs from stored results
 python3 bench/graphs.py
-python3 bench/graphs_backlog.py
+python3 bench/graphs_modules.py
 python3 bench/unified_graphs.py
 python3 bench/graphs_readme.py
 ```
@@ -42,15 +42,15 @@ Body sizes 1 KB / 8 KB / 64 KB × connections 10 / 100 / 1000.
 
 | Body | Conns | Zocket | actix | Bun | httpx | nginx | Caddy |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 1 KB | 10 | 117.4 | 82.8 | 50.3 | 2.6 | 62.5 | 31.1 |
-| 1 KB | 100 | 195.9 | 158.0 | 43.1 | 2.8 | 114.0 | 35.7 |
-| 1 KB | 1000 | 157.5 | 123.9 | 36.9 | 2.6 | 47.0 | 36.1 |
-| 8 KB | 10 | 56.0 | 38.4 | 34.4 | 2.6 | 45.8 | 17.9 |
-| 8 KB | 100 | 105.8 | 82.8 | 30.2 | 2.4 | 37.0 | 8.7 |
-| 8 KB | 1000 | 63.8 | 80.4 | 39.5 | 3.5 | 44.3 | 5.3 |
-| 64 KB | 10 | 26.9 | 29.6 | 16.6 | 2.7 | 20.7 | 6.0 |
-| 64 KB | 100 | 23.2 | 18.0 | 11.6 | 1.9 | 24.4 | 7.3 |
-| 64 KB | 1000 | 16.0 | 14.2 | 14.3 | 2.2 | 15.2 | 9.0 |
+| 1 KB | 10 | 133.8 | 119.6 | 65.1 | 3.6 | 110.2 | 48.2 |
+| 1 KB | 100 | 197.2 | 188.9 | 63.2 | 3.5 | 145.8 | 48.0 |
+| 1 KB | 1000 | 171.8 | 163.6 | 56.0 | 4.3 | 130.5 | 41.0 |
+| 8 KB | 10 | 97.5 | 83.0 | 47.8 | 3.5 | 48.4 | 24.0 |
+| 8 KB | 100 | 126.1 | 111.8 | 45.0 | 3.4 | 64.2 | 24.2 |
+| 8 KB | 1000 | 97.2 | 84.3 | 41.1 | 4.3 | 62.6 | 23.4 |
+| 64 KB | 10 | 63.4 | 39.3 | 21.9 | 3.0 | 19.9 | 9.5 |
+| 64 KB | 100 | 35.0 | 23.3 | 19.3 | 3.0 | 23.0 | 9.4 |
+| 64 KB | 1000 | 25.4 | 18.0 | 18.9 | 3.8 | 21.4 | 9.4 |
 
 ## Static file serving (GET, req/s)
 
@@ -61,10 +61,10 @@ to batch the HTTP head + sendfile body into one TCP segment.
 
 | File | Conns | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
-| 1 KB | 100 | 168,740 | 131,179 | 1.29x |
-| 1 KB | 1000 | 165,241 | 107,472 | 1.54x |
-| 1 MB | 100 | 8,203 | 8,308 | 0.99x |
-| 1 MB | 1000 | 8,485 | 5,813 | 1.46x |
+| 1 KB | 100 | 233,490 | 146,012 | 1.60x |
+| 1 KB | 1000 | 189,346 | 127,745 | 1.48x |
+| 1 MB | 100 | 9,774 | 9,313 | 1.05x |
+| 1 MB | 1000 | 8,406 | 7,717 | 1.09x |
 
 ## Zocket vs nginx (all cells)
 
@@ -72,19 +72,19 @@ Head-to-head across every workload: echo, static, and per-request cost.
 
 ![Zocket vs nginx](bench/graphs/nginx_compare.png)
 
-## Backlog modules vs nginx
+## Module features vs nginx
 
-Module-level comparison on feature-specific endpoints (100 conns, interleaved reps).
+Feature-specific comparison on module endpoints (100 conns, interleaved reps).
 
-![Backlog modules](bench/graphs/backlog_compare.png)
+![Module features](bench/graphs/modules_compare.png)
 
 | Cell | Zocket | nginx | Ratio |
-|---|---:|---:|---:|
-| headers (3 ops/req) | 203,785 | 165,839 | 1.23x |
-| auth_basic ({SHA}) | 187,948 | 151,218 | 1.24x |
-| precompressed (.gz 8K) | 161,937 | 113,205 | 1.43x |
-| proxy_cache (HIT) | 56,968 | 150,208 | 0.38x |
-| limit_req (pass-through) | 208,278 | 200,008 | 1.04x |
+|---|---|---:|---:|
+| headers (3 ops/req) | 233,894 | 217,518 | 1.08x |
+| auth_basic ({SHA}) | 216,632 | 173,749 | 1.25x |
+| precompressed (.gz 8K) | 182,087 | 122,575 | 1.49x |
+| proxy_cache (HIT) | 219,381 | 165,244 | 1.33x |
+| limit_req (pass-through) | 225,491 | 214,374 | 1.05x |
 
 ## Unified benchmark (web/file/LB)
 
@@ -93,15 +93,15 @@ All servers co-resident: Zocket, nginx, HAProxy. 8 workload cells.
 ![Unified](bench/graphs/unified_web.png)
 
 | Cell | Zocket | nginx | HAProxy |
-|---|---:|---:|---:|
-| h1_echo | 206,930 | 136,046 | — |
-| static_small | 182,081 | 114,375 | — |
-| static_large | 9,784 | 9,575 | — |
-| precompressed | 176,502 | 119,872 | — |
-| headers_ops | 217,990 | 188,421 | — |
-| auth_basic | 196,403 | 160,050 | — |
-| cache_hit | 211,259 | 159,427 | — |
-| lb_rr | 215,242 | 71,347 | 73,152 |
+|---|---|---:|---:|---:|
+| h1_echo | 218,172 | 136,354 | — |
+| static_small | 166,438 | 111,769 | — |
+| static_large | 10,415 | 7,659 | — |
+| precompressed | 175,828 | 112,237 | — |
+| headers_ops | 215,776 | 190,317 | — |
+| auth_basic | 164,474 | 159,393 | — |
+| cache_hit | 149,983 | 120,698 | — |
+| lb_rr | 172,818 | 71,890 | 73,756 |
 
 ## HTTP/2 (h2c, h2load)
 
@@ -125,12 +125,12 @@ python3 bench/graphs.py --run
 zig build -Doptimize=ReleaseFast
 bash bench/compare-servers.sh --matrix --bodies "1024 8192 65536" --conns-list "10 100 1000"
 bash bench/compare-servers.sh --static "1024 1048576" --conns-list "100 1000"
-bash bench/backlog-bench.sh
+bash bench/modules-bench.sh
 bash bench/unified.sh
 
 # Generate graphs
 python3 bench/graphs.py
-python3 bench/graphs_backlog.py
+python3 bench/graphs_modules.py
 python3 bench/unified_graphs.py
 python3 bench/graphs_readme.py
 ```

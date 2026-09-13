@@ -25,7 +25,7 @@ AUTH_HEADER="Authorization: Basic YmVuY2g6cGFzc3dvcmQ="
 ZP=18701 NP=18702 HP=18703 EP=18704 ORIGIN_BASE=18910
 
 echo "== ensuring builds =="
-(cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=bench/backlog-zocket.conf)
+(cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=bench/modules-zocket.conf)
 mkdir -p "$ROOT/bench/.cache"
 if [ ! -x "$ROOT/bench/.cache/zocket-origin" ]; then
     (cd "$ROOT" && zig build -Doptimize=ReleaseFast)

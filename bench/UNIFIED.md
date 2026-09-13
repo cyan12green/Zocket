@@ -1,7 +1,7 @@
 # Unified Benchmark Plan — webserver / load-balancer / fileserver
 
 Single entry point (to be built): `bench/unified.sh` — same skeleton as
-`backlog-bench.sh` (interleaved reps, port-swap bias correction, crashed-rep
+`modules-bench.sh` (interleaved reps, port-swap bias correction, crashed-rep
 filter, medians). Servers: Zocket, nginx, HAProxy, Envoy; each enabled only
 for cells it can legitimately serve (documented per cell).
 
@@ -65,7 +65,7 @@ LB-only comparison — no local content generation:
 Group A harness validated end-to-end; KNOWN ISSUE: nginx served its old
 3-endpoint template, so nginx numbers for f8k/f1m/precompressed/etc. are
 invalid until unified.sh renders an nginx config mirroring ALL cells
-(reuse foreign/nginx/backlog template + /echo + /f1m). Zocket
+(reuse foreign/nginx/modules template + /echo + /f1m). Zocket
 static_large 9.4k x 1MiB ~= 9.4 GB/s is real wire saturation.
 Next: mirrored nginx template, HAProxy lb cells (build-haproxy.sh ready),
 graphs renderer, README graph swap.

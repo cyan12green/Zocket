@@ -1,7 +1,7 @@
 # Milestones
 
 The milestone history of Zocket. Current status: M1–M18 complete,
-M18.5 complete, protocol-completeness backlog shipped as modules (B1),
+M18.5 complete, modules shipped as a batch (B1),
 reload-surviving zones + vhost readiness audit (B2), and multi-server
 vhost pipeline (B3). M19 (HTTP/3) is planned. Forward-looking roadmap:
 `docs/ROADMAP.md`; benchmarks per milestone in `bench/BENCH.md`.
@@ -27,7 +27,7 @@ vhost pipeline (B3). M19 (HTTP/3) is planned. Forward-looking roadmap:
 | M17 | DONE | TLS/HTTPS: native Zig TLS 1.3 (no OpenSSL) — ECDSA certs, X25519, ALPN h2 + http/1.1, stateless session tickets + PSK resumption. |
 state:open| M18.5 | DONE | Conf language (M-A..M-E): nginx-flavored `.conf` compiled entirely at comptime (`-Dconfig=<file>`) replaced the JSON config; complex values (`$var`), `set`, regex routing, `proxy_set_header`; `--reload-hard` is the only reload. See `docs/config.md`. |
 | M18 | DONE | WebSocket / connection upgrade (RFC 6455): handshake digest, frame codec with mandatory client masking, reactor byte-pipe mode (echo/ping-pong/close), non-RFC upgrades stay HTTP. |
-| B1 | DONE | Backlog modules as a batch: headers (add/set/remove + always + inheritance), auth_basic (comptime htpasswd), auth_request (subrequest hook), limit_req/limit_conn (shmem leaky bucket + conn cap), precompressed (.gz twins), proxy_cache (bounded LRU + conditional revalidation), LB random/consistent_hash/least_time + cookie sticky sessions. Framework: shared request memory (`ctx.sharedAlloc/Dupe/Fmt`), bounded shmem zones (`dsl/shmem.zig`), per-request timeouts (client_header/body_timeout), nginx-style directive model. Benchmarks: `bench/BENCH.md` backlog section. |
+| B1 | DONE | Modules batch: headers (add/set/remove + always + inheritance), auth_basic (comptime htpasswd), auth_request (subrequest hook), limit_req/limit_conn (shmem leaky bucket + conn cap), precompressed (.gz twins), proxy_cache (bounded LRU + conditional revalidation), LB random/consistent_hash/least_time + cookie sticky sessions. Framework: shared request memory (`ctx.sharedAlloc/Dupe/Fmt`), bounded shmem zones (`dsl/shmem.zig`), per-request timeouts (client_header/body_timeout), nginx-style directive model. Benchmarks: `bench/BENCH.md` module features section. |
 | B2 | DONE | Reload-surviving zones + vhost readiness audit: memfd-backed named shmem zones (`src/dsl/memfd.zig`) handed through daemon state file across `--reload-hard`; `MmapKeyedTable` for mmap-backed key tables; `ZoneRegistry` for zone lifecycle; limit.zig lifecycle init from inherited fds; per-server `ServerStats` (allocated in `embeddedInit`, freed in `deinitPrepared`); `ModuleError` enum with status mapping (502/503/500); `needs_body`/`touches_headers`/`streams_response` capability flags; body spooling via memfd (`src/net/body_storage.zig`). |
 | B3 | DONE | Multi-server vhost pipeline: `server_name` directive (exact + `*.domain` wildcard), multiple `server {}` blocks with per-block `listen` port; `host_select on|off;` directive; comptime `ServerSelectFn` (FNV-style exact + wildcard match in .rodata); `ServerGroup` (independent per-server trie/dispatch/stats, no single-server backward compat); `ServerGroup.comptimeInit` + `embeddedInitGroupWithTls`; reactor holds `*ServerGroup` with per-request Host resolution (`resolveServer`); multireactor `initWithThreadsAndHandlerGroup`; main builds `ServerGroup`, collects unique listen ports, spawns one multireactor thread per port. |
 | M19 | PLANNED | HTTP/3 + QUIC (after M16+M17; feasibility revisited). |
@@ -748,7 +748,7 @@ upgrade attempts (wrong version/method) stay plain HTTP. The 101 carries no
 Content-Length/body framing (RFC 9110 §9.4.2). Gates met: 8 websocket codec
 tests + 2 reactor e2e tests over socketpairs (handshake vector, masked text
 echo, ping→pong, close→EOF; rejection paths), `zig build test` 280/280.
-Upstream `ws://` passthrough for the proxy module remains open (backlog).
+Upstream `ws://` passthrough for the proxy module remains open (tracked as a future item).
 
 > **Note**: the M18 session-ticket work originally planned under M17 was
 > delivered there — TLS reactor integration, config `tls`, resumption
@@ -869,6 +869,6 @@ budget check), M-B/M-C (complex values, variables, `set` —
 `access_log` rewrite on `LogFormat`), M-D (regex engine + router
 integration) and M-E (`proxy_set_header`). M18 (WebSocket + connection
 upgrade) has since shipped. Remaining candidates: HTTP/3 (M19), the proxy
-`ws://` passthrough left open by M18, or the planned-after-protocol backlog
+`ws://` passthrough left open by M18, or the post-protocol modules batch
 (rate limiting, header manipulation, auth, per-request timeouts,
 `proxy_cache`, IPv6 listeners).

@@ -47,7 +47,7 @@ Status summary (full delivery records live in `docs/milestones.md`):
 | M17 | DONE | Native Zig TLS 1.3 + session resumption |
 | M18 | DONE | WebSocket + connection upgrade (RFC 6455) |
 | M18.5 | DONE | Conf language, comptime-only (`-Dconfig`) |
-| B1 | DONE | Backlog batch as modules: headers, auth_basic/auth_request, limit_req/limit_conn, precompressed, proxy_cache, LB extensions + sticky; shared request memory, bounded shmem zones, per-request timeouts |
+| B1 | DONE | Modules batch: headers, auth_basic/auth_request, limit_req/limit_conn, precompressed, proxy_cache, LB extensions + sticky; shared request memory, bounded shmem zones, per-request timeouts |
 | B2 | DONE | Reload-surviving zones + vhost readiness audit |
 | B3 | DONE | Multi-server vhost pipeline (server_name, Host matching, per-port multireactor) |
 | B4 | DONE | Connection limits + parser hardening + IPv6 listeners |
@@ -55,7 +55,7 @@ Status summary (full delivery records live in `docs/milestones.md`):
 
 
 
-Most of this backlog SHIPPED as registry modules (2026-08-23), built on
+Most of these shipped as registry modules (2026-08-23), built on
 two framework additions — the shared request memory
 (`ctx.sharedAlloc/sharedDupe/sharedFmt`, reclaimed per response) and
 bounded shared-memory zones (`dsl/shmem.zig`: capped key tables +
@@ -193,7 +193,7 @@ Folded into Stage 2 (rides the upstream seam):
    such routes bypass body filters (header filters still run) until an
    incremental filter API exists. Documented constraint, never silent.
 
-Tracked backlog (design notes recorded here; build later):
+Tracked items (design notes recorded here; build later):
 
 9. DONE Reload-surviving zones: memfd_create zones handed through daemon
     state file across `--reload-hard`; `src/dsl/memfd.zig` utility,

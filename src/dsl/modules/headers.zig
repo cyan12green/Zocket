@@ -1,5 +1,4 @@
-//! Response-header manipulation module (nginx `headers_filter`-equivalent,
-//! backlog item). Bound to the log phase — the pipeline's post-processing
+//! Response-header manipulation module (nginx `headers_filter`-equivalent). Bound to the log phase — the pipeline's post-processing
 //! slot, which runs even after a content module claimed the request — so
 //! set/add/remove apply to the final module-produced header set. Note the
 //! transport-owned Connection/Date/Server headers are appended by the
