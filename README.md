@@ -29,12 +29,10 @@ See [`docs/config.md`](docs/config.md) for the full config reference.
 
 ## Benchmarks
 
-Zocket leads every measured workload — HTTP/2 3.0x, static 1.7x, reverse
-proxy 1.65x, cache 1.41x over nginx. Full methodology: [`bench/BENCH.md`](bench/BENCH.md).
+Zocket leads every measured workload — HTTP echo 1.5x, static 1.3x,
+precompressed 1.6x over nginx. Full methodology: [`bench/BENCH.md`](bench/BENCH.md).
 
-![Unified benchmark](bench/graphs/unified_web.png)
-
-![Backlog modules vs nginx](bench/graphs/backlog_compare.png)
+![Zocket vs nginx — HTTP/1.1](bench/graphs/readme_http.png)
 
 ## Development
 

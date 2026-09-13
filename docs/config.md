@@ -156,6 +156,7 @@ Server-scope declarations inherit to child locations.
 | Directive | Syntax | Default | Description |
 |---|---|---|---|
 | `chunked` | `chunked on\|off;` | off | Route opt-in for chunked transfer encoding. |
+| `tcp_nopush` | `tcp_nopush on\|off;` | off | Batch head+sendfile into one TCP segment (Linux tcp_nopush). |
 | `max_age` | `max_age seconds;` | 0 | Cache-Control max-age for cache_headers module. |
 
 ## Embedded variables
