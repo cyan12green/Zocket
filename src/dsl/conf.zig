@@ -8,6 +8,7 @@ const ct_pool = @import("../ct_pool.zig");
 const vars = @import("vars.zig");
 const regex_mod = @import("regex.zig");
 const htpasswd_mod = @import("htpasswd.zig");
+const sockets_mod = @import("../net/sockets.zig");
 const embeds_mod = @import("embeds");
 
 const Config = config_mod.Config;
@@ -15,6 +16,7 @@ const TlsConfig = config_mod.TlsConfig;
 const LogFormat = config_mod.LogFormat;
 const Route = router.Route;
 const Match = router.Match;
+const mem = std.mem;
 const ModuleBinding = router.ModuleBinding;
 const TemplateHeader = router.TemplateHeader;
 const ResponseTemplate = router.ResponseTemplate;
@@ -71,6 +73,8 @@ const H_static_cache_entries = keyHash("static_cache_entries");
 const H_static_cache_valid = keyHash("static_cache_valid");
 const H_static_content_cache_max = keyHash("static_content_cache_max");
 const H_connection_pool_max = keyHash("connection_pool_max");
+const H_max_connections = keyHash("max_connections");
+const H_server_limit_conn = keyHash("server_limit_conn");
 const H_proxy_cache_max_bytes = keyHash("proxy_cache_max_bytes");
 const H_proxy_cache_max_entries = keyHash("proxy_cache_max_entries");
 const H_listen = keyHash("listen");
@@ -135,6 +139,187 @@ const H_log = keyHash("log");
 const H_round_robin = keyHash("round_robin");
 const H_least_connections = keyHash("least_connections");
 const H_ip_hash = keyHash("ip_hash");
+
+/// Parse the listen directive value (shared by global and server-level).
+/// Sets `b.listen_port` and optionally `b.listen_spec` / `b.server_listen_spec`.
+fn parseListenValue(lx: *Lexer, b: *Builder, is_server: bool) void {
+    const first = lx.token() orelse lx.fail("listen: expected a value");
+    const raw = first.srcOf("listen");
+    if (raw.len == 0) lx.fail("listen: empty value");
+    if (raw[0] == '[') {
+        const close_bracket = mem.indexOfScalar(u8, raw, ']') orelse lx.fail("listen: missing ']'");
+        if (close_bracket + 1 >= raw.len or raw[close_bracket + 1] != ':') lx.fail("listen: expected ':port' after ']'");
+        const addr_str = raw[1..close_bracket];
+        const port_str = raw[close_bracket + 2 ..];
+        const port = std.fmt.parseInt(u16, port_str, 10) catch lx.fail("listen: invalid port");
+        const spec = sockets_mod.ListenSpec{
+            .family = .ipv6,
+            .addr = parseIpv6Addr(addr_str) orelse lx.fail("listen: invalid IPv6 address"),
+            .port = port,
+        };
+        if (is_server) {
+            b.server_listen_ports[b.current_server] = port;
+            b.server_listen_specs[b.current_server] = spec;
+        } else {
+            b.listen_port = port;
+            b.listen_spec = spec;
+        }
+        if (lx.peek() == 'i') {
+            const flag = lx.token() orelse lx.fail("listen: expected ipv6only flag");
+            const fraw = flag.srcOf("listen");
+            if (mem.eql(u8, fraw, "ipv6only=on")) {
+                if (is_server) {
+                    b.server_listen_specs[b.current_server].?.ipv6_only = true;
+                } else {
+                    b.listen_spec.?.ipv6_only = true;
+                }
+            } else if (!mem.eql(u8, fraw, "ipv6only=off")) {
+                lx.fail("listen: unknown flag");
+            }
+        }
+    } else if (mem.indexOfScalar(u8, raw, ':')) |colon| {
+        const addr_str = raw[0..colon];
+        const port_str = raw[colon + 1 ..];
+        const port = std.fmt.parseInt(u16, port_str, 10) catch lx.fail("listen: invalid port");
+        const spec = sockets_mod.ListenSpec{
+            .family = .ipv4,
+            .addr = parseIpv4Addr(addr_str) orelse lx.fail("listen: invalid IPv4 address"),
+            .port = port,
+        };
+        if (is_server) {
+            b.server_listen_ports[b.current_server] = port;
+            b.server_listen_specs[b.current_server] = spec;
+        } else {
+            b.listen_port = port;
+            b.listen_spec = spec;
+        }
+    } else {
+        const port = std.fmt.parseInt(u16, raw, 10) catch lx.fail("listen: invalid port");
+        if (is_server) {
+            b.server_listen_ports[b.current_server] = port;
+        } else {
+            b.listen_port = port;
+        }
+        if (lx.peek() == 'i') {
+            const flag = lx.token() orelse lx.fail("listen: expected ipv6only flag");
+            const fraw = flag.srcOf("listen");
+            if (mem.eql(u8, fraw, "ipv6only=on")) {
+                if (is_server) {
+                    b.server_listen_specs[b.current_server] = .{ .family = .ipv6, .port = port, .ipv6_only = true };
+                } else {
+                    b.listen_spec = .{ .family = .ipv6, .port = port, .ipv6_only = true };
+                }
+            } else if (!mem.eql(u8, fraw, "ipv6only=off")) {
+                lx.fail("listen: unknown flag");
+            }
+        }
+    }
+}
+
+/// Parse a dotted-decimal IPv4 address at comptime. Returns the 4-byte
+/// address in network byte order, or null on failure.
+fn parseIpv4Addr(s: []const u8) ?[16]u8 {
+    var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 };
+    var i: usize = 0;
+    var octet_idx: usize = 0;
+    while (octet_idx < 4) : (octet_idx += 1) {
+        if (i >= s.len) return null;
+        var val: u16 = 0;
+        var digits: usize = 0;
+        while (i < s.len and s[i] != '.') : (i += 1) {
+            if (s[i] < '0' or s[i] > '9') return null;
+            val = val * 10 + (s[i] - '0');
+            digits += 1;
+        }
+        if (digits == 0 or val > 255) return null;
+        result[12 + octet_idx] = @intCast(val);
+        if (octet_idx < 3) {
+            if (i >= s.len or s[i] != '.') return null;
+            i += 1;
+        }
+    }
+    if (i != s.len) return null;
+    return result;
+}
+
+/// Parse an IPv6 address at comptime. Returns the 16-byte address in
+/// network byte order, or null on failure. Supports full form, compressed
+/// (::), and IPv4-mapped (::ffff:a.b.c.d).
+fn parseIpv6Addr(s: []const u8) ?[16]u8 {
+    // Handle the :: compression by splitting on "::" and parsing both sides.
+    if (mem.indexOf(u8, s, "::")) |dbl| {
+        const left_str = s[0..dbl];
+        const right_str = s[dbl + 2 ..];
+        // Count groups on each side.
+        var left_groups: usize = 0;
+        if (left_str.len > 0) {
+            var tmp = left_str;
+            while (mem.indexOfScalar(u8, tmp, ':')) |pos| {
+                left_groups += 1;
+                tmp = tmp[pos + 1 ..];
+            }
+            left_groups += 1; // last group
+        }
+        var right_groups: usize = 0;
+        if (right_str.len > 0) {
+            var tmp = right_str;
+            while (mem.indexOfScalar(u8, tmp, ':')) |pos| {
+                right_groups += 1;
+                tmp = tmp[pos + 1 ..];
+            }
+            right_groups += 1;
+        }
+        const missing = 8 - left_groups - right_groups;
+        if (missing < 0) return null;
+        var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        var idx: usize = 0;
+        // Parse left groups.
+        if (left_str.len > 0) {
+            idx = parseIpv6Groups(left_str, &result, 0);
+        }
+        // Fill compressed groups with zeros.
+        for (0..missing * 2) |_| {
+            if (idx < 16) {
+                result[idx] = 0;
+                idx += 1;
+            }
+        }
+        // Parse right groups.
+        if (right_str.len > 0) {
+            _ = parseIpv6Groups(right_str, &result, idx);
+        }
+        return result;
+    }
+    // No :: — parse up to 8 hex groups.
+    var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    _ = parseIpv6Groups(s, &result, 0);
+    return result;
+}
+
+/// Parse hex groups from an IPv6 address string into `result` starting at
+/// byte offset `start`. Returns the number of bytes written.
+fn parseIpv6Groups(s: []const u8, result: *[16]u8, start: usize) usize {
+    var pos = start;
+    var i: usize = 0;
+    while (i < s.len) {
+        // Read up to 4 hex chars.
+        var val: u16 = 0;
+        var digits: usize = 0;
+        while (i < s.len and s[i] != ':') : (i += 1) {
+            const c = s[i];
+            const d = if (c >= '0' and c <= '9') c - '0' else if (c >= 'a' and c <= 'f') c - 'a' + 10 else if (c >= 'A' and c <= 'F') c - 'A' + 10 else return 0;
+            val = val * 16 + d;
+            digits += 1;
+        }
+        if (digits > 0 and pos + 1 < 16) {
+            result[pos] = @intCast(val >> 8);
+            result[pos + 1] = @intCast(val & 0xff);
+            pos += 2;
+        }
+        if (i < s.len and s[i] == ':') i += 1;
+    }
+    return pos;
+}
 
 /// A value argument as parsed: either a zero-copy slice into the conf source
 /// (unquoted tokens, quoted strings without escapes) or a reference into the
@@ -289,11 +474,13 @@ const Builder = struct {
     tls_key: Str = .{ .src = "" },
     tls_seen: bool = false,
     listen_port: ?u16 = null,
+    listen_spec: ?sockets_mod.ListenSpec = null,
     host_select: bool = true,
     server_seen: bool = false,
     /// Per-server state: accumulated across multiple server blocks.
     server_count: usize = 0,
     server_listen_ports: [max_servers]?u16 = [_]?u16{null} ** max_servers,
+    server_listen_specs: [max_servers]?sockets_mod.ListenSpec = [_]?sockets_mod.ListenSpec{null} ** max_servers,
     server_names: [max_servers]?Str = [_]?Str{null} ** max_servers,
     server_routes_start: [max_servers]usize = [_]usize{0} ** max_servers,
     /// Current server index being parsed (incremented on each `server {}`).
@@ -664,6 +851,14 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
             b.limits.connection_pool_max = lx.number(name, usize);
             lx.expectTerminator(name);
         },
+        H_max_connections => {
+            b.limits.max_connections = lx.number(name, usize);
+            lx.expectTerminator(name);
+        },
+        H_server_limit_conn => {
+            b.limits.server_limit_conn = lx.number(name, u32);
+            lx.expectTerminator(name);
+        },
         H_proxy_cache_max_bytes => {
             b.limits.proxy_cache_max_bytes = lx.size(name);
             lx.expectTerminator(name);
@@ -673,7 +868,7 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
             lx.expectTerminator(name);
         },
         H_listen => {
-            b.listen_port = lx.number(name, u16);
+            parseListenValue(lx, b, false);
             lx.expectTerminator(name);
         },
         H_host_select => {
@@ -1225,7 +1420,7 @@ fn parseServer(lx: *Lexer, b: *Builder) void {
             continue;
         }
         if (keyHash(dn) == H_listen) {
-            b.server_listen_ports[b.current_server] = lx.number("listen", u16);
+            parseListenValue(lx, b, true);
             lx.expectTerminator("listen");
             continue;
         }
@@ -1606,6 +1801,7 @@ fn build(b: *const Builder) Config {
             const end = if (i + 1 < b.server_count) b.server_routes_start[i + 1] else routes_built.len;
             items[len] = .{
                 .listen_port = b.server_listen_ports[i] orelse b.listen_port,
+                .listen_spec = b.server_listen_specs[i] orelse b.listen_spec,
                 .server_name = if (b.server_names[i]) |n| resolve(n, strings) else null,
                 .routes_start = start,
                 .routes_len = end - start,
@@ -1674,6 +1870,7 @@ fn build(b: *const Builder) Config {
             .key = resolve(b.tls_key, strings),
         },
         .listen_port = b.listen_port,
+        .listen_spec = b.listen_spec,
         .log_formats = log_table.items[0..log_table.len],
         .servers = servers_built.items[0..servers_built.len],
         .select_fn = select_fn,
@@ -2190,4 +2387,49 @@ test "conf: single server block with no server_name" {
     try testing.expectEqual(@as(usize, 1), cfg.servers.len);
     try testing.expectEqual(@as(?u16, 9000), cfg.servers[0].listen_port);
     try testing.expect(cfg.servers[0].server_name == null);
+}
+
+test "conf: listen with IPv6 bracket syntax" {
+    const cfg = parse(
+        \\listen [::]:8080;
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.listen_spec != null);
+    try testing.expect(cfg.listen_spec.?.family == .ipv6);
+    try testing.expectEqual(@as(u16, 8080), cfg.listen_spec.?.port);
+}
+
+test "conf: listen with IPv4 addr:port syntax" {
+    const cfg = parse(
+        \\listen 127.0.0.1:3000;
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.listen_spec != null);
+    try testing.expect(cfg.listen_spec.?.family == .ipv4);
+    try testing.expectEqual(@as(u16, 3000), cfg.listen_spec.?.port);
+    try testing.expectEqual(@as(u8, 127), cfg.listen_spec.?.addr[12]);
+    try testing.expectEqual(@as(u8, 1), cfg.listen_spec.?.addr[15]);
+}
+
+test "conf: listen bare port with ipv6only=on" {
+    const cfg = parse(
+        \\listen 8080 ipv6only=on;
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.listen_spec != null);
+    try testing.expect(cfg.listen_spec.?.family == .ipv6);
+    try testing.expect(cfg.listen_spec.?.ipv6_only);
+    try testing.expectEqual(@as(u16, 8080), cfg.listen_spec.?.port);
 }

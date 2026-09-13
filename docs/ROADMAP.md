@@ -48,6 +48,9 @@ Status summary (full delivery records live in `docs/milestones.md`):
 | M18 | DONE | WebSocket + connection upgrade (RFC 6455) |
 | M18.5 | DONE | Conf language, comptime-only (`-Dconfig`) |
 | B1 | DONE | Backlog batch as modules: headers, auth_basic/auth_request, limit_req/limit_conn, precompressed, proxy_cache, LB extensions + sticky; shared request memory, bounded shmem zones, per-request timeouts |
+| B2 | DONE | Reload-surviving zones + vhost readiness audit |
+| B3 | DONE | Multi-server vhost pipeline (server_name, Host matching, per-port multireactor) |
+| B4 | DONE | Connection limits + parser hardening + IPv6 listeners |
 | M19 | PLANNED | HTTP/3 + QUIC (feasibility revisited before pickup) |
 
 
@@ -91,11 +94,9 @@ byte-budgeted LRU stores; nothing grows under load):
 - Traffic mirroring (nginx `mirror`).
 - Prometheus `/metrics` endpoint and structured JSON access logs.
 - OpenTelemetry trace spans.
-- Connection limits (`max_connections`) and accept-backlog tuning.
-- HTTP parser fuzzing + request-smuggling audit (TE/CL conflicts, RFC
-  9110 §6.3).
-- gRPC proxying (on top of M16).
-- IPv6 listeners (dual-stack).
+- DONE Connection limits: `max_connections` (global ceiling) + `server_limit_conn` (per-IP cap) with shmem-backed counters.
+- DONE HTTP parser hardening: CL.TE/TE.CL smuggling rejection, duplicate Content-Length detection (RFC 9112 §3.3.3).
+- DONE IPv6 listeners (dual-stack): `listen [::]:8080;` syntax, `sockaddr_in6`, IPv4-mapped IPv6 for v4 peers, 16-byte `peer_ip` throughout.
 - DONE Multi-server blocks: multiple `server {}` blocks with per-block
   `listen` and `server_name` directives; request routing by Host header
   / SNI to the matching server's route table. Comptime `ServerSelectFn`

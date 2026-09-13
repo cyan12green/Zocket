@@ -226,6 +226,10 @@ pub const Request = struct {
     slots: []Slot = &.{},
     header_count: usize = 0,
     transfer_chunked: bool = false,
+    /// True when at least one Content-Length header has been seen. Used to
+    /// reject duplicate Content-Length headers (RFC 9112 §3.3.3) and to
+    /// detect simultaneous TE+CL (request-smuggling vector).
+    seen_content_length: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Request {
         return initWithLimits(allocator, max_headers, (limits_mod.Limits{}).max_body_spool);
@@ -270,6 +274,7 @@ pub const Request = struct {
         if (self.body_storage) |*bs| bs.reset();
         self.header_count = 0;
         self.transfer_chunked = false;
+        self.seen_content_length = false;
     }
 
     pub fn headerCount(self: *const Request) usize {
@@ -328,6 +333,9 @@ pub const Request = struct {
         const tag: HeaderTag = @enumFromInt(header_dfa.classify(n));
         switch (tag) {
             .content_length => {
+                // RFC 9112 §3.3.3: reject duplicate Content-Length headers.
+                if (self.seen_content_length) return error.Malformed;
+                self.seen_content_length = true;
                 self.content_length = std.fmt.parseInt(usize, v, 10) catch return error.Malformed;
             },
             .transfer_encoding => {
@@ -541,6 +549,10 @@ pub const Parser = struct {
                             // split CRLF remnant) is dead; clear it so the
                             // chunked states never see stale bytes.
                             self.line.clearRetainingCapacity();
+                            // RFC 9112 §3.3.3: reject requests that carry
+                            // both Transfer-Encoding and Content-Length — a
+                            // classic request-smuggling signal (CL.TE / TE.CL).
+                            if (req.transfer_chunked and req.seen_content_length) return .bad_request;
                             finalizeKeepAlive(req);
                             if (req.transfer_chunked) {
                                 self.state = .chunk_size;
@@ -1316,4 +1328,138 @@ test "partial body across recv boundaries" {
     try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
     try testing.expectEqualStrings("abcdefghij", req.body);
     try testing.expectEqual(@as(usize, 0), buf.availableRead());
+}
+
+// ── Request-smuggling defence tests ────────────────────────────────────
+
+test "CL.TE smuggling: simultaneous Content-Length + Transfer-Encoding rejected" {
+    const allocator = testing.allocator;
+    const raw = "GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nX";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.bad_request, parser.parse(buf, &req));
+}
+
+test "TE.CL smuggling: Transfer-Encoding before Content-Length rejected" {
+    const allocator = testing.allocator;
+    const raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\nabcde";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.bad_request, parser.parse(buf, &req));
+}
+
+test "duplicate Content-Length rejected" {
+    const allocator = testing.allocator;
+    const raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 5\r\n\r\nhello";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.bad_request, parser.parse(buf, &req));
+}
+
+test "duplicate Content-Length same value rejected" {
+    const allocator = testing.allocator;
+    const raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.bad_request, parser.parse(buf, &req));
+}
+
+test "CL with leading zeros is accepted" {
+    const allocator = testing.allocator;
+    const raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 005\r\n\r\nhello";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("hello", req.body);
+}
+
+test "TE obfuscation: chunked with semicolon parameters accepted" {
+    const allocator = testing.allocator;
+    const raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked;ext=val\r\n\r\n0\r\n\r\n";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(req.transfer_chunked);
+}
+
+test "TE obfuscation: multiple Transfer-Encoding values with chunked wins" {
+    const allocator = testing.allocator;
+    const raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(req.transfer_chunked);
+}
+
+test "TE identity without chunked does not trigger chunked mode" {
+    const allocator = testing.allocator;
+    const raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\nContent-Length: 5\r\n\r\nhello";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(!req.transfer_chunked);
+    try testing.expectEqualStrings("hello", req.body);
+}
+
+test "pipeline poisoning: wrong Content-Length leaves body bytes for next request" {
+    const allocator = testing.allocator;
+    // CL=3 but only 3 body bytes followed by a pipelined request.
+    // The parser should consume exactly 3 bytes; the next request
+    // remains in the buffer.
+    const raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nhelGET /second HTTP/1.1\r\nHost: x\r\n\r\n";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("hel", req.body);
+    // The remaining buffer should contain the pipelined GET request.
+    try testing.expect(buf.availableRead() > 0);
+}
+
+test "zero Content-Length POST with no body completes immediately" {
+    const allocator = testing.allocator;
+    const raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+    const buf = try fill(allocator, raw);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("", req.body);
 }

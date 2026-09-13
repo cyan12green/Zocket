@@ -176,7 +176,7 @@ pub const Session = struct {
     pub const Handler = struct {
         server: *const server_mod.Server,
         allocator: std.mem.Allocator,
-        client_ip: [4]u8 = .{ 0, 0, 0, 0 },
+        client_ip: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         stats: ?*const registry.ServerStats = null,
         static_cache: ?*static_cache_mod.StaticCache = null,
         limits: *const limits_mod.Limits,

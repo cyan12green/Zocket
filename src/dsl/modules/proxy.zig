@@ -481,9 +481,11 @@ fn pickBackend(route: *const registry.Route, upstreams: []const router.Upstream,
         .random => {
             // xorshift64* seeded from the request clock + client IP; usable
             // backends get equal probability.
-            var st = rng_state ^ now_ns ^ (@as(u64, ctx.client_ip[0]) << 24 |
-                @as(u64, ctx.client_ip[1]) << 16 | @as(u64, ctx.client_ip[2]) << 8 |
-                @as(u64, ctx.client_ip[3]));
+            var st = rng_state ^ now_ns ^ (@as(u64, ctx.client_ip[0]) << 56 |
+                @as(u64, ctx.client_ip[1]) << 48 | @as(u64, ctx.client_ip[2]) << 40 |
+                @as(u64, ctx.client_ip[3]) << 32 | @as(u64, ctx.client_ip[4]) << 24 |
+                @as(u64, ctx.client_ip[5]) << 16 | @as(u64, ctx.client_ip[6]) << 8 |
+                @as(u64, ctx.client_ip[7]));
             st ^= st >> 12;
             st ^= st << 25;
             st ^= st >> 27;
@@ -838,7 +840,7 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
     // "Host: upstream:port\r\n"
     total += 6 + up.host.len + 1 + digitCount(up.port) + 2;
     // "X-Forwarded-For: a.b.c.d\r\nX-Real-IP: a.b.c.d\r\n"
-    var ip_buf: [15]u8 = undefined;
+    var ip_buf: [48]u8 = undefined;
     const ip = fmtIp(ctx.client_ip, &ip_buf);
     total += 18 + ip.len + 2 + 11 + ip.len + 2;
 
@@ -987,27 +989,43 @@ fn digitCount(v: anytype) usize {
 }
 
 /// Format an IP address into `buf`, returning the used slice.
-fn fmtIp(ip: [4]u8, buf: []u8) []const u8 {
-    var pos: usize = 0;
-    inline for (0..4) |i| {
-        if (i > 0) {
-            buf[pos] = '.';
+/// IPv4-mapped addresses (::ffff:a.b.c.d) are formatted as dotted-decimal;
+/// full IPv6 addresses are formatted as colon-separated hex groups.
+fn fmtIp(ip: [16]u8, buf: []u8) []const u8 {
+    // IPv4-mapped: bytes 10-11 are 0xff 0xff -> dotted-decimal.
+    if (ip[10] == 0xff and ip[11] == 0xff) {
+        var pos: usize = 0;
+        inline for (0..4) |i| {
+            if (i > 0) {
+                buf[pos] = '.';
+                pos += 1;
+            }
+            const d = ip[12 + i];
+            if (d >= 100) {
+                buf[pos] = '0' + d / 100;
+                pos += 1;
+                buf[pos] = '0' + (d / 10) % 10;
+                pos += 1;
+            } else if (d >= 10) {
+                buf[pos] = '0' + d / 10;
+                pos += 1;
+            }
+            buf[pos] = '0' + d % 10;
             pos += 1;
         }
-        const d = ip[i];
-        if (d >= 100) {
-            buf[pos] = '0' + d / 100;
-            pos += 1;
-            buf[pos] = '0' + (d / 10) % 10;
-            pos += 1;
-        } else if (d >= 10) {
-            buf[pos] = '0' + d / 10;
-            pos += 1;
-        }
-        buf[pos] = '0' + d % 10;
-        pos += 1;
+        return buf[0..pos];
     }
-    return buf[0..pos];
+    // Full IPv6: hex groups separated by ':'.
+    return std.fmt.bufPrint(buf, "[{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}]", .{
+        @as(u16, ip[0]) << 8 | ip[1],
+        @as(u16, ip[2]) << 8 | ip[3],
+        @as(u16, ip[4]) << 8 | ip[5],
+        @as(u16, ip[6]) << 8 | ip[7],
+        @as(u16, ip[8]) << 8 | ip[9],
+        @as(u16, ip[10]) << 8 | ip[11],
+        @as(u16, ip[12]) << 8 | ip[13],
+        @as(u16, ip[14]) << 8 | ip[15],
+    }) catch "-";
 }
 
 // ---- upstream response reading ----
@@ -1169,7 +1187,7 @@ test "consistent_hash keeps one client on one backend" {
     defer req.deinit();
     var resp = registry.Response.init(.ok);
     var ctx = Context{ .req = &req, .resp = &resp };
-    ctx.client_ip = .{ 192, 168, 1, 7 };
+    ctx.client_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 7 };
 
     const route = registry.Route{
         .path = "/",
@@ -1193,7 +1211,7 @@ test "least_time prefers the lower EWMA and samples complete requests" {
     defer req.deinit();
     var resp = registry.Response.init(.ok);
     var ctx = Context{ .req = &req, .resp = &resp };
-    ctx.client_ip = .{ 10, 0, 0, 1 };
+    ctx.client_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
 
     const route = registry.Route{
         .path = "/",

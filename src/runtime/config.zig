@@ -3,6 +3,7 @@ const router = @import("../dsl/router.zig");
 const registry = @import("../dsl/registry.zig");
 const dsl_limits = @import("../dsl/limits.zig");
 const conf = @import("../dsl/conf.zig");
+const sockets = @import("../net/sockets.zig");
 const vars = @import("../dsl/vars.zig");
 
 pub const Route = router.Route;
@@ -39,6 +40,9 @@ pub const Config = struct {
     /// Listen port from the conf `listen` directive; null = CLI `--port`
     /// default (8080). CLI wins when both are present.
     listen_port: ?u16 = null,
+    /// Full listen specification (address family, bind address, port,
+    /// ipv6_only). When set, overrides listen_port.
+    listen_spec: ?sockets.ListenSpec = null,
     /// Named log formats (`log_format` directives); index 0 is the default
     /// `combined` when none is declared.
     log_formats: []const LogFormat = &.{},
@@ -61,6 +65,7 @@ pub const Config = struct {
     /// Per-server virtual host spec.
     pub const ServerSpec = struct {
         listen_port: ?u16 = null,
+        listen_spec: ?sockets.ListenSpec = null,
         server_name: ?[]const u8 = null,
         routes_start: usize = 0,
         routes_len: usize = 0,

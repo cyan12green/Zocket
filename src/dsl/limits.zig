@@ -41,5 +41,13 @@ pub const Limits = struct {
     static_content_cache_max: usize = 16384,
     /// Recycled connections held by the per-reactor pool.
     connection_pool_max: usize = 1024,
+    /// Global ceiling on concurrent connections across all reactor threads.
+    /// When active connections reach this limit, new accepts are closed
+    /// immediately. 0 = unlimited. nginx: worker_connections.
+    max_connections: usize = 0,
+    /// Per-IP concurrent-connection cap enforced at the server level
+    /// (across all routes). 0 = unlimited. nginx: limit_conn ... N at the
+    /// server/http scope.
+    server_limit_conn: u32 = 0,
 };
 

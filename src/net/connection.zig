@@ -32,8 +32,9 @@ pub const Connection = struct {
     /// Wheel tick the idle timer was last armed at /// lets the reactor skip the rearm when back-to-back recvs fall in the
     /// same tick.
     timer_last_tick: u64 = 0,
-    /// IPv4 address of the peer, in network byte order.
-    peer_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    /// IPv4-mapped IPv6 address of the peer, in network byte order.
+    /// IPv4 connections are stored as `::ffff:a.b.c.d` (bytes 12-15).
+    peer_ip: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     /// True when this object came from a reactor connection pool (free-list
     /// link in `next`); external connections (tests, attach path) destroy
     /// themselves on close.
@@ -46,6 +47,9 @@ pub const Connection = struct {
     write_iovs: [1]posix.iovec_const = undefined,
     /// Close deferred until the pending ring read is cancelled.
     closing: bool = false,
+    /// Server-level limit_conn hash key (0 = not tracked). Stored so the
+    /// reactor can decrement the per-IP counter on connection close.
+    server_limit_conn_key: u64 = 0,
     /// Free-list link used while the connection is pooled.
     next: ?*Connection = null,
 
@@ -106,7 +110,7 @@ pub const Connection = struct {
         self.send_buf.reset();
         self.timer = .{};
         self.timer_last_tick = 0;
-        self.peer_ip = .{ 0, 0, 0, 0 };
+        self.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         self.read_pending = false;
         self.write_pending = false;
         self.closing = false;

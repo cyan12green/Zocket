@@ -40,14 +40,14 @@ const ConnState = struct {
 };
 
 const ReqZone = shmem.MmapKeyedTable(ReqState, table_len);
-const ConnZone = shmem.MmapKeyedTable(ConnState, table_len);
+pub const ConnZone = shmem.MmapKeyedTable(ConnState, table_len);
 
 /// Per-thread shard count: matches the max reactor thread count so each
 /// reactor gets its own rate-limit bucket — zero cross-thread mutex
 /// contention on the hot path. The total rate is split evenly across shards.
 const num_shards = 8;
 var req_zones: [num_shards]ReqZone = undefined;
-var conn_zone: ConnZone = undefined;
+pub var conn_zone: ConnZone = undefined;
 var zones_initialised = false;
 
 const zone_name_req = "limit_req_zone";
@@ -81,6 +81,25 @@ pub fn lifecycleInit(_: ?*const registry.Limits) anyerror!void {
 
 pub fn lifecycleDeinit() void {
     // Zone memory is managed by the global registry; nothing to free here.
+}
+
+/// Ensure the conn_zone is initialised. Called by the reactor when
+/// `server_limit_conn > 0` so the zone exists before the first connection.
+pub fn ensureConnZoneInit() void {
+    if (zones_initialised) return;
+    lifecycleInit(null) catch return;
+}
+
+/// Hash a client IP for server-level limit_conn tracking (FNV-1a, same
+/// algorithm as hashKey but without needing a Context).
+pub fn hashClientIp(ip: [16]u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (ip) |b| {
+        h ^= b;
+        h *%= 0x100000001b3;
+        h ^= 0x2e;
+    }
+    return h;
 }
 
 const limit_lifecycle = registry.Lifecycle{
@@ -216,7 +235,7 @@ const Case = struct {
     ctx: Context,
 };
 
-fn makeCtx(c: *Case, ip: [4]u8, now_ns: u64) void {
+fn makeCtx(c: *Case, ip: [16]u8, now_ns: u64) void {
     c.req = Request.init(testing.allocator);
     c.resp = Response.init(.ok);
     c.ctx = Context{ .req = &c.req, .resp = &c.resp };
@@ -229,7 +248,7 @@ test "limit_req admits the burst then sheds load, recovering over time" {
     // for the burst test to work cleanly. Each shard gets rate/num_shards.
     const route = Route{ .path = "/", .limit_req_rate = 800, .limit_req_burst = 80 };
     var c1: Case = undefined;
-    makeCtx(&c1, .{ 1, 2, 3, 4 }, T0);
+    makeCtx(&c1, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4 }, T0);
     defer c1.req.deinit();
     const ctx = &c1.ctx;
     ctx.route = &route;
@@ -254,7 +273,7 @@ test "limit_req admits the burst then sheds load, recovering over time" {
 test "limit_req passes through when unconfigured" {
     const route = Route{ .path = "/" };
     var c1: Case = undefined;
-    makeCtx(&c1, .{ 9, 9, 9, 9 }, T0);
+    makeCtx(&c1, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 9, 9, 9, 9 }, T0);
     defer c1.req.deinit();
     c1.ctx.route = &route;
     try testing.expectEqual(Action.pass, try runReq(&c1.ctx));
@@ -265,13 +284,13 @@ test "limit_conn caps concurrency and releases through the log phase" {
     const other = Route{ .path = "/", .limit_conn_max = 0 };
 
     var a: Case = undefined;
-    makeCtx(&a, .{ 5, 5, 5, 5 }, T0);
+    makeCtx(&a, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 5, 5, 5, 5 }, T0);
     defer a.req.deinit();
     var b: Case = undefined;
-    makeCtx(&b, .{ 5, 5, 5, 5 }, T0);
+    makeCtx(&b, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 5, 5, 5, 5 }, T0);
     defer b.req.deinit();
     var c: Case = undefined;
-    makeCtx(&c, .{ 5, 5, 5, 5 }, T0);
+    makeCtx(&c, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 5, 5, 5, 5 }, T0);
     defer c.req.deinit();
     a.ctx.route = &route;
     b.ctx.route = &route;
@@ -292,7 +311,7 @@ test "limit_conn caps concurrency and releases through the log phase" {
 
     // Unconfigured routes never engage (and never hold slots).
     var d: Case = undefined;
-    makeCtx(&d, .{ 6, 6, 6, 6 }, T0);
+    makeCtx(&d, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 6, 6, 6, 6 }, T0);
     defer d.req.deinit();
     d.ctx.route = &other;
     try testing.expectEqual(Action.pass, try runConn(&d.ctx));
@@ -301,10 +320,10 @@ test "limit_conn caps concurrency and releases through the log phase" {
 test "different client keys have independent budgets" {
     const route = Route{ .path = "/", .limit_req_rate = 800, .limit_req_burst = 8 };
     var a: Case = undefined;
-    makeCtx(&a, .{ 10, 0, 0, 1 }, T0);
+    makeCtx(&a, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 }, T0);
     defer a.req.deinit();
     var b: Case = undefined;
-    makeCtx(&b, .{ 10, 0, 0, 2 }, T0);
+    makeCtx(&b, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 2 }, T0);
     defer b.req.deinit();
     a.ctx.route = &route;
     b.ctx.route = &route;

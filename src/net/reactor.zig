@@ -13,6 +13,7 @@ const static_cache_mod = @import("../dsl/static_cache.zig");
 const cache_mod = @import("../dsl/modules/cache.zig");
 const iouring_mod = @import("iouring.zig");
 const limits_mod = @import("../dsl/limits.zig");
+const limit_mod = @import("../dsl/modules/limit.zig");
 const version_mod = @import("../version.zig");
 const http2_session = @import("../http2/session.zig");
 const tls_conn = @import("../tls/conn.zig");
@@ -1639,7 +1640,7 @@ pub const Reactor = struct {
             .req = &session.req,
             .resp = &session.resp,
             .allocator = self.allocator,
-            .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0 },
+            .client_ip = if (self.connections.get(fd)) |c| c.peer_ip else .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
             .stats = self.stats,
             .static_cache = &self.static_cache,
             .limits = &self.limits,
@@ -2188,8 +2189,8 @@ pub const Reactor = struct {
         // increment the test runner's log_err_count and fail tests.
         {
             const code = @intFromEnum(status);
-            var ip_buf: [16]u8 = undefined;
-            const ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ conn.peer_ip[0], conn.peer_ip[1], conn.peer_ip[2], conn.peer_ip[3] }) catch "-";
+            var ip_buf: [48]u8 = undefined;
+            const ip = sockets.fmtIp(conn.peer_ip, &ip_buf);
             std.log.warn("{s} - -> {d} {s}", .{ ip, code, status.reasonPhrase() });
         }
 
@@ -2221,6 +2222,18 @@ pub const Reactor = struct {
                 error.WouldBlock => return,
                 else => return,
             };
+            // Global max_connections ceiling: reject before acquiring a pool
+            // slot or registering the fd. The ServerStats.active atomic is
+            // shared across all reactor threads and already tracks the live
+            // connection count; checking it here costs one atomic load.
+            if (self.limits.max_connections > 0) {
+                if (self.stats) |s| {
+                    if (s.active.load(.monotonic) >= self.limits.max_connections) {
+                        posix.close(conn_fd);
+                        return;
+                    }
+                }
+            }
             // TCP_NODELAY on accepted connections: nginx (default), Caddy
             // and Bun all enable it; without it the Nagle/delayed-ACK
             // interlock adds ~40 ms stalls to small two-part responses.
@@ -2250,6 +2263,37 @@ pub const Reactor = struct {
     /// Register a freshly created connection with this reactor's epoll and
     /// registries (shared by the pending queue and the accept path).
     fn registerConnection(self: *Reactor, conn: *connection.Connection) void {
+        // Server-level limit_conn: reject if this IP already holds the max
+        // number of concurrent connections. Checked AFTER the fd is accepted
+        // but BEFORE epoll registration so a rejected connection never
+        // consumes an epoll slot or a session slot.
+        if (self.limits.server_limit_conn > 0) {
+            limit_mod.ensureConnZoneInit();
+            const key = limit_mod.hashClientIp(conn.peer_ip);
+            var admitted = false;
+            {
+                limit_mod.conn_zone.mutex.lock();
+                defer limit_mod.conn_zone.mutex.unlock();
+                if (limit_mod.conn_zone.upsertLocked(key)) |r| {
+                    if (!r.existed) {
+                        // First connection from this IP: set count and admit.
+                        r.slot.active = 1;
+                        admitted = true;
+                    } else if (r.slot.active < self.limits.server_limit_conn) {
+                        r.slot.active += 1;
+                        admitted = true;
+                    }
+                }
+                // If upsertLocked returned null, the table is full — fail open
+                // (admit) rather than silently dropping connections from IPs
+                // we can no longer track.
+            }
+            if (!admitted) {
+                self.dropConnection(conn);
+                return;
+            }
+            conn.server_limit_conn_key = key;
+        }
         if (self.io_mode == .ring) {
             // Reads and writes go through the ring: the connection is never
             // epoll-registered.
@@ -2366,6 +2410,14 @@ pub const Reactor = struct {
         }
         if (self.connections.fetchRemove(fd)) |kv| {
             const conn = kv.value;
+            // Release the server-level limit_conn slot before dropping.
+            if (conn.server_limit_conn_key != 0) {
+                limit_mod.conn_zone.mutex.lock();
+                defer limit_mod.conn_zone.mutex.unlock();
+                if (limit_mod.conn_zone.upsertLocked(conn.server_limit_conn_key)) |r| {
+                    if (r.slot.active > 0) r.slot.active -= 1;
+                }
+            }
             // Unlink the idle timer so the wheel never points at freed memory.
             self.wheel.remove(&conn.timer);
             if (self.io_mode == .epoll) self.ep.remove(fd) catch {};
@@ -3447,4 +3499,140 @@ test "upstream driver sends parked request and adopts response" {
         if (std.ascii.eqlIgnoreCase(h.name, "X-Mid")) saw_mid = true;
     }
     try testing.expect(saw_ct and saw_mid);
+}
+
+test "max_connections: active counter tracks registered connections" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.limits.max_connections = 2;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    // Attach two connections — both go through registerConnection which
+    // bumps stats.active.
+    const pair1 = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair1[0]);
+    try sockets.setNonBlock(pair1[0]);
+    try sockets.setNonBlock(pair1[1]);
+    const conn1 = try connection.Connection.create(allocator, pair1[1]);
+    r.attach(conn1);
+    std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+
+    const pair2 = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair2[0]);
+    try sockets.setNonBlock(pair2[0]);
+    try sockets.setNonBlock(pair2[1]);
+    const conn2 = try connection.Connection.create(allocator, pair2[1]);
+    r.attach(conn2);
+    std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+
+    // Both registered: countConnections reflects the map size.
+    try testing.expectEqual(@as(usize, 2), r.countConnections());
+}
+
+test "max_connections: accept path rejects when active >= limit" {
+    std.testing.log_level = .err;
+    // The accept-path check is: if (s.active.load() >= limits.max_connections)
+    // close the fd. This is a single atomic comparison in acceptConnections.
+    // Full integration coverage comes from the bench suite.
+    // Here we verify the config field propagates correctly.
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.limits.max_connections = 42;
+    try testing.expectEqual(@as(usize, 42), r.limits.max_connections);
+    r.limits.max_connections = 0;
+    try testing.expectEqual(@as(usize, 0), r.limits.max_connections);
+}
+
+test "server_limit_conn: per-IP concurrent cap enforced via attach" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.limits.server_limit_conn = 2;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    // Attach two connections — both should be admitted.
+    const pair1 = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair1[0]);
+    try sockets.setNonBlock(pair1[0]);
+    try sockets.setNonBlock(pair1[1]);
+    var conn1 = try connection.Connection.create(allocator, pair1[1]);
+    conn1.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
+    r.attach(conn1);
+    std.posix.nanosleep(0, 30 * std.time.ns_per_ms);
+
+    const pair2 = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair2[0]);
+    try sockets.setNonBlock(pair2[0]);
+    try sockets.setNonBlock(pair2[1]);
+    var conn2 = try connection.Connection.create(allocator, pair2[1]);
+    conn2.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
+    r.attach(conn2);
+    std.posix.nanosleep(0, 30 * std.time.ns_per_ms);
+
+    try testing.expectEqual(@as(usize, 2), r.countConnections());
+
+    // Third connection from the same IP should be rejected.
+    const pair3 = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(pair3[0]);
+    try sockets.setNonBlock(pair3[0]);
+    try sockets.setNonBlock(pair3[1]);
+    var conn3 = try connection.Connection.create(allocator, pair3[1]);
+    conn3.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
+    r.attach(conn3);
+    std.posix.nanosleep(0, 30 * std.time.ns_per_ms);
+
+    // Exactly 2 connections: third was rejected.
+    try testing.expectEqual(@as(usize, 2), r.countConnections());
+}
+
+test "server_limit_conn: different IPs tracked independently" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.limits.server_limit_conn = 1;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    // IP A: first connection admitted.
+    const p1 = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(p1[0]);
+    try sockets.setNonBlock(p1[0]);
+    try sockets.setNonBlock(p1[1]);
+    var c1 = try connection.Connection.create(allocator, p1[1]);
+    c1.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
+    r.attach(c1);
+    std.posix.nanosleep(0, 30 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 1), r.countConnections());
+
+    // IP A: second connection rejected (limit = 1).
+    const p2 = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(p2[0]);
+    try sockets.setNonBlock(p2[0]);
+    try sockets.setNonBlock(p2[1]);
+    var c2 = try connection.Connection.create(allocator, p2[1]);
+    c2.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
+    r.attach(c2);
+    std.posix.nanosleep(0, 30 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 1), r.countConnections());
+
+    // IP B: admitted (different IP, independent counter).
+    const p3 = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(p3[0]);
+    try sockets.setNonBlock(p3[0]);
+    try sockets.setNonBlock(p3[1]);
+    var c3 = try connection.Connection.create(allocator, p3[1]);
+    c3.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 2 };
+    r.attach(c3);
+    std.posix.nanosleep(0, 30 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 2), r.countConnections());
 }

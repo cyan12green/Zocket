@@ -25,10 +25,33 @@ fn run(ctx: *Context) anyerror!Action {
     const severity: Severity = if (code >= 500) .err else if (code >= 400) .warn else .info;
     if (@intFromEnum(severity) > @intFromEnum(severity_threshold)) return .pass;
 
-    var ip_buf: [16]u8 = undefined;
+    var ip_buf: [48]u8 = undefined;
     var ip: []const u8 = "-";
-    if (ctx.client_ip[0] != 0 or ctx.client_ip[1] != 0 or ctx.client_ip[2] != 0 or ctx.client_ip[3] != 0) {
-        ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ctx.client_ip[0], ctx.client_ip[1], ctx.client_ip[2], ctx.client_ip[3] }) catch "-";
+    // Check if any non-zero bytes exist (non-empty peer IP).
+    var nonzero = false;
+    for (ctx.client_ip) |b| {
+        if (b != 0) {
+            nonzero = true;
+            break;
+        }
+    }
+    if (nonzero) {
+        // IPv4-mapped: bytes 10-11 are 0xff 0xff -> dotted-decimal.
+        if (ctx.client_ip[10] == 0xff and ctx.client_ip[11] == 0xff) {
+            ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ctx.client_ip[12], ctx.client_ip[13], ctx.client_ip[14], ctx.client_ip[15] }) catch "-";
+        } else {
+            // Full IPv6: hex groups separated by ':'.
+            ip = std.fmt.bufPrint(&ip_buf, "[{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}]", .{
+                @as(u16, ctx.client_ip[0]) << 8 | ctx.client_ip[1],
+                @as(u16, ctx.client_ip[2]) << 8 | ctx.client_ip[3],
+                @as(u16, ctx.client_ip[4]) << 8 | ctx.client_ip[5],
+                @as(u16, ctx.client_ip[6]) << 8 | ctx.client_ip[7],
+                @as(u16, ctx.client_ip[8]) << 8 | ctx.client_ip[9],
+                @as(u16, ctx.client_ip[10]) << 8 | ctx.client_ip[11],
+                @as(u16, ctx.client_ip[12]) << 8 | ctx.client_ip[13],
+                @as(u16, ctx.client_ip[14]) << 8 | ctx.client_ip[15],
+            }) catch "-";
+        }
     }
     var line_buf: [512]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "[{s}] {s} {s} {s} -> {d} {s}\n", .{

@@ -169,15 +169,33 @@ fn runServer(
     var reactors_len: usize = 0;
     errdefer for (reactors_buf[0..reactors_len]) |*r| r.deinit();
     for (ports) |p| {
-        reactors_buf[reactors_len] = try zocket.multireactor.Server.initWithThreadsAndHandlerGroup(
-            allocator,
-            p,
-            n,
-            opts.mode,
-            &http_group.servers[0],
-            &http_group,
-            opts.idle_timeout,
-        );
+        // Use ListenSpec when available (IPv6 / address-bound), fall back to
+        // the legacy port-only path for backward compatibility.
+        const spec: ?zocket.sockets.ListenSpec = if (embedded) |cfg|
+            if (cfg.listen_spec) |s| s else .{ .port = p }
+        else
+            .{ .port = p };
+        if (spec) |s| {
+            reactors_buf[reactors_len] = try zocket.multireactor.Server.initWithThreadsAndSpec(
+                allocator,
+                s,
+                n,
+                opts.mode,
+                &http_group.servers[0],
+                &http_group,
+                opts.idle_timeout,
+            );
+        } else {
+            reactors_buf[reactors_len] = try zocket.multireactor.Server.initWithThreadsAndHandlerGroup(
+                allocator,
+                p,
+                n,
+                opts.mode,
+                &http_group.servers[0],
+                &http_group,
+                opts.idle_timeout,
+            );
+        }
         reactors_len += 1;
     }
     defer for (reactors_buf[0..reactors_len]) |*r| r.deinit();

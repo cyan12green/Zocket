@@ -159,6 +159,69 @@ pub const Server = struct {
         self.reactors.deinit(self.allocator);
     }
 
+    /// Like `initWithThreadsAndHandlerGroup`, but accepts a full `ListenSpec`
+    /// for IPv6 / address-bound listeners.
+    pub fn initWithThreadsAndSpec(
+        allocator: std.mem.Allocator,
+        spec: sockets.ListenSpec,
+        n_threads: usize,
+        mode: reactor.Mode,
+        http_handler: ?*const runtime_server.Server,
+        server_group: ?*const runtime_server.ServerGroup,
+        idle_timeout_seconds: u32,
+    ) !Server {
+        const n = @max(n_threads, 1);
+
+        const stop_ev = try eventfd.EventFd.create();
+        errdefer stop_ev.close();
+
+        var reactors_list = std.ArrayList(*reactor.Reactor).empty;
+        var listeners = std.ArrayList(posix.fd_t).empty;
+        {
+            errdefer {
+                for (reactors_list.items) |r| r.deinit();
+                reactors_list.deinit(allocator);
+                for (listeners.items) |l| posix.close(l);
+                listeners.deinit(allocator);
+            }
+            try reactors_list.ensureTotalCapacity(allocator, n);
+            try listeners.ensureTotalCapacity(allocator, n);
+            var shared_accepted = std.atomic.Value(usize).init(0);
+            for (0..n) |i| {
+                const listener = try sockets.createListeningSocketFromSpec(spec, 4096, true);
+                listeners.appendAssumeCapacity(listener);
+                const r = try allocator.create(reactor.Reactor);
+                const init_res = reactor.Reactor.initWithHandlerGroup(allocator, i, mode, http_handler, server_group, idle_timeout_seconds, listener) catch |e| {
+                    allocator.destroy(r);
+                    return e;
+                };
+                r.* = init_res;
+                r.accepted_counter = &shared_accepted;
+                reactors_list.appendAssumeCapacity(r);
+            }
+        }
+        // Server doesn't store the listener fds — they live inside each
+        // reactor.  Free the tracking list (but not the fds).
+        listeners.deinit(allocator);
+        const accepted_counter = try allocator.create(std.atomic.Value(usize));
+        accepted_counter.* = .init(0);
+        var self = Server{
+            .allocator = allocator,
+            .port = spec.port,
+            .stop_ev = stop_ev,
+            .reactors = reactors_list,
+            .running = std.atomic.Value(bool).init(false),
+            .total_accepted = accepted_counter,
+            .mode = mode,
+            .http_handler = http_handler,
+            .server_group = server_group,
+            .idle_timeout_seconds = idle_timeout_seconds,
+            .draining = .empty,
+        };
+        for (self.reactors.items) |r| r.accepted_counter = accepted_counter;
+        return self;
+    }
+
     pub fn threadCount(self: *const Server) usize {
         return self.reactors.items.len;
     }

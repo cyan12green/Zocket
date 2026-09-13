@@ -13,6 +13,8 @@ on every measured workload.
 - **10-phase module pipeline** — handlers, filters, upstreams; comptime dispatch specialisation; prefix/exact/regex routing
 - **Modules** — static files + sendfile, reverse proxy (round-robin / least-conn / ip_hash / consistent_hash / least_time), sticky sessions, response cache, gzip, conditional GET, auth_basic, auth_request, rate limiting, header manipulation, precompressed serving, access/error logs, stub_status
 - **Virtual hosts** — multiple `server {}` blocks with `server_name` (exact + wildcard), per-port multireactor threads, comptime Host matching
+- **IPv6** — dual-stack listeners (`listen [::]:8080;`), IPv4-mapped IPv6 for v4 clients, `IPV6_V6ONLY` control
+- **Connection limits** — `max_connections` global ceiling, `server_limit_conn` per-IP cap
 - **Operations** — daemon mode (`--start/--stop/--status`), zero-downtime config reload (`--reload-hard`), graceful shutdown
 
 ## Quick start
@@ -37,7 +39,7 @@ precompressed 1.6x over nginx. Full methodology: [`bench/BENCH.md`](bench/BENCH.
 ## Development
 
 ```sh
-zig build test                                     # 342 tests
+zig build test                                     # 358 tests
 zig build h2test                                   # HTTP/2 conformance (curl + h2spec)
 bash bench/bench.sh <binary> <tag>                 # benchmark
 bash bench/compare-servers.sh                      # vs nginx/actix/Bun/Caddy/httpx

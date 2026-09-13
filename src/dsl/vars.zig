@@ -339,8 +339,30 @@ fn getBuiltin(ctx: *Context, id: VarId, scratch: *GetterScratch) []const u8 {
         .body_bytes_sent, .bytes => return scratch.fmt("{d}", .{ctx.resp.body.len}),
         .remote_addr, .ip => {
             const ip = ctx.client_ip;
-            if (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0) return "-";
-            return scratch.fmt("{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+            // Check for all-zero (no peer).
+            var nonzero = false;
+            for (ip) |b| {
+                if (b != 0) {
+                    nonzero = true;
+                    break;
+                }
+            }
+            if (!nonzero) return "-";
+            // IPv4-mapped: bytes 10-11 are 0xff 0xff -> dotted-decimal.
+            if (ip[10] == 0xff and ip[11] == 0xff) {
+                return scratch.fmt("{d}.{d}.{d}.{d}", .{ ip[12], ip[13], ip[14], ip[15] });
+            }
+            // Full IPv6.
+            return scratch.fmt("[{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}]", .{
+                @as(u16, ip[0]) << 8 | ip[1],
+                @as(u16, ip[2]) << 8 | ip[3],
+                @as(u16, ip[4]) << 8 | ip[5],
+                @as(u16, ip[6]) << 8 | ip[7],
+                @as(u16, ip[8]) << 8 | ip[9],
+                @as(u16, ip[10]) << 8 | ip[11],
+                @as(u16, ip[12]) << 8 | ip[13],
+                @as(u16, ip[14]) << 8 | ip[15],
+            });
         },
         .remote_port => return "-", // not tracked on Context yet (plan §5.2)
         .server_protocol => return switch (req.version.major) {

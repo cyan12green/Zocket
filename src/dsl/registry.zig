@@ -158,7 +158,7 @@ pub const Context = struct {
     last_modified: ?[]const u8 = null,
     /// IPv4 address of the client (network byte order), for proxy headers
     /// Zeroes when unknown (socketpair tests).
-    client_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    client_ip: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     /// Shared server counters for the stub status page,
     /// updated atomically by the reactors.
     stats: ?*const ServerStats = null,

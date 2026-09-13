@@ -101,6 +101,19 @@ Filters (run after every outcome, reverse declaration order):
 Zone sizing (in `limits` section): `proxy_cache_max_bytes` (32 MiB),
 `proxy_cache_max_entries` (256).
 
+### Listen directive
+
+| Syntax | Description |
+|---|---|
+| `listen 8080;` | Bind to all interfaces on port 8080 (IPv4). |
+| `listen [::]:8080;` | Bind to all interfaces on port 8080 (IPv6, dual-stack). |
+| `listen 127.0.0.1:3000;` | Bind to a specific IPv4 address and port. |
+| `listen 8080 ipv6only=on;` | Bare port with IPv6-only flag (no IPv4-mapped). |
+
+The `listen` directive is valid in `server {}` blocks. If omitted, defaults
+to port 8080 on all interfaces. IPv6 addresses use bracket syntax (`[addr]:port`).
+The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
+
 ### Limits & buffers
 
 | Directive | Syntax | Default | Description |
@@ -112,6 +125,8 @@ Zone sizing (in `limits` section): `proxy_cache_max_bytes` (32 MiB),
 | `recv_buffer_size` | `recv_buffer_size size;` | 16k | Per-connection recv buffer. |
 | `send_buffer_size` | `send_buffer_size size;` | 16k | Per-connection send buffer. |
 | `connection_pool_max` | `connection_pool_max number;` | 1024 | Max pooled connections per reactor. |
+| `max_connections` | `max_connections number;` | 0 | Global ceiling on concurrent connections. 0 = unlimited. New accepts are rejected when active connections reach this limit. |
+| `server_limit_conn` | `server_limit_conn number;` | 0 | Per-IP concurrent-connection cap at the server level (across all routes). 0 = unlimited. |
 | `proxy_cache_max_bytes` | `proxy_cache_max_bytes size;` | 32m | mmap zone size for response cache entries. |
 | `proxy_cache_max_entries` | `proxy_cache_max_entries number;` | 256 | Max distinct URL cache slots. |
 | `client_header_timeout` | `client_header_timeout seconds;` | 10 | Total time for request line + headers (anti-slowloris). 0 disables. |
