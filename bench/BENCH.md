@@ -2,140 +2,135 @@
 
 Methodology, commands, and results for Zocket performance benchmarks.
 
-## Quick reference
+## Quick start
 
 ```bash
-# Server binaries
-zig build run -- --single                    # single-threaded echo
-zig build run -- --echo                      # multi-reactor echo
-zig build -Dconfig=config.example.conf run   # multi-reactor HTTP
-zig build run -- --http                      # multi-reactor HTTP (minimal)
+# Run the full comparison suite and generate graphs
+python3 bench/graphs.py --run
 
-# Benchmarks
-bash bench/bench.sh  zig-out/bin/zocket "echo"      # echo sweep
-bash bench/bench.sh  zig-out/bin/zocket "http"       # HTTP sweep
-bash bench/bench2.sh zig-out/bin/zocket "echo"       # true-capacity echo
-bash bench/http-check.py 8080                        # validate HTTP responses
+# Or run individual benchmarks
+bash bench/compare-servers.sh --matrix              # echo sweep
+bash bench/compare-servers.sh --static "1024 1048576"  # file serving
+bash bench/backlog-bench.sh                         # module-level
+bash bench/unified.sh                               # unified web/file/LB
 
-# Results
-bench/summarize.py       # echo + HTTP summary
-bench/summarize2.py      # true-capacity summary
+# Generate graphs from stored results
+python3 bench/graphs.py
+python3 bench/graphs_backlog.py
+python3 bench/unified_graphs.py
+python3 bench/graphs_readme.py
 ```
 
-## Parameters
+## Methodology
 
-| Parameter | Values |
-|---|---|
-| Payloads | 100B, 1KB, 10KB, 100KB, 1MB |
-| Connections | 50, 100, 500, 1000, 5000, 10000 |
-| Concurrency | 64 (default bombardier; 100 for true-capacity) |
+- **Process isolation**: `--rep-label N` starts a fresh server per rep; no shared in-memory state
+- **Interleaved A/B**: reps alternate between servers to cancel thermal/load drift
+- **Port-bias correction**: layout B swaps ports and repeats
+- **Same binary**: `-Doptimize=ReleaseFast` built once, used for all reps
+- ** bombardier**: HTTP/1.1 load generator, measures p50/p95/p99 latency + throughput
 
-## Key flags
+## Echo matrix (POST, req/s)
 
-- `--rep-label N` — process-level isolation, no shared state with other reps
-- `-Doptimize=ReleaseFast` — must use same binary for A and B
-- Run on same machine/load/thermal state for A vs B comparison
+Six servers: Zocket, actix-web, Bun.serve, httpx.zig, nginx, Caddy.
+Body sizes 1 KB / 8 KB / 64 KB × connections 10 / 100 / 1000.
 
-## How it works
+![Matrix 1 KB](bench/graphs/matrix_1024.png)
+![Matrix 8 KB](bench/graphs/matrix_8192.png)
+![Matrix 64 KB](bench/graphs/matrix_65536.png)
 
-1. Build server binary once, use identical binary across all A/B reps
-2. Run A and B in interleaved reps (`--rep-label 1` A, `--rep-label 1` B, ...)
-3. Each rep starts fresh server process; no shared in-memory state
-4. `bombardier` measures p50/p95/p99 latency + throughput
-5. `summarize.py` / `summarize2.py` aggregate across reps
+### Results table (req/s × 1000)
 
-## Results (2026-09-07)
+| Body | Conns | Zocket | actix | Bun | httpx | nginx | Caddy |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 KB | 10 | 117.4 | 82.8 | 50.3 | 2.6 | 62.5 | 31.1 |
+| 1 KB | 100 | 195.9 | 158.0 | 43.1 | 2.8 | 114.0 | 35.7 |
+| 1 KB | 1000 | 157.5 | 123.9 | 36.9 | 2.6 | 47.0 | 36.1 |
+| 8 KB | 10 | 56.0 | 38.4 | 34.4 | 2.6 | 45.8 | 17.9 |
+| 8 KB | 100 | 105.8 | 82.8 | 30.2 | 2.4 | 37.0 | 8.7 |
+| 8 KB | 1000 | 63.8 | 80.4 | 39.5 | 3.5 | 44.3 | 5.3 |
+| 64 KB | 10 | 26.9 | 29.6 | 16.6 | 2.7 | 20.7 | 6.0 |
+| 64 KB | 100 | 23.2 | 18.0 | 11.6 | 1.9 | 24.4 | 7.3 |
+| 64 KB | 1000 | 16.0 | 14.2 | 14.3 | 2.2 | 15.2 | 9.0 |
 
-**Test environment:** 8-core Intel, Linux, Zig 0.16.0-dev
+## Static file serving (GET, req/s)
 
-### Echo performance (req/s × 1000)
+1 KB and 1 MB files, 100 / 1000 connections. `tcp_nopush on` enables TCP_CORK
+to batch the HTTP head + sendfile body into one TCP segment.
 
-| Payload | 50 conns | 100 conns | 1k conns | 5k conns |
-|---|---|---|---|---|
-| 100B  | 467.3  | 627.4  | 1,007.3 | 965.8  |
-| 1KB   | 363.9  | 500.3  | 855.3   | 852.2  |
-| 10KB  | 138.0  | 171.2  | 220.8   | 217.3  |
-| 100KB | 20.0   | 21.3   | 22.5    | 21.7   |
+![Static serving](bench/graphs/static.png)
 
-### HTTP performance (req/s × 1000)
+| File | Conns | Zocket | nginx | Ratio |
+|---|---|---:|---:|---:|
+| 1 KB | 100 | 168,740 | 131,179 | 1.29x |
+| 1 KB | 1000 | 165,241 | 107,472 | 1.54x |
+| 1 MB | 100 | 8,203 | 8,308 | 0.99x |
+| 1 MB | 1000 | 8,485 | 5,813 | 1.46x |
 
-| Payload | 50 conns | 100 conns | 1k conns | 5k conns |
-|---|---|---|---|---|
-| 100B  | 393.8  | 434.8  | 429.5   | 392.5  |
-| 1KB   | 310.3  | 438.6  | 551.3   | 398.9  |
-| 10KB  | 125.6  | 164.6  | 190.4   | 169.8  |
-| 100KB | 19.7   | 21.4   | 22.7    | 21.0   |
+## Zocket vs nginx (all cells)
 
-### Zocket vs nginx
+Head-to-head across every workload: echo, static, and per-request cost.
 
-| Metric | Zocket | nginx | Difference |
-|---|---|---|---|
-| Throughput (50B) | 235,256 req/s | 129,903 req/s | +81.1% |
-| Throughput (100B) | 345,862 req/s | 194,189 req/s | +78.1% |
-| Throughput (1KB) | 170,598 req/s | 103,936 req/s | +64.1% |
-| Throughput (10KB) | 34,395 req/s | 18,224 req/s | +88.7% |
-| Throughput (100KB) | 3,199 req/s | 2,174 req/s | +47.2% |
-| Per-request cost (100B) | 2.89 μs | 5.15 μs | -43.9% |
-| Per-request cost (1KB) | 5.86 μs | 9.62 μs | -39.1% |
+![Zocket vs nginx](bench/graphs/nginx_compare.png)
 
-## Full-rep results (6 reps, process-isolated)
+## Backlog modules vs nginx
 
-Zocket leads every payload × concurrency cell across 6 alternating reps:
+Module-level comparison on feature-specific endpoints (100 conns, interleaved reps).
 
-| Payload | Conns | Zocket median | nginx median | Zocket advantage |
-|---|---|---|---|---|
-| 100B, 50c | 1,007,330 | 627,431 | +60.5% |
-| 100B, 100c | 852,161 | 625,564 | +36.2% |
-| 1KB, 50c | 855,284 | 500,314 | +71.0% |
-| 1KB, 100c | 551,256 | 438,618 | +25.7% |
-| 10KB, 50c | 220,838 | 171,171 | +29.0% |
-| 10KB, 100c | 190,438 | 164,642 | +15.7% |
-| 100KB, 50c | 22,739 | 21,418 | +6.2% |
-| 100KB, 100c | 22,491 | 21,376 | +5.2% |
+![Backlog modules](bench/graphs/backlog_compare.png)
 
-All multi-rep tests used `--rep-label` for process-level isolation. Same binary,
-same machine, same thermal state. Interleaved A/B reps.
+| Cell | Zocket | nginx | Ratio |
+|---|---:|---:|---:|
+| headers (3 ops/req) | 203,785 | 165,839 | 1.23x |
+| auth_basic ({SHA}) | 187,948 | 151,218 | 1.24x |
+| precompressed (.gz 8K) | 161,937 | 113,205 | 1.43x |
+| proxy_cache (HIT) | 56,968 | 150,208 | 0.38x |
+| limit_req (pass-through) | 208,278 | 200,008 | 1.04x |
 
-## True-capacity echo (`bench2.sh`)
+## Unified benchmark (web/file/LB)
 
-Uses `bench2.sh` with the true-capacity echo client. Key differences from `bench.sh`:
-binary search finds max throughput before saturation, reports req/s + p50/p95/p99 latency.
+All servers co-resident: Zocket, nginx, HAProxy. 8 workload cells.
 
-```bash
-bash bench/bench2.sh zig-out/bin/zocket echo --extra "--threads 4"
-```
+![Unified](bench/graphs/unified_web.png)
 
-## Cross-language matrix
+| Cell | Zocket | nginx | HAProxy |
+|---|---:|---:|---:|
+| h1_echo | 206,930 | 136,046 | — |
+| static_small | 182,081 | 114,375 | — |
+| static_large | 9,784 | 9,575 | — |
+| precompressed | 176,502 | 119,872 | — |
+| headers_ops | 217,990 | 188,421 | — |
+| auth_basic | 196,403 | 160,050 | — |
+| cache_hit | 211,259 | 159,427 | — |
+| lb_rr | 215,242 | 71,347 | 73,152 |
 
-```bash
-bash bench/compare-servers.sh          # single-cell
-bash bench/compare-servers.sh --matrix # payload × concurrency
-bash bench/compare-servers.sh --static "1024 1048576"
-bash bench/compare-servers.sh --conns-list "50 100 200 400 800 1000 2000 5000 10000 12000"
-```
+## HTTP/2 (h2c, h2load)
 
-C++-compiled harness for zero-tool overhead. Servers: nginx, Caddy, actix-web,
-Bun.serve, httpx (Zig), Zocket. Verify HTTP before benching: `bench/http-check.py`.
+![H2 compare](bench/graphs/h2_compare.png)
+
+## HTTP/2 over TLS
+
+![TLS compare](bench/graphs/tls_compare.png)
+
+## Chunked transfer
+
+![Chunked compare](bench/graphs/chunked_compare.png)
 
 ## Reproduce
 
 ```bash
-# Build
+# Full suite (matrix + static + graphs)
+python3 bench/graphs.py --run
+
+# Individual benchmarks
 zig build -Doptimize=ReleaseFast
-zig build -Doptimize=ReleaseFast -Dconfig=config.example.conf
+bash bench/compare-servers.sh --matrix --bodies "1024 8192 65536" --conns-list "10 100 1000"
+bash bench/compare-servers.sh --static "1024 1048576" --conns-list "100 1000"
+bash bench/backlog-bench.sh
+bash bench/unified.sh
 
-# Echo sweep
-bash bench/bench.sh zig-out/bin/zocket echo --extra "--echo"
-
-# HTTP sweep
-bash bench/bench.sh zig-out/bin/zocket http --extra "-Dconfig=config.example.conf"
-
-# True-capacity
-bash bench/bench2.sh zig-out/bin/zocket http --extra "-Dconfig=config.example.conf"
-
-# Validate
-bench/http-check.py 8080
-
-# Compare
-bash bench/compare-servers.sh --matrix
+# Generate graphs
+python3 bench/graphs.py
+python3 bench/graphs_backlog.py
+python3 bench/unified_graphs.py
+python3 bench/graphs_readme.py
 ```

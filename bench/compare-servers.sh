@@ -107,6 +107,7 @@ server {
     location / {
         content static;
         root $STATIC_DIR;
+        tcp_nopush on;
     }
 }
 CONF
