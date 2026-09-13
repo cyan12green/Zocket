@@ -1,0 +1,4 @@
+Bombarding http://127.0.0.1:18702/cached for 5s using 100 connection(s)
+ 00m04s 00m03s 00m03s 00m03s 00m03s 00m03s 00m02s 00m02s 00m02s 00m02s 00m02s 00m01s 00m01s 00m01s 00m01s 00m01s 5s
+Done!
+{"spec":{"numberOfConnections":100,"testType":"timed","testDurationSeconds":5,"method":"GET","url":"http://127.0.0.1:18702/cached","body":"","stream":false,"timeoutSeconds":2,"client":"fasthttp"},"result":{"bytesRead":95241870,"bytesWritten":57646395,"timeTakenSeconds":5.001651526,"req1xx":0,"req2xx":835455,"req3xx":0,"req4xx":0,"req5xx":0,"others":0,"latency":{"mean":595.8622690629657,"stddev":196.51287776635016,"max":10798,"percentiles":{"50":516,"75":683,"90":980,"95":1240,"99":2085}},"rps":{"mean":167004.7435816278,"stddev":17080.16213789426,"max":196234.17629910845,"percentiles":{"50":170273.241156,"75":177940.136925,"90":184922.856465,"95":188556.413722,"99":192946.795834}}}}

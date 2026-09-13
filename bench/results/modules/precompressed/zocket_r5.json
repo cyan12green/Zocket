@@ -1,0 +1,4 @@
+Bombarding http://127.0.0.1:18702/f8k for 5s using 100 connection(s)
+ 00m04s 00m03s 00m03s 00m03s 00m03s 00m03s 00m02s 00m02s 00m02s 00m02s 00m02s 00m01s 00m01s 00m01s 00m01s 00m01s 5s
+Done!
+{"spec":{"numberOfConnections":100,"testType":"timed","testDurationSeconds":5,"method":"GET","url":"http://127.0.0.1:18702/f8k","body":"","stream":false,"timeoutSeconds":2,"client":"fasthttp"},"result":{"bytesRead":7609235814,"bytesWritten":59765508,"timeTakenSeconds":5.001392482,"req1xx":0,"req2xx":905538,"req3xx":0,"req4xx":0,"req5xx":0,"others":0,"latency":{"mean":548.8164903074195,"stddev":337.71977381788685,"max":15958,"percentiles":{"50":364,"75":606,"90":1096,"95":1656,"99":3304}},"rps":{"mean":180945.76307448608,"stddev":19951.948003714657,"max":213104.20212956506,"percentiles":{"50":184592.252328,"75":195047.736472,"90":202441.174054,"95":206071.919001,"99":210494.448859}}}}
