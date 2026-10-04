@@ -122,6 +122,9 @@ const H_upstream = keyHash("upstream");
 const H_balance = keyHash("balance");
 const H_host_select = keyHash("host_select");
 const H_max_fails = keyHash("max_fails");
+const H_proxy_connect_timeout = keyHash("proxy_connect_timeout");
+const H_proxy_send_timeout = keyHash("proxy_send_timeout");
+const H_proxy_read_timeout = keyHash("proxy_read_timeout");
 const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
 const H_access_log = keyHash("access_log");
@@ -412,6 +415,12 @@ const LocationSpec = struct {
     limit_rate: u32 = 0,
     limit_burst: u32 = 0,
     limit_conn_max: u32 = 0,
+    /// `proxy_connect_timeout` / `proxy_send_timeout` / `proxy_read_timeout`
+    /// (seconds; 0 = compiled default). Passed to the proxy module, which
+    /// resolves them against its defaults.
+    proxy_connect_timeout: u32 = 0,
+    proxy_send_timeout: u32 = 0,
+    proxy_read_timeout: u32 = 0,
     /// `error_page 404 500 /50x;` / `error_page 503 =200;`: range into the
     /// builder's error-page pool (status -> target URI or =code).
     error_pages_start: usize = 0,
@@ -1207,6 +1216,18 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             spec.fail_timeout_seconds = lx.number("fail_timeout", u32);
             lx.expectTerminator("fail_timeout");
         },
+        H_proxy_connect_timeout => {
+            spec.proxy_connect_timeout = lx.number("proxy_connect_timeout", u32);
+            lx.expectTerminator("proxy_connect_timeout");
+        },
+        H_proxy_send_timeout => {
+            spec.proxy_send_timeout = lx.number("proxy_send_timeout", u32);
+            lx.expectTerminator("proxy_send_timeout");
+        },
+        H_proxy_read_timeout => {
+            spec.proxy_read_timeout = lx.number("proxy_read_timeout", u32);
+            lx.expectTerminator("proxy_read_timeout");
+        },
         H_proxy_set_header => {
             // `proxy_set_header <name> "<cv>";` (M-E): an upstream request
             // header override; the value is a complex value.
@@ -1977,6 +1998,9 @@ fn build(b: *const Builder) Config {
                 .balance = spec.balance,
                 .max_fails = spec.max_fails,
                 .fail_timeout_seconds = spec.fail_timeout_seconds,
+                .proxy_connect_timeout_s = spec.proxy_connect_timeout,
+                .proxy_send_timeout_s = spec.proxy_send_timeout,
+                .proxy_read_timeout_s = spec.proxy_read_timeout,
                 .chunked = spec.chunked,
                 .tcp_nopush = spec.tcp_nopush,
                 .log_format = logFormatIndex(spec.log_format, log_table.items[0..log_table.len], strings),
@@ -3029,4 +3053,29 @@ test "conf: rewrite parses rules with flags, binding the module" {
     }
     try testing.expect(found_rewrite);
     try testing.expect(found_proxy);
+}
+
+test "conf: proxy timeouts parse into route fields" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite proxy;
+        \\        upstream 127.0.0.1:8001;
+        \\        proxy_connect_timeout 2;
+        \\        proxy_send_timeout 3;
+        \\        proxy_read_timeout 10;
+        \\    }
+        \\    location /default {
+        \\        rewrite proxy;
+        \\        upstream 127.0.0.1:8002;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(u32, 2), cfg.routes[0].proxy_connect_timeout_s);
+    try testing.expectEqual(@as(u32, 3), cfg.routes[0].proxy_send_timeout_s);
+    try testing.expectEqual(@as(u32, 10), cfg.routes[0].proxy_read_timeout_s);
+    // Unset: 0 selects the compiled defaults in the proxy module.
+    try testing.expectEqual(@as(u32, 0), cfg.routes[1].proxy_connect_timeout_s);
+    try testing.expectEqual(@as(u32, 0), cfg.routes[1].proxy_send_timeout_s);
+    try testing.expectEqual(@as(u32, 0), cfg.routes[1].proxy_read_timeout_s);
 }

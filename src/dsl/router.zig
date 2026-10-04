@@ -84,6 +84,13 @@ pub const Route = struct {
     balance: Balance = .round_robin,
     max_fails: u32 = 3,
     fail_timeout_seconds: u32 = 30,
+    /// Upstream I/O timeouts in seconds (proxy module): connect / send /
+    /// read. 0 selects the compiled default (1 s connect, 1 s send, 5 s
+    /// read — the pre-timeout-directive behavior; the 5 s read cap is the
+    /// documented sync-driver limitation, not a per-request deadline).
+    proxy_connect_timeout_s: u32 = 0,
+    proxy_send_timeout_s: u32 = 0,
+    proxy_read_timeout_s: u32 = 0,
     /// Route opt-in for chunked transfer encoding (HTTP/1.1 only): responses
     /// on this route are framed as a single chunk with
     /// `Transfer-Encoding: chunked` instead of Content-Length. Off by

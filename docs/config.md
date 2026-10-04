@@ -89,6 +89,9 @@ Filters (run after every outcome, reverse declaration order):
 | `proxy_set_header` | `proxy_set_header name value;` | — | Override upstream request header. |
 | `max_fails` | `max_fails number;` | 3 | Failures before marking backend down. |
 | `fail_timeout` | `fail_timeout number;` | 30 | Seconds backend stays down. |
+| `proxy_connect_timeout` | `proxy_connect_timeout seconds;` | 1 | Upstream connect deadline. |
+| `proxy_send_timeout` | `proxy_send_timeout seconds;` | 1 | Upstream request-write deadline. |
+| `proxy_read_timeout` | `proxy_read_timeout seconds;` | 5 | Upstream response-read deadline (SO_RCVTIMEO; sync-driver cap). |
 | `health_check` | `health_check path=... interval=... rise=... fall=... timeout=...` | — | Active backend probing. |
 | `sticky_cookie` | `sticky_cookie name;` | — | Cookie-based backend affinity. |
 

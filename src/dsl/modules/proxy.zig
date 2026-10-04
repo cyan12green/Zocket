@@ -108,11 +108,11 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
     const up = &upstreams[pick];
     var fd = acquirePooled(pick, started_ns);
     if (fd < 0) {
-        fd = connectUpstream(up) catch {
+        fd = connectUpstream(up, connectTimeoutMs(route)) catch {
             markFailure(pick, route, started_ns);
             return badGateway(ctx);
         };
-        setRecvTimeout(fd);
+        setRecvTimeout(fd, readTimeoutS(route));
     }
     // Serialize fully NOW (arena-backed) so a parked transaction never
     // touches the parser again.
@@ -243,6 +243,32 @@ fn nowNs() u64 {
 /// Upstream sockets receive-timed out after this long (avoids hanging the
 /// reactor on a silent upstream).
 const upstream_timeout_ms = 5000;
+/// Compiled defaults for the proxy_*_timeout directives (0 = default):
+/// connect and send are tight (a half-dead backend must not park a reactor
+/// thread); read matches the historical 5 s sync-driver cap.
+const default_connect_timeout_ms: i32 = 1000;
+const default_send_timeout_ms: i32 = 1000;
+const default_read_timeout_s: u32 = 5;
+
+/// Effective timeouts for a route: explicit seconds, else the defaults.
+fn connectTimeoutMs(route: *const registry.Route) i32 {
+    if (route.proxy_connect_timeout_s != 0) {
+        return @intCast(route.proxy_connect_timeout_s * 1000);
+    }
+    return default_connect_timeout_ms;
+}
+
+fn sendTimeoutMs(route: *const registry.Route) i32 {
+    if (route.proxy_send_timeout_s != 0) {
+        return @intCast(route.proxy_send_timeout_s * 1000);
+    }
+    return default_send_timeout_ms;
+}
+
+fn readTimeoutS(route: *const registry.Route) u32 {
+    if (route.proxy_read_timeout_s != 0) return route.proxy_read_timeout_s;
+    return default_read_timeout_s;
+}
 /// Pooled upstream sockets idle longer than this are closed on the next use.
 const pool_idle_ns = 60 * std.time.ns_per_s;
 
@@ -378,15 +404,15 @@ fn forward(
     const up = &upstreams[pick];
     var fd = acquirePooled(pick, started_ns);
     if (fd < 0) {
-        fd = connectUpstream(up) catch {
+        fd = connectUpstream(up, connectTimeoutMs(route)) catch {
             markFailure(pick, route, started_ns);
             return badGateway(ctx);
         };
-        setRecvTimeout(fd);
+        setRecvTimeout(fd, readTimeoutS(route));
     }
 
     // Build and send the upstream request.
-    sendUpstreamRequest(fd, ctx, up) catch {
+    sendUpstreamRequest(fd, ctx, up, sendTimeoutMs(route)) catch {
         posix_close(fd);
         active[pick] -|= 1;
         markFailure(pick, route, started_ns);
@@ -664,9 +690,9 @@ fn healthThread() void {
 /// Default probe: TCP connect; with a `path`, upgrade to a minimal HEAD and
 /// require a 2xx/3xx status line.
 fn tcpProbe(up: *const router.Upstream, path: []const u8, timeout_s: u32) bool {
-    const fd = connectUpstream(up) catch return false;
+    const fd = connectUpstream(up, @intCast(@as(u64, if (timeout_s == 0) 1 else timeout_s) * 1000)) catch return false;
     defer posix_close(fd);
-    setRecvTimeout(fd);
+    setRecvTimeout(fd, if (timeout_s == 0) 1 else timeout_s);
     if (path.len == 0 or std.mem.eql(u8, path, "/")) return true; // connect-only
     var req_buf: [512]u8 = undefined;
     const req = std.fmt.bufPrint(&req_buf, "HEAD {s} HTTP/1.1\r\nHost: zocket-hc\r\nConnection: close\r\n\r\n", .{path}) catch return false;
@@ -760,11 +786,7 @@ fn releasePooled(idx: usize, fd: posix_fd, now_ns: u64) void {
     }
 }
 
-/// Connect timeout for upstream sockets (bounded so a half-dead backend
-/// cannot park a reactor thread indefinitely).
-const upstream_connect_timeout_ms: i32 = 1000;
-
-fn connectUpstream(up: *const router.Upstream) !posix_fd {
+fn connectUpstream(up: *const router.Upstream, connect_ms: i32) !posix_fd {
     // Non-blocking + CLOEXEC: the connect completes under a bounded poll,
     // and every later read/write on this fd gets EAGAIN handling instead
     // of parking the reactor thread on a slow backend.
@@ -776,7 +798,7 @@ fn connectUpstream(up: *const router.Upstream) !posix_fd {
         else => return e,
     };
     var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-    const ready = std.posix.poll(&pfds, upstream_connect_timeout_ms) catch return error.ConnectTimeout;
+    const ready = std.posix.poll(&pfds, connect_ms) catch return error.ConnectTimeout;
     if (ready == 0) return error.ConnectTimeout;
     var err_bytes: [4]u8 = undefined;
     compat.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, &err_bytes) catch return error.ConnectFailed;
@@ -791,8 +813,8 @@ fn waitReadable(fd: posix_fd, timeout_ms: i32) bool {
     return ready > 0 and (pfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
 }
 
-fn setRecvTimeout(fd: posix_fd) void {
-    var tv = std.posix.timeval{ .sec = 5, .usec = 0 };
+fn setRecvTimeout(fd: posix_fd, read_s: u32) void {
+    var tv = std.posix.timeval{ .sec = @intCast(read_s), .usec = 0 };
     std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
@@ -804,14 +826,14 @@ fn posix_close(fd: posix_fd) void {
 
 pub var async_supported: bool = false;
 
-fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) !void {
+fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream, send_ms: i32) !void {
     const req = try buildUpstreamRequest(ctx, up);
     var remaining = req;
     while (remaining.len > 0) {
         const n = compat.write(fd, remaining) catch |e| switch (e) {
             error.WouldBlock => {
                 var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-                const ready = std.posix.poll(&pfds, upstream_connect_timeout_ms) catch return error.UpstreamWriteFailed;
+                const ready = std.posix.poll(&pfds, send_ms) catch return error.UpstreamWriteFailed;
                 if (ready == 0) return error.UpstreamWriteFailed;
                 continue;
             },
@@ -1584,7 +1606,7 @@ test "proxy round-trips through the sync forward path with pool reuse" {
     // (WouldBlock -> 502). Blocking + recv timeout is deterministic.
     const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
     try compat.connect(seed, &ups[0].sockaddr, 16);
-    setRecvTimeout(seed);
+    setRecvTimeout(seed, default_read_timeout_s);
     releasePooled(0, seed, nowNs());
 
     var i: usize = 0;
@@ -1613,7 +1635,7 @@ test "proxy connectUpstream dials a live listener" {
     const srv = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 1);
     defer srv.stop();
     var ups = [_]router.Upstream{mkUp("127.0.0.1", srv.port)};
-    const cfd = try connectUpstream(&ups[0]);
+    const cfd = try connectUpstream(&ups[0], default_connect_timeout_ms);
     defer posix_close(cfd);
     drainPool(0);
 }
@@ -1652,3 +1674,29 @@ test "proxy answers 502 when the upstream refuses" {
 }
 
 
+
+test "proxy timeouts resolve explicit seconds over defaults" {
+    const def = registry.Route{ .path = "/" };
+    try testing.expectEqual(@as(i32, 1000), connectTimeoutMs(&def));
+    try testing.expectEqual(@as(i32, 1000), sendTimeoutMs(&def));
+    try testing.expectEqual(@as(u32, 5), readTimeoutS(&def));
+    const tuned = registry.Route{
+        .path = "/",
+        .proxy_connect_timeout_s = 2,
+        .proxy_send_timeout_s = 3,
+        .proxy_read_timeout_s = 10,
+    };
+    try testing.expectEqual(@as(i32, 2000), connectTimeoutMs(&tuned));
+    try testing.expectEqual(@as(i32, 3000), sendTimeoutMs(&tuned));
+    try testing.expectEqual(@as(u32, 10), readTimeoutS(&tuned));
+}
+
+test "proxy setRecvTimeout applies SO_RCVTIMEO read-back" {
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    defer compat.close(pair[1]);
+    setRecvTimeout(pair[0], 7);
+    var tv: std.posix.timeval = undefined;
+    try compat.getsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try testing.expectEqual(@as(i64, 7), tv.sec);
+}
