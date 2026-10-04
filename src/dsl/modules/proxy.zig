@@ -388,11 +388,53 @@ fn stickyBackendFromCookie(
     return null;
 }
 
-/// Connect/send/read against backend `pick`, copy the response into the
+/// Connect/send/read against backends, copy the response into the
 /// context and finish LB bookkeeping (EWMA latency sample on success,
 /// failure marking on error). `offer_sticky` adds the Set-Cookie binding
 /// when the route asked for affinity and the client had none.
+///
+/// With `proxy_next_upstream`, a transport failure (connect/send/read
+/// error or timeout) retries each remaining usable backend once, in index
+/// order, instead of answering 502 immediately. A failover onto a
+/// different backend re-offers the sticky tag (the client's pinned backend
+/// just proved dead). HTTP error statuses from a live backend are final —
+/// only transport failures retry.
 fn forward(
+    ctx: *Context,
+    route: *const registry.Route,
+    upstreams: []const router.Upstream,
+    first_pick: usize,
+    started_ns: u64,
+    offer_sticky: bool,
+) anyerror!Action {
+    ensureHealthChecker(route);
+    var tried: u64 = 0;
+    var pick = first_pick;
+    var failed_over = false;
+    while (true) {
+        tried |= @as(u64, 1) << @intCast(pick);
+        _ = attemptForward(ctx, route, upstreams, pick, started_ns, offer_sticky or failed_over) catch |e| {
+            if (e != error.UpstreamTransport or !route.proxy_next_upstream) return badGateway(ctx);
+            failed_over = true;
+            var advanced = false;
+            for (0..upstreams.len) |i| {
+                if (tried & (@as(u64, 1) << @intCast(i)) != 0) continue;
+                if (!backendUsable(route, i, nowNs())) continue;
+                pick = i;
+                advanced = true;
+                break;
+            }
+            if (!advanced) return badGateway(ctx);
+            continue;
+        };
+        return .handled;
+    }
+}
+
+/// One connect/send/read attempt against backend `idx`: transport failures
+/// surface as `error.UpstreamTransport` (retryable); anything else answers
+/// directly. See `forward` for the bookkeeping contract.
+fn attemptForward(
     ctx: *Context,
     route: *const registry.Route,
     upstreams: []const router.Upstream,
@@ -400,13 +442,12 @@ fn forward(
     started_ns: u64,
     offer_sticky: bool,
 ) anyerror!Action {
-    ensureHealthChecker(route);
     const up = &upstreams[pick];
     var fd = acquirePooled(pick, started_ns);
     if (fd < 0) {
         fd = connectUpstream(up, connectTimeoutMs(route)) catch {
             markFailure(pick, route, started_ns);
-            return badGateway(ctx);
+            return error.UpstreamTransport;
         };
         setRecvTimeout(fd, readTimeoutS(route));
     }
@@ -416,7 +457,7 @@ fn forward(
         posix_close(fd);
         active[pick] -|= 1;
         markFailure(pick, route, started_ns);
-        return badGateway(ctx);
+        return error.UpstreamTransport;
     };
 
     // Read the upstream response (status + headers + body).
@@ -428,7 +469,7 @@ fn forward(
         posix_close(fd);
         active[pick] -|= 1;
         markFailure(pick, route, started_ns);
-        return badGateway(ctx);
+        return error.UpstreamTransport;
     }
 
     // Success: clear passive failures, refresh the EWMA latency sample,
@@ -1699,4 +1740,107 @@ test "proxy setRecvTimeout applies SO_RCVTIMEO read-back" {
     var tv: std.posix.timeval = undefined;
     try compat.getsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
     try testing.expectEqual(@as(i64, 7), tv.sec);
+}
+
+/// Reserve a loopback port, then close it: connecting to it refuses fast.
+fn deadBackendPort() !u16 {
+    const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    addr[0] = 2;
+    addr[4] = 127;
+    addr[7] = 1;
+    try compat.bind(lfd, @ptrCast(&addr), 16);
+    var slen: posix.socklen_t = 16;
+    var bound: [16]u8 align(@alignOf(u16)) = undefined;
+    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+    compat.close(lfd);
+    return (@as(u16, bound[2]) << 8) | bound[3];
+}
+
+test "proxy_next_upstream off: sticky-pinned dead backend answers 502" {
+    const srv = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", 4);
+    defer srv.stop();
+    var ups = [_]router.Upstream{ mkUp("127.0.0.1", try deadBackendPort()), mkUp("127.0.0.1", srv.port) };
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .sticky_cookie = "zsid",
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    _ = req.addHeaderParsed("Cookie", "zsid=s0") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+test "proxy_next_upstream on: failover serves from the live backend" {
+    const srv = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Up: 1\r\n\r\nhello", 4);
+    defer srv.stop();
+    var ups = [_]router.Upstream{ mkUp("127.0.0.1", try deadBackendPort()), mkUp("127.0.0.1", srv.port) };
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .sticky_cookie = "zsid",
+        .proxy_next_upstream = true,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    // Seed backend 1 with a blocking socket (deterministic read).
+    const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try compat.connect(seed, &ups[1].sockaddr, 16);
+    setRecvTimeout(seed, default_read_timeout_s);
+    releasePooled(1, seed, nowNs());
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    _ = req.addHeaderParsed("Cookie", "zsid=s0") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("hello", resp.body);
+    // Failover re-offers the sticky tag pointing at the live backend.
+    var retagged = false;
+    for (resp.headers[0..resp.header_count]) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Set-Cookie") and std.mem.indexOf(u8, h.value, "zsid=s1") != null) {
+            retagged = true;
+        }
+    }
+    try testing.expect(retagged);
+    drainPool(1);
+}
+
+test "proxy_next_upstream on: all backends dead still answers 502" {
+    var ups = [_]router.Upstream{ mkUp("127.0.0.1", try deadBackendPort()), mkUp("127.0.0.1", try deadBackendPort()) };
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_next_upstream = true,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
 }

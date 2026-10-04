@@ -92,6 +92,7 @@ Filters (run after every outcome, reverse declaration order):
 | `proxy_connect_timeout` | `proxy_connect_timeout seconds;` | 1 | Upstream connect deadline. |
 | `proxy_send_timeout` | `proxy_send_timeout seconds;` | 1 | Upstream request-write deadline. |
 | `proxy_read_timeout` | `proxy_read_timeout seconds;` | 5 | Upstream response-read deadline (SO_RCVTIMEO; sync-driver cap). |
+| `proxy_next_upstream` | `proxy_next_upstream on\|off;` | off | Retry transport failures (connect/send/read error or timeout) on the next usable backend, once each. Failover re-offers the sticky tag. HTTP error statuses from a live backend are final. Sync forward path only. |
 | `health_check` | `health_check path=... interval=... rise=... fall=... timeout=...` | — | Active backend probing. |
 | `sticky_cookie` | `sticky_cookie name;` | — | Cookie-based backend affinity. |
 

@@ -91,6 +91,15 @@ pub const Route = struct {
     proxy_connect_timeout_s: u32 = 0,
     proxy_send_timeout_s: u32 = 0,
     proxy_read_timeout_s: u32 = 0,
+    /// Retry on the next backend after a transport failure (connect/send/
+    /// read error or timeout): `proxy_next_upstream on;`. Off by default —
+    /// a retry re-sends the request, which is unsafe for non-idempotent
+    /// methods; opt in when backends are interchangeable. Retries each
+    /// usable backend at most once per request; HTTP error statuses from a
+    /// live backend (5xx etc.) are NOT retried in v1, only transport
+    /// failures. Sync forward path only (the parked/async path marks the
+    /// failure and answers 502 as before).
+    proxy_next_upstream: bool = false,
     /// Route opt-in for chunked transfer encoding (HTTP/1.1 only): responses
     /// on this route are framed as a single chunk with
     /// `Transfer-Encoding: chunked` instead of Content-Length. Off by
