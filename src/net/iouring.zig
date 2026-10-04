@@ -113,3 +113,61 @@ test "io_uring read/write on a socketpair" {
     try testing.expectEqual(@as(u64, @intCast(pair[1])), comps[0].user_data);
     try testing.expectEqualStrings("hello", buf[0..5]);
 }
+
+test "io_uring writev, poll and cancel completions" {
+    var ring = IoRing.init() catch return error.SkipZigTest;
+    defer ring.deinit();
+    try testing.expect(ring.ringFd() > 0);
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    defer compat.close(pair[1]);
+
+    // writev completion carries fd | write_tag.
+    const iov = [_]posix.iovec_const{
+        .{ .base = "foo".ptr, .len = 3 },
+        .{ .base = "bar".ptr, .len = 3 },
+    };
+    try ring.submitWritev(pair[0], &iov);
+    try ring.submit();
+    var comps: [4]IoRing.Completion = undefined;
+    const nw = try ring.drain(&comps, true);
+    try testing.expectEqual(@as(usize, 1), nw);
+    try testing.expectEqual(@as(i32, 6), comps[0].result);
+    try testing.expectEqual((@as(u64, @intCast(pair[0])) | IoRing.write_tag), comps[0].user_data);
+    var rbuf: [6]u8 = undefined;
+    var got: usize = 0;
+    while (got < 6) {
+        const n = try posix.read(pair[1], rbuf[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    try testing.expectEqualStrings("foobar", rbuf[0..got]);
+
+    // poll-out on a writable socket completes immediately.
+    try ring.submitPollOut(pair[0]);
+    try ring.submit();
+    const np = try ring.drain(&comps, true);
+    try testing.expectEqual(@as(usize, 1), np);
+    try testing.expectEqual((@as(u64, @intCast(pair[0])) | IoRing.poll_tag), comps[0].user_data);
+
+    // Cancel a pending read: a cancel completion arrives.
+    var cbuf: [64]u8 = undefined;
+    try ring.submitRead(pair[1], &cbuf);
+    try ring.submit();
+    try testing.expectEqual(@as(usize, 0), try ring.drain(&comps, false));
+    try ring.submitCancel(pair[1]);
+    try ring.submit();
+    const nc = try ring.drain(&comps, true);
+    try testing.expect(nc >= 1);
+}
+
+test "io_uring tag constants are distinct and uninit deinit is a no-op" {
+    try testing.expect(IoRing.write_tag != IoRing.poll_tag);
+    try testing.expect(IoRing.write_tag != IoRing.cancel_tag);
+    try testing.expect(IoRing.poll_tag != IoRing.cancel_tag);
+    try testing.expectEqual(@as(usize, 128), IoRing.completion_batch);
+    var ring = IoRing{};
+    try testing.expect(!ring.inited);
+    ring.deinit(); // must not touch an uninitialised ring
+}

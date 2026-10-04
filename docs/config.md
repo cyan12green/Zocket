@@ -42,7 +42,7 @@ top-level directives + `server {}` blocks holding `location {}` blocks. No
 |---|---|---|---|---|
 | `listen` | `listen port;` | 8080 | main, server | Listen port. CLI `--port` wins. Per-server overrides global. |
 | `server` | `server { ... }` | — | main | Virtual host block (up to 16). Own routes, port, hostname. |
-| `server_name` | `server_name name;` | — | server | Hostname for vhost matching. `*.domain` wildcards supported. |
+| `server_name` | `server_name name;` (repeatable) | — | server | Hostname(s) for vhost matching. Repeat the directive for multiple names. `*.domain` wildcards supported. |
 | `host_select` | `host_select on\|off;` | on | main | Host-based vhost routing. `off` always uses first server. |
 | `location` | `location [= ~ ~* ^~] uri { ... }` | — | server | Route declaration. Modifiers: exact/regex/prefix. |
 | `return` | `return code [value];` | — | location | Fixed-response template (pre-serialised). |
@@ -67,6 +67,8 @@ top-level directives + `server {}` blocks holding `location {}` blocks. No
 | `access limit_conn` | — | access | Concurrency limiting |
 | `content precompressed` | — | content | .gz sibling serving |
 | `rewrite proxy_cache` | — | rewrite | Response cache lookup |
+| `content try_files` | — | content | Probe files, fall back (auto-bound by `try_files`) |
+| `log error_page` | — | log | Status → alternate URI (auto-bound by `error_page`) |
 
 Filters (run after every outcome, reverse declaration order):
 
@@ -94,12 +96,24 @@ Filters (run after every outcome, reverse declaration order):
 
 | Directive | Syntax | Default | Description |
 |---|---|---|---|
-| `proxy_cache` | `proxy_cache on\|off;` | off | Enable response caching. |
+| `proxy_cache` | `proxy_cache on\|off;` | off | Enable response caching. The lookup is ordered before `proxy` regardless of declaration order (a HIT short-circuits upstream contact). |
 | `proxy_cache_valid` | `proxy_cache_valid seconds;` | 60 | Fresh window. |
 | `proxy_cache_stale_while_revalidate` | `proxy_cache_stale_while_revalidate seconds;` | 0 | Grace period. |
 
 Zone sizing (in `limits` section): `proxy_cache_max_bytes` (32 MiB),
 `proxy_cache_max_entries` (256).
+
+### Internal redirects: try_files & error_page
+
+Both build on the same primitive: a handler sets an internal-redirect
+target and the server re-walks the new URI from `find_config` (capped at 8
+hops per request; a self-referential entry stops at the cap instead of
+spinning).
+
+| Directive | Syntax | Default | Description |
+|---|---|---|---|
+| `try_files` | `try_files $uri $uri/ /fallback;` or `try_files $uri =404;` | — | Probe each candidate against `root` in order; redirect to the first that exists. `$uri` is the request target, `$uri/` appends `index`. The last entry is the fallback: a URI redirects to it, `=code` answers that status in place. |
+| `error_page` | `error_page 404 500 /50x.html;` or `error_page 503 =200;` | — | After the walk, when the outgoing status matches, redirect to the URI (methods other than GET/HEAD become GET) or rewrite the status in place (`=code`). Matches the status the request is heading out with — including 404 when no module claimed it. |
 
 ### Listen directive
 
@@ -303,7 +317,10 @@ server {
 }
 ```
 
-Matching: exact name → longest wildcard → first server (default).
+Matching: exact name → longest wildcard → first server on that port (default).
+Repeat `server_name` for multiple names on one block. Each `listen` port is
+served only by the blocks listening on it; `--port` overrides every block
+(single group, Host selection across all blocks).
 
 ## Examples directory
 

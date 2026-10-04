@@ -463,3 +463,201 @@ fn headerOf(resp: *const Response, name: []const u8) ?[]const u8 {
     }
     return null;
 }
+
+test "disabled routes and non-cacheable traffic pass through both halves" {
+    resetZone();
+    defer resetZone();
+    const off = Route{
+        .path = "/off",
+        .upstreams = &.{.{ .host = "127.0.0.1", .port = 9 }},
+    };
+    var m: Case = undefined;
+    makeCase(&m, .get, "/off/x");
+    defer m.req.deinit();
+    m.ctx.route = &off;
+    m.ctx.resp.setBody("origin");
+    try testing.expectEqual(Action.pass, try runLookup(&m.ctx));
+    try testing.expectEqual(Action.pass, try runStore(&m.ctx));
+    try testing.expect(headerOf(m.ctx.resp, "X-Cache") == null);
+
+    // No route at all: both halves inert.
+    var n: Case = undefined;
+    makeCase(&n, .get, "/off/x");
+    defer n.req.deinit();
+    try testing.expectEqual(Action.pass, try runLookup(&n.ctx));
+    try testing.expectEqual(Action.pass, try runStore(&n.ctx));
+}
+
+test "serialization rejects unrepresentable blobs" {
+    var tiny: [10]u8 = undefined;
+    try testing.expect(serialize(&tiny, .{ .status = 200, .etag = "e", .ctype = "t", .body = "way-too-long-a-body" }) == null);
+    // An etag longer than u16 can never serialize.
+    var big: [8]u8 = undefined;
+    const huge_etag = @as([70000]u8, @splat('e'));
+    try testing.expect(serialize(&big, .{ .status = 200, .etag = huge_etag[0..], .ctype = "", .body = "" }) == null);
+    // Truncated blobs never deserialize.
+    try testing.expect(deserialize(&.{ 1, 2, 3 }) == null);
+    try testing.expect(deserialize(&.{ 0, 200, 0, 5, 0, 5 }) == null);
+    // Empty representation round-trips.
+    var buf: [16]u8 = undefined;
+    const n = serialize(&buf, .{ .status = 200, .etag = "", .ctype = "", .body = "" }).?;
+    const s = deserialize(buf[0..n]).?;
+    try testing.expectEqual(@as(u16, 200), s.status);
+    try testing.expectEqual(@as(usize, 0), s.body.len);
+}
+
+test "head requests cache and hit like gets, with separate keys" {
+    resetZone();
+    defer resetZone();
+    const route = Route{
+        .path = "/h",
+        .proxy_cache_enabled = true,
+        .upstreams = &.{.{ .host = "127.0.0.1", .port = 9 }},
+    };
+    var seed: Case = undefined;
+    makeCase(&seed, .head, "/h/x");
+    defer seed.req.deinit();
+    seed.ctx.route = &route;
+    seed.ctx.resp.setBody("head-body");
+    try testing.expectEqual(Action.pass, try runStore(&seed.ctx));
+
+    var hit: Case = undefined;
+    makeCase(&hit, .head, "/h/x");
+    defer hit.req.deinit();
+    hit.ctx.route = &route;
+    hit.ctx.now_ns = T0 + 1000;
+    try testing.expectEqual(Action.handled, try runLookup(&hit.ctx));
+    try testing.expectEqualStrings("HIT", headerOf(hit.ctx.resp, "X-Cache").?);
+
+    // Same target as GET is a different cache key: miss.
+    var get: Case = undefined;
+    makeCase(&get, .get, "/h/x");
+    defer get.req.deinit();
+    get.ctx.route = &route;
+    get.ctx.now_ns = T0 + 1000;
+    try testing.expectEqual(Action.pass, try runLookup(&get.ctx));
+}
+
+test "non-200 and owned bodies are never stored" {
+    resetZone();
+    defer resetZone();
+    const route = Route{
+        .path = "/s",
+        .proxy_cache_enabled = true,
+        .upstreams = &.{.{ .host = "127.0.0.1", .port = 9 }},
+    };
+    // A 404 flows through the storer untouched.
+    var nf: Case = undefined;
+    makeCase(&nf, .get, "/s/missing");
+    defer nf.req.deinit();
+    nf.ctx.route = &route;
+    nf.ctx.resp.status = .not_found;
+    nf.ctx.resp.setBody("nope");
+    try testing.expectEqual(Action.pass, try runStore(&nf.ctx));
+    var probe: Case = undefined;
+    makeCase(&probe, .get, "/s/missing");
+    defer probe.req.deinit();
+    probe.ctx.route = &route;
+    try testing.expectEqual(Action.pass, try runLookup(&probe.ctx));
+
+    // Owned (streaming) bodies are skipped too.
+    var owned: Case = undefined;
+    makeCase(&owned, .get, "/s/stream");
+    defer owned.req.deinit();
+    owned.ctx.route = &route;
+    owned.ctx.resp.setBody("streamed");
+    owned.ctx.resp.body_owned = true;
+    try testing.expectEqual(Action.pass, try runStore(&owned.ctx));
+    var probe2: Case = undefined;
+    makeCase(&probe2, .get, "/s/stream");
+    defer probe2.req.deinit();
+    probe2.ctx.route = &route;
+    try testing.expectEqual(Action.pass, try runLookup(&probe2.ctx));
+}
+
+test "expired entry without an etag revalidates unconditionally" {
+    resetZone();
+    defer resetZone();
+    const route = Route{
+        .path = "/u",
+        .proxy_cache_enabled = true,
+        .cache_ttl_seconds = 10,
+        .upstreams = &.{.{ .host = "127.0.0.1", .port = 9 }},
+    };
+    var seed: Case = undefined;
+    makeCase(&seed, .get, "/u/x");
+    defer seed.req.deinit();
+    seed.ctx.route = &route;
+    seed.ctx.resp.setBody("no-validator");
+    try testing.expectEqual(Action.pass, try runStore(&seed.ctx));
+
+    // Past TTL with no ETag on the stored copy: pass-through, no validator.
+    var probe: Case = undefined;
+    makeCase(&probe, .get, "/u/x");
+    defer probe.req.deinit();
+    probe.ctx.route = &route;
+    probe.ctx.now_ns = T0 + 11 * std.time.ns_per_s;
+    try testing.expectEqual(Action.pass, try runLookup(&probe.ctx));
+    try testing.expect(probe.ctx.req.header("if-none-match") == null);
+}
+
+test "default ttl applies when the route sets none" {
+    resetZone();
+    defer resetZone();
+    const route = Route{
+        .path = "/d",
+        .proxy_cache_enabled = true,
+        .upstreams = &.{.{ .host = "127.0.0.1", .port = 9 }},
+    };
+    var seed: Case = undefined;
+    makeCase(&seed, .get, "/d/x");
+    defer seed.req.deinit();
+    seed.ctx.route = &route;
+    seed.ctx.resp.setBody("default-ttl");
+    try testing.expectEqual(Action.pass, try runStore(&seed.ctx));
+
+    // 59 s later (default 60 s window): still fresh.
+    var fresh: Case = undefined;
+    makeCase(&fresh, .get, "/d/x");
+    defer fresh.req.deinit();
+    fresh.ctx.route = &route;
+    fresh.ctx.now_ns = T0 + 59 * std.time.ns_per_s;
+    try testing.expectEqual(Action.handled, try runLookup(&fresh.ctx));
+    try testing.expectEqualStrings("HIT", headerOf(fresh.ctx.resp, "X-Cache").?);
+
+    // 61 s: expired past grace (no swr configured) — pass-through.
+    var old: Case = undefined;
+    makeCase(&old, .get, "/d/x");
+    defer old.req.deinit();
+    old.ctx.route = &route;
+    old.ctx.now_ns = T0 + 61 * std.time.ns_per_s;
+    try testing.expectEqual(Action.pass, try runLookup(&old.ctx));
+}
+
+test "limits-sized budgets isolate the store" {
+    resetZone();
+    defer resetZone();
+    const limits_mod = @import("../limits.zig");
+    const small = limits_mod.Limits{ .proxy_cache_max_bytes = 4096, .proxy_cache_max_entries = 4 };
+    const route = Route{
+        .path = "/b",
+        .proxy_cache_enabled = true,
+        .upstreams = &.{.{ .host = "127.0.0.1", .port = 9 }},
+    };
+    var seed: Case = undefined;
+    makeCase(&seed, .get, "/b/x");
+    defer seed.req.deinit();
+    seed.ctx.route = &route;
+    seed.ctx.limits = &small;
+    seed.ctx.resp.setBody("budgeted");
+    try testing.expectEqual(Action.pass, try runStore(&seed.ctx));
+
+    var hit: Case = undefined;
+    makeCase(&hit, .get, "/b/x");
+    defer hit.req.deinit();
+    hit.ctx.route = &route;
+    hit.ctx.limits = &small;
+    hit.ctx.now_ns = T0 + 1000;
+    try testing.expectEqual(Action.handled, try runLookup(&hit.ctx));
+    try testing.expectEqualStrings("budgeted", hit.ctx.resp.body);
+}

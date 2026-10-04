@@ -186,7 +186,10 @@ fn cache_date(secs: u64, buf: []u8) ?[]const u8 {
         m += 1;
     }
     const day = d + 1;
-    const weekday = (days + 4) % 7; // 1970-01-01 was a Thursday
+    // Epoch (day 0) was a Thursday and names[0] is "Thu": index by
+    // days % 7 directly. (The sibling cache.zig uses (days + 4) % 7 with
+    // Sunday-first names — same mapping, different table origin.)
+    const weekday = days % 7;
     const names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
     const mnames = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     return std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
@@ -262,4 +265,90 @@ test "static cache revalidates a changed file" {
     const stale = cache.lookup(path) orelse return error.SkipZigTest;
     stale.refreshed = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
     try testing.expect(cache.lookup(path) == null);
+}
+
+test "static cache lookup misses on an empty cache" {
+    const allocator = testing.allocator;
+    var cache = StaticCache.init(allocator);
+    defer cache.deinit();
+    try testing.expect(cache.lookup("testdata/hello.txt") == null);
+    // Zero-entry caches never store (insert returns null, no crash).
+    var empty = StaticCache.initWithConfig(allocator, 0, 1, content_cache_max);
+    defer empty.deinit();
+    try testing.expect(empty.lookup("anything") == null);
+    // Fake fd: insert has nowhere to put it.
+    try testing.expect(empty.insert("anything", -1, 10, 10) == null);
+}
+
+test "static cache skips content for large files" {
+    const allocator = testing.allocator;
+    var cache = StaticCache.initWithConfig(allocator, 4, 60, 8);
+    defer cache.deinit();
+    const src = compat.openFile("testdata/hello.txt") catch return error.SkipZigTest;
+    const fd = compat.dup(src) catch return error.SkipZigTest;
+    // 19 bytes > 8-byte content budget: metadata caches, body does not.
+    const e = cache.insert("testdata/hello.txt", fd, 19, 1709164800) orelse return error.SkipZigTest;
+    try testing.expect(!e.content_cached);
+    try testing.expect(e.etag_len > 0);
+    try testing.expect(e.lm_len > 0);
+    // Leap-day mtime formats through the date path.
+    try testing.expect(std.mem.indexOf(u8, e.lm[0..e.lm_len], "Feb 2024") != null);
+    const hit = cache.lookup("testdata/hello.txt") orelse return error.SkipZigTest;
+    try testing.expectEqual(fd, hit.fd);
+}
+
+test "static cache evicts a deleted file on revalidation" {
+    const allocator = testing.allocator;
+    var cache = StaticCache.init(allocator);
+    defer cache.deinit();
+
+    const path = "testdata/cache-vanish-tmp";
+    compat.writeFile(path, "here today") catch return error.SkipZigTest;
+    const file = compat.openFile(path) catch return error.SkipZigTest;
+    const st = compat.fstat(file) catch return error.SkipZigTest;
+    const mtime: u64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+    _ = cache.insert(path, file, st.size, mtime) orelse return error.SkipZigTest;
+    _ = cache.lookup(path) orelse return error.SkipZigTest;
+
+    // The file vanishes: a stale lookup evicts and reports a miss.
+    compat.deleteFile(path) catch return error.SkipZigTest;
+    const stale = cache.lookup(path) orelse return error.SkipZigTest;
+    stale.refreshed = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+    try testing.expect(cache.lookup(path) == null);
+    // Second lookup stays a miss (entry is gone).
+    try testing.expect(cache.lookup(path) == null);
+}
+
+test "static cache refreshes the timestamp of an unchanged file" {
+    const allocator = testing.allocator;
+    var cache = StaticCache.init(allocator);
+    defer cache.deinit();
+
+    const path = "testdata/cache-steady-tmp";
+    compat.writeFile(path, "steady") catch return error.SkipZigTest;
+    defer compat.deleteFile(path) catch {};
+    const file = compat.openFile(path) catch return error.SkipZigTest;
+    const st = compat.fstat(file) catch return error.SkipZigTest;
+    const mtime: u64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+    _ = cache.insert(path, file, st.size, mtime) orelse return error.SkipZigTest;
+
+    // Force staleness without touching the file: revalidation succeeds and
+    // the entry stays live (covers the refreshed=now success branch).
+    const stale = cache.lookup(path) orelse return error.SkipZigTest;
+    stale.refreshed = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+    const hit = cache.lookup(path) orelse return error.SkipZigTest;
+    try testing.expectEqual(file, hit.fd);
+}
+
+test "static cache date helpers handle month ends and leap years" {
+    var buf: [48]u8 = undefined;
+    // Century leap year, weekday pinned (2000-02-29 was a Tuesday).
+    try testing.expectEqualStrings("Tue, 29 Feb 2000 12:00:00 GMT", cache_date(951825600, &buf).?);
+    try testing.expectEqualStrings("Tue, 28 Feb 2023 00:00:00 GMT", cache_date(1677542400, &buf).?);
+    // Epoch: Thursday.
+    try testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", cache_date(0, &buf).?);
+    try testing.expect(isLeap(2000));
+    try testing.expect(!isLeap(1900));
+    try testing.expect(isLeap(2024));
+    try testing.expect(!isLeap(2023));
 }

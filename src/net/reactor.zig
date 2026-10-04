@@ -1519,7 +1519,7 @@ pub const Reactor = struct {
                 var off: i64 = @intCast(session.file_offset);
                 while (session.file_remaining > 0) {
                     const rc = linux.sendfile(fd, session.file_fd, &off, @intCast(@min(session.file_remaining, 1 << 20)));
-                    const err = posix.errno(rc);
+                    const err = linux.errno(rc);
                     if (err != .SUCCESS) {
                         if (err == .AGAIN or err == .INTR) break; // wait for EPOLLOUT
                         if (!session.file_fd_cached) compat.close(session.file_fd);
@@ -1584,7 +1584,7 @@ pub const Reactor = struct {
             var off: i64 = @intCast(session.file_offset);
             while (session.file_remaining > 0) {
                 const rc = linux.sendfile(fd, session.file_fd, &off, @intCast(@min(session.file_remaining, 1 << 20)));
-                const err = posix.errno(rc);
+                const err = linux.errno(rc);
                 if (err != .SUCCESS) {
                     if (err == .AGAIN or err == .INTR) {
                         if (self.io_mode == .ring) {
@@ -3676,4 +3676,209 @@ test "server_limit_conn: different IPs tracked independently" {
     r.attach(c3);
     compat.nanosleep(0, 30 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 2), r.countConnections());
+}
+
+/// Fake keepalive upstream for parked-proxy tests (mirrors the one in
+/// proxy.zig's tests; duplicated so reactor tests don't depend on
+/// module-test internals).
+const TestUpstream = struct {
+    listener: posix.fd_t,
+    port: u16,
+    response: []const u8,
+    stop_flag: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn start(response: []const u8) !*TestUpstream {
+        const self = try testing.allocator.create(TestUpstream);
+        const lfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+        var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+        addr[0] = 2;
+        addr[4] = 127;
+        addr[7] = 1;
+        try compat.bind(lfd, @ptrCast(&addr), 16);
+        try compat.listen(lfd, 8);
+        var slen: posix.socklen_t = 16;
+        var bound: [16]u8 align(@alignOf(u16)) = undefined;
+        try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+        self.* = .{
+            .listener = lfd,
+            .port = (@as(u16, bound[2]) << 8) | bound[3],
+            .response = response,
+        };
+        self.thread = try std.Thread.spawn(.{}, runFn, .{self});
+        return self;
+    }
+
+    fn runFn(self: *TestUpstream) void {
+        while (!self.stop_flag.load(.acquire)) {
+            var pfds = [_]posix.pollfd{.{ .fd = self.listener, .events = posix.POLL.IN, .revents = 0 }};
+            const ready = posix.poll(&pfds, 100) catch break;
+            if (ready == 0) continue;
+            const cfd = linux.accept4(self.listener, null, null, 0);
+            if (linux.errno(cfd) != .SUCCESS) break;
+            const fd: posix.fd_t = @intCast(cfd);
+            while (!self.stop_flag.load(.acquire)) {
+                var rpfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+                const rready = posix.poll(&rpfds, 1000) catch break;
+                if (rready == 0) break;
+                var req_buf: [4096]u8 = undefined;
+                var used: usize = 0;
+                var complete = false;
+                while (used < req_buf.len) {
+                    const n = posix.read(fd, req_buf[used..]) catch break;
+                    if (n == 0) break;
+                    used += n;
+                    if (std.mem.indexOf(u8, req_buf[0..used], "\r\n\r\n") != null) {
+                        complete = true;
+                        break;
+                    }
+                }
+                if (!complete) break;
+                _ = compat.write(fd, self.response) catch break;
+            }
+            compat.close(fd);
+        }
+    }
+
+    fn stop(self: *TestUpstream) void {
+        self.stop_flag.store(true, .release);
+        compat.close(self.listener);
+        self.thread.join();
+        testing.allocator.destroy(self);
+    }
+};
+
+/// Read a full response head (through \r\n\r\n) then the Content-Length
+/// body. Returns head_len and body_len.
+fn readHeadBody(sock: posix.fd_t, buf: []u8) !struct { head_len: usize, body_len: usize } {
+    var total: usize = 0;
+    const start = compat.Instant.now() catch return error.Timeout;
+    while (true) {
+        if ((compat.Instant.now() catch return error.Timeout).since(start) > 8000 * std.time.ns_per_ms) {
+            return error.Timeout;
+        }
+        if (total >= buf.len) return error.TooLong;
+        const n = posix.read(sock, buf[total .. total + 1]) catch {
+            compat.nanosleep(0, 1 * std.time.ns_per_ms);
+            continue;
+        };
+        if (n == 0) return error.Eof;
+        total += n;
+        if (total >= 4 and std.mem.eql(u8, buf[total - 4 .. total], "\r\n\r\n")) break;
+    }
+    // Minimal Content-Length scan of the head.
+    var body_len: usize = 0;
+    var i: usize = 0;
+    const head = buf[0..total];
+    const cl = "Content-Length:";
+    while (i + cl.len < head.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(head[i .. i + cl.len], cl)) {
+            var j = i + cl.len;
+            while (j < head.len and (head[j] == ' ' or head[j] == '\t')) j += 1;
+            var k = j;
+            while (k < head.len and head[k] >= '0' and head[k] <= '9') k += 1;
+            body_len = std.fmt.parseInt(usize, head[j..k], 10) catch 0;
+            break;
+        }
+    }
+    if (body_len > 0) {
+        const n = try readUntil(sock, buf[total..], body_len, 5000);
+        if (n < body_len) return error.Eof;
+        total += n;
+    }
+    return .{ .head_len = total - body_len, .body_len = body_len };
+}
+
+test "reactor parked proxy completes through epoll events" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    const up = try TestUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Up: 1\r\n\r\nhello");
+    defer up.stop();
+
+    const router_mod = @import("../dsl/router.zig");
+    var ups = [_]router_mod.Upstream{.{
+        .host = "127.0.0.1",
+        .port = up.port,
+        .sockaddr = router_mod.Upstream.makeSockaddr("127.0.0.1", up.port).?,
+    }};
+    const bindings = [_]router_mod.ModuleBinding{.{ .phase = .rewrite, .module = "proxy" }};
+    const routes = [_]router_mod.Route{.{
+        .path = "/",
+        .modules = &bindings,
+        .upstreams = &ups,
+    }};
+    var proxy_srv = runtime_server.Server.init(.{ .routes = &routes });
+    proxy_mod.testResetRoute(&routes[0]);
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.handler = &proxy_srv;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "GET /proxied/x HTTP/1.1\r\nHost: test\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    const res = try readHeadBody(pair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
+    try testing.expectEqualStrings("hello", buf[res.head_len..][0..res.body_len]);
+}
+
+test "reactor parked proxy to a dead upstream yields 502" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    // Reserve-then-close a port so nothing listens on it.
+    const lfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    addr[0] = 2;
+    addr[4] = 127;
+    addr[7] = 1;
+    try compat.bind(lfd, @ptrCast(&addr), 16);
+    var slen: posix.socklen_t = 16;
+    var bound: [16]u8 align(@alignOf(u16)) = undefined;
+    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+    const dead_port = (@as(u16, bound[2]) << 8) | bound[3];
+    compat.close(lfd);
+
+    const router_mod = @import("../dsl/router.zig");
+    var ups = [_]router_mod.Upstream{.{
+        .host = "127.0.0.1",
+        .port = dead_port,
+        .sockaddr = router_mod.Upstream.makeSockaddr("127.0.0.1", dead_port).?,
+    }};
+    const bindings = [_]router_mod.ModuleBinding{.{ .phase = .rewrite, .module = "proxy" }};
+    const routes = [_]router_mod.Route{.{
+        .path = "/",
+        .modules = &bindings,
+        .upstreams = &ups,
+        .max_fails = 1000000,
+    }};
+    var proxy_srv = runtime_server.Server.init(.{ .routes = &routes });
+    proxy_mod.testResetRoute(&routes[0]);
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.handler = &proxy_srv;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: test\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    const res = try readHeadBody(pair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 502 Bad Gateway"));
 }

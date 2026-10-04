@@ -255,3 +255,87 @@ test "cert: RSA and garbage keys are rejected" {
     try testing.expectError(error.KeyNotFound, loadCredentials(testing.allocator, tls_cert_pem, "not a key"));
     try testing.expectError(error.CertificateNotFound, loadCredentials(testing.allocator, "no cert", tls_key_pem));
 }
+
+test "cert: curve metadata for both curves" {
+    try testing.expectEqual(@as(u16, 0x0403), Curve.p256.signatureScheme());
+    try testing.expectEqual(@as(u16, 0x0503), Curve.p384.signatureScheme());
+    try testing.expectEqualSlices(u8, &.{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }, Curve.p256.paramsOid());
+    try testing.expectEqualSlices(u8, &.{ 0x2b, 0x81, 0x04, 0x00, 0x22 }, Curve.p384.paramsOid());
+    try testing.expectEqual(@as(?Curve, .p256), try curveFromOid(Curve.p256.paramsOid()));
+    try testing.expectEqual(@as(?Curve, .p384), try curveFromOid(Curve.p384.paramsOid()));
+    try testing.expectEqual(@as(?Curve, null), try curveFromOid(&.{0x01}));
+    try testing.expectEqual(@as(?Curve, null), try curveFromOid(Curve.p256.paramsOid()[0 .. Curve.p256.paramsOid().len - 1]));
+}
+
+test "cert: DER reader rejects truncation and bad lengths" {
+    var empty = Der{ .buf = &.{} };
+    try testing.expectError(error.InvalidKey, empty.readByte());
+    var bad_len = Der{ .buf = &.{0x85} };
+    try testing.expectError(error.InvalidKey, bad_len.readLen());
+    // Long-form length with zero octets, and with more than 4 octets.
+    var zero_len = Der{ .buf = &.{0x80} };
+    try testing.expectError(error.InvalidKey, zero_len.readLen());
+    var huge_len = Der{ .buf = &.{ 0x85, 1, 2, 3, 4, 5 } };
+    try testing.expectError(error.InvalidKey, huge_len.readLen());
+    // Declared length overruns the buffer.
+    var overrun = Der{ .buf = &.{ 0x04, 0x05, 0x01 } };
+    try testing.expectError(error.InvalidKey, overrun.readTlv());
+    // Multi-byte length decodes correctly.
+    var long = Der{ .buf = &.{ 0x04, 0x82, 0x00, 0x02, 0xaa, 0xbb } };
+    const tlv = try long.readTlv();
+    try testing.expectEqual(@as(u8, 0x04), tlv.tag);
+    try testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, tlv.value);
+    try testing.expect(long.eof());
+}
+
+test "cert: SEC1 parsing validates tags and key length" {
+    var out: KeyPair = undefined;
+    // Not a SEQUENCE at all.
+    try testing.expectError(error.InvalidKey, parseSec1(&.{ 0x01, 0x02, 0x03 }, .p256, &out));
+    // SEQUENCE with a non-INTEGER version.
+    try testing.expectError(error.InvalidKey, parseSec1(&.{ 0x30, 0x03, 0x04, 0x01, 0x00 }, .p256, &out));
+    // SEQUENCE with a non-OCTET-STRING private key.
+    try testing.expectError(error.InvalidKey, parseSec1(&.{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00 }, .p256, &out));
+    // Private key of the wrong length (1 byte, want 32).
+    try testing.expectError(error.InvalidKey, parseSec1(&.{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x04, 0x01, 0x00 }, .p256, &out));
+    // Minimal well-formed SEC1 (params absent): parses, OID lookup is null.
+    const minimal = &.{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x04, 0x01, 0x00 };
+    try testing.expectError(error.InvalidKey, parseSec1(minimal, .p256, &out)); // len 1 != 32
+    try testing.expectEqual(@as(?[]const u8, null), try sec1CurveOid(minimal));
+    // A [1] publicKey element stops the OID scan (the a1 break).
+    const with_pub = &.{ 0x30, 0x08, 0x02, 0x01, 0x01, 0x04, 0x01, 0x00, 0xa1, 0x00 };
+    try testing.expectEqual(@as(?[]const u8, null), try sec1CurveOid(with_pub));
+    // A [0] parameters element with a non-OID inside is an error.
+    const bad_params = &.{ 0x30, 0x0a, 0x02, 0x01, 0x01, 0x04, 0x01, 0x00, 0xa0, 0x02, 0x04, 0x01 };
+    try testing.expectError(error.InvalidKey, sec1CurveOid(bad_params));
+}
+
+test "cert: PKCS#8 parsing validates its envelope" {
+    var out: KeyPair = undefined;
+    try testing.expectError(error.InvalidKey, parsePkcs8(&.{ 0x01, 0x02 }, &out));
+    // Unknown curve OID inside a well-formed envelope -> UnsupportedCurve.
+    // SEQUENCE { INTEGER 0, SEQUENCE { OID ecPublicKey, OID 1.2.3 }, OCTET STRING {} }.
+    const unknown_curve = &.{
+        0x30, 0x13, 0x02, 0x01, 0x00, 0x30, 0x0c, 0x06, 0x07, 0x2a, 0x86, 0x48,
+        0xce, 0x3d, 0x02, 0x01, 0x06, 0x01, 0x2b, 0x04, 0x00,
+    };
+    try testing.expectError(error.UnsupportedCurve, parsePkcs8(unknown_curve, &out));
+}
+
+test "cert: EC keys without parameters are rejected as UnsupportedCurve" {
+    // SEC1 "30 06 02 01 01 04 01 00" (base64 "MAYCAQEEAQA="): no [0]
+    // parameters element, so the curve is unknown.
+    const no_params =
+        \\-----BEGIN EC PRIVATE KEY-----
+        \\MAYCAQEEAQA=
+        \\-----END EC PRIVATE KEY-----
+    ;
+    try testing.expectError(error.UnsupportedCurve, loadCredentials(testing.allocator, tls_cert_pem, no_params));
+    // Valid base64 but not DER at all.
+    const not_der =
+        \\-----BEGIN EC PRIVATE KEY-----
+        \\QUJD
+        \\-----END EC PRIVATE KEY-----
+    ;
+    try testing.expectError(error.InvalidKey, loadCredentials(testing.allocator, tls_cert_pem, not_der));
+}

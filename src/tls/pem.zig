@@ -118,3 +118,51 @@ test "pem: garbage and truncation fail cleanly" {
     try testing.expectError(error.InvalidBase64, decodeFirst("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n", "CERTIFICATE", &out));
     try testing.expectError(error.InvalidPemHeader, decodeFirst("-----BEGIN CERTIFICATE\nAAAA\n-----END CERTIFICATE-----\n", "CERTIFICATE", &out));
 }
+
+test "pem: END label mismatch is a header error" {
+    var out: [64]u8 = undefined;
+    try testing.expectError(error.InvalidPemHeader, decodeFirst("-----BEGIN CERTIFICATE-----\nAAAA\n-----END PRIVATE KEY-----\n", "CERTIFICATE", &out));
+}
+
+test "pem: undecodable and oversized bodies fail as InvalidBase64" {
+    var out: [64]u8 = undefined;
+    // Valid alphabet but not decodable (length 1 modulo 4).
+    try testing.expectError(error.InvalidBase64, decodeFirst("-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n", "CERTIFICATE", &out));
+    // Decodes to 3 bytes, which do not fit a 1-byte buffer.
+    var tiny: [1]u8 = undefined;
+    try testing.expectError(error.InvalidBase64, decodeFirst("-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n", "CERTIFICATE", &tiny));
+}
+
+test "pem: skips non-matching blocks and tolerates whitespace" {
+    const pem =
+        \\-----BEGIN EC PRIVATE KEY-----
+        \\QUJD
+        \\-----END EC PRIVATE KEY-----
+        \\-----BEGIN CERTIFICATE-----
+        \\QUJD
+        \\-----END CERTIFICATE-----
+    ;
+    var out: [64]u8 = undefined;
+    // The first CERTIFICATE block wins even when it is not first in file.
+    const n = try decodeFirst(pem, "CERTIFICATE", &out);
+    try testing.expect(n != null);
+    try testing.expectEqualSlices(u8, "ABC", out[0..n.?]);
+    // No CERTIFICATE block at all.
+    const only_key =
+        \\-----BEGIN EC PRIVATE KEY-----
+        \\QUJD
+        \\-----END EC PRIVATE KEY-----
+    ;
+    try testing.expectEqual(@as(?usize, null), try decodeFirst(only_key, "CERTIFICATE", &out));
+    // CRLF line endings and surrounding whitespace are tolerated.
+    const crlf = "-----BEGIN CERTIFICATE-----\r\nQUJD\r\n-----END CERTIFICATE-----\r\n";
+    const m = try decodeFirst(crlf, "CERTIFICATE", &out);
+    try testing.expect(m != null);
+    try testing.expectEqualSlices(u8, "ABC", out[0..m.?]);
+}
+
+test "pem: empty input has no blocks" {
+    var out: [64]u8 = undefined;
+    try testing.expectEqual(@as(?usize, null), try decodeFirst("", "CERTIFICATE", &out));
+    try testing.expectEqual(@as(?usize, null), try decodeFirst("just some text\nno markers\n", "CERTIFICATE", &out));
+}

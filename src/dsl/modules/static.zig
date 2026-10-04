@@ -186,7 +186,7 @@ fn openat2Beneath(dirfd: posix.fd_t, path: []const u8) error{ Unsupported, NotFo
     @memcpy(path_buf[0..path.len], path);
     path_buf[path.len] = 0;
     const rc = linux.syscall4(SYS_openat2, @intCast(dirfd), @intFromPtr(&path_buf), @intFromPtr(&how), @sizeOf(OpenHow));
-    const err = posix.errno(rc);
+    const err = linux.errno(rc);
     return switch (err) {
         .SUCCESS => @intCast(rc),
         .NOSYS, .INVAL => error.Unsupported,
@@ -837,4 +837,145 @@ test "cached small-file content serves as the response body (no sendfile)" {
     });
     try testing.expectEqual(registry.Status.partial_content, ranged.resp.status);
     try testing.expectEqualStrings("hello", ranged.resp.body);
+}
+
+test "autoindex renders a directory listing with entries" {
+    const allocator = testing.allocator;
+    const route = registry.Route{ .path = "/", .root = "testdata", .autoindex = true };
+    var served = try serveWith(allocator, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", &route);
+    defer served.deinit();
+    try testing.expectEqual(registry.Status.ok, served.resp.status);
+    try testing.expectEqualStrings("text/html", headerValue(&served.resp, "Content-Type").?);
+    try testing.expect(std.mem.indexOf(u8, served.resp.body, "hello.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, served.resp.body, "<ul>") != null);
+}
+
+test "autoindex without entries flag yields 404 on directories" {
+    const allocator = testing.allocator;
+    const route = registry.Route{ .path = "/", .root = "testdata" };
+    var served = try serveWith(allocator, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", &route);
+    defer served.deinit();
+    // No index file at testdata/ root and autoindex off: 404.
+    try testing.expectEqual(registry.Status.not_found, served.resp.status);
+}
+
+test "static passes through with no route or no root" {
+    const allocator = testing.allocator;
+    var st = try staticRequest(allocator, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    defer st.req.deinit();
+    defer st.parser.deinit();
+    defer st.buf.deinit(allocator);
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &st.req, .resp = &resp, .allocator = allocator };
+    try testing.expectEqual(Action.pass, try run(&ctx));
+
+    const bare = registry.Route{ .path = "/" };
+    ctx.route = &bare;
+    try testing.expectEqual(Action.pass, try run(&ctx));
+}
+
+test "route prefix is stripped before resolving" {
+    const allocator = testing.allocator;
+    const route = registry.Route{ .path = "/static", .root = "testdata" };
+    var served = try serveWith(allocator, "GET /static/hello.txt HTTP/1.1\r\nHost: x\r\n\r\n", &route);
+    defer served.deinit();
+    try testing.expectEqual(registry.Status.ok, served.resp.status);
+    try testing.expect(served.resp.body_from_file);
+    compat.close(served.resp.file_fd);
+}
+
+test "missing index falls back to autoindex when enabled" {
+    const allocator = testing.allocator;
+    const route = registry.Route{ .path = "/", .root = "testdata", .index = "nope.html", .autoindex = true };
+    var served = try serveWith(allocator, "GET /dir/ HTTP/1.1\r\nHost: x\r\n\r\n", &route);
+    defer served.deinit();
+    try testing.expectEqual(registry.Status.ok, served.resp.status);
+    try testing.expect(std.mem.indexOf(u8, served.resp.body, "index.html") != null);
+}
+
+test "legacy path refuses symlink escapes via the realpath check" {
+    const allocator = testing.allocator;
+    compat.symLink("/etc/hostname", "testdata/link-out-tmp") catch return error.SkipZigTest;
+    defer compat.deleteFile("testdata/link-out-tmp") catch {};
+    const route = registry.Route{ .path = "/", .root = "testdata" };
+    var served = try serveWith(allocator, "GET /link-out-tmp HTTP/1.1\r\nHost: x\r\n\r\n", &route);
+    defer served.deinit();
+    try testing.expectEqual(registry.Status.not_found, served.resp.status);
+}
+
+test "if-modified-since against file mtime answers 304 or 200" {
+    const allocator = testing.allocator;
+    const route = registry.Route{ .path = "/", .root = "testdata" };
+    var first = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\n\r\n", &route);
+    const lm = headerValue(&first.resp, "Last-Modified").?;
+    try testing.expect(first.resp.body_from_file);
+    compat.close(first.resp.file_fd);
+    defer first.deinit();
+
+    var wire_buf: [320]u8 = undefined;
+    const wire = std.fmt.bufPrint(&wire_buf, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: {s}\r\n\r\n", .{lm}) catch unreachable;
+    var second = try serveWith(allocator, wire, &route);
+    defer second.deinit();
+    try testing.expectEqual(registry.Status.not_modified, second.resp.status);
+
+    // An epoch-zero client copy is stale: full 200.
+    var third = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n", &route);
+    defer third.deinit();
+    try testing.expectEqual(registry.Status.ok, third.resp.status);
+    compat.close(third.resp.file_fd);
+
+    // Garbage dates never match: the request passes through to content.
+    var fourth = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: garbage\r\n\r\n", &route);
+    defer fourth.deinit();
+    try testing.expectEqual(registry.Status.ok, fourth.resp.status);
+    compat.close(fourth.resp.file_fd);
+}
+
+test "multi-range requests fall back to the full 200" {
+    const allocator = testing.allocator;
+    const route = registry.Route{ .path = "/", .root = "testdata" };
+    var served = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1,3-4\r\n\r\n", &route);
+    defer served.deinit();
+    try testing.expectEqual(registry.Status.ok, served.resp.status);
+    try testing.expectEqual(@as(usize, 19), served.resp.file_len);
+    compat.close(served.resp.file_fd);
+}
+
+test "path builders reject oversized inputs" {
+    const big = @as([4000]u8, @splat('a'));
+    var buf: [100]u8 = undefined;
+    try testing.expect(buildFullPath(&buf, big[0..], "target") == null);
+    try testing.expect(buildRelPath(&buf, big[0..], "sub") == null);
+    var exact: [12]u8 = undefined;
+    const used = buildFullPath(&exact, "root", "target").?;
+    try testing.expectEqualStrings("root/target", exact[0..used]);
+    var rel: [8]u8 = undefined;
+    const rel_used = buildRelPath(&rel, "rel", "sub").?;
+    try testing.expectEqualStrings("rel/sub", rel[0..rel_used]);
+}
+
+test "path safety rejects nul bytes and content hashes differ" {
+    try testing.expect(!pathIsSafe("a\x00b"));
+    try testing.expectEqual(contentHash("same"), contentHash("same"));
+    try testing.expect(contentHash("aaa") != contentHash("aab"));
+}
+
+test "range parser edge cases" {
+    // Leading whitespace is skipped.
+    const spaced = parseRange("bytes= 2-4", 10);
+    try testing.expectEqual(@as(u64, 2), spaced.single.offset);
+    try testing.expectEqual(@as(u64, 3), spaced.single.length);
+    // Empty/garbage specs serve the full response.
+    try testing.expectEqual(Range.full, parseRange("bytes= ", 10));
+    try testing.expectEqual(Range.full, parseRange("bytes=-", 10));
+    try testing.expectEqual(Range.full, parseRange("bytes=5-99999999999999999999999", 10));
+    try testing.expectEqual(Range.full, parseRange("bytes=99999999999999999999999-", 10));
+    // Suffix larger than the file serves it whole; zero suffix is 416.
+    const all = parseRange("bytes=-99", 10);
+    try testing.expectEqual(@as(u64, 0), all.single.offset);
+    try testing.expectEqual(@as(u64, 10), all.single.length);
+    // Digit overflow never panics.
+    try testing.expect(parseDigits("") == null);
+    try testing.expect(parseDigits("99999999999999999999999999") == null);
+    try testing.expectEqual(@as(u64, 12), parseDigits("12abc").?);
 }

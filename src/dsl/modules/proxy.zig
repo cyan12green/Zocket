@@ -251,6 +251,7 @@ const PoolEntry = struct {
     last_used_ns: u64 = 0,
 };
 const posix = std.posix;
+const linux = std.os.linux;
 const posix_fd = std.posix.fd_t;
 
 // Per-reactor state (thread-local: each reactor owns its upstream sockets).
@@ -1461,3 +1462,193 @@ test "tcpProbe distinguishes a live listener from a dead port" {
     }
     try testing.expect(dead_ok_checked);
 }
+
+/// Fake upstream for round-trip tests: accepts connections on a loopback
+/// listener and answers every request with a canned response. Bounded by a
+/// poll deadline so a test bug fails instead of hanging the suite.
+const FakeUpstream = struct {
+    listener: posix_fd,
+    port: u16,
+    max_conns: usize,
+    response: []const u8,
+    stop_flag: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn start(response: []const u8, max_conns: usize) !*FakeUpstream {
+        const self = try testing.allocator.create(FakeUpstream);
+        const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+        addr[0] = 2;
+        addr[4] = 127;
+        addr[7] = 1;
+        try compat.bind(lfd, @ptrCast(&addr), 16);
+        try compat.listen(lfd, 8);
+        var slen: posix.socklen_t = 16;
+        var bound: [16]u8 align(@alignOf(u16)) = undefined;
+        try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+        self.* = .{
+            .listener = lfd,
+            .port = (@as(u16, bound[2]) << 8) | bound[3],
+            .max_conns = max_conns,
+            .response = response,
+        };
+        self.thread = try std.Thread.spawn(.{}, runFn, .{self});
+        return self;
+    }
+
+    fn runFn(self: *FakeUpstream) void {
+        var served: usize = 0;
+        while (served < self.max_conns and !self.stop_flag.load(.acquire)) {
+            var pfds = [_]std.posix.pollfd{.{ .fd = self.listener, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&pfds, 100) catch break;
+            if (ready == 0) continue; // recheck stop flag
+            const cfd = linux.accept4(self.listener, null, null, 0);
+            if (linux.errno(cfd) != .SUCCESS) {
+                break;
+            }
+            const fd: posix_fd = @intCast(cfd);
+            // Keepalive: serve requests on this connection until the peer
+            // closes, the deadline passes, or the connection budget runs out.
+            while (!self.stop_flag.load(.acquire)) {
+                var rpfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                const rready = std.posix.poll(&rpfds, 1000) catch break;
+                if (rready == 0) break;
+                // Drain one request head, then answer (connection stays
+                // open for the next pipelined/keepalive request).
+                var req_buf: [4096]u8 = undefined;
+                var used: usize = 0;
+                var complete = false;
+                while (used < req_buf.len) {
+                    const n = posix.read(fd, req_buf[used..]) catch break;
+                    if (n == 0) break;
+                    used += n;
+                    if (std.mem.indexOf(u8, req_buf[0..used], "\r\n\r\n") != null) {
+                        complete = true;
+                        break;
+                    }
+                }
+                if (!complete) break;
+                _ = compat.write(fd, self.response) catch break;
+            }
+            compat.close(fd);
+            served += 1;
+        }
+    }
+
+    fn stop(self: *FakeUpstream) void {
+        self.stop_flag.store(true, .release);
+        compat.close(self.listener); // wakes the poll
+        self.thread.join();
+        testing.allocator.destroy(self);
+    }
+};
+
+/// Empty a backend's keepalive pool (test isolation: pooled fds from one
+/// test must never leak into another's backend idx 0).
+fn drainPool(idx: usize) void {
+    while (true) {
+        const fd = acquirePooled(idx, nowNs());
+        if (fd < 0) break;
+        posix_close(fd);
+    }
+}
+
+/// Test-only: clear all backend state for `route` (health slots, pools,
+/// in-flight counts). Backend state is keyed by route pointer in
+/// process-wide zones, and stack-allocated test routes alias addresses
+/// across tests — call this at the start of any test that forwards.
+pub fn testResetRoute(route: *const registry.Route) void {
+    health_zone.mutex.lock();
+    defer health_zone.mutex.unlock();
+    for (0..max_backends) |i| {
+        if (health_zone.upsertLocked(backendKey(route, i))) |r| r.slot.* = .{};
+    }
+    for (0..max_backends) |i| drainPool(i);
+    for (&active) |*a| a.* = 0;
+}
+
+test "proxy round-trips through the sync forward path with pool reuse" {
+    const srv = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Up: 1\r\n\r\nhello", 4);
+    defer srv.stop();
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", srv.port)};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 3,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+
+    // Seed the pool with a BLOCKING socket: the sync forward path reads
+    // exactly once, so a nonblocking fd would race the fake's response
+    // (WouldBlock -> 502). Blocking + recv timeout is deterministic.
+    const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try compat.connect(seed, &ups[0].sockaddr, 16);
+    setRecvTimeout(seed);
+    releasePooled(0, seed, nowNs());
+
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.method = .get;
+        req.target = "/proxied/hello.txt";
+        var resp = registry.Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &route;
+        try testing.expectEqual(Action.handled, try run(&ctx));
+        try testing.expectEqual(registry.Status.ok, resp.status);
+        try testing.expectEqualStrings("hello", resp.body);
+        var seen_upstream = false;
+        for (resp.headers[0..resp.header_count]) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "X-Up")) seen_upstream = true;
+        }
+        try testing.expect(seen_upstream);
+    }
+    // The second request reused the pooled keepalive connection.
+    drainPool(0);
+}
+
+test "proxy connectUpstream dials a live listener" {
+    const srv = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", 1);
+    defer srv.stop();
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", srv.port)};
+    const cfd = try connectUpstream(&ups[0]);
+    defer posix_close(cfd);
+    drainPool(0);
+}
+
+test "proxy answers 502 when the upstream refuses" {
+    // Reserve-then-close a listener so the port is definitely shut.
+    const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    addr[0] = 2;
+    addr[4] = 127;
+    addr[7] = 1;
+    try compat.bind(lfd, @ptrCast(&addr), 16);
+    var slen: posix.socklen_t = 16;
+    var bound: [16]u8 align(@alignOf(u16)) = undefined;
+    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+    const dead_port = (@as(u16, bound[2]) << 8) | bound[3];
+    compat.close(lfd);
+
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", dead_port)};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route); // a pooled live fd must not mask the refused dial
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+

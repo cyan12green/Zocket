@@ -29,6 +29,7 @@ const ProxyHeader = router.ProxyHeader;
 const Regex = router.Regex;
 const Upstream = router.Upstream;
 const Balance = router.Balance;
+const ErrorPage = router.ErrorPage;
 const Phase = phase_mod.Phase;
 const Limits = dsl_limits.Limits;
 
@@ -124,6 +125,8 @@ const H_max_fails = keyHash("max_fails");
 const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
 const H_access_log = keyHash("access_log");
+const H_error_page = keyHash("error_page");
+const H_try_files = keyHash("try_files");
 const H_off = keyHash("off");
 const H_on = keyHash("on");
 const H_post_read = keyHash("post_read");
@@ -409,6 +412,18 @@ const LocationSpec = struct {
     limit_rate: u32 = 0,
     limit_burst: u32 = 0,
     limit_conn_max: u32 = 0,
+    /// `error_page 404 500 /50x;` / `error_page 503 =200;`: range into the
+    /// builder's error-page pool (status -> target URI or =code).
+    error_pages_start: usize = 0,
+    error_pages_len: usize = 0,
+    /// `try_files $uri $uri/ /fallback;` / `=404`: range into the builder's
+    /// try-files pool (candidates in test order, last is the fallback).
+    try_files_start: usize = 0,
+    try_files_len: usize = 0,
+    /// `rewrite <pattern> <replacement> [flag];`: range into the builder's
+    /// rewrite-rule pool (pattern NFA compiled at parse time).
+    rewrite_start: usize = 0,
+    rewrite_len: usize = 0,
     /// Server block index this location belongs to (for multi-server routing).
     server_idx: u8 = 0,
 };
@@ -447,12 +462,29 @@ const LogFormatSpec = struct {
     value: Str = .{ .src = "" },
 };
 
+/// One `error_page` entry as parsed (target unresolved until build).
+const ErrorPageSpec = struct {
+    status: u16,
+    target: Str = .{ .src = "" },
+};
+
+/// One `rewrite` rule as parsed (replacement unresolved until build, when
+/// the route's set scope is known; the pattern NFA compiles immediately).
+const RewriteSpec = struct {
+    pattern: Regex,
+    replacement: Str = .{ .src = "" },
+    flag: router.RewriteFlag = .last,
+};
+
 /// Comptime builder: append-only pools for every piece of the config.
 const Builder = struct {
     routes: ct_pool.CtPool(LocationSpec, route_cap) = .{},
     modules: ct_pool.CtPool(ModuleBinding, module_cap) = .{},
     headers: ct_pool.CtPool(TemplateHeader, header_cap) = .{},
     upstreams: ct_pool.CtPool(Upstream, upstream_cap) = .{},
+    error_pages: ct_pool.CtPool(ErrorPageSpec, 256) = .{},
+    try_files: ct_pool.CtPool(Str, 1024) = .{},
+    rewrites: ct_pool.CtPool(RewriteSpec, 256) = .{},
     strings: ct_pool.CtPool(u8, string_cap) = .{},
     log_formats: ct_pool.CtPool(LogFormatSpec, 16) = .{},
     set_vars: ct_pool.CtPool(SetSpec, 1024) = .{},
@@ -897,7 +929,7 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
             lx.expectTerminator(name);
         },
         H_host_select => {
-            b.host_select = lx.onOff(name);
+            b.host_select = lx.boolOnOff(name);
             lx.expectTerminator(name);
         },
         H_tls => {
@@ -949,6 +981,46 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
 
 /// Parse the phase-directive bindings and route directives inside a location.
 fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime name: []const u8) void {
+    // `rewrite` is BOTH a phase name (`rewrite <module>;`) and a directive
+    // (`rewrite <pattern> <replacement> [flag];`). The directive form has
+    // two or more values before the terminator; the phase form has exactly
+    // one. Peek ahead to disambiguate (positions rewind cleanly).
+    if (keyHash(name) == H_rewrite) {
+        const saved = lx.pos;
+        _ = lx.token() orelse lx.fail("rewrite: expected a module or pattern");
+        const single = lx.peek() == ';';
+        lx.pos = saved;
+        if (!single) {
+            const pat = lx.value(b, "rewrite");
+            const repl = lx.value(b, "rewrite");
+            var flag: router.RewriteFlag = .last;
+            if (lx.peek() != ';') {
+                const ft = lx.token() orelse lx.fail("rewrite: expected a flag");
+                const fs = ft.srcOf("rewrite: flag cannot contain escapes");
+                if (std.mem.eql(u8, fs, "last")) {
+                    flag = .last;
+                } else if (std.mem.eql(u8, fs, "break")) {
+                    flag = .@"break";
+                } else if (std.mem.eql(u8, fs, "redirect")) {
+                    flag = .redirect;
+                } else if (std.mem.eql(u8, fs, "permanent")) {
+                    flag = .permanent;
+                } else lx.fail("rewrite: flag must be last|break|redirect|permanent");
+            }
+            lx.expectTerminator("rewrite");
+            if (spec.rewrite_len == 0) spec.rewrite_start = b.rewrites.len;
+            _ = b.rewrites.create(.{
+                .pattern = regex_mod.compileRegex(resolve(pat, b.strings.items[0..])),
+                .replacement = repl,
+                .flag = flag,
+            });
+            spec.rewrite_len += 1;
+            ensureModuleBound(b, spec, .rewrite, "rewrite");
+            b.cost += 8;
+            return;
+        }
+        // else: single value — fall through to the phase binding below.
+    }
     // Generic filter binding: `filter <name>;` (location scope).
     if (keyHash(name) == H_filter) {
         const fname = resolve(lx.value(b, name), b.strings.items[0..]);
@@ -1222,7 +1294,10 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
                 const t = lx.token() orelse lx.fail("health_check: expected a parameter");
                 const kv = t.srcOf("health_check: parameter cannot contain escapes");
                 if (std.mem.startsWith(u8, kv, "path=")) {
-                    pth = lx.value(b, "health_check");
+                    // Glued (`path=/hz`) or spaced (`path= /hz`): the value
+                    // rides on the same token or the next one.
+                    const rest = kv["path=".len..];
+                    pth = if (rest.len > 0) Str{ .src = rest } else lx.value(b, "health_check");
                 } else if (std.mem.startsWith(u8, kv, "interval=")) {
                     interval = std.fmt.parseInt(u32, kv["interval=".len..], 10) catch
                         lx.fail("health_check: bad interval");
@@ -1317,6 +1392,51 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const s = t.srcOf("access_log: value cannot contain escapes");
             spec.log_format = if (keyHash(s) == H_off) null else t;
             lx.expectTerminator("access_log");
+            b.cost += 8;
+        },
+        H_error_page => {
+            // `error_page 404 500 /50x;` / `error_page 503 =200;`: one or
+            // more status codes, then the target (URI or `=code`). The last
+            // token before ';' is the target; every token before it must be
+            // a status code (`=code` never parses as u16, so it can only
+            // ever be the target).
+            var toks: [9]Str = undefined;
+            var ntoks: usize = 0;
+            while (lx.peek() != ';') {
+                if (ntoks >= toks.len) lx.fail("error_page: too many arguments");
+                toks[ntoks] = lx.token() orelse lx.fail("error_page: expected a status code or target");
+                ntoks += 1;
+            }
+            if (ntoks < 2) lx.fail("error_page: expected at least one status code and a target");
+            lx.expectTerminator("error_page");
+            if (spec.error_pages_len == 0) spec.error_pages_start = b.error_pages.len;
+            for (toks[0 .. ntoks - 1]) |ct| {
+                const cs = ct.srcOf("error_page: status code cannot contain escapes");
+                const code = std.fmt.parseInt(u16, cs, 10) catch
+                    lx.fail("error_page: status code must be an integer");
+                _ = b.error_pages.create(.{ .status = code, .target = toks[ntoks - 1] });
+                spec.error_pages_len += 1;
+            }
+            ensureModuleBound(b, spec, .log, "error_page");
+            b.cost += 8;
+        },
+        H_try_files => {
+            // `try_files $uri $uri/ /fallback;` / `try_files $uri =404;`:
+            // candidates in test order; the last is the fallback (URI or
+            // `=code`). Values (not bare tokens): `$uri` must survive.
+            if (spec.try_files_len != 0) lx.fail("try_files: duplicate directive");
+            spec.try_files_start = b.try_files.len;
+            var n: usize = 0;
+            while (lx.peek() != ';') {
+                const t = lx.value(b, "try_files");
+                _ = b.try_files.create(t);
+                n += 1;
+                if (n > 16) lx.fail("try_files: too many candidates");
+            }
+            lx.expectTerminator("try_files");
+            if (n == 0) lx.fail("try_files: expected at least one candidate");
+            spec.try_files_len = n;
+            ensureModuleBound(b, spec, .content, "try_files");
             b.cost += 8;
         },
         else => lx.fail("unknown location directive '" ++ name ++ "'"),
@@ -1595,6 +1715,38 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .ranges = ranges };
     };
 
+    // `error_page` entries per route (M-C1): targets resolve to strings.
+    const ErrTable = struct { items: [256]ErrorPage, ranges: [route_cap]Range };
+    const err_table: ErrTable = comptime blk: {
+        var items: [256]ErrorPage = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.error_pages_len };
+            for (b.error_pages.items[spec.error_pages_start..][0..spec.error_pages_len]) |ep| {
+                items[pos] = .{ .status = ep.status, .target = resolve(ep.target, strings) };
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
+    // `try_files` candidates per route (M-C1): each resolves to a string.
+    const TryTable = struct { items: [1024][]const u8, ranges: [route_cap]Range };
+    const try_table: TryTable = comptime blk: {
+        var items: [1024][]const u8 = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.try_files_len };
+            for (b.try_files.items[spec.try_files_start..][0..spec.try_files_len]) |tf| {
+                items[pos] = resolve(tf, strings);
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
     const LogTable = struct { items: [16]LogFormat, len: usize };
     const log_table: LogTable = comptime blk: {
         var items: [16]LogFormat = undefined;
@@ -1658,6 +1810,30 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .ranges = ranges };
     };
 
+    // `rewrite` rules per route (M-C1): replacements resolve as complex
+    // values against the route's set scope (`$1..$9` need no scope — the
+    // match publishes them, not the config).
+    const RewriteTable = struct { items: [256]router.RewriteRule, ranges: [route_cap]Range };
+    const rewrite_table: RewriteTable = comptime blk: {
+        var items: [256]router.RewriteRule = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.rewrite_len };
+            const sr = set_table.ranges[ri];
+            const route_sets = set_table.items[sr.start..][0..sr.len];
+            for (b.rewrites.items[spec.rewrite_start..][0..spec.rewrite_len]) |rs| {
+                items[pos] = .{
+                    .pattern = rs.pattern,
+                    .replacement = vars.parseComplexValue(resolve(rs.replacement, strings), route_sets),
+                    .flag = rs.flag,
+                };
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
     // Header-manipulation ops per route (headers module): names resolve to
     // strings, values parse into complex-value fragment lists.
     const HeaderOpTable = struct { items: [256]HeaderOp, ranges: [route_cap]Range };
@@ -1671,6 +1847,7 @@ fn build(b: *const Builder) Config {
                 items[pos] = .{
                     .kind = hs.kind,
                     .name = resolve(hs.name, strings),
+                    .always = hs.always,
                     .value = if (hs.kind == .remove)
                         &.{}
                     else
@@ -1794,6 +1971,9 @@ fn build(b: *const Builder) Config {
                 .limit_req_burst = spec.limit_burst,
                 .limit_conn_max = spec.limit_conn_max,
                 .upstreams = up_table.items[ur.start..][0..ur.len],
+                .error_pages = err_table.items[err_table.ranges[ri].start..][0..err_table.ranges[ri].len],
+                .try_files = try_table.items[try_table.ranges[ri].start..][0..try_table.ranges[ri].len],
+                .rewrites = rewrite_table.items[rewrite_table.ranges[ri].start..][0..rewrite_table.ranges[ri].len],
                 .balance = spec.balance,
                 .max_fails = spec.max_fails,
                 .fail_timeout_seconds = spec.fail_timeout_seconds,
@@ -2519,4 +2699,334 @@ test "conf: listen bare port with ipv6only=on" {
     try testing.expect(cfg.listen_spec.?.family == .ipv6);
     try testing.expect(cfg.listen_spec.?.ipv6_only);
     try testing.expectEqual(@as(u16, 8080), cfg.listen_spec.?.port);
+}
+
+test "conf: timeout, zone and pool limits parse" {
+    const cfg = parse(
+        \\client_header_timeout 5;
+        \\client_body_timeout 20;
+        \\proxy_cache_max_bytes 64m;
+        \\proxy_cache_max_entries 512;
+        \\connection_pool_max 64;
+        \\static_content_cache_max 32k;
+        \\max_chunked_body 128k;
+        \\max_connections 4096;
+        \\server_limit_conn 100;
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(u64, 5), cfg.limits.client_header_timeout_s);
+    try testing.expectEqual(@as(u64, 20), cfg.limits.client_body_timeout_s);
+    try testing.expectEqual(@as(usize, 64 * 1024 * 1024), cfg.limits.proxy_cache_max_bytes);
+    try testing.expectEqual(@as(usize, 512), cfg.limits.proxy_cache_max_entries);
+    try testing.expectEqual(@as(usize, 64), cfg.limits.connection_pool_max);
+    try testing.expectEqual(@as(usize, 32 * 1024), cfg.limits.static_content_cache_max);
+    try testing.expectEqual(@as(usize, 128 * 1024), cfg.limits.max_chunked_body);
+    try testing.expectEqual(@as(usize, 4096), cfg.limits.max_connections);
+    try testing.expectEqual(@as(u32, 100), cfg.limits.server_limit_conn);
+}
+
+test "conf: host_select off disables Host routing" {
+    const cfg = parse(
+        \\host_select off;
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    try testing.expect(!cfg.host_select);
+    const cfg2 = parse(
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    try testing.expect(cfg2.host_select);
+}
+
+test "conf: every balance strategy parses" {
+    const cfg = parse(
+        \\server {
+        \\    location /rr { rewrite proxy; upstream 127.0.0.1:8001; balance round_robin; }
+        \\    location /lc { rewrite proxy; upstream 127.0.0.1:8002; balance least_connections; }
+        \\    location /ip { rewrite proxy; upstream 127.0.0.1:8003; balance ip_hash; }
+        \\    location /rnd { rewrite proxy; upstream 127.0.0.1:8004; balance random; }
+        \\    location /ch { rewrite proxy; upstream 127.0.0.1:8005; balance consistent_hash; }
+        \\    location /lt { rewrite proxy; upstream 127.0.0.1:8006; balance least_time; }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 6), cfg.routes.len);
+    try testing.expectEqual(Balance.round_robin, cfg.routes[0].balance);
+    try testing.expectEqual(Balance.least_connections, cfg.routes[1].balance);
+    try testing.expectEqual(Balance.ip_hash, cfg.routes[2].balance);
+    try testing.expectEqual(Balance.random, cfg.routes[3].balance);
+    try testing.expectEqual(Balance.consistent_hash, cfg.routes[4].balance);
+    try testing.expectEqual(Balance.least_time, cfg.routes[5].balance);
+    for (cfg.routes) |r| {
+        try testing.expectEqual(@as(usize, 1), r.upstreams.len);
+    }
+}
+
+test "conf: proxy hardening directives parse" {
+    const cfg = parse(
+        \\server {
+        \\    location /sticky {
+        \\        rewrite proxy;
+        \\        upstream 127.0.0.1:8001;
+        \\        sticky_cookie sessid;
+        \\        health_check path= /hz interval=5 rise=2 fall=3 timeout=1;
+        \\    }
+        \\    location /hc-defaults {
+        \\        rewrite proxy;
+        \\        upstream 127.0.0.1:8002;
+        \\        health_check path= /ping;
+        \\    }
+        \\    location /limited {
+        \\        content echo;
+        \\        limit_req rate=10;
+        \\        limit_conn 3;
+        \\    }
+        \\    location /bursty {
+        \\        content echo;
+        \\        limit_req rate=5 burst=20;
+        \\    }
+        \\}
+    );
+    // Both `path=` spellings work: glued (`path=/hz`) reads the same
+    // token's suffix, spaced (`path= /ping`) the next token — like
+    // interval=/rise=/fall=/timeout=, which always parse the suffix.
+    try testing.expectEqualStrings("sessid", cfg.routes[0].sticky_cookie.?);
+    try testing.expectEqualStrings("/hz", cfg.routes[0].health_check_path.?);
+    try testing.expectEqual(@as(u32, 5), cfg.routes[0].health_check_interval_s);
+    try testing.expectEqual(@as(u32, 2), cfg.routes[0].health_check_rise);
+    try testing.expectEqual(@as(u32, 3), cfg.routes[0].health_check_fall);
+    try testing.expectEqual(@as(u32, 1), cfg.routes[0].health_check_timeout_s);
+    try testing.expectEqualStrings("/ping", cfg.routes[1].health_check_path.?);
+    try testing.expectEqual(@as(u32, 0), cfg.routes[1].health_check_interval_s);
+    // No burst: burst defaults to the rate.
+    try testing.expectEqual(@as(u32, 10), cfg.routes[2].limit_req_rate);
+    try testing.expectEqual(@as(u32, 10), cfg.routes[2].limit_req_burst);
+    try testing.expectEqual(@as(u32, 3), cfg.routes[2].limit_conn_max);
+    try testing.expectEqual(@as(u32, 5), cfg.routes[3].limit_req_rate);
+    try testing.expectEqual(@as(u32, 20), cfg.routes[3].limit_req_burst);
+}
+
+test "conf: cache, auth and encoding toggles parse" {
+    const cfg = parse(
+        \\server {
+        \\    location /a {
+        \\        rewrite proxy;
+        \\        proxy_pass 127.0.0.1:9000;
+        \\        proxy_cache on;
+        \\        proxy_cache_valid 60;
+        \\        proxy_cache_stale_while_revalidate 10;
+        \\        auth_request /auth;
+        \\    }
+        \\    location /b {
+        \\        content echo;
+        \\        proxy_cache off;
+        \\        gzip off;
+        \\        access_log off;
+        \\    }
+        \\    location /c {
+        \\        content static;
+        \\        root testdata;
+        \\        precompressed gz;
+        \\        tcp_nopush on;
+        \\        chunked on;
+        \\    }
+        \\    location /auth {
+        \\        content echo;
+        \\        auth_basic "realm-x";
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.routes[0].proxy_cache_enabled);
+    try testing.expectEqual(@as(u32, 60), cfg.routes[0].cache_ttl_seconds);
+    try testing.expectEqual(@as(u32, 10), cfg.routes[0].cache_swr_seconds);
+    try testing.expectEqualStrings("/auth", cfg.routes[0].auth_request_uri.?);
+    try testing.expect(!cfg.routes[1].proxy_cache_enabled);
+    try testing.expect(cfg.routes[1].moduleFor(.content) != null);
+    try testing.expect(cfg.routes[1].log_format == null); // access_log off
+    try testing.expect(cfg.routes[2].precompressed);
+    try testing.expect(cfg.routes[2].tcp_nopush);
+    try testing.expect(cfg.routes[2].chunked);
+    try testing.expectEqualStrings("realm-x", cfg.routes[3].auth_basic_realm.?);
+}
+
+test "conf: return without body and header ops with always" {
+    const cfg = parse(
+        \\server {
+        \\    location = /bare {
+        \\        return 204;
+        \\    }
+        \\    location /redir {
+        \\        return 301 "/new";
+        \\        add_header X-Moved "yes";
+        \\    }
+        \\    location /mod {
+        \\        content echo;
+        \\        set_header X-S "v" always;
+        \\        add_header X-A "a" always;
+        \\        remove_header X-R;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(u16, 204), cfg.routes[0].response.?.status);
+    try testing.expectEqualStrings("", cfg.routes[0].response.?.body);
+    try testing.expectEqual(@as(u16, 301), cfg.routes[1].response.?.status);
+    try testing.expectEqualStrings("/new", cfg.routes[1].response.?.body);
+    try testing.expectEqual(@as(usize, 1), cfg.routes[1].response.?.headers.len);
+    try testing.expectEqualStrings("X-Moved", cfg.routes[1].response.?.headers[0].name);
+    const ops = cfg.routes[2].headers_ops;
+    try testing.expectEqual(@as(usize, 3), ops.len);
+    try testing.expectEqual(vars.HeaderOpKind.set, ops[0].kind);
+    try testing.expectEqualStrings("X-S", ops[0].name);
+    try testing.expectEqual(vars.HeaderOpKind.add, ops[1].kind);
+    try testing.expectEqual(vars.HeaderOpKind.remove, ops[2].kind);
+    // The `always` flag survives build() into the route table.
+    try testing.expect(ops[0].always);
+    try testing.expect(ops[1].always);
+    try testing.expect(!ops[2].always);
+}
+
+test "conf: select_fn routes exact, wildcard, port-stripped and default hosts" {
+    const cfg = parse(
+        \\server {
+        \\    listen 8080;
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+        \\server {
+        \\    listen 8080;
+        \\    server_name example.com;
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+        \\server {
+        \\    listen 8080;
+        \\    server_name *.example.com;
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 3), cfg.servers.len);
+    const sel = cfg.select_fn orelse return error.NoSelectFn;
+    try testing.expectEqual(@as(usize, 1), sel("example.com"));
+    try testing.expectEqual(@as(usize, 1), sel("example.com:8080")); // port stripped
+    try testing.expectEqual(@as(usize, 2), sel("api.example.com"));
+    try testing.expectEqual(@as(usize, 2), sel("deep.api.example.com:9000"));
+    try testing.expectEqual(@as(usize, 0), sel("unknown.io")); // default: first block
+    try testing.expectEqual(@as(usize, 0), sel(""));
+}
+
+test "conf: single-quoted values and backslash escapes" {
+    const cfg = parse(
+        \\server {
+        \\    location = /q {
+        \\        return 200 'single-quoted';
+        \\    }
+        \\    location = /e {
+        \\        return 200 "a\\b";
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("single-quoted", cfg.routes[0].response.?.body);
+    // "a\\b" decodes the escaped backslash: a, \, b.
+    try testing.expectEqual(@as(usize, 3), cfg.routes[1].response.?.body.len);
+    try testing.expectEqual(@as(u8, 'a'), cfg.routes[1].response.?.body[0]);
+    try testing.expectEqual(@as(u8, 0x5C), cfg.routes[1].response.?.body[1]);
+    try testing.expectEqual(@as(u8, 'b'), cfg.routes[1].response.?.body[2]);
+}
+
+test "conf: error_page parses codes and targets, binding the module" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        error_page 404 500 /errors/50x.html;
+        \\        error_page 503 =200;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 3), cfg.routes[0].error_pages.len);
+    try testing.expectEqual(@as(u16, 404), cfg.routes[0].error_pages[0].status);
+    try testing.expectEqualStrings("/errors/50x.html", cfg.routes[0].error_pages[0].target);
+    try testing.expectEqual(@as(u16, 500), cfg.routes[0].error_pages[1].status);
+    try testing.expectEqualStrings("/errors/50x.html", cfg.routes[0].error_pages[1].target);
+    try testing.expectEqual(@as(u16, 503), cfg.routes[0].error_pages[2].status);
+    try testing.expectEqualStrings("=200", cfg.routes[0].error_pages[2].target);
+    // The log-phase module is bound by directive presence.
+    var found = false;
+    for (cfg.routes[0].modules) |mb| {
+        if (std.mem.eql(u8, mb.module, "error_page")) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "conf: try_files parses candidates, binding the module" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        root "testdata";
+        \\        try_files $uri $uri/ /fallback.html;
+        \\    }
+        \\    location /strict {
+        \\        root "testdata";
+        \\        try_files $uri =404;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 3), cfg.routes[0].try_files.len);
+    try testing.expectEqualStrings("$uri", cfg.routes[0].try_files[0]);
+    try testing.expectEqualStrings("$uri/", cfg.routes[0].try_files[1]);
+    try testing.expectEqualStrings("/fallback.html", cfg.routes[0].try_files[2]);
+    try testing.expectEqual(@as(usize, 2), cfg.routes[1].try_files.len);
+    try testing.expectEqualStrings("=404", cfg.routes[1].try_files[1]);
+    var found = false;
+    for (cfg.routes[0].modules) |mb| {
+        if (std.mem.eql(u8, mb.module, "try_files")) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "conf: rewrite parses rules with flags, binding the module" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        rewrite ^/old/(.*) /new/$1 last;
+        \\        rewrite ^/tmp/(.*) /cache/$1 break;
+        \\        rewrite ^/moved$ /elsewhere redirect;
+        \\        rewrite ^/gone$ /elsewhere permanent;
+        \\        rewrite ^/shorthand/(.*) /s/$1;
+        \\    }
+        \\    location /plain {
+        \\        rewrite proxy;
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 5), cfg.routes[0].rewrites.len);
+    try testing.expectEqual(router.RewriteFlag.last, cfg.routes[0].rewrites[0].flag);
+    try testing.expectEqual(router.RewriteFlag.@"break", cfg.routes[0].rewrites[1].flag);
+    try testing.expectEqual(router.RewriteFlag.redirect, cfg.routes[0].rewrites[2].flag);
+    try testing.expectEqual(router.RewriteFlag.permanent, cfg.routes[0].rewrites[3].flag);
+    try testing.expectEqual(router.RewriteFlag.last, cfg.routes[0].rewrites[4].flag);
+    // `rewrite proxy;` (single value) still binds the phase module.
+    try testing.expectEqual(@as(usize, 0), cfg.routes[1].rewrites.len);
+    var found_proxy = false;
+    var found_rewrite = false;
+    for (cfg.routes[0].modules) |mb| {
+        if (std.mem.eql(u8, mb.module, "rewrite")) found_rewrite = true;
+    }
+    for (cfg.routes[1].modules) |mb| {
+        if (std.mem.eql(u8, mb.module, "proxy")) found_proxy = true;
+    }
+    try testing.expect(found_rewrite);
+    try testing.expect(found_proxy);
 }

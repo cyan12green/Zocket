@@ -115,3 +115,36 @@ test "keyschedule: handshake secrets match the TLS 1.3 vectors (RFC 8448)" {
         0x51, 0x67, 0x18, 0x69, 0x5b, 0x85, 0xa9, 0xd7, 0x25, 0x86, 0x8a, 0x25, 0x00, 0x3e, 0xd3, 0x61,
     }, &secrets.server_handshake_key);
 }
+
+test "keyschedule: PSK resumption changes every secret" {
+    const ecdhe = @as([32]u8, @splat(@as(u8, 0x11)));
+    const hello_hash = @as([32]u8, @splat(@as(u8, 0x22)));
+    var plain: Secrets(T) = undefined;
+    plain.deriveHandshake(&ecdhe, hello_hash, null);
+    var resumed: Secrets(T) = undefined;
+    resumed.deriveHandshake(&ecdhe, hello_hash, &@as([32]u8, @splat(@as(u8, 0x33))));
+    try testing.expect(!std.mem.eql(u8, &plain.server_handshake_key, &resumed.server_handshake_key));
+    try testing.expect(!std.mem.eql(u8, &plain.client_handshake_key, &resumed.client_handshake_key));
+    // Client and server directions always differ.
+    try testing.expect(!std.mem.eql(u8, &plain.server_handshake_key, &plain.client_handshake_key));
+    try testing.expect(!std.mem.eql(u8, &plain.server_handshake_iv, &plain.client_handshake_iv));
+}
+
+test "keyschedule: application secrets derive and verify end to end" {
+    const ecdhe = @as([32]u8, @splat(@as(u8, 0x44)));
+    const hello_hash = @as([32]u8, @splat(@as(u8, 0x55)));
+    var secrets: Secrets(T) = undefined;
+    secrets.deriveHandshake(&ecdhe, hello_hash, null);
+    const hs_hash = @as([32]u8, @splat(@as(u8, 0x66)));
+    secrets.deriveApplication(hs_hash);
+    try testing.expect(!std.mem.eql(u8, &secrets.server_application_key, &secrets.client_application_key));
+    try testing.expect(!std.mem.eql(u8, &secrets.server_application_key, &secrets.server_handshake_key));
+    // Finished verify_data is a stable HMAC of the transcript hash.
+    const transcript = @as([32]u8, @splat(@as(u8, 0x77)));
+    const vd1 = Secrets(T).verifyData(secrets.server_finished_key, transcript);
+    const vd2 = Secrets(T).verifyData(secrets.server_finished_key, transcript);
+    try testing.expectEqualSlices(u8, &vd1, &vd2);
+    try testing.expectEqual(@as(usize, 32), vd1.len);
+    const vd_client = Secrets(T).verifyData(secrets.client_finished_key, transcript);
+    try testing.expect(!std.mem.eql(u8, &vd1, &vd_client));
+}

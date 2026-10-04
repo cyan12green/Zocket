@@ -277,6 +277,13 @@ pub fn dup(old: fd_t) DupError!fd_t {
 }
 
 pub fn dup2(old: fd_t, new: fd_t) DupError!void {
+    // POSIX: when old and new are the same valid descriptor, dup2 is a
+    // no-op success (dup3 would return EINVAL instead).
+    if (old == new) {
+        const probe = linux.fcntl(old, linux.F.GETFD, 0);
+        if (linux.errno(probe) != .SUCCESS) return error.Unexpected;
+        return;
+    }
     const rc = linux.dup3(old, new, 0);
     switch (linux.errno(rc)) {
         .SUCCESS => return,
@@ -912,4 +919,225 @@ pub fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
 /// dummy cwd is never consulted).
 pub fn relativePath(allocator: std.mem.Allocator, from: []const u8, to: []const u8) ![]u8 {
     return std.fs.path.relativeAlloc(allocator, ".", null, from, to);
+}
+
+const testing = std.testing;
+
+test "compat: Instant and clock_gettime move forward" {
+    const t0 = try Instant.now();
+    nanosleep(0, 2 * std.time.ns_per_ms);
+    const t1 = try Instant.now();
+    try testing.expect(t1.since(t0) >= 2 * std.time.ns_per_ms / 2);
+    try testing.expectEqual(@as(u64, 0), t0.since(t1)); // saturates
+    const ts = try clock_gettime(posix.CLOCK.REALTIME);
+    try testing.expect(ts.sec > 0);
+}
+
+test "compat: Mutex excludes concurrent increments" {
+    var m = Mutex{};
+    try testing.expect(m.tryLock());
+    try testing.expect(!m.tryLock());
+    m.unlock();
+    const N = 4;
+    const Per = 5000;
+    var counter: u32 = 0;
+    const Worker = struct {
+        fn run(mu: *Mutex, c: *u32) void {
+            var i: usize = 0;
+            while (i < Per) : (i += 1) {
+                mu.lock();
+                c.* += 1;
+                mu.unlock();
+            }
+        }
+    };
+    var threads: [N]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &m, &counter });
+    for (&threads) |*t| t.join();
+    try testing.expectEqual(@as(u32, N * Per), counter);
+}
+
+test "compat: randomBytes fills and indexOfIgnoreCase matches" {
+    var a: [32]u8 = @splat(0);
+    randomBytes(&a);
+    var empty: [0]u8 = .{};
+    randomBytes(&empty); // zero-length is a no-op
+    try testing.expectEqual(@as(?usize, 0), indexOfIgnoreCase("Hello", ""));
+    try testing.expectEqual(@as(?usize, 0), indexOfIgnoreCase("Hello", "he"));
+    try testing.expectEqual(@as(?usize, 2), indexOfIgnoreCase("aBcDe", "CD"));
+    try testing.expectEqual(@as(?usize, null), indexOfIgnoreCase("abc", "abcd"));
+    try testing.expectEqual(@as(?usize, null), indexOfIgnoreCase("abc", "x"));
+}
+
+test "compat: relativePath computes a relative path" {
+    const rel = try relativePath(testing.allocator, "/a/b", "/a/c");
+    defer testing.allocator.free(rel);
+    try testing.expectEqualStrings("../c", rel);
+}
+
+test "compat: file helpers round-trip" {
+    const dir = "/tmp";
+    const path = dir ++ "/zocket-compat-roundtrip.txt";
+    const link = dir ++ "/zocket-compat-roundtrip-link";
+    defer deleteFile(path) catch {};
+    defer deleteFile(link) catch {};
+
+    try writeFile(path, "hello compat");
+    const st = try statFile(path);
+    try testing.expectEqual(std.Io.File.Kind.file, st.kind);
+    try testing.expectEqual(@as(u64, 12), st.size);
+
+    const fd = try openFile(path);
+    const fst = try fstat(fd);
+    try testing.expectEqual(@as(u64, 12), fst.size);
+    var head: [5]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), try pread(fd, &head, 0));
+    try testing.expectEqualStrings("hello", &head);
+    try lseek_SET(fd, 0);
+    close(fd);
+
+    const got = try readFileAlloc(testing.allocator, path, 1024);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("hello compat", got);
+
+    var rp_buf: [512]u8 = undefined;
+    const rp = try realpath(path, &rp_buf);
+    try testing.expectEqualStrings(path, rp);
+
+    try symLink(path, link);
+    const lst = try statFile(link); // follows the link
+    try testing.expectEqual(@as(u64, 12), lst.size);
+
+    const cf = try createFile(dir ++ "/created.txt");
+    defer deleteFile(dir ++ "/created.txt") catch {};
+    try writeAll(cf, "created");
+    close(cf);
+    try testing.expectError(error.FileNotFound, statFile(dir ++ "/missing.txt"));
+}
+
+test "compat: truncate and writev gather" {
+    const path = "/tmp/zocket-compat-trunc";
+    defer deleteFile(path) catch {};
+    const fd = try createFile(path);
+    defer close(fd);
+    try writeAll(fd, "0123456789");
+    try ftruncate(fd, 4);
+    try testing.expectEqual(@as(u64, 4), (try fstat(fd)).size);
+
+    const pair = try socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer close(pair[0]);
+    defer close(pair[1]);
+    const iov = [_]posix.iovec_const{
+        .{ .base = "foo".ptr, .len = 3 },
+        .{ .base = "bar".ptr, .len = 3 },
+    };
+    try testing.expectEqual(@as(usize, 6), try writev(pair[0], &iov));
+    try testing.expectEqual(@as(usize, 3), try write(pair[0], "baz"));
+    var buf: [9]u8 = undefined;
+    var got: usize = 0;
+    while (got < 9) {
+        const n = try posix.read(pair[1], buf[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    try testing.expectEqualStrings("foobarbaz", buf[0..got]);
+}
+
+test "compat: sockets bind/listen/connect/accept" {
+    const listen_fd = try socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer close(listen_fd);
+    var zero_sa = std.mem.zeroes(posix.sockaddr);
+    bind(listen_fd, &zero_sa, 0) catch |e| switch (e) {
+        // Zeroed addr is invalid; the point is the error path works.
+        error.AddressNotAvailable, error.AddressFamilyNotSupported, error.Unexpected => {},
+        else => return e,
+    };
+    _ = try fcntl(listen_fd, 3, 0); // F_GETFL round-trips
+    try testing.expect(getpid() > 0);
+
+    // Real loopback listener via the sockets helper shape (raw here).
+    const lfd = try socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer close(lfd);
+    var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    addr[0] = 2; // AF_INET
+    addr[2] = 0;
+    addr[3] = 0; // port 0 = ephemeral
+    addr[4] = 127;
+    addr[7] = 1; // 127.0.0.1
+    const sa: *const posix.sockaddr = @ptrCast(&addr);
+    try bind(lfd, sa, 16);
+    try listen(lfd, 8);
+    var slen: posix.socklen_t = 16;
+    var bound: [16]u8 align(@alignOf(u16)) = undefined;
+    try getsockname(lfd, @ptrCast(&bound), &slen);
+    const port = (@as(u16, bound[2]) << 8) | bound[3];
+    try testing.expect(port != 0);
+
+    const cfd = try socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer close(cfd);
+    var caddr: [16]u8 align(@alignOf(u16)) = addr;
+    caddr[2] = bound[2];
+    caddr[3] = bound[3];
+    try connect(cfd, @ptrCast(&caddr), 16);
+    var err_bytes: [4]u8 = undefined;
+    try getsockopt(cfd, posix.SOL.SOCKET, posix.SO.ERROR, &err_bytes);
+    try testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, &err_bytes, .little));
+
+    // Refused: connect to the same port after closing the listener copy.
+    const dead = try socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer close(dead);
+    const lfd2 = try socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    {
+        var a2: [16]u8 align(@alignOf(u16)) = addr;
+        const sa2: *const posix.sockaddr = @ptrCast(&a2);
+        try bind(lfd2, sa2, 16);
+    }
+    var sl2: posix.socklen_t = 16;
+    var b2: [16]u8 align(@alignOf(u16)) = undefined;
+    try getsockname(lfd2, @ptrCast(&b2), &sl2);
+    close(lfd2);
+    var c2: [16]u8 align(@alignOf(u16)) = addr;
+    c2[2] = b2[2];
+    c2[3] = b2[3];
+    const refused = connect(dead, @ptrCast(&c2), 16);
+    try testing.expect(refused == error.ConnectionRefused or refused == error.WouldBlock);
+}
+
+test "compat: eventfd, epoll and pipe/dup round-trip" {
+    const efd = try eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+    defer close(efd);
+    const ep = try epoll_create1(0);
+    defer close(ep);
+    var ev = linux.epoll_event{ .events = 0x1, .data = .{ .ptr = 0 } };
+    try epoll_ctl(ep, 1, efd, &ev); // ADD
+    try epoll_ctl(ep, 3, efd, &ev); // MOD
+    try epoll_ctl(ep, 2, efd, null); // DEL
+    try testing.expectError(error.NotFound, epoll_ctl(ep, 2, efd, null)); // DEL again
+
+    const fds = try pipe();
+    const w = fds[1];
+    defer close(fds[0]);
+    defer close(w);
+    const d = try dup(w);
+    defer close(d);
+    try dup2(d, d); // self-dup is a no-op success
+    try writeAll(w, "piped");
+    var buf: [5]u8 = undefined;
+    var got: usize = 0;
+    while (got < 5) {
+        const n = try posix.read(fds[0], buf[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    try testing.expectEqualStrings("piped", buf[0..got]);
+}
+
+test "compat: openDir iterates entries" {
+    var dir = try openDir("testdata");
+    defer close(dir.fd);
+    var found_hello = false;
+    while (dir.next()) |e| {
+        if (std.mem.eql(u8, e.name, "hello.txt")) found_hello = true;
+    }
+    try testing.expect(found_hello);
 }

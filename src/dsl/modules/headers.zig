@@ -101,6 +101,85 @@ test "headers with no route or no ops passes through" {
     try testing.expectEqual(Action.pass, try run(&ctx));
 }
 
+test "headers without always skips non-carrying statuses" {
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.not_found);
+    resp.setHeader("X-Old", "stale");
+    var ctx = Context{ .req = &req, .resp = &resp };
+    const route = registry.Route{
+        .path = "/",
+        .headers_ops = &.{
+            .{ .kind = .set, .name = "X-Old", .value = &.{.{ .literal = "fresh" }} },
+            .{ .kind = .add, .name = "X-New", .value = &.{.{ .literal = "n" }} },
+            .{ .kind = .remove, .name = "X-Old" },
+        },
+    };
+    ctx.route = &route;
+    try testing.expectEqual(Action.pass, try run(&ctx));
+    // Nothing applied: the 404 keeps its original header set.
+    try testing.expectEqualStrings("stale", headerOf(&resp, "X-Old").?);
+    try testing.expect(headerOf(&resp, "X-New") == null);
+    try testing.expectEqual(@as(usize, 1), resp.header_count);
+}
+
+test "headers with always applies on error statuses" {
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.internal_error);
+    resp.setHeader("X-Old", "stale");
+    var ctx = Context{ .req = &req, .resp = &resp };
+    const route = registry.Route{
+        .path = "/",
+        .headers_ops = &.{
+            .{ .kind = .remove, .name = "X-Old", .always = true },
+            .{ .kind = .add, .name = "X-New", .value = &.{.{ .literal = "n" }}, .always = true },
+        },
+    };
+    ctx.route = &route;
+    try testing.expectEqual(Action.pass, try run(&ctx));
+    try testing.expect(headerOf(&resp, "X-Old") == null);
+    try testing.expectEqualStrings("n", headerOf(&resp, "X-New").?);
+}
+
+test "headers set appends when missing and add stops at capacity" {
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    const route = registry.Route{
+        .path = "/",
+        .headers_ops = &.{
+            .{ .kind = .set, .name = "X-Fresh", .value = &.{.{ .literal = "v" }} },
+        },
+    };
+    ctx.route = &route;
+    try testing.expectEqual(Action.pass, try run(&ctx));
+    try testing.expectEqualStrings("v", headerOf(&resp, "X-Fresh").?);
+
+    // A full header table (8/8): `add` is dropped, never panics.
+    var full = Response.init(.ok);
+    full.setHeader("H0", "0");
+    full.setHeader("H1", "1");
+    full.setHeader("H2", "2");
+    full.setHeader("H3", "3");
+    full.setHeader("H4", "4");
+    full.setHeader("H5", "5");
+    full.setHeader("H6", "6");
+    full.setHeader("H7", "7");
+    var ctx2 = Context{ .req = &req, .resp = &full };
+    const route2 = registry.Route{
+        .path = "/",
+        .headers_ops = &.{
+            .{ .kind = .add, .name = "X-Overflow", .value = &.{.{ .literal = "x" }} },
+        },
+    };
+    ctx2.route = &route2;
+    try testing.expectEqual(Action.pass, try run(&ctx2));
+    try testing.expectEqual(@as(usize, 8), full.header_count);
+    try testing.expect(headerOf(&full, "X-Overflow") == null);
+}
+
 fn headerOf(resp: *const Response, name: []const u8) ?[]const u8 {
     for (resp.headers[0..resp.header_count]) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;

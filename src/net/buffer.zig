@@ -227,3 +227,98 @@ test "buffer grow is a no-op when already large enough" {
     try testing.expectEqual(@as(usize, 16384), buf.data.len);
     try testing.expectEqualStrings("data", buf.peek());
 }
+
+test "buffer fromSlice views external storage without owning it" {
+    var storage: [16]u8 = undefined;
+    var buf = Buffer.fromSlice(&storage);
+    try testing.expect(!buf.owns_data);
+    try testing.expectEqual(@as(usize, 16), buf.availableWrite());
+    try testing.expectEqual(@as(usize, 3), buf.writeSlice("abc"));
+    try testing.expectEqualStrings("abc", buf.peek());
+    // deinitData must not free embedded storage.
+    buf.deinitData(testing.allocator);
+    try testing.expectEqualStrings("abc", buf.peek());
+}
+
+test "buffer writeSlice truncates when the buffer is full" {
+    const allocator = testing.allocator;
+    const buf = try Buffer.initFixed(allocator, 8);
+    defer buf.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 8), buf.writeSlice("12345678"));
+    // Only 3 bytes of headroom... actually none: partial write of 0.
+    try testing.expectEqual(@as(usize, 0), buf.writeSlice("abc"));
+    try testing.expectEqual(@as(usize, 8), buf.availableRead());
+    try testing.expectEqual(@as(usize, 0), buf.availableWrite());
+}
+
+test "buffer readSlice into a smaller destination is partial" {
+    const allocator = testing.allocator;
+    const buf = try Buffer.init(allocator);
+    defer buf.deinit(allocator);
+
+    _ = buf.writeSlice("hello world");
+    var small: [5]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), buf.readSlice(&small));
+    try testing.expectEqualStrings("hello", small[0..5]);
+    try testing.expectEqual(@as(usize, 6), buf.availableRead());
+}
+
+test "buffer compact preserves unread data" {
+    const allocator = testing.allocator;
+    const buf = try Buffer.init(allocator);
+    defer buf.deinit(allocator);
+
+    _ = buf.writeSlice("hello world");
+    buf.consume(6);
+    buf.compact();
+    try testing.expectEqual(@as(usize, 0), buf.read_pos);
+    try testing.expectEqual(@as(usize, 5), buf.write_pos);
+    try testing.expectEqualStrings("world", buf.peek());
+    // Compacting an already-compact buffer is a no-op.
+    buf.compact();
+    try testing.expectEqualStrings("world", buf.peek());
+}
+
+test "buffer reset discards everything" {
+    const allocator = testing.allocator;
+    const buf = try Buffer.init(allocator);
+    defer buf.deinit(allocator);
+
+    _ = buf.writeSlice("hello");
+    buf.consume(2);
+    buf.reset();
+    try testing.expectEqual(@as(usize, 0), buf.read_pos);
+    try testing.expectEqual(@as(usize, 0), buf.write_pos);
+    try testing.expectEqual(@as(usize, 0), buf.availableRead());
+    try testing.expectEqual(@as(usize, 16384), buf.availableWrite());
+}
+
+test "buffer reserveWrite hands out contiguous space and fails when full" {
+    const allocator = testing.allocator;
+    const buf = try Buffer.initFixed(allocator, 8);
+    defer buf.deinit(allocator);
+
+    const region = buf.reserveWrite(5) orelse return error.NoSpace;
+    @memcpy(region, "hello");
+    try testing.expectEqualStrings("hello", buf.peek());
+    try testing.expect(buf.reserveWrite(4) == null);
+    const tail = buf.reserveWrite(3) orelse return error.NoSpace;
+    try testing.expectEqual(@as(usize, 3), tail.len);
+}
+
+test "buffer second grow frees the previous heap allocation" {
+    const allocator = testing.allocator;
+    var storage: [16]u8 = undefined;
+    var buf = Buffer.fromSlice(&storage);
+    defer buf.deinitData(allocator);
+    _ = buf.writeSlice("0123456789abcdef");
+
+    try buf.grow(allocator, 64);
+    try testing.expect(buf.owns_data);
+    try testing.expectEqualStrings("0123456789abcdef", buf.peek());
+    // Growing again replaces (and frees) the first heap buffer.
+    try buf.grow(allocator, 1024);
+    try testing.expect(buf.data.len >= 1024);
+    try testing.expectEqualStrings("0123456789abcdef", buf.peek());
+}

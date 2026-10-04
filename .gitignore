@@ -3,6 +3,8 @@ zig-out/
 main
 bench/results/*.server.log
 bench/echo_client
+# zig-cov runtime output (SanitizerCoverage counter dumps)
+*.zcov
 
 # benchmark artifacts
 bench/.cache/

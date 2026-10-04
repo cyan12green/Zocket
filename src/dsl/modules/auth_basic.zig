@@ -130,3 +130,94 @@ test "inert without realm or without users" {
     ctx.route = &.{ .path = "/", .auth_basic_users = &.{.{ .user = "a", .kind = .plain, .secret = "b" }} };
     try testing.expectEqual(Action.pass, try run(&ctx));
 }
+
+test "passes through with no route configured" {
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(Action.pass, try run(&ctx));
+}
+
+test "empty, oversized and undecodable credentials are challenged" {
+    const users = [_]htpasswd.Entry{
+        .{ .user = "alice", .kind = .plain, .secret = "secret-pw" },
+    };
+    // "Basic " with nothing after it.
+    {
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        req.addHeaderParsed("Authorization", "Basic ") catch unreachable;
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &.{ .path = "/", .auth_basic_realm = "R", .auth_basic_users = &users };
+        try testing.expectEqual(Action.handled, try run(&ctx));
+        try testing.expectEqual(Status.unauthorized, resp.status);
+    }
+    // Not base64 at all.
+    {
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        req.addHeaderParsed("Authorization", "Basic !!!not-base64!!!") catch unreachable;
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &.{ .path = "/", .auth_basic_realm = "R", .auth_basic_users = &users };
+        try testing.expectEqual(Action.handled, try run(&ctx));
+        try testing.expectEqual(Status.unauthorized, resp.status);
+    }
+    // Valid base64 but no user:password colon. base64("nocolonhere").
+    {
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        req.addHeaderParsed("Authorization", "Basic bm9jb2xvbmhlcmU=") catch unreachable;
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &.{ .path = "/", .auth_basic_realm = "R", .auth_basic_users = &users };
+        try testing.expectEqual(Action.handled, try run(&ctx));
+        try testing.expectEqual(Status.unauthorized, resp.status);
+    }
+    // Over the 256-byte credential cap.
+    {
+        const big = @as([300]u8, @splat('A'));
+        var abuf: [320]u8 = undefined;
+        const auth = std.fmt.bufPrint(&abuf, "Basic {s}", .{big}) catch unreachable;
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        req.addHeaderParsed("Authorization", auth) catch unreachable;
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &.{ .path = "/", .auth_basic_realm = "R", .auth_basic_users = &users };
+        try testing.expectEqual(Action.handled, try run(&ctx));
+        try testing.expectEqual(Status.unauthorized, resp.status);
+    }
+}
+
+test "scheme match is case-insensitive and tolerant of whitespace" {
+    const users = [_]htpasswd.Entry{
+        .{ .user = "alice", .kind = .plain, .secret = "secret-pw" },
+    };
+    const variants = [_][]const u8{
+        "basic YWxpY2U6c2VjcmV0LXB3",
+        "  Basic   YWxpY2U6c2VjcmV0LXB3  ",
+        "Basic  YWxpY2U6c2VjcmV0LXB3",
+    };
+    for (variants) |auth| {
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        req.addHeaderParsed("Authorization", auth) catch unreachable;
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &.{ .path = "/", .auth_basic_realm = "R", .auth_basic_users = &users };
+        try testing.expectEqual(Action.pass, try run(&ctx));
+    }
+    // "BasicX..." (no space after the scheme) is malformed.
+    {
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        req.addHeaderParsed("Authorization", "BasicYWxpY2U6c2VjcmV0LXB3") catch unreachable;
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &.{ .path = "/", .auth_basic_realm = "R", .auth_basic_users = &users };
+        try testing.expectEqual(Action.handled, try run(&ctx));
+    }
+}

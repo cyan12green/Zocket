@@ -106,6 +106,10 @@ pub const Regex = struct {
     /// Character-class bitmaps referenced by kind_class/kind_class_ci
     /// states (`byte` = index into this table).
     class_bitmaps: []const [32]u32 = &.{},
+    /// NFA entry state: the final fragment's start. Usually 0, but a
+    /// leading quantifier (`a?`, `a*`) or group creates its entry split
+    /// after earlier states — match() must seed here, not at states[0].
+    start: u32 = 0,
 };
 
 /// One NFA state (M-D; shape from the plan §6.2).
@@ -759,4 +763,283 @@ test "getBuiltin request renders method and target" {
     var scratch = GetterScratch{};
     const s = getBuiltin(&ctx, .request, &scratch);
     try testing.expectEqualStrings("GET /who?q=1 HTTP/1.1", s);
+}
+
+test "resolveBuiltin maps every documented name and rejects unknown ones" {
+    try testing.expectEqual(VarId.method, resolveBuiltin("method").?);
+    try testing.expectEqual(VarId.request_uri, resolveBuiltin("request_uri").?);
+    try testing.expectEqual(VarId.uri, resolveBuiltin("uri").?);
+    try testing.expectEqual(VarId.args, resolveBuiltin("args").?);
+    try testing.expectEqual(VarId.query_string, resolveBuiltin("query_string").?);
+    try testing.expectEqual(VarId.host, resolveBuiltin("host").?);
+    try testing.expectEqual(VarId.status, resolveBuiltin("status").?);
+    try testing.expectEqual(VarId.body_bytes_sent, resolveBuiltin("body_bytes_sent").?);
+    try testing.expectEqual(VarId.remote_addr, resolveBuiltin("remote_addr").?);
+    try testing.expectEqual(VarId.remote_port, resolveBuiltin("remote_port").?);
+    try testing.expectEqual(VarId.server_protocol, resolveBuiltin("server_protocol").?);
+    try testing.expectEqual(VarId.scheme, resolveBuiltin("scheme").?);
+    try testing.expectEqual(VarId.request_time, resolveBuiltin("request_time").?);
+    try testing.expectEqual(VarId.content_length, resolveBuiltin("content_length").?);
+    try testing.expectEqual(VarId.content_type, resolveBuiltin("content_type").?);
+    try testing.expectEqual(VarId.ip, resolveBuiltin("ip").?);
+    try testing.expectEqual(VarId.date, resolveBuiltin("date").?);
+    try testing.expectEqual(VarId.request, resolveBuiltin("request").?);
+    try testing.expectEqual(VarId.bytes, resolveBuiltin("bytes").?);
+    try testing.expectEqual(VarId.referer, resolveBuiltin("referer").?);
+    try testing.expectEqual(VarId.user_agent, resolveBuiltin("user_agent").?);
+    try testing.expectEqual(VarId.time_local, resolveBuiltin("time_local").?);
+    try testing.expectEqual(VarId.time_iso8601, resolveBuiltin("time_iso8601").?);
+    try testing.expect(resolveBuiltin("nope") == null);
+    try testing.expect(resolveBuiltin("HOST") == null); // exact names only
+}
+
+test "getBuiltin renders every method name" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    var scratch = GetterScratch{};
+    const cases = [_]struct { m: http_parser.Method, want: []const u8 }{
+        .{ .m = .get, .want = "GET" },
+        .{ .m = .head, .want = "HEAD" },
+        .{ .m = .post, .want = "POST" },
+        .{ .m = .put, .want = "PUT" },
+        .{ .m = .delete, .want = "DELETE" },
+        .{ .m = .options, .want = "OPTIONS" },
+        .{ .m = .patch, .want = "PATCH" },
+        .{ .m = .unknown, .want = "?" },
+    };
+    for (cases) |c| {
+        req.method = c.m;
+        try testing.expectEqualStrings(c.want, getBuiltin(&ctx, .method, &scratch));
+    }
+}
+
+test "getBuiltin renders request URIs, args and plain literals" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/p?q=1";
+    req.decoded_target = "/p";
+    req.query_string = "q=1";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    var scratch = GetterScratch{};
+    try testing.expectEqualStrings("/p?q=1", getBuiltin(&ctx, .request_uri, &scratch));
+    try testing.expectEqualStrings("/p", getBuiltin(&ctx, .uri, &scratch));
+    try testing.expectEqualStrings("q=1", getBuiltin(&ctx, .args, &scratch));
+    try testing.expectEqualStrings("q=1", getBuiltin(&ctx, .query_string, &scratch));
+    try testing.expectEqualStrings("http", getBuiltin(&ctx, .scheme, &scratch));
+    try testing.expectEqualStrings("-", getBuiltin(&ctx, .remote_port, &scratch));
+}
+
+test "getBuiltin renders status, byte counts and content length" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.content_length = 123;
+    var resp = registry.Response.init(.not_found);
+    resp.setBody("oops");
+    var ctx = Context{ .req = &req, .resp = &resp };
+    var scratch = GetterScratch{};
+    try testing.expectEqualStrings("404", getBuiltin(&ctx, .status, &scratch));
+    try testing.expectEqualStrings("4", getBuiltin(&ctx, .body_bytes_sent, &scratch));
+    try testing.expectEqualStrings("4", getBuiltin(&ctx, .bytes, &scratch));
+    try testing.expectEqualStrings("123", getBuiltin(&ctx, .content_length, &scratch));
+}
+
+test "getBuiltin renders server protocol versions" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    var scratch = GetterScratch{};
+    req.version = .{ .major = 1, .minor = 1 };
+    try testing.expectEqualStrings("HTTP/1.1", getBuiltin(&ctx, .server_protocol, &scratch));
+    req.version = .{ .major = 1, .minor = 0 };
+    try testing.expectEqualStrings("HTTP/1.0", getBuiltin(&ctx, .server_protocol, &scratch));
+    req.version = .{ .major = 0, .minor = 9 };
+    try testing.expectEqualStrings("HTTP/?", getBuiltin(&ctx, .server_protocol, &scratch));
+}
+
+test "getBuiltin renders client addresses: v4, v6 and unknown" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    var scratch = GetterScratch{};
+    // Zero address (unknown peer).
+    try testing.expectEqualStrings("-", getBuiltin(&ctx, .remote_addr, &scratch));
+    try testing.expectEqualStrings("-", getBuiltin(&ctx, .ip, &scratch));
+    // IPv4-mapped IPv6 -> dotted decimal.
+    ctx.client_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 7 };
+    try testing.expectEqualStrings("192.168.1.7", getBuiltin(&ctx, .remote_addr, &scratch));
+    try testing.expectEqualStrings("192.168.1.7", getBuiltin(&ctx, .ip, &scratch));
+    // Full IPv6 -> bracketed hex groups.
+    ctx.client_ip = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 };
+    try testing.expectEqualStrings("[2001:db8:0:0:0:0:0:1]", getBuiltin(&ctx, .ip, &scratch));
+}
+
+test "getBuiltin renders headers with empty and missing fallbacks" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.addHeaderParsed("host", "example.com") catch unreachable;
+    req.addHeaderParsed("referer", "https://x.test/") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    var scratch = GetterScratch{};
+    try testing.expectEqualStrings("example.com", getBuiltin(&ctx, .host, &scratch));
+    try testing.expectEqualStrings("https://x.test/", getBuiltin(&ctx, .referer, &scratch));
+    try testing.expectEqualStrings("-", getBuiltin(&ctx, .user_agent, &scratch));
+    try testing.expectEqualStrings("", getBuiltin(&ctx, .content_type, &scratch));
+    var req2 = registry.Request.init(testing.allocator);
+    defer req2.deinit();
+    var ctx2 = Context{ .req = &req2, .resp = &resp };
+    try testing.expectEqualStrings("", getBuiltin(&ctx2, .host, &scratch));
+    try testing.expectEqualStrings("-", getBuiltin(&ctx2, .referer, &scratch));
+}
+
+test "getBuiltin renders request_time, date and iso8601 clocks" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.started = compat.Instant.now() catch return error.SkipZigTest;
+    var scratch = GetterScratch{};
+    // Started "now": whole seconds elapsed is 0.
+    try testing.expectEqualStrings("0", getBuiltin(&ctx, .request_time, &scratch));
+    const d = getBuiltin(&ctx, .date, &scratch);
+    try testing.expect(d.len > 20); // "02/Jan/2006:15:04:05 +0000"
+    try testing.expect(std.mem.endsWith(u8, d, " +0000"));
+    const tl = getBuiltin(&ctx, .time_local, &scratch);
+    try testing.expectEqualStrings(d, tl);
+    const iso = getBuiltin(&ctx, .time_iso8601, &scratch);
+    try testing.expect(std.mem.endsWith(u8, iso, "+00:00"));
+    try testing.expect(std.mem.indexOfScalar(u8, iso, 'T') != null);
+}
+
+test "logDate formats the epoch exactly" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("01/Jan/1970:00:00:00 +0000", logDate(0, &buf));
+    try testing.expectEqualStrings("02/Jan/1970:00:00:00 +0000", logDate(86400, &buf));
+}
+
+test "getArg splits the query once on & and =" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.query_string = "?a=1&b=&flag&c=3";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqualStrings("1", getArg(&ctx, comptime hashFn("a")));
+    try testing.expectEqualStrings("", getArg(&ctx, comptime hashFn("b")));
+    try testing.expectEqualStrings("", getArg(&ctx, comptime hashFn("flag")));
+    try testing.expectEqualStrings("3", getArg(&ctx, comptime hashFn("c")));
+    try testing.expectEqualStrings("", getArg(&ctx, comptime hashFn("missing")));
+    // Case-sensitive: "A" is not "a".
+    try testing.expectEqualStrings("", getArg(&ctx, comptime hashFn("A")));
+}
+
+test "getCookie splits Cookie on ; and matches case-insensitively" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    // No Cookie header -> empty.
+    try testing.expectEqualStrings("", getCookie(&ctx, comptime hashLower("s")));
+    req.addHeaderParsed("cookie", "Session=abc; theme=dark; flagless; =bad") catch unreachable;
+    try testing.expectEqualStrings("abc", getCookie(&ctx, comptime hashLower("session")));
+    try testing.expectEqualStrings("abc", getCookie(&ctx, comptime hashLower("SESSION")));
+    try testing.expectEqualStrings("dark", getCookie(&ctx, comptime hashLower("theme")));
+    try testing.expectEqualStrings("", getCookie(&ctx, comptime hashLower("flagless")));
+    try testing.expectEqualStrings("", getCookie(&ctx, comptime hashLower("missing")));
+}
+
+test "getHttpHeader misses return empty" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.addHeaderParsed("x-real", "yes") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqualStrings("yes", getHttpHeader(&ctx, comptime http_parser.header_hasher.hash("x-real")));
+    try testing.expectEqualStrings("", getHttpHeader(&ctx, comptime http_parser.header_hasher.hash("x-absent")));
+}
+
+test "getCapture rejects out-of-range indexes and ranges" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.capture_subject = "/ab";
+    ctx.captures[0] = .{ .start = 0, .end = 3 };
+    ctx.captures[1] = .{ .start = 9, .end = 12 }; // past the subject
+    ctx.captures[2] = .{ .start = 2, .end = 1 }; // end < start
+    ctx.capture_count = 3;
+    try testing.expectEqualStrings("/ab", getCapture(&ctx, 0));
+    try testing.expectEqualStrings("", getCapture(&ctx, 1));
+    try testing.expectEqualStrings("", getCapture(&ctx, 2));
+    try testing.expectEqualStrings("", getCapture(&ctx, 3)); // >= count
+    try testing.expectEqualStrings("", getCapture(&ctx, 9));
+}
+
+test "renderComplex renders user slots lazily and caches" {
+    const set_frags = comptime parseComplexValue("hi-$host", &.{});
+    const route_set = SetVar{ .name = "greet", .slot = 0, .value = set_frags };
+    const frags = comptime parseComplexValue("v=$greet!", &.{route_set});
+    var route = registry.Route{ .path = "/", .set_vars = &.{route_set} };
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.addHeaderParsed("host", "example.com") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp, .route = &route };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(testing.allocator);
+    var sink = ArrayListSink{ .list = &out, .allocator = testing.allocator };
+    try renderComplex(&ctx, frags, &sink);
+    try testing.expectEqualStrings("v=hi-example.com!", out.items);
+    // Cached in the slot now; rendering again appends the cached value.
+    try renderComplex(&ctx, frags, &sink);
+    try testing.expectEqualStrings("v=hi-example.com!v=hi-example.com!", out.items);
+
+    // renderComplexArena takes the same user path (fragLen + fragSlice).
+    const rendered = renderComplexArena(&ctx, frags, &req.arena).?;
+    try testing.expectEqualStrings("v=hi-example.com!", rendered);
+}
+
+test "renderComplex with a user slot but no route renders empty" {
+    const set_frags = comptime parseComplexValue("hi", &.{});
+    const route_set = SetVar{ .name = "greet", .slot = 0, .value = set_frags };
+    const frags = comptime parseComplexValue("v=$greet!", &.{route_set});
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp }; // route = null
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(testing.allocator);
+    var sink = ArrayListSink{ .list = &out, .allocator = testing.allocator };
+    try renderComplex(&ctx, frags, &sink);
+    try testing.expectEqualStrings("v=!", out.items);
+}
+
+test "ArenaSink copies fragments into the arena" {
+    var a = arena_mod.Arena.init(testing.allocator);
+    defer a.deinit();
+    var sink = ArenaSink{ .arena = &a };
+    try sink.appendAll("hello");
+    try sink.appendAll("-world");
+    // 5 + 3 alignment pad + 6: bump allocations are 8-byte aligned.
+    try testing.expectEqual(@as(usize, 14), a.usedBytes());
+}
+
+test "GetterScratch.fmt falls back to dash when the value overflows" {
+    var scratch = GetterScratch{};
+    const big = &@as([200]u8, @splat(@as(u8, 'z')));
+    try testing.expectEqualStrings("-", scratch.fmt("{s}", .{big}));
+    try testing.expectEqualStrings("42", scratch.fmt("{d}", .{@as(u32, 42)}));
+}
+
+test "hashFn and hashLower are deterministic and case-distinct" {
+    try testing.expectEqual(hashFn("abc"), hashFn("abc"));
+    try testing.expect(hashFn("abc") != hashFn("abd"));
+    try testing.expectEqual(hashLower("ABC"), hashLower("abc"));
+    try testing.expectEqual(hashLower("AbC"), hashLower("aBc"));
+    try testing.expect(hashLower("a") != hashLower("b"));
 }

@@ -457,7 +457,13 @@ pub const Session = struct {
         }
         if (hdr.flag_bits & frames.flags.end_stream != 0) {
             stream.end_stream_received = true;
-            try self.maybeRunRequest(hdr.stream_id, send, handler);
+            // Dispatch only once the header block is complete: without
+            // END_HEADERS the block continues in CONTINUATION frames and
+            // st.request does not exist yet (its completion path
+            // dispatches when end_stream_received is set).
+            if (hdr.flag_bits & frames.flags.end_headers != 0) {
+                try self.maybeRunRequest(hdr.stream_id, send, handler);
+            }
         }
     }
 
@@ -580,7 +586,10 @@ pub const Session = struct {
 
         // The stream's request was created (and its arena reset) in
         // decodeAndDispatch; the decoded fields still live in that arena, so
-        // it must not be reset again here.
+        // it must not be reset again here. A null request means the header
+        // block never completed (caller gates on END_HEADERS) — nothing to
+        // run yet.
+        if (st.request == null) return;
         const req = &st.request.?;
         self.max_headers = handler.limits.max_headers;
         var method_set = false;
@@ -875,9 +884,18 @@ pub const Session = struct {
     fn flushPendingResponse(self: *Session, stream_id: u31, send: *std.ArrayList(u8)) !void {
         const st = self.streams.getPtr(stream_id) orelse return;
         if (st.pending_response.items.len == 0) return;
-        const pending = st.pending_response.items;
-        st.pending_response.clearRetainingCapacity();
-        try self.writeBodyFrames(stream_id, pending, send);
+        // Move the backlog out before resending: if the windows are still
+        // exhausted, writeBodyFrames re-buffers the remainder — appending
+        // the list into its own backing store would be a self-aliased
+        // @memcpy (panic in safe modes, corruption otherwise).
+        var pending = st.pending_response;
+        st.pending_response = .empty;
+        errdefer {
+            st.pending_response.deinit(self.allocator);
+            st.pending_response = pending;
+        }
+        try self.writeBodyFrames(stream_id, pending.items, send);
+        pending.deinit(self.allocator);
         self.maybeCloseStream(stream_id);
     }
 
@@ -1062,4 +1080,929 @@ test "session: an allocator-owned module body is freed (gzip path, no leak)" {
     _ = try s.process(req_bytes.items, &send, &handler);
     // Deinits release everything; the testing allocator fails the test if the
     // gzip body leaked.
+}
+
+const h2t_limits: limits_mod.Limits = .{};
+
+fn h2tHandler(server: *const server_mod.Server) Session.Handler {
+    return .{
+        .server = server,
+        .allocator = testing.allocator,
+        .limits = &h2t_limits,
+        .date_header = "Sat, 15 Aug 2026 00:00:00 GMT",
+        .version_string = "Zocket/1.0.0",
+    };
+}
+
+/// Append one frame header + payload to a byte list.
+fn h2tFrame(list: *std.ArrayList(u8), length: usize, t: frames.FrameType, flag_bits: u8, stream_id: u31, payload: []const u8) !void {
+    var fh = frames.FrameHeader{ .length = @intCast(length), .type = t, .flag_bits = flag_bits, .stream_id = stream_id };
+    var hdr: [9]u8 = undefined;
+    fh.encode(&hdr);
+    try list.appendSlice(testing.allocator, &hdr);
+    try list.appendSlice(testing.allocator, payload);
+}
+
+/// A fresh session that already saw the preface (tests feed bare frames).
+fn h2tSession() Session {
+    var s = Session.init(testing.allocator);
+    s.preface_seen = true;
+    s.settings_sent = true;
+    return s;
+}
+
+/// True when `send` holds a frame of type `t` on `stream_id`.
+fn h2tHasFrame(send: []const u8, t: frames.FrameType, stream_id: u31) bool {
+    var off: usize = 0;
+    while (off + 9 <= send.len) {
+        const fh = frames.parseHeader(send[off..]) orelse return false;
+        if (off + 9 + fh.length > send.len) return false;
+        if (fh.type == t and fh.stream_id == stream_id) return true;
+        off += 9 + fh.length;
+    }
+    return false;
+}
+
+/// The RST_STREAM error code sent for `stream_id`, if any.
+fn h2tRstCode(send: []const u8, stream_id: u31) ?u32 {
+    var off: usize = 0;
+    while (off + 9 <= send.len) {
+        const fh = frames.parseHeader(send[off..]) orelse return null;
+        if (off + 9 + fh.length > send.len) return null;
+        if (fh.type == .rst_stream and fh.stream_id == stream_id and fh.length == 4) {
+            return std.mem.readInt(u32, send[off + 9 ..][0..4], .big);
+        }
+        off += 9 + fh.length;
+    }
+    return null;
+}
+
+/// Decode the first HEADERS frame for `stream_id` and return its :status
+/// (caller frees).
+fn h2tStatus(send: []const u8, stream_id: u31) !?[]u8 {
+    var off: usize = 0;
+    while (off + 9 <= send.len) {
+        const fh = frames.parseHeader(send[off..]) orelse return null;
+        if (off + 9 + fh.length > send.len) return null;
+        if (fh.type == .headers and fh.stream_id == stream_id) {
+            var dec = hpack.Decoder.init(testing.allocator);
+            defer dec.deinit();
+            var flds = std.ArrayList(hpack.Field).empty;
+            defer flds.deinit(testing.allocator);
+            dec.decode(testing.allocator, send[off + 9 .. off + 9 + fh.length], &flds) catch return null;
+            defer for (flds.items) |f| {
+                testing.allocator.free(f.name);
+                testing.allocator.free(f.value);
+            };
+            for (flds.items) |f| {
+                if (std.mem.eql(u8, f.name, ":status")) {
+                    const owned: ?[]u8 = try testing.allocator.dupe(u8, f.value);
+                    return owned;
+                }
+            }
+            return null;
+        }
+        off += 9 + fh.length;
+    }
+    return null;
+}
+
+/// Build a minimal GET / HPACK block (extra literal headers optional).
+const H2tHeader = struct { name: []const u8, value: []const u8 };
+fn h2tGetBlock(block: *std.ArrayList(u8), method: []const u8, extra: []const H2tHeader) !void {
+    try hpack.encodeField(block, testing.allocator, ":method", method);
+    try hpack.encodeField(block, testing.allocator, ":scheme", "http");
+    try hpack.encodeField(block, testing.allocator, ":path", "/");
+    for (extra) |h| try hpack.encodeField(block, testing.allocator, h.name, h.value);
+}
+
+test "session: settings are ACKed, validated and applied" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+
+    // Empty SETTINGS -> ACK.
+    try h2tFrame(&fr, 0, .settings, 0, 0, &.{});
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expect(h2tHasFrame(send.items, .settings, 0));
+
+    // Unknown setting ids are ignored (still ACKed).
+    fr.clearRetainingCapacity();
+    send.clearRetainingCapacity();
+    try h2tFrame(&fr, 6, .settings, 0, 0, &.{ 0x00, 0x09, 0, 0, 0, 42 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expect(h2tHasFrame(send.items, .settings, 0));
+
+    // MAX_FRAME_SIZE applies to the peer limit.
+    fr.clearRetainingCapacity();
+    send.clearRetainingCapacity();
+    try h2tFrame(&fr, 6, .settings, 0, 0, &.{ 0x00, 0x05, 0, 0, 0x40, 0x00 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(u24, 16384), s.peer_max_frame_size);
+
+    // INITIAL_WINDOW_SIZE applies to new streams.
+    fr.clearRetainingCapacity();
+    send.clearRetainingCapacity();
+    try h2tFrame(&fr, 6, .settings, 0, 0, &.{ 0x00, 0x04, 0, 1, 0x00, 0x00 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(u32, 65536), s.peer_initial_window);
+
+    // Bad SETTINGS: stream, ACK-with-payload, odd length, out-of-range value.
+    var bad = std.ArrayList(u8).empty;
+    defer bad.deinit(testing.allocator);
+    try h2tFrame(&bad, 0, .settings, 0, 1, &.{}); // stream != 0
+    try testing.expectError(error.ProtocolError, s.process(bad.items, &send, &handler));
+    bad.clearRetainingCapacity();
+    try h2tFrame(&bad, 6, .settings, frames.flags.ack, 0, &.{ 0, 4, 0, 1, 0, 0 }); // ACK + payload
+    try testing.expectError(error.ProtocolError, s.process(bad.items, &send, &handler));
+    bad.clearRetainingCapacity();
+    try h2tFrame(&bad, 5, .settings, 0, 0, &.{ 0, 4, 0, 1, 0 }); // length % 6
+    try testing.expectError(error.ProtocolError, s.process(bad.items, &send, &handler));
+    bad.clearRetainingCapacity();
+    try h2tFrame(&bad, 6, .settings, 0, 0, &.{ 0x00, 0x02, 0, 0, 0, 2 }); // ENABLE_PUSH=2
+    try testing.expectError(error.ProtocolError, s.process(bad.items, &send, &handler));
+    bad.clearRetainingCapacity();
+    try h2tFrame(&bad, 6, .settings, 0, 0, &.{ 0x00, 0x05, 0, 0, 0x3f, 0xff }); // MAX_FRAME_SIZE too small
+    try testing.expectError(error.ProtocolError, s.process(bad.items, &send, &handler));
+}
+
+test "session: ping lifecycle" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+
+    const payload = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
+    try h2tFrame(&fr, 8, .ping, 0, 0, &payload);
+    _ = try s.process(fr.items, &send, &handler);
+    // The ACK echoes the opaque payload.
+    var off: usize = 0;
+    var acked = false;
+    while (off + 9 <= send.items.len) {
+        const fh = frames.parseHeader(send.items[off..]).?;
+        if (fh.type == .ping and fh.flag_bits & frames.flags.ack != 0 and
+            std.mem.eql(u8, send.items[off + 9 .. off + 9 + fh.length], &payload)) acked = true;
+        off += 9 + fh.length;
+    }
+    try testing.expect(acked);
+
+    // Our own ACKs are ignored; bad pings are connection errors.
+    fr.clearRetainingCapacity();
+    send.clearRetainingCapacity();
+    try h2tFrame(&fr, 8, .ping, frames.flags.ack, 0, &payload);
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(usize, 0), send.items.len);
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 8, .ping, 0, 1, &payload); // stream != 0
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 7, .ping, 0, 0, payload[0..7]); // short payload
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+}
+
+test "session: preface, truncation and frame-size edges" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s0 = Session.init(testing.allocator);
+    defer s0.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    // Fewer than 24 bytes: wait, consume nothing.
+    try testing.expectEqual(@as(usize, 0), try s0.process("PRI * HTTP/2", &send, &handler));
+    // Wrong 24 bytes: connection error.
+    try testing.expectError(error.ProtocolError, s0.process("GET / HTTP/1.1\r\nHost: x\r\n\r\nxx", &send, &handler));
+
+    var s = h2tSession();
+    defer s.deinit();
+    // A bare frame header waits for its payload.
+    var hdr: [9]u8 = undefined;
+    var fh = frames.FrameHeader{ .length = 8, .type = .ping };
+    fh.encode(&hdr);
+    try testing.expectEqual(@as(usize, 0), try s.process(&hdr, &send, &handler));
+    // A frame larger than the peer limit is a connection error.
+    var big: [9]u8 = undefined;
+    var bh = frames.FrameHeader{ .length = 20000, .type = .data, .stream_id = 1 };
+    bh.encode(&big);
+    try testing.expectError(error.FrameSizeError, s.process(&big, &send, &handler));
+    // Unknown extension types are ignored (RFC 9113 §4.1).
+    var unk: [9]u8 = undefined;
+    var uh = frames.FrameHeader{ .length = 0, .type = .unknown };
+    uh.encode(&unk);
+    try testing.expectEqual(@as(usize, 9), try s.process(&unk, &send, &handler));
+}
+
+test "session: window-update paths" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+
+    // Connection-level increment grows the send window.
+    try h2tFrame(&fr, 4, .window_update, 0, 0, &.{ 0, 0, 0, 100 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(u32, 65535 + 100), s.conn_send_window);
+
+    // Zero increments and short payloads are connection errors.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .window_update, 0, 0, &.{ 0, 0, 0, 0 });
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 3, .window_update, 0, 0, &.{ 0, 0, 0 });
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    // Stream update on an idle stream is a connection error.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .window_update, 0, 7, &.{ 0, 0, 0, 10 });
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+
+    // Open a stream, pin its window at the ceiling, then overflow it:
+    // a stream-level FLOW_CONTROL_ERROR (RST), not a connection error.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+    s.streams.getPtr(1).?.send_window = 0x7fffffff;
+    fr.clearRetainingCapacity();
+    send.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .window_update, 0, 1, &.{ 0, 0, 0, 1 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(?u32, 0x3), h2tRstCode(send.items, 1));
+
+    // A stream update on a fully closed stream is ignored.
+    var s2 = h2tSession();
+    defer s2.deinit();
+    var send2 = std.ArrayList(u8).empty;
+    defer send2.deinit(testing.allocator);
+    var full = std.ArrayList(u8).empty;
+    defer full.deinit(testing.allocator);
+    try h2tFrame(&full, hb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, hb.items);
+    _ = try s2.process(full.items, &send2, &handler);
+    try testing.expect(s2.streams.getPtr(1) == null); // fully closed, removed
+    full.clearRetainingCapacity();
+    send2.clearRetainingCapacity();
+    try h2tFrame(&full, 4, .window_update, 0, 1, &.{ 0, 0, 0, 10 });
+    _ = try s2.process(full.items, &send2, &handler);
+    try testing.expectEqual(@as(usize, 0), send2.items.len);
+}
+
+test "session: reset, priority, goaway and push_promise" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+
+    // RST on idle/zero/short frames is a connection error.
+    try h2tFrame(&fr, 4, .rst_stream, 0, 9, &.{ 0, 0, 0, 1 });
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .rst_stream, 0, 0, &.{ 0, 0, 0, 1 });
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 3, .rst_stream, 0, 1, &.{ 0, 0, 0 });
+    try testing.expectError(error.FrameSizeError, s.process(fr.items, &send, &handler));
+
+    // A valid RST closes an open stream without failing the connection.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .rst_stream, 0, 1, &.{ 0, 0, 0, 8 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expect(s.streams.getPtr(1).?.reset);
+
+    // PRIORITY: zero stream, short payload, self-dependency.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 5, .priority, 0, 0, &.{ 0, 0, 0, 1, 16 });
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .priority, 0, 1, &.{ 0, 0, 0, 1 });
+    try testing.expectError(error.FrameSizeError, s.process(fr.items, &send, &handler));
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 5, .priority, 0, 3, &.{ 0, 0, 0, 3, 16 });
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    // A benign PRIORITY is accepted.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 5, .priority, 0, 3, &.{ 0, 0, 0, 1, 16 });
+    _ = try s.process(fr.items, &send, &handler);
+
+    // GOAWAY marks the connection closing; short/streamed GOAWAYs fail.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 8, .goaway, 0, 0, &.{ 0, 0, 0, 1, 0, 0, 0, 0 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expect(s.closing);
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .goaway, 0, 0, &.{ 0, 0, 0, 1 });
+    try testing.expectError(error.FrameSizeError, s.process(fr.items, &send, &handler));
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 8, .goaway, 0, 1, &.{ 0, 0, 0, 1, 0, 0, 0, 0 });
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    // Push is never allowed.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .push_promise, 0, 1, &.{ 0, 0, 0, 1 });
+    try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+}
+
+test "session: header validation errors reset the stream" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+
+    // Even stream ids and stream zero are connection errors.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tGetBlock(&hb, "GET", &.{});
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 2, hb.items);
+        try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+        fr.clearRetainingCapacity();
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 0, hb.items);
+        try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    }
+    // A numerically smaller new stream id is a connection error.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        hb.clearRetainingCapacity();
+        try h2tGetBlock(&hb, "GET", &.{});
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 3, hb.items);
+        _ = try s.process(fr.items, &send, &handler);
+        fr.clearRetainingCapacity();
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, hb.items);
+        try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    }
+    // Malformed requests (each on stream 1 of a fresh session) get RST_STREAM.
+    const Case = struct { extra: []const H2tHeader, method: []const u8 = "GET" };
+    const cases = [_]Case{
+        .{ .extra = &.{.{ .name = "connection", .value = "keep-alive" }} },
+        .{ .extra = &.{.{ .name = "keep-alive", .value = "timeout=5" }} },
+        .{ .extra = &.{.{ .name = "transfer-encoding", .value = "chunked" }} },
+        .{ .extra = &.{.{ .name = "upgrade", .value = "h2c" }} },
+        .{ .extra = &.{.{ .name = "te", .value = "chunked" }} },
+        .{ .extra = &.{.{ .name = ":status", .value = "200" }} },
+        .{ .extra = &.{.{ .name = "content-length", .value = "abc" }} },
+        .{ .extra = &.{.{ .name = "content-length", .value = "5" }} }, // no body follows
+    };
+    for (cases) |c| {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        var blk = std.ArrayList(u8).empty;
+        defer blk.deinit(testing.allocator);
+        try h2tGetBlock(&blk, c.method, c.extra);
+        try h2tFrame(&fr, blk.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, blk.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tRstCode(send.items, 1) != null);
+    }
+    // Uppercase header names are malformed (hand-built: the encoder would
+    // have lower-cased them).
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        var blk = std.ArrayList(u8).empty;
+        defer blk.deinit(testing.allocator);
+        try hpack.encodeField(&blk, testing.allocator, ":method", "GET");
+        try hpack.encodeField(&blk, testing.allocator, ":scheme", "http");
+        try hpack.encodeField(&blk, testing.allocator, ":path", "/");
+        // Literal without indexing, new name "X-Custom" (uppercase preserved).
+        try blk.appendSlice(testing.allocator, &.{ 0x00, 0x08, 'X', '-', 'C', 'u', 's', 't', 'o', 'm', 0x01, 'v' });
+        try h2tFrame(&fr, blk.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, blk.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tRstCode(send.items, 1) != null);
+    }
+    // Missing :scheme (only method/path/authority): stream error.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        var blk = std.ArrayList(u8).empty;
+        defer blk.deinit(testing.allocator);
+        try hpack.encodeField(&blk, testing.allocator, ":method", "GET");
+        try hpack.encodeField(&blk, testing.allocator, ":path", "/");
+        try h2tFrame(&fr, blk.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, blk.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tRstCode(send.items, 1) != null);
+    }
+    // Empty :path is malformed.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        var blk = std.ArrayList(u8).empty;
+        defer blk.deinit(testing.allocator);
+        try hpack.encodeField(&blk, testing.allocator, ":method", "GET");
+        try hpack.encodeField(&blk, testing.allocator, ":scheme", "http");
+        try hpack.encodeField(&blk, testing.allocator, ":path", "");
+        try h2tFrame(&fr, blk.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, blk.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tRstCode(send.items, 1) != null);
+    }
+    // Pseudo-header after a regular header is malformed.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        var blk = std.ArrayList(u8).empty;
+        defer blk.deinit(testing.allocator);
+        try hpack.encodeField(&blk, testing.allocator, ":method", "GET");
+        try hpack.encodeField(&blk, testing.allocator, ":scheme", "http");
+        try hpack.encodeField(&blk, testing.allocator, ":path", "/");
+        try hpack.encodeField(&blk, testing.allocator, "x-a", "b");
+        try hpack.encodeField(&blk, testing.allocator, ":authority", "h");
+        try h2tFrame(&fr, blk.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, blk.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tRstCode(send.items, 1) != null);
+    }
+    // A repeated pseudo-header is malformed.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        var blk = std.ArrayList(u8).empty;
+        defer blk.deinit(testing.allocator);
+        try hpack.encodeField(&blk, testing.allocator, ":method", "GET");
+        try hpack.encodeField(&blk, testing.allocator, ":method", "POST");
+        try hpack.encodeField(&blk, testing.allocator, ":scheme", "http");
+        try hpack.encodeField(&blk, testing.allocator, ":path", "/");
+        try h2tFrame(&fr, blk.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, blk.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tRstCode(send.items, 1) != null);
+    }
+    // A second HEADERS on a bodyless stream is a stream error.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        hb.clearRetainingCapacity();
+        try h2tGetBlock(&hb, "GET", &.{});
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+        _ = try s.process(fr.items, &send, &handler);
+        fr.clearRetainingCapacity();
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tRstCode(send.items, 1) != null);
+    }
+    // Padded + priority-flagged HEADERS still dispatch (self-dependent
+    // priority is a stream error; valid padding runs the request).
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        hb.clearRetainingCapacity();
+        try h2tGetBlock(&hb, "GET", &.{});
+        // Priority data claiming self-dependency.
+        var pri = std.ArrayList(u8).empty;
+        defer pri.deinit(testing.allocator);
+        try pri.appendSlice(testing.allocator, &.{ 0, 0, 0, 1, 16 });
+        try pri.appendSlice(testing.allocator, hb.items);
+        try h2tFrame(&fr, pri.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream | frames.flags.priority, 1, pri.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tRstCode(send.items, 1) != null);
+    }
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        hb.clearRetainingCapacity();
+        try h2tGetBlock(&hb, "GET", &.{});
+        // Pad length 3: payload = [3] ++ block ++ [0,0,0].
+        var padded = std.ArrayList(u8).empty;
+        defer padded.deinit(testing.allocator);
+        try padded.append(testing.allocator, 3);
+        try padded.appendSlice(testing.allocator, hb.items);
+        try padded.appendSlice(testing.allocator, &.{ 0, 0, 0 });
+        try h2tFrame(&fr, padded.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream | frames.flags.padded, 1, padded.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tHasFrame(send.items, .headers, 1));
+    }
+    // te: trailers is the one legal TE value: the request runs.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        var blk = std.ArrayList(u8).empty;
+        defer blk.deinit(testing.allocator);
+        try h2tGetBlock(&blk, "GET", &.{.{ .name = "te", .value = "trailers" }});
+        try h2tFrame(&fr, blk.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, blk.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tHasFrame(send.items, .headers, 1));
+    }
+}
+
+test "session: unknown methods answer 501" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var blk = std.ArrayList(u8).empty;
+    defer blk.deinit(testing.allocator);
+    try h2tGetBlock(&blk, "FOO", &.{});
+    try h2tFrame(&fr, blk.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, blk.items);
+    _ = try s.process(fr.items, &send, &handler);
+    const status = try h2tStatus(send.items, 1);
+    defer if (status) |st| testing.allocator.free(st);
+    try testing.expect(status != null);
+    try testing.expectEqualStrings("501", status.?);
+}
+
+test "session: continuation assembly and misuse" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+    const half = hb.items.len / 2;
+
+    // Split header block across HEADERS + CONTINUATION, closed by an empty
+    // DATA with END_STREAM: runs the request.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, half, .headers, 0, 1, hb.items[0..half]);
+        try h2tFrame(&fr, hb.items.len - half, .continuation, frames.flags.end_headers, 1, hb.items[half..]);
+        try h2tFrame(&fr, 0, .data, frames.flags.end_stream, 1, &.{});
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tHasFrame(send.items, .headers, 1));
+    }
+    // A CONTINUATION for the wrong stream, or with no HEADERS pending, fails.
+    // A non-CONTINUATION while one is pending fails too.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, half, .headers, 0, 1, hb.items[0..half]);
+        try h2tFrame(&fr, hb.items.len - half, .continuation, frames.flags.end_headers, 3, hb.items[half..]);
+        try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    }
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, 1, .continuation, frames.flags.end_headers, 1, &.{0x82});
+        try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    }
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, half, .headers, 0, 1, hb.items[0..half]);
+        try h2tFrame(&fr, 8, .ping, 0, 0, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+        try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    }
+}
+
+test "session: END_STREAM without END_HEADERS waits for CONTINUATION" {
+    // HEADERS carrying END_STREAM but not END_HEADERS used to dispatch
+    // before HPACK decode (null request panic). Now the stream waits for
+    // the CONTINUATION block, then runs normally.
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+    const half = hb.items.len / 2;
+
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    // END_STREAM set, END_HEADERS clear: must not dispatch (or crash).
+    try h2tFrame(&fr, half, .headers, frames.flags.end_stream, 1, hb.items[0..half]);
+    // Completing CONTINUATION carries END_HEADERS: dispatches the request.
+    try h2tFrame(&fr, hb.items.len - half, .continuation, frames.flags.end_headers, 1, hb.items[half..]);
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expect(h2tHasFrame(send.items, .headers, 1));
+}
+
+test "session: trailers are validated" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    // HEADERS, DATA (no END_STREAM), then a trailer HEADERS.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        var hb = std.ArrayList(u8).empty;
+        defer hb.deinit(testing.allocator);
+        try h2tGetBlock(&hb, "POST", &.{});
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+        try h2tFrame(&fr, 2, .data, 0, 1, "hi");
+        // Bad trailer: pseudo-headers are forbidden here.
+        var tb = std.ArrayList(u8).empty;
+        defer tb.deinit(testing.allocator);
+        try hpack.encodeField(&tb, testing.allocator, ":method", "GET");
+        try h2tFrame(&fr, tb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, tb.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tRstCode(send.items, 1) != null);
+    }
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        var hb = std.ArrayList(u8).empty;
+        defer hb.deinit(testing.allocator);
+        try h2tGetBlock(&hb, "POST", &.{});
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+        try h2tFrame(&fr, 2, .data, 0, 1, "hi");
+        // Good trailer: regular header + END_STREAM runs the request.
+        var tb = std.ArrayList(u8).empty;
+        defer tb.deinit(testing.allocator);
+        try hpack.encodeField(&tb, testing.allocator, "x-trailer", "v");
+        try h2tFrame(&fr, tb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, tb.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tHasFrame(send.items, .headers, 1));
+    }
+}
+
+test "session: data frame flow control" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "POST", &.{});
+    // DATA on an idle stream is a connection error; on stream zero too.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, 2, .data, 0, 5, "hi");
+        try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+        fr.clearRetainingCapacity();
+        try h2tFrame(&fr, 2, .data, 0, 0, "hi");
+        try testing.expectError(error.ProtocolError, s.process(fr.items, &send, &handler));
+    }
+    // DATA past the receive windows is a stream error.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+        _ = try s.process(fr.items, &send, &handler);
+        s.conn_recv_window = 1;
+        fr.clearRetainingCapacity();
+        try h2tFrame(&fr, 2, .data, 0, 1, "hi");
+        try testing.expectError(error.StreamError, s.process(fr.items, &send, &handler));
+    }
+    // DATA on a fully closed stream is ignored.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, hb.items);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(s.streams.getPtr(1) == null);
+        fr.clearRetainingCapacity();
+        send.clearRetainingCapacity();
+        try h2tFrame(&fr, 2, .data, 0, 1, "hi");
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expectEqual(@as(usize, 0), send.items.len);
+    }
+    // Padded DATA strips padding and runs; tiny windows emit WINDOW_UPDATEs.
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+        _ = try s.process(fr.items, &send, &handler);
+        s.streams.getPtr(1).?.recv_window = 100;
+        s.conn_recv_window = 100;
+        fr.clearRetainingCapacity();
+        send.clearRetainingCapacity();
+        const big_body = @as([60]u8, @splat(@as(u8, 'a')));
+        try h2tFrame(&fr, big_body.len, .data, 0, 1, &big_body);
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tHasFrame(send.items, .window_update, 1));
+        try testing.expect(h2tHasFrame(send.items, .window_update, 0));
+    }
+    {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+        _ = try s.process(fr.items, &send, &handler);
+        fr.clearRetainingCapacity();
+        send.clearRetainingCapacity();
+        // Pad length 2: [2] ++ "hi" ++ [0,0], END_STREAM runs the request.
+        try h2tFrame(&fr, 5, .data, frames.flags.end_stream | frames.flags.padded, 1, &.{ 2, 'h', 'i', 0, 0 });
+        _ = try s.process(fr.items, &send, &handler);
+        try testing.expect(h2tHasFrame(send.items, .headers, 1));
+    }
+}
+
+test "session: response body windows buffer and resume" {
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    try s.streams.put(1, .{});
+    // No windows: the whole body buffers, nothing is sent.
+    s.streams.getPtr(1).?.send_window = 0;
+    s.conn_send_window = 0;
+    try s.writeBodyFrames(1, "hello world", &send);
+    try testing.expectEqual(@as(usize, 0), send.items.len);
+    try testing.expectEqualSlices(u8, "hello world", s.streams.getPtr(1).?.pending_response.items);
+    // Full windows: everything drains (in peer_max_frame_size chunks).
+    s.streams.getPtr(1).?.send_window = 65535;
+    s.conn_send_window = 65535;
+    s.peer_max_frame_size = 4;
+    try s.flushPendingResponse(1, &send);
+    try testing.expectEqual(@as(usize, 0), s.streams.getPtr(1).?.pending_response.items.len);
+    // Missing streams and empty buffers are quiet no-ops.
+    try s.flushPendingResponse(9, &send);
+    try s.writeBodyFrames(9, "x", &send);
+    try s.flushPendingResponse(1, &send);
+}
+
+test "session: flush with exhausted windows re-buffers without aliasing" {
+    // Regression: flushPendingResponse used to clear-then-reappend the
+    // backlog into its own backing store (self-aliased @memcpy) when the
+    // windows were still exhausted.
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    try s.streams.put(1, .{});
+    s.streams.getPtr(1).?.send_window = 0;
+    s.conn_send_window = 0;
+    try s.writeBodyFrames(1, "hello world", &send);
+    try testing.expectEqualSlices(u8, "hello world", s.streams.getPtr(1).?.pending_response.items);
+    // Windows still shut: flush must leave the backlog byte-identical
+    // (re-buffered into fresh storage, nothing sent).
+    try s.flushPendingResponse(1, &send);
+    try testing.expectEqual(@as(usize, 0), send.items.len);
+    try testing.expectEqualSlices(u8, "hello world", s.streams.getPtr(1).?.pending_response.items);
+    // Stream window opens but connection window stays shut: still stuck,
+    // still intact.
+    s.streams.getPtr(1).?.send_window = 65535;
+    try s.flushPendingResponse(1, &send);
+    try testing.expectEqual(@as(usize, 0), send.items.len);
+    try testing.expectEqualSlices(u8, "hello world", s.streams.getPtr(1).?.pending_response.items);
+    // Both open: drains.
+    s.conn_send_window = 65535;
+    try s.flushPendingResponse(1, &send);
+    try testing.expectEqual(@as(usize, 0), s.streams.getPtr(1).?.pending_response.items.len);
+    try testing.expect(send.items.len > 0);
+}
+
+test "session: file-backed responses frame from the fd" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    try s.streams.put(1, .{});
+    const fd = try compat.openFile("/dev/zero");
+    defer compat.close(fd);
+    var resp = response_mod.Response.init(.ok);
+    resp.body_from_file = true;
+    resp.file_fd = fd;
+    resp.file_len = 8;
+    resp.file_offset = 0;
+    try s.frameResponse(1, &resp, false, &send, &handler);
+    try testing.expect(h2tHasFrame(send.items, .headers, 1));
+    // The DATA frame carries the 8 zero bytes read from the fd.
+    var off: usize = 0;
+    var found_data = false;
+    while (off + 9 <= send.items.len) {
+        const fh = frames.parseHeader(send.items[off..]).?;
+        if (off + 9 + fh.length > send.items.len) break;
+        if (fh.type == .data and fh.stream_id == 1) {
+            found_data = true;
+            try testing.expectEqual(@as(u24, 8), fh.length);
+            try testing.expectEqualSlices(u8, &@as([8]u8, @splat(@as(u8, 0))), send.items[off + 9 .. off + 9 + 8]);
+        }
+        off += 9 + fh.length;
+    }
+    try testing.expect(found_data);
+    // An unreadable fd yields an empty body (HEADERS with END_STREAM).
+    var s2 = h2tSession();
+    defer s2.deinit();
+    var send2 = std.ArrayList(u8).empty;
+    defer send2.deinit(testing.allocator);
+    try s2.streams.put(1, .{});
+    var resp2 = response_mod.Response.init(.ok);
+    resp2.body_from_file = true;
+    resp2.file_fd = -1;
+    resp2.file_len = 8;
+    resp2.file_offset = 0;
+    try s2.frameResponse(1, &resp2, false, &send2, &handler);
+    const fh2 = frames.parseHeader(send2.items[0..9]).?;
+    try testing.expectEqual(frames.FrameType.headers, fh2.type);
+    try testing.expect(fh2.flag_bits & frames.flags.end_stream != 0);
+}
+
+test "session: lookup helpers and preface emission" {
+    try testing.expect(Session.settingRange(1).?.id == 1);
+    try testing.expectEqualStrings("ENABLE_PUSH", Session.settingRange(2).?.name);
+    try testing.expect(Session.settingRange(0x99) == null);
+    try testing.expect(!Session.looksLikeHttp2Preface("short"));
+    var s = Session.init(testing.allocator);
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    try s.onPreface(&send);
+    try testing.expect(s.preface_seen);
+    try testing.expect(s.settings_sent);
+    try testing.expect(h2tHasFrame(send.items, .settings, 0));
 }

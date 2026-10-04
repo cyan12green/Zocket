@@ -137,3 +137,74 @@ fn makeTwin(src: []const u8, dst: []const u8) !void {
     defer allocator.free(compressed);
     try compat.writeFile(dst, compressed);
 }
+
+test "passes through without route, root, or a safe target" {
+    // No route at all.
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.decoded_target = "hello.txt";
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(Action.pass, try run(&ctx));
+
+    // Route without a root.
+    ctx.route = &.{ .path = "/" };
+    try testing.expectEqual(Action.pass, try run(&ctx));
+
+    // Unsafe or unusable targets never touch the disk.
+    const bad_targets = [_][]const u8{
+        "",
+        "/hello.txt",
+        "../escape.txt",
+        "a/../b.txt",
+    };
+    for (bad_targets) |t| {
+        var req2 = Request.init(testing.allocator);
+        defer req2.deinit();
+        req2.decoded_target = t;
+        var resp2 = Response.init(.ok);
+        var ctx2 = Context{ .req = &req2, .resp = &resp2 };
+        ctx2.route = &.{ .path = "/", .root = "testdata" };
+        try testing.expectEqual(Action.pass, try run(&ctx2));
+    }
+
+    // Overlong target (twin path would overflow the stack buffer).
+    var req3 = Request.init(testing.allocator);
+    defer req3.deinit();
+    const long: [520]u8 = @as([520]u8, @splat('a'));
+    req3.decoded_target = long[0..];
+    var resp3 = Response.init(.ok);
+    var ctx3 = Context{ .req = &req3, .resp = &resp3 };
+    ctx3.route = &.{ .path = "/", .root = "testdata" };
+    try testing.expectEqual(Action.pass, try run(&ctx3));
+}
+
+test "passes through without client gzip support" {
+    // No Accept-Encoding header at all.
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.decoded_target = "hello.txt";
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &.{ .path = "/", .root = "testdata" };
+    try testing.expectEqual(Action.pass, try run(&ctx));
+
+    // Explicitly non-gzip encodings.
+    _ = req.addHeaderParsed("Accept-Encoding", "br, zstd") catch unreachable;
+    try testing.expectEqual(Action.pass, try run(&ctx));
+}
+
+test "uppercase GZIP matches case-insensitively" {
+    try makeTwin("testdata/hello.txt", "testdata/hello.txt.gz");
+    defer compat.deleteFile("testdata/hello.txt.gz") catch {};
+
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.decoded_target = "hello.txt";
+    _ = req.addHeaderParsed("Accept-Encoding", "GZIP") catch unreachable;
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &.{ .path = "/", .root = "testdata" };
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+}

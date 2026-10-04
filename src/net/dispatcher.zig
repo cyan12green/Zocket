@@ -113,3 +113,28 @@ test "dispatcher picks stay balanced under concurrent threads" {
     }
     try testing.expectEqual(total, sum);
 }
+
+test "dispatcher with one reactor always picks it" {
+    const allocator = testing.allocator;
+    const raws = try makeReactors(allocator, 1);
+    defer destroyReactors(allocator, raws);
+
+    var disp = Dispatcher.init(raws);
+    try testing.expectEqual(@as(usize, 1), disp.count());
+    for (0..10) |_| {
+        try testing.expectEqual(raws[0], disp.pick());
+    }
+}
+
+test "dispatcher alternates strictly in round-robin order" {
+    const allocator = testing.allocator;
+    const raws = try makeReactors(allocator, 2);
+    defer destroyReactors(allocator, raws);
+
+    var disp = Dispatcher.init(raws);
+    try testing.expectEqual(@as(usize, 2), disp.count());
+    // Two full rotations must alternate exactly.
+    for (0..4) |k| {
+        try testing.expectEqual(raws[k % 2], disp.pick());
+    }
+}

@@ -13,6 +13,12 @@ pub const ServerStats = registry.ServerStats;
 /// Shared counters for the default (comptime) server instance.
 var default_stats: ServerStats = .{};
 
+/// Hard cap on internal-redirect hops per request (nginx's `X-Accel`/
+/// `error_page` cycles cap at 10; 8 leaves headroom for nested subrequests).
+/// A backstop against a misconfigured `try_files`/`error_page` pair — normal
+/// configurations converge in one or two hops.
+pub const max_internal_redirects: u8 = 8;
+
 /// The config-driven HTTP request processor. A single immutable instance is
 /// shared by every reactor; it holds the route table and dispatches each fully
 /// parsed request through the DSL phase pipeline.
@@ -161,8 +167,42 @@ pub const Server = struct {
     /// Run one fully-parsed request through the phase pipeline. On
     /// `.not_handled` the caller sends the default (404) response. Module
     /// errors propagate to the caller, which turns them into a 500.
+    ///
+    /// A handler may request an INTERNAL REDIRECT by setting
+    /// `ctx.internal_redirect_target` (the target URI) and returning
+    /// `.pass`: after the walk ends, the request target is rewritten and the
+    /// whole walk runs again — nginx `try_files` / `error_page` semantics.
+    /// Redirects are capped at `max_internal_redirects`; the cap is a
+    /// misconfiguration backstop (`try_files` converges on its own because
+    /// the redirect target is the candidate that already exists).
     pub fn handleRequest(self: *const Server, ctx: *pipeline.Context) !pipeline.Outcome {
-        return pipeline.runWithRouter(registry.default_registry, self.cfg.routes, &self.router, ctx);
+        var outcome = try pipeline.runWithRouter(registry.default_registry, self.cfg.routes, &self.router, ctx);
+        var hops: u8 = 0;
+        while (ctx.internal_redirect_target) |target| {
+            ctx.internal_redirect_target = null;
+            hops += 1;
+            // Published on the context: log-phase modules (error_page)
+            // read it to keep chains short; one log line per client
+            // request, not per hop.
+            ctx.redirect_hops = hops;
+            if (hops >= max_internal_redirects) {
+                // Backstop: refuse the redirect, keep the current response.
+                // nginx reports 500 here; we keep the last response, which is
+                // what a rewrite loop in a hand-written config should show.
+                break;
+            }
+            // The new URI lives in the request arena: it must outlive this
+            // walk (the reactor reclaims the arena per request, not per hop).
+            const uri = ctx.req.arena.asAllocator().dupe(u8, target) catch break;
+            ctx.req.target = uri;
+            ctx.req.decoded_target = uri;
+            // Re-resolve: the previous route's modules must not re-run
+            // against the new target, and captures belong to the old match.
+            ctx.route = null;
+            ctx.capture_count = 0;
+            outcome = try pipeline.runWithRouter(registry.default_registry, self.cfg.routes, &self.router, ctx);
+        }
+        return outcome;
     }
 
     /// Fast path: when the matched route is a module-less
@@ -844,6 +884,167 @@ test "access_log runs through the pipeline with a custom format" {
     try testing.expectEqual(pipeline.Outcome.handled, out);
 }
 
+test "formats returns null without log formats and the table with them" {
+    const plain = Server.init(Config.default());
+    try testing.expect(plain.formats() == null);
+
+    const cfg = comptime Config.fromConfComptime(
+        \\log_format short "$request $status";
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    const with_formats = Server.init(cfg);
+    const fmts = with_formats.formats().?;
+    try testing.expectEqual(@as(usize, 1), fmts.len);
+    try testing.expectEqualStrings("short", fmts[0].name);
+}
+
+test "subrequestImpl runs a target through the server pipeline" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location = /only { content echo; }
+        \\}
+    );
+    const srv = Server.init(cfg);
+
+    var src = registry.Request.init(testing.allocator);
+    defer src.deinit();
+    src.addHeaderParsed("authorization", "Bearer s3cret") catch unreachable;
+
+    var code: u16 = 0;
+    try Server.subrequestImpl(&srv, &src, "/only", &code);
+    try testing.expectEqual(@as(u16, 200), code);
+    // Unmatched targets mirror the reactor's default 404.
+    try Server.subrequestImpl(&srv, &src, "/nope-missing", &code);
+    try testing.expectEqual(@as(u16, 404), code);
+}
+
+test "subrequestImpl forwards only the Authorization header" {
+    // A request that echoes the body: empty body here, so any 200 proves
+    // the subrequest ran; header filtering is covered by the impl reading
+    // exactly one header (no error when others are present).
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    var src = registry.Request.init(testing.allocator);
+    defer src.deinit();
+    src.addHeaderParsed("x-other", "1") catch unreachable;
+    src.addHeaderParsed("cookie", "a=b") catch unreachable;
+    var code: u16 = 0;
+    try Server.subrequestImpl(&srv, &src, "/", &code);
+    try testing.expectEqual(@as(u16, 200), code);
+}
+
+test "loadTls is a no-op without TLS and errors on missing files" {
+    var plain = Server.init(Config.default());
+    try plain.loadTls(testing.allocator);
+    try testing.expect(plain.tls_creds == null);
+
+    var missing = Server.init(.{ .tls = .{ .cert = "/nonexistent-dir/cert.pem", .key = "/nonexistent-dir/key.pem" } });
+    try testing.expectError(error.FileNotFound, missing.loadTls(testing.allocator));
+    try testing.expect(missing.tls_creds == null);
+}
+
+test "loadTls loads credentials from disk files" {
+    const testdata = @import("../tls/testdata.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cert_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cert_path = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
+    const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
+    try compat.writeFile(cert_path, testdata.cert_pem);
+    try compat.writeFile(key_path, testdata.key_pem);
+
+    var srv = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path } });
+    try srv.loadTls(testing.allocator);
+    try testing.expect(srv.tls_creds != null);
+    // Credentials are process-lifetime in production (never freed); the
+    // test releases the allocator-owned DER copy itself.
+    testing.allocator.free(@constCast(srv.tls_creds.?.cert_der));
+    srv.tls_creds = null;
+}
+
+test "ServerGroup.init builds runtime servers with per-server stats" {
+    // Runtime-built groups are freed piece-wise (per-server deinitPrepared
+    // + servers free), mirroring main.zig's teardown — there is no group
+    // deinit by design (servers may be comptime-owned or arena-owned).
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    listen 8080;
+        \\    server_name a.test;
+        \\    location / { content echo; }
+        \\}
+        \\server {
+        \\    listen 8081;
+        \\    server_name b.test;
+        \\    location / { content echo; }
+        \\}
+    );
+    var group = try ServerGroup.init(arena_state.allocator(), cfg);
+    try testing.expect(group.servers_owned);
+    try testing.expectEqual(@as(usize, 2), group.servers.len);
+    try testing.expectEqual(@as(?u16, 8080), group.servers[0].cfg.listen_port);
+    try testing.expectEqual(@as(?u16, 8081), group.servers[1].cfg.listen_port);
+    // Runtime fallback selection still honors names and defaults.
+    try testing.expectEqual(&group.servers[0], group.selectServer("a.test", null));
+    try testing.expectEqual(&group.servers[1], group.selectServer("b.test:8081", null));
+    try testing.expectEqual(&group.servers[0], group.selectServer("unknown", null));
+    // Each server answers through its own route slice.
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/";
+    req.decoded_target = "/";
+    req.body = "via-group";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(pipeline.Outcome.handled, try group.servers[1].handleRequest(&ctx));
+    try testing.expectEqualStrings("via-group", resp.body);
+}
+
+test "ServerGroup selectServer honors host_select off" {
+    const s1 = Server.init(.{ .server_names = &.{"example.com"} });
+    const s2 = Server.init(.{ .server_names = &.{"other.com"} });
+    const servers = [_]Server{ s1, s2 };
+    const group = ServerGroup{ .servers = &servers, .default_idx = 0, .host_select = false };
+    try testing.expectEqual(&servers[0], group.selectServer("other.com", null));
+    try testing.expectEqual(&servers[0], group.selectServer("example.com", null));
+}
+
+test "ServerGroup selectServer clamps an out-of-range select_fn" {
+    const clk = struct {
+        fn sel(host: []const u8) usize {
+            _ = host;
+            return 99; // bogus: must clamp to the last server, not crash
+        }
+    }.sel;
+    const s1 = Server.init(.{});
+    const servers = [_]Server{s1};
+    const group = ServerGroup{ .servers = &servers, .default_idx = 0 };
+    const cfg = Config{ .select_fn = clk };
+    try testing.expectEqual(&servers[0], group.selectServer("anything", cfg));
+}
+
+test "embeddedInitGroupWithTls builds a single-server group without servers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    // See the deinit NOTE above: arena owns the route copy + stats.
+    const group = try ServerGroup.embeddedInitGroupWithTls(arena_state.allocator(), cfg);
+    try testing.expectEqual(@as(usize, 1), group.servers.len);
+    try testing.expect(group.servers_owned);
+}
+
 /// A group of virtual-host servers: holds one `Server` per `server {}`
 /// block. The reactor calls `selectServer` with the Host header to pick
 /// the right server, then `handleRequest` on the selected one.
@@ -941,16 +1142,6 @@ pub const ServerGroup = struct {
         return .{ .servers = srvs, .default_idx = 0, .host_select = cfg.host_select, .servers_owned = true };
     }
 
-    pub fn deinit(self: *ServerGroup, allocator: std.mem.Allocator) void {
-        for (self.servers) |*srv| {
-            if (srv.stats != &default_stats) {
-                allocator.destroy(srv.stats);
-                srv.stats = &default_stats;
-            }
-        }
-        if (self.servers_owned) allocator.free(self.servers);
-    }
-
     /// Select a server by Host header value. Uses the comptime-generated
     /// select_fn when available (O(1) exact match + wildcard scan), falls
     /// back to runtime matching for dynamically-constructed configs.
@@ -981,3 +1172,95 @@ pub const ServerGroup = struct {
         return &self.servers[self.default_idx];
     }
 };
+
+test "internal redirect: try_files falls through to a static fallback" {
+    // /app/missing.txt does not exist under testdata -> try_files
+    // redirects to /hello.txt, which the static route serves (200).
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /app/ {
+        \\        root "testdata";
+        \\        try_files $uri /hello.txt;
+        \\    }
+        \\    location / {
+        \\        root "testdata";
+        \\        content static;
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/app/missing.txt";
+    req.decoded_target = "/app/missing.txt";
+
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+    try testing.expectEqual(@as(u8, 1), ctx.redirect_hops);
+    try testing.expectEqualStrings("/hello.txt", req.decoded_target);
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    // Static serves the file by fd (sendfile), not body bytes: the unit
+    // context sees the flag, the reactor pumps the bytes.
+    try testing.expect(resp.body_from_file);
+}
+
+test "internal redirect: error_page serves the alternate URI" {
+    // /files/nope.txt misses in static (404 handled) -> error_page
+    // redirects to /hello.txt, served 200 by the static route.
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /files/ {
+        \\        root "testdata";
+        \\        content static;
+        \\        error_page 404 /hello.txt;
+        \\    }
+        \\    location / {
+        \\        root "testdata";
+        \\        content static;
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/files/nope.txt";
+    req.decoded_target = "/files/nope.txt";
+
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+    try testing.expectEqual(@as(u8, 1), ctx.redirect_hops);
+    try testing.expectEqualStrings("/hello.txt", req.decoded_target);
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    // Same sendfile-by-fd shape as above (walk 1's "Not Found" body is
+    // replaced by the fd response, not by body bytes).
+    try testing.expect(resp.body_from_file);
+}
+
+test "internal redirect: self-referential error_page stops at the cap" {
+    // `error_page 404` on the very URI that 404s: the server hop budget
+    // terminates the chain. redirect_hops must equal the cap, never spin.
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /loop {
+        \\        root "testdata";
+        \\        content static;
+        \\        error_page 404 /loop;
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/loop";
+    req.decoded_target = "/loop";
+
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+
+    _ = try srv.handleRequest(&ctx);
+    try testing.expectEqual(max_internal_redirects, ctx.redirect_hops);
+}

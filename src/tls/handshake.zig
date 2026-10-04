@@ -414,20 +414,6 @@ pub fn selectAlpn(client_alpn_list: []const u8) ?[]const u8 {
     return null;
 }
 
-/// ECDSA signature (DER) of `transcript_hash` with the given key.
-pub fn signEcdsa(
-    comptime Ecdsa: type,
-    secret_key: []const u8,
-    transcript_hash: [64]u8,
-    hash_len: usize,
-) Error![Ecdsa.Signature.der_encoded_length_max]u8 {
-    var sig_buf: [Ecdsa.Signature.der_encoded_length_max]u8 = undefined;
-    const sk = try Ecdsa.SecretKey.fromBytes(secret_key[0..secret_key.len].*);
-    const kp = try Ecdsa.KeyPair.fromSecretKey(sk);
-    const sig = try Ecdsa.signPrehashed(kp, transcript_hash[0..hash_len].*, null);
-    return sig.toDer(&sig_buf);
-}
-
 /// Rebuild the truncated ClientHello (RFC 8446 §4.2.11.2) for binder
 /// verification: the pre_shared_key extension's binders list is removed —
 /// and, per the RFC, ALL length fields (handshake message length,
@@ -517,4 +503,103 @@ test "handshake: message builders produce self-consistent frames" {
     const f = try buildFinished(buf[sh + ee + cert ..], &(@as([12]u8, @splat(@as(u8, 0xaa)))));
     try testing.expectEqual(@as(u8, 0x14), buf[sh + ee + cert]);
     try testing.expectEqual(@as(usize, 12 + 4), f);
+}
+
+test "handshake: suite selection follows server preference" {
+    // Client offers 0x1302 first, but our order prefers 0x1301.
+    const offered = [_]u8{ 0x13, 0x02, 0x13, 0x01 };
+    try testing.expectEqual(@as(?u16, 0x1301), selectCipherSuite(&offered));
+    try testing.expectEqual(@as(?u16, null), selectCipherSuite(&[_]u8{}));
+    try testing.expectEqual(@as(?u16, null), selectCipherSuite(&[_]u8{ 0x00, 0xff }));
+    // Odd trailing byte is ignored, not read out of bounds.
+    try testing.expectEqual(@as(?u16, null), selectCipherSuite(&[_]u8{ 0x13 }));
+    // CHACHA is selectable when offered alone.
+    try testing.expectEqual(@as(?u16, 0x1303), selectCipherSuite(&[_]u8{ 0x13, 0x03 }));
+}
+
+test "handshake: key-share selection needs x25519" {
+    var empty = ClientHello{};
+    try testing.expect(selectKeyShare(&empty) == null);
+    var no_x = ClientHello{ .key_shares = &.{.{ .group = 0x0017, .data = "0123456789abcdef0123456789abcdef" }} };
+    try testing.expect(selectKeyShare(&no_x) == null);
+    var yes_x = ClientHello{ .key_shares = &.{
+        .{ .group = 0x0017, .data = "0123456789abcdef0123456789abcdef" },
+        .{ .group = x25519_group, .data = "0123456789abcdef0123456789abcdef" },
+    } };
+    try testing.expectEqualSlices(u8, "0123456789abcdef0123456789abcdef", selectKeyShare(&yes_x).?);
+}
+
+test "handshake: ALPN selection edge cases" {
+    try testing.expectEqual(@as(?[]const u8, null), selectAlpn(&[_]u8{}));
+    // Declared length overruns the list.
+    try testing.expectEqual(@as(?[]const u8, null), selectAlpn(&[_]u8{ 9, 'h', '2' }));
+    // Unknown protocols are skipped, later known ones still match.
+    const mixed = [_]u8{ 3, 'f', 'o', 'o', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+    try testing.expectEqualStrings("http/1.1", selectAlpn(&mixed).?);
+}
+
+test "handshake: ClientHello parse errors" {
+    try testing.expectError(error.TlsDecodeError, parseClientHello(&[_]u8{}));
+    try testing.expectError(error.TlsDecodeError, parseClientHello(&[_]u8{ 0x03, 0x03 }));
+    // Bad legacy version.
+    var bad_ver = [_]u8{@as(u8, 0x03), 0x02} ++ @as([32]u8, @splat(@as(u8, 0))) ++ [_]u8{0} ++ [_]u8{ 0, 2, 0x13, 0x01 } ++ [_]u8{1} ++ [_]u8{0};
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(&bad_ver));
+    // Zero cipher suites.
+    var no_suites = [_]u8{@as(u8, 0x03), 0x03} ++ @as([32]u8, @splat(@as(u8, 0))) ++ [_]u8{0} ++ [_]u8{ 0, 0 } ++ [_]u8{1} ++ [_]u8{0};
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(&no_suites));
+    // Odd cipher-suite length.
+    var odd_suites = [_]u8{@as(u8, 0x03), 0x03} ++ @as([32]u8, @splat(@as(u8, 0))) ++ [_]u8{0} ++ [_]u8{ 0, 3, 0x13, 0x01, 0x00 } ++ [_]u8{1} ++ [_]u8{0};
+    try testing.expectError(error.TlsIllegalParameter, parseClientHello(&odd_suites));
+    // Truncated session id.
+    var trunc_sid = [_]u8{@as(u8, 0x03), 0x03} ++ @as([32]u8, @splat(@as(u8, 0))) ++ [_]u8{32};
+    try testing.expectError(error.TlsDecodeError, parseClientHello(&trunc_sid));
+    // Truncated extensions length.
+    var trunc_ext = [_]u8{@as(u8, 0x03), 0x03} ++ @as([32]u8, @splat(@as(u8, 0))) ++ [_]u8{0} ++ [_]u8{ 0, 2, 0x13, 0x01 } ++ [_]u8{1} ++ [_]u8{0} ++ [_]u8{0};
+    try testing.expectError(error.TlsDecodeError, parseClientHello(&trunc_ext));
+}
+
+test "handshake: ServerHello HRR and PSK variants" {
+    var buf: [512]u8 = undefined;
+    // HelloRetryRequest carries only the group, no share.
+    const hrr = try buildServerHello(&buf, @as([32]u8, @splat(@as(u8, 9))), &.{0x01}, 0x1301, true, null, null);
+    try testing.expectEqual(@as(u8, 0x02), buf[0]);
+    const hrr_body_len: usize = std.mem.readInt(u24, buf[1..4], .big);
+    try testing.expectEqual(hrr - 4, hrr_body_len);
+    // PSK-accepted ServerHello is longer (extra pre_shared_key extension).
+    const no_psk = try buildServerHello(&buf, @as([32]u8, @splat(@as(u8, 9))), &.{0x01}, 0x1301, false, &(@as([32]u8, @splat(@as(u8, 1)))), null);
+    var buf2: [512]u8 = undefined;
+    const with_psk = try buildServerHello(&buf2, @as([32]u8, @splat(@as(u8, 9))), &.{0x01}, 0x1301, false, &(@as([32]u8, @splat(@as(u8, 1)))), 0);
+    try testing.expect(with_psk > no_psk);
+    try testing.expectEqual(@as(usize, 6), with_psk - no_psk);
+}
+
+test "handshake: EncryptedExtensions, CertificateVerify and Finished shapes" {
+    var buf: [512]u8 = undefined;
+    // No ALPN: empty extension list.
+    const ee0 = try buildEncryptedExtensions(&buf, null);
+    try testing.expectEqual(@as(u8, 0x08), buf[0]);
+    try testing.expectEqual(@as(usize, 4 + 2), ee0);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, buf[4..6], .big));
+    // CertificateVerify wraps the DER signature with its scheme.
+    const cv = try buildCertificateVerify(&buf, 0x0403, &.{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02 });
+    try testing.expectEqual(@as(u8, 0x0f), buf[0]);
+    try testing.expectEqual(@as(u16, 0x0403), std.mem.readInt(u16, buf[4..6], .big));
+    try testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, buf[6..8], .big));
+    try testing.expectEqual(cv, 4 + 2 + 2 + 8);
+}
+
+test "handshake: truncated ClientHello edge cases" {
+    var out: [64]u8 = undefined;
+    var no_psk = ClientHello{};
+    // No PSK extension recorded.
+    try testing.expectEqual(@as(usize, 0), truncatedClientHello(&.{ 1, 2, 3, 4, 5 }, &no_psk, &out));
+    // Binders position past the message.
+    var past = ClientHello{ .psk_binders_pos = 100 };
+    try testing.expectEqual(@as(usize, 0), truncatedClientHello(&.{ 1, 2, 3 }, &past, &out));
+    // Happy path: prefix is preserved verbatim.
+    const msg = [_]u8{ 1, 0, 0, 8, 5, 5, 5, 5, 9, 9, 9, 9 };
+    var hello = ClientHello{ .psk_binders_pos = 8 };
+    const n = truncatedClientHello(&msg, &hello, &out);
+    try testing.expectEqual(@as(usize, 8), n);
+    try testing.expectEqualSlices(u8, msg[0..8], out[0..n]);
 }

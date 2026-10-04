@@ -78,3 +78,44 @@ test "empty body produces an empty 200" {
     try testing.expectEqual(http_response.Status.ok, resp.status);
     try testing.expectEqual(@as(usize, 0), resp.body.len);
 }
+
+test "echo honours the configured max_body limit" {
+    const limits_mod = @import("../limits.zig");
+    // A tighter cap rejects a body the default would accept.
+    const tight = limits_mod.Limits{ .max_body = 4 };
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.body = "12345";
+        var resp = http_response.Response.init(.ok);
+        var ctx = registry.Context{ .req = &req, .resp = &resp, .limits = &tight };
+        try testing.expectEqual(registry.Action.handled, try run(&ctx));
+        try testing.expectEqual(http_response.Status.payload_too_large, resp.status);
+        try testing.expectEqualStrings("Payload Too Large", resp.body);
+        try testing.expect(ctx.close_after_write);
+    }
+    // A generous cap echoes a body the tight one refused.
+    const loose = limits_mod.Limits{ .max_body = 1024 };
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.body = "12345";
+        var resp = http_response.Response.init(.ok);
+        var ctx = registry.Context{ .req = &req, .resp = &resp, .limits = &loose };
+        try testing.expectEqual(registry.Action.handled, try run(&ctx));
+        try testing.expectEqual(http_response.Status.ok, resp.status);
+        try testing.expectEqualStrings("12345", resp.body);
+        try testing.expect(!ctx.close_after_write);
+    }
+    // Exactly at the cap still echoes.
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.body = "1234";
+        var resp = http_response.Response.init(.ok);
+        var ctx = registry.Context{ .req = &req, .resp = &resp, .limits = &tight };
+        try testing.expectEqual(registry.Action.handled, try run(&ctx));
+        try testing.expectEqual(http_response.Status.ok, resp.status);
+        try testing.expectEqualStrings("1234", resp.body);
+    }
+}

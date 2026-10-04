@@ -60,3 +60,21 @@ test "eventfd multiple writes coalesce into one counter" {
     try testing.expectEqual(8, (try posix.read(ev.fd, std.mem.asBytes(&value))));
     try testing.expectEqual(3, value);
 }
+
+test "eventfd read drains the counter best-effort" {
+    const ev = try EventFd.create();
+    defer ev.close();
+
+    ev.write();
+    ev.write();
+    ev.read(); // drain via the method (not raw posix.read)
+
+    var drained: u64 = 0;
+    try testing.expectError(error.WouldBlock, posix.read(ev.fd, std.mem.asBytes(&drained)));
+
+    // Draining an already-empty counter is a silent no-op.
+    ev.read();
+    ev.write();
+    ev.read();
+    try testing.expectError(error.WouldBlock, posix.read(ev.fd, std.mem.asBytes(&drained)));
+}

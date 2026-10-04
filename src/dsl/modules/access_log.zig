@@ -97,3 +97,53 @@ test "access_log renders a custom format via renderComplex" {
     try vars.renderComplex(&ctx, fmt, &sink);
     try testing.expectEqualStrings("GET /who?q=1 HTTP/1.1 200", line.items);
 }
+
+test "access_log passes with no allocator and logs the combined default" {
+    // No allocator: nothing to render into, pass silently.
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(Action.pass, try run(&ctx));
+
+    // Default combined format renders end to end (info-level line).
+    var req2 = registry.Request.init(testing.allocator);
+    defer req2.deinit();
+    req2.method = .get;
+    req2.target = "/";
+    var resp2 = registry.Response.init(.ok);
+    resp2.setBody("hi");
+    var ctx2 = Context{ .req = &req2, .resp = &resp2, .allocator = testing.allocator };
+    ctx2.client_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 };
+    try testing.expectEqual(Action.pass, try run(&ctx2));
+}
+
+test "access_log honours a named format and falls back on bad indexes" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .post;
+    req.target = "/submit";
+    var resp = registry.Response.init(.not_found);
+    var ctx = Context{ .req = &req, .resp = &resp, .allocator = testing.allocator };
+
+    const short_value = vars.parseComplexValue("$request $status", &.{});
+    const fmts = [_]registry.LogFormat{
+        .{ .name = "short", .value = short_value },
+    };
+    ctx.formats = &fmts;
+
+    // Valid index selects the named format.
+    const short_route = registry.Route{ .path = "/", .log_format = 0 };
+    ctx.route = &short_route;
+    try testing.expectEqual(Action.pass, try run(&ctx));
+
+    // Out-of-range index falls back to combined.
+    const bad_route = registry.Route{ .path = "/", .log_format = 7 };
+    ctx.route = &bad_route;
+    try testing.expectEqual(Action.pass, try run(&ctx));
+
+    // Index set but no format table: combined default.
+    var ctx2 = Context{ .req = &req, .resp = &resp, .allocator = testing.allocator };
+    ctx2.route = &short_route;
+    try testing.expectEqual(Action.pass, try run(&ctx2));
+}

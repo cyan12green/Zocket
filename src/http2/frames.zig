@@ -247,3 +247,149 @@ test "writeHeaders splits large HPACK blocks into CONTINUATION" {
     const h1 = parseHeader(buf.items[9 + 16 ..][0..9]).?;
     try testing.expectEqual(FrameType.continuation, h1.type);
 }
+
+test "frame: short buffers and unknown types" {
+    try testing.expect(parseHeader(&.{ 0, 0, 1 }) == null);
+    try testing.expect(parseHeader(&.{}) == null);
+    try testing.expectEqual(FrameType.data, FrameType.fromByte(0x0));
+    try testing.expectEqual(FrameType.continuation, FrameType.fromByte(0x9));
+    try testing.expectEqual(FrameType.unknown, FrameType.fromByte(0x0a));
+    try testing.expectEqual(FrameType.unknown, FrameType.fromByte(0x63));
+    try testing.expectEqual(FrameType.unknown, FrameType.fromByte(0xff));
+    // Stream id masks the reserved bit (RFC 9113 §4.1).
+    const h = parseHeader(&.{ 0, 0, 0, 0x1, 0x5, 0x80, 0, 0, 1 }).?;
+    try testing.expectEqual(FrameType.headers, h.type);
+    try testing.expectEqual(@as(u31, 1), h.stream_id);
+    try testing.expectEqual(@as(u8, 0x5), h.flag_bits);
+}
+
+test "frame: writeSettings empty and multiple values" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    try writeSettings(&buf, testing.allocator, &.{});
+    try testing.expectEqual(@as(usize, 9), buf.items.len);
+    const h = parseHeader(buf.items[0..9]).?;
+    try testing.expectEqual(FrameType.settings, h.type);
+    try testing.expectEqual(@as(u24, 0), h.length);
+
+    buf.clearRetainingCapacity();
+    try writeSettings(&buf, testing.allocator, &.{ .{ .id = 1, .value = 4096 }, .{ .id = 4, .value = 65535 } });
+    try testing.expectEqual(@as(usize, 9 + 12), buf.items.len);
+    const h2 = parseHeader(buf.items[0..9]).?;
+    try testing.expectEqual(@as(u24, 12), h2.length);
+    // Second setting: id 4, value 65535.
+    try testing.expectEqualSlices(u8, &.{ 0, 4, 0, 0, 0xff, 0xff }, buf.items[9 + 6 .. 9 + 12]);
+}
+
+test "frame: writePingAck echoes the payload" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    const payload = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try writePingAck(&buf, testing.allocator, &payload);
+    try testing.expectEqual(@as(usize, 9 + 8), buf.items.len);
+    const h = parseHeader(buf.items[0..9]).?;
+    try testing.expectEqual(FrameType.ping, h.type);
+    try testing.expectEqual(flags.ack, h.flag_bits);
+    try testing.expectEqual(@as(u24, 8), h.length);
+    try testing.expectEqualSlices(u8, &payload, buf.items[9..]);
+}
+
+test "frame: writeGoaway carries last-stream, code and debug data" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    try writeGoaway(&buf, testing.allocator, 7, 0x1, "bye");
+    const h = parseHeader(buf.items[0..9]).?;
+    try testing.expectEqual(FrameType.goaway, h.type);
+    try testing.expectEqual(@as(u24, 8 + 3), h.length);
+    try testing.expectEqual(@as(u31, 0), h.stream_id);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 7, 0, 0, 0, 1 }, buf.items[9 .. 9 + 8]);
+    try testing.expectEqualSlices(u8, "bye", buf.items[9 + 8 ..]);
+}
+
+test "frame: writeRstStream and writeWindowUpdate round-trip" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    try writeRstStream(&buf, testing.allocator, 3, 0x8);
+    const h = parseHeader(buf.items[0..9]).?;
+    try testing.expectEqual(FrameType.rst_stream, h.type);
+    try testing.expectEqual(@as(u31, 3), h.stream_id);
+    try testing.expectEqual(@as(u24, 4), h.length);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 8 }, buf.items[9..13]);
+
+    buf.clearRetainingCapacity();
+    try writeWindowUpdate(&buf, testing.allocator, 0, 0x7fffffff);
+    const w = parseHeader(buf.items[0..9]).?;
+    try testing.expectEqual(FrameType.window_update, w.type);
+    try testing.expectEqual(@as(u31, 0), w.stream_id);
+    // Reserved bit masked: 0x7fffffff encodes with top bit clear.
+    try testing.expectEqualSlices(u8, &.{ 0x7f, 0xff, 0xff, 0xff }, buf.items[9..13]);
+}
+
+test "frame: writeData chunking and empty-body edge cases" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    // Empty body without END_STREAM emits nothing.
+    try writeData(&buf, testing.allocator, 1, &.{}, false, 16);
+    try testing.expectEqual(@as(usize, 0), buf.items.len);
+    // Empty body with END_STREAM emits one empty DATA frame.
+    try writeData(&buf, testing.allocator, 1, &.{}, true, 16);
+    try testing.expectEqual(@as(usize, 9), buf.items.len);
+    const h0 = parseHeader(buf.items[0..9]).?;
+    try testing.expectEqual(FrameType.data, h0.type);
+    try testing.expectEqual(flags.end_stream, h0.flag_bits);
+    try testing.expectEqual(@as(u31, 1), h0.stream_id);
+
+    // Multi-chunk: 40 bytes at 16/frame, END_STREAM only on the last.
+    buf.clearRetainingCapacity();
+    const payload = @as([40]u8, @splat(@as(u8, 0x61)));
+    try writeData(&buf, testing.allocator, 1, &payload, true, 16);
+    try testing.expectEqual(@as(usize, 3 * 9 + 40), buf.items.len);
+    var off: usize = 0;
+    var chunks: usize = 0;
+    while (off + 9 <= buf.items.len) {
+        const fh = parseHeader(buf.items[off..][0..9]).?;
+        try testing.expectEqual(FrameType.data, fh.type);
+        chunks += 1;
+        const last = off + 9 + fh.length >= buf.items.len;
+        if (last) {
+            try testing.expectEqual(flags.end_stream, fh.flag_bits);
+            try testing.expectEqual(@as(u24, 8), fh.length);
+        } else {
+            try testing.expectEqual(@as(u8, 0), fh.flag_bits);
+        }
+        off += 9 + fh.length;
+    }
+    try testing.expectEqual(@as(usize, 3), chunks);
+
+    // end_stream=false: no END_STREAM anywhere.
+    buf.clearRetainingCapacity();
+    try writeData(&buf, testing.allocator, 1, &payload, false, 64);
+    const single = parseHeader(buf.items[0..9]).?;
+    try testing.expectEqual(@as(u8, 0), single.flag_bits);
+    try testing.expectEqual(@as(u24, 40), single.length);
+}
+
+test "frame: writeHeaders without END_STREAM omits the flag" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    const block = @as([40]u8, @splat(@as(u8, 0x82)));
+    try writeHeaders(&buf, testing.allocator, 5, &block, false, 16);
+    const h0 = parseHeader(buf.items[0..9]).?;
+    try testing.expectEqual(flags.end_headers, h0.flag_bits);
+    // Last CONTINUATION still carries END_HEADERS.
+    var off: usize = 0;
+    var last_flags: u8 = 0;
+    var last_type = FrameType.headers;
+    while (off + 9 <= buf.items.len) {
+        const fh = parseHeader(buf.items[off..][0..9]).?;
+        last_flags = fh.flag_bits;
+        last_type = fh.type;
+        off += 9 + fh.length;
+    }
+    try testing.expectEqual(FrameType.continuation, last_type);
+    try testing.expectEqual(flags.end_headers, last_flags);
+    // Small block: single HEADERS, no CONTINUATION.
+    buf.clearRetainingCapacity();
+    try writeHeaders(&buf, testing.allocator, 5, &.{0x82}, true, 16384);
+    try testing.expectEqual(@as(usize, 10), buf.items.len);
+}

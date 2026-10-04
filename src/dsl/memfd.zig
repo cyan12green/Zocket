@@ -50,3 +50,40 @@ test "memfd create and map round-trips" {
     try std.testing.expectEqual(@as(u8, 0xAB), region[0]);
     try std.testing.expectEqual(@as(u8, 0xCD), region[1]);
 }
+
+test "memfd inheritAndMap remaps a live fd" {
+    const size = std.heap.page_size_min;
+    const fd = try create("test-inherit", size);
+    defer compat.close(fd);
+    const first = try map(fd, size);
+    defer posix.munmap(first);
+    first[0] = 0x5A;
+    // Same fd remapped: shared mapping sees the write.
+    const second = try inheritAndMap(fd, size);
+    defer posix.munmap(second);
+    try std.testing.expectEqual(@as(u8, 0x5A), second[0]);
+}
+
+test "memfd regions are independent per fd" {
+    const size = std.heap.page_size_min;
+    const fd_a = try create("test-iso-a", size);
+    defer compat.close(fd_a);
+    const fd_b = try create("test-iso-b", size);
+    defer compat.close(fd_b);
+
+    const a = try map(fd_a, size);
+    defer posix.munmap(a);
+    const b = try map(fd_b, size);
+    defer posix.munmap(b);
+
+    // A 16-byte pattern survives through a second shared mapping.
+    for (0..16) |i| a[i] = @intCast(0x30 + i);
+    const a2 = try inheritAndMap(fd_a, size);
+    defer posix.munmap(a2);
+    for (0..16) |i| try std.testing.expectEqual(@as(u8, @intCast(0x30 + i)), a2[i]);
+
+    // The sibling fd sees none of it (still zero-initialized).
+    for (0..16) |i| try std.testing.expectEqual(@as(u8, 0), b[i]);
+    b[0] = 0xFF;
+    try std.testing.expectEqual(@as(u8, 0x30), a[0]);
+}

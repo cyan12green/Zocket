@@ -151,3 +151,42 @@ pub const Server = struct {
         self.running = false;
     }
 };
+
+const testing = std.testing;
+
+test "single-threaded server echoes bytes on an ephemeral port" {
+    var srv = try Server.init(testing.allocator, 0);
+    defer srv.deinit();
+    const port = try sockets.boundPort(srv.listener);
+    try testing.expect(port != 0);
+
+    const Runner = struct {
+        fn run(s: *Server) void {
+            s.run() catch {};
+        }
+    };
+    const thr = try std.Thread.spawn(.{}, Runner.run, .{&srv});
+
+    const cfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer compat.close(cfd);
+    var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    addr[0] = 2; // AF_INET
+    addr[2] = @intCast(port >> 8);
+    addr[3] = @intCast(port & 0xff);
+    addr[4] = 127;
+    addr[7] = 1;
+    try compat.connect(cfd, @ptrCast(&addr), 16);
+    try compat.writeAll(cfd, "ping-echo");
+
+    var buf: [9]u8 = undefined;
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = try posix.read(cfd, buf[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    try testing.expectEqualStrings("ping-echo", buf[0..got]);
+
+    srv.stop();
+    thr.join();
+}

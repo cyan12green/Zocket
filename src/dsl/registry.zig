@@ -202,6 +202,17 @@ pub const Context = struct {
     /// after the current walk completes (nginx internal-redirect semantics;
     /// capped by the reactor at 8 hops).
     internal_redirect_target: ?[]const u8 = null,
+    /// Internal-redirect hops taken so far for this client request. Log-phase
+    /// modules skip when > 0 (one log line per client request, not per hop);
+    /// `error_page` reads it to keep chains short and to avoid re-entering
+    /// itself on the same status.
+    redirect_hops: u8 = 0,
+    /// Status the request is heading out with, as seen by post-processing
+    /// (log-phase) modules: the response status, or 404 when no module
+    /// claimed the request (the reactor's default). Set by the pipeline
+    /// right before it runs the log phase, so `error_page` can match on it
+    /// even though nothing ever set `resp.status` to 404.
+    effective_status: u16 = 200,
     /// Whether the running I/O backend can park requests (epoll yes;
     /// io_uring/TLS fronts keep the synchronous driver). Set by the
     /// runtime; modules check before returning .async.
@@ -450,6 +461,9 @@ pub const default_registry = Registry(.{
     @import("modules/auth_request.zig").auth_request,
     @import("modules/proxy_cache.zig").proxy_cache,
     @import("modules/proxy_cache.zig").proxy_cache_store,
+    @import("modules/error_page.zig").error_page,
+    @import("modules/try_files.zig").try_files,
+    @import("modules/rewrite.zig").rewrite,
 });
 
 const testing = std.testing;
@@ -506,4 +520,124 @@ test "resolve runs the echo module to a handled response" {
     try testing.expectEqual(Action.handled, try run_fn(&ctx));
     try testing.expectEqual(Status.ok, resp.status);
     try testing.expectEqualStrings("hello pipeline", resp.body);
+}
+
+test "module error mapping covers every ModuleError variant" {
+    try testing.expectEqual(Status.bad_gateway, statusForModuleError(error.UpstreamBadResponse));
+    try testing.expectEqual(Status.internal_error, statusForModuleError(error.Internal));
+    try testing.expectEqual(Status.internal_error, statusForModuleError(error.ConfigInvalid));
+}
+
+test "registry capability queries answer for known and unknown names" {
+    try testing.expect(default_registry.isRegistered("echo"));
+    try testing.expect(!default_registry.isRegistered("nope"));
+    try testing.expect(default_registry.isHandler("echo"));
+    try testing.expect(!default_registry.isHandler("gzip")); // a filter
+    try testing.expect(!default_registry.isHandler("nope"));
+    try testing.expect(default_registry.isFilter("gzip"));
+    try testing.expect(!default_registry.isFilter("echo"));
+    try testing.expect(default_registry.kindOf("echo") == .handler);
+    try testing.expect(default_registry.kindOf("gzip") == .filter);
+    try testing.expect(default_registry.kindOf("nope") == null);
+    // Capability flags default off unless the module sets them.
+    try testing.expect(!default_registry.streamsResponse("echo"));
+    try testing.expect(!default_registry.streamsResponse("nope"));
+    try testing.expect(!default_registry.needsBody("echo"));
+    try testing.expect(!default_registry.touchesHeaders("nope"));
+}
+
+test "registry indexOf resolves compile-time names" {
+    try testing.expectEqual(@as(usize, 0), default_registry.indexOf("echo"));
+    try testing.expect(default_registry.indexOf("gzip") > 0);
+    try testing.expect(default_registry.indexOf("proxy") != default_registry.indexOf("proxy_cache"));
+}
+
+test "applyModuleError stamps status and body" {
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    const st = default_registry.applyModuleError("proxy", error.UpstreamConnectFailed, &ctx);
+    try testing.expectEqual(Status.bad_gateway, st);
+    try testing.expectEqual(Status.bad_gateway, resp.status);
+    try testing.expectEqualStrings("Bad Gateway", resp.body);
+    const st2 = default_registry.applyModuleError("limit_req", error.RateLimited, &ctx);
+    try testing.expectEqual(Status.service_unavailable, st2);
+    try testing.expectEqualStrings("Service Unavailable", resp.body);
+}
+
+test "module lifecycle gate inits once and shuts down" {
+    // Idempotent gate: first call runs inits, second is a no-op, deinit
+    // resets so a later init runs again. Null limits exercise the
+    // compiled-defaults fallback in every module init.
+    default_registry.initModules(null);
+    default_registry.initModules(null);
+    default_registry.deinitModules();
+    default_registry.deinitModules(); // no gate held: no-op
+    default_registry.initModules(null);
+    default_registry.deinitModules();
+}
+
+test "Context sharedAlloc/sharedDupe/sharedFmt borrow the request arena" {
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    const mem = ctx.sharedAlloc(16).?;
+    try testing.expectEqual(@as(usize, 16), mem.len);
+    const duped = ctx.sharedDupe("hello-shared").?;
+    try testing.expectEqualStrings("hello-shared", duped);
+    const fmted = ctx.sharedFmt("n={d}", .{42}).?;
+    try testing.expectEqualStrings("n=42", fmted);
+}
+
+test "Context module state slots are per-module and nullable" {
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expect(ctx.getState("echo") == null);
+    var marker: u8 = 0xAB;
+    ctx.setState("echo", @ptrCast(&marker));
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&marker)), ctx.getState("echo"));
+    // Other modules' slots are untouched.
+    try testing.expect(ctx.getState("gzip") == null);
+    ctx.setState("echo", null);
+    try testing.expect(ctx.getState("echo") == null);
+}
+
+test "Context runSubrequest guards depth and needs a hook" {
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    var code: u16 = 0;
+    // No hook installed.
+    try testing.expectError(error.NoSubrequestHook, ctx.runSubrequest("/x", &code));
+    // Depth guard fires before the hook is consulted.
+    ctx.subrequest_depth = 8;
+    try testing.expectError(error.SubrequestDepthExceeded, ctx.runSubrequest("/x", &code));
+    ctx.subrequest_depth = 0;
+
+    const Hook = struct {
+        fn call(impl: *const anyopaque, src: *const Request, target: []const u8, out: *u16) anyerror!void {
+            _ = impl;
+            _ = src;
+            try testing.expectEqualStrings("/auth", target);
+            out.* = 200;
+        }
+    };
+    var token: u8 = 0;
+    ctx.subrequest = .{ .impl = @ptrCast(&token), .call = Hook.call };
+    try ctx.runSubrequest("/auth", &code);
+    try testing.expectEqual(@as(u16, 200), code);
+    try testing.expectEqual(@as(u8, 0), ctx.subrequest_depth); // restored
+}
+
+test "ServerStats starts zeroed" {
+    var stats = ServerStats.init();
+    try testing.expectEqual(@as(u64, 0), stats.accepted.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), stats.requests.load(.monotonic));
+    _ = stats.active.fetchAdd(1, .monotonic);
+    try testing.expectEqual(@as(u64, 1), stats.active.load(.monotonic));
 }

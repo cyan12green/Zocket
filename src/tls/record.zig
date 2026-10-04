@@ -146,3 +146,65 @@ test "record: truncated and oversized records fail cleanly" {
     try testing.expectError(error.TlsConnectionTruncated, decryptInPlace(Aes128Gcm, key, iv, 0, out[0 .. n - 2]));
     try testing.expectError(error.TlsRecordOverflow, decryptInPlace(Aes128Gcm, key, iv, 0, out[0..3]));
 }
+
+test "record: header bytes are exact" {
+    var hdr: [header_len]u8 = undefined;
+    writeHeader(&hdr, 0x17, 0x1234);
+    try testing.expectEqualSlices(u8, &.{ 0x17, 0x03, 0x03, 0x12, 0x34 }, &hdr);
+}
+
+test "record: nonce XORs the sequence big-endian into the IV" {
+    const iv = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    try testing.expectEqualSlices(u8, &iv, &nonce(&iv, 0));
+    var want = iv;
+    want[11] ^= 1;
+    try testing.expectEqualSlices(u8, &want, &nonce(&iv, 1));
+    var want2 = iv;
+    want2[4] ^= 0x01;
+    want2[11] ^= 0x00;
+    try testing.expectEqualSlices(u8, &want2, &nonce(&iv, 0x0100000000000000));
+    // Distinct sequence numbers never collide.
+    try testing.expect(!std.mem.eql(u8, &nonce(&iv, 41), &nonce(&iv, 42)));
+}
+
+test "record: tiny output buffers fail with TlsRecordOverflow" {
+    var key: [Aes128Gcm.key_length]u8 = undefined;
+    var iv: [Aes128Gcm.nonce_length]u8 = undefined;
+    compat.randomBytes(&key);
+    compat.randomBytes(&iv);
+    var out: [8]u8 = undefined;
+    try testing.expectError(error.TlsRecordOverflow, encrypt(Aes128Gcm, key, iv, 0, 0, "hello world, too long", &out));
+    // Empty input is not a record at all.
+    var empty: [0]u8 = .{};
+    try testing.expectError(error.TlsRecordOverflow, decryptInPlace(Aes128Gcm, key, iv, 0, &empty));
+}
+
+test "record: oversized length fields fail cleanly" {
+    var key: [Aes128Gcm.key_length]u8 = undefined;
+    var iv: [Aes128Gcm.nonce_length]u8 = undefined;
+    compat.randomBytes(&key);
+    compat.randomBytes(&iv);
+    // A record whose length exceeds the TLS ceiling is rejected even when
+    // the bytes are all present.
+    const big: usize = tls.max_ciphertext_len + 1;
+    const buf = try testing.allocator.alloc(u8, header_len + big);
+    defer testing.allocator.free(buf);
+    @memset(buf, 0);
+    var hdr: [header_len]u8 = undefined;
+    writeHeader(&hdr, @intFromEnum(tls.ContentType.application_data), @intCast(big));
+    @memcpy(buf[0..header_len], &hdr);
+    try testing.expectError(error.TlsRecordOverflow, decryptInPlace(Aes128Gcm, key, iv, 0, buf));
+}
+
+test "record: huge fragments are refused at encrypt time" {
+    var key: [Aes128Gcm.key_length]u8 = undefined;
+    var iv: [Aes128Gcm.nonce_length]u8 = undefined;
+    compat.randomBytes(&key);
+    compat.randomBytes(&iv);
+    const frag = try testing.allocator.alloc(u8, max_plaintext_len + 1);
+    defer testing.allocator.free(frag);
+    @memset(frag, 0x61);
+    const out = try testing.allocator.alloc(u8, frag.len + header_len + Aes128Gcm.tag_length + 1);
+    defer testing.allocator.free(out);
+    try testing.expectError(error.TlsRecordOverflow, encrypt(Aes128Gcm, key, iv, 0, 0, frag, out));
+}

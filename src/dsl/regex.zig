@@ -79,6 +79,10 @@ pub fn compileRegex(comptime pattern: []const u8) Regex {
             .states = c.states.freeze(),
             .group_count = c.group_count,
             .class_bitmaps = c.classes.freeze(),
+            // Entry point: the fragment's start, NOT states[0]. A leading
+            // quantifier (`a?b`, `a*b`) creates its entry split after the
+            // atom, so seeding at 0 skips the skip-arm (empty path).
+            .start = frag.start,
         };
     };
 }
@@ -557,22 +561,27 @@ pub fn match(re: *const Regex, subject: []const u8, caps: []CaptureRange, start:
 
     var s = start;
     while (s <= subject.len) : (s += 1) {
-        const st0 = re.states[0];
+        const st0 = re.states[re.start];
         if (st0.kind == kind_anchor_start and s != 0) {
             // Anchored at start: only position 0 can match.
             if (s > start) break;
             continue;
         }
-        // Initial thread: state 0, empty capture state.
+        // Initial thread: entry state, empty capture state.
         curr_len = 0;
-        addThread(&curr, &curr_len, 0, emptyCaps());
+        addThread(&curr, &curr_len, re.start, emptyCaps());
         closure(re, &curr, &curr_len, s, subject.len, ci);
 
         // Check for a match state in the initial closure (empty match).
+        // Longest-wins at this start position: a match now does not stop
+        // the walk (greedy quantifiers like `(.*)` reach accept with an
+        // empty span first; consuming further extends it). The last accept
+        // seen is the reported match.
         matched = findMatch(&curr, curr_len);
+        var match_end: usize = s;
 
         var pos = s;
-        while (matched == null and pos < subject.len) : (pos += 1) {
+        while (pos < subject.len) : (pos += 1) {
             const ch = if (ci) std.ascii.toLower(subject[pos]) else subject[pos];
             next_len = 0;
             for (curr[0..curr_len]) |t| {
@@ -589,7 +598,11 @@ pub fn match(re: *const Regex, subject: []const u8, caps: []CaptureRange, start:
             curr_len = next_len;
             next = saved_curr;
             _ = saved_len;
-            matched = findMatch(&curr, curr_len);
+            if (findMatch(&curr, curr_len)) |acc| {
+                matched = acc;
+                match_end = pos + 1;
+            }
+            if (curr_len == 0) break; // no live threads left: done early
         }
         if (matched) |t| {
             const ng = @min(caps.len, max_caps);
@@ -599,6 +612,9 @@ pub fn match(re: *const Regex, subject: []const u8, caps: []CaptureRange, start:
                     .end = @intCast(@max(0, t.caps[g].end)),
                 };
             }
+            // Whole match (group 0): the compiler emits markers only for
+            // explicit groups 1..9, so record the span directly.
+            if (ng > 0) caps[0] = .{ .start = @intCast(s), .end = @intCast(match_end) };
             return true;
         }
         if (st0.kind == kind_anchor_start) break;
@@ -798,4 +814,111 @@ test "regex: braced quantifiers compile and match" {
     try testing.expect(m("^a{2,}$", "aaaa"));
     try testing.expect(m("^a{2,3}$", "aaa"));
     try testing.expect(!m("^a{2,3}$", "aaaa"));
+}
+
+test "regex: empty pattern matches empty at every position" {
+    try testing.expect(m("", ""));
+    try testing.expect(m("", "abc"));
+    const re = compileRegex("");
+    try testing.expect(re.states.len > 0);
+    try testing.expectEqual(@as(u8, 0), re.group_count);
+}
+
+test "regex: nested groups capture outside-in" {
+    const re = compileRegex("^((a+)(b+))$");
+    try testing.expectEqual(@as(u8, 3), re.group_count);
+    var caps: [max_groups + 1]CaptureRange = undefined;
+    const subject = "aaabb";
+    try testing.expect(match(&re, subject, &caps, 0, false));
+    try testing.expectEqualStrings("aaabb", subject[caps[1].start..caps[1].end]);
+    try testing.expectEqualStrings("aaa", subject[caps[2].start..caps[2].end]);
+    try testing.expectEqualStrings("bb", subject[caps[3].start..caps[3].end]);
+    try testing.expect(!m("^((a+)(b+))$", "aaacbb"));
+}
+
+test "regex: match from a non-zero start offset" {
+    const re = compileRegex("abc");
+    var caps: [max_groups + 1]CaptureRange = undefined;
+    try testing.expect(match(&re, "xxabcxx", &caps, 2, false));
+    // Start past the occurrence misses; start past the end never matches.
+    try testing.expect(!match(&re, "xxabcxx", &caps, 3, false));
+    try testing.expect(!match(&re, "abc", &caps, 4, false));
+    try testing.expect(!match(&re, "", &caps, 1, false));
+}
+
+test "regex: start-anchored patterns only match at position zero" {
+    const re = compileRegex("^ab");
+    var caps: [max_groups + 1]CaptureRange = undefined;
+    try testing.expect(match(&re, "abc", &caps, 0, false));
+    // A nonzero start can never satisfy ^: the scan stops immediately.
+    try testing.expect(!match(&re, "zab", &caps, 1, false));
+}
+
+test "regex: end anchor on empty and non-empty subjects" {
+    try testing.expect(m("^a*$", ""));
+    try testing.expect(m("a*$", "aaa"));
+    // PCRE semantics: `a*$` matches "aaab" via the empty match at the end
+    // (a* takes zero, $ holds at pos 4). The engine seeds the fragment
+    // entry state, so the skip arm is reachable at every position.
+    try testing.expect(m("a*$", "aaab"));
+    try testing.expect(m("$", ""));
+    try testing.expect(m("$", "anything"));
+    // Leading quantifiers: match() seeds the fragment entry state, so the
+    // skip arm is reachable (unanchored search semantics).
+    try testing.expect(m("a*", ""));
+    try testing.expect(m("a?b", "b"));
+    try testing.expect(m("a?b", "ab"));
+    try testing.expect(m("a*b", "b"));
+    try testing.expect(m("a*b", "aaab"));
+}
+
+test "regex: dot matches everything but newline, classes fold case-insensitively" {
+    try testing.expect(m("^.+$", "a\t b"));
+    try testing.expect(!m("^.+$", "a\nb"));
+    const re = compileRegex("^[a-z]+$");
+    var caps: [max_groups + 1]CaptureRange = undefined;
+    try testing.expect(!match(&re, "ABC", &caps, 0, false));
+    try testing.expect(match(&re, "ABC", &caps, 0, true));
+    try testing.expect(match(&re, "aBc", &caps, 0, true));
+}
+
+test "regex: alternation of empty and optional groups" {
+    try testing.expect(m("^(a|)$", ""));
+    try testing.expect(m("^(a|)$", "a"));
+    try testing.expect(!m("^(a|)$", "b"));
+    try testing.expect(m("^(ab)?c$", "c"));
+    try testing.expect(m("^(ab)?c$", "abc"));
+    try testing.expect(!m("^(ab)?c$", "abbc"));
+}
+
+test "regex: many groups up to the cap" {
+    const re = compileRegex("^(a)(b)(c)(d)(e)(f)(g)(h)(i)$");
+    try testing.expectEqual(@as(u8, 9), re.group_count);
+    var caps: [max_groups + 1]CaptureRange = undefined;
+    try testing.expect(match(&re, "abcdefghi", &caps, 0, false));
+    try testing.expectEqualStrings("a", "abcdefghi"[caps[1].start..caps[1].end]);
+    try testing.expectEqualStrings("i", "abcdefghi"[caps[9].start..caps[9].end]);
+}
+
+test "regex: no match leaves whole-match caps at zero" {
+    const re = compileRegex("^xyz$");
+    var caps: [max_groups + 1]CaptureRange = undefined;
+    for (&caps) |*c| c.* = .{ .start = 7, .end = 9 };
+    try testing.expect(!match(&re, "abc", &caps, 0, false));
+}
+
+test "regex: greedy quantifiers extend captures to the longest match" {
+    // `(.*)` with no trailing context used to report the empty match (the
+    // star's skip arm reaches accept first); longest-wins keeps consuming.
+    const re = compileRegex("^/old/(.*)");
+    var caps: [max_groups + 1]CaptureRange = undefined;
+    try testing.expect(match(&re, "/old/page", &caps, 0, false));
+    try testing.expectEqualStrings("page", "/old/page"[caps[1].start..caps[1].end]);
+    try testing.expectEqualStrings("/old/page", "/old/page"[caps[0].start..caps[0].end]);
+    // Trailing context still constrains the match.
+    const re2 = compileRegex("^(.*)/end$");
+    var caps2: [max_groups + 1]CaptureRange = undefined;
+    try testing.expect(match(&re2, "/a/end", &caps2, 0, false));
+    try testing.expectEqualStrings("/a", "/a/end"[caps2[1].start..caps2[1].end]);
+    try testing.expect(!match(&re2, "/a/mid", &caps2, 0, false));
 }

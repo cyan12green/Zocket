@@ -148,7 +148,7 @@ pub const AcceptError = error{
 pub fn acceptNonBlock(listener: posix.fd_t) AcceptError!posix.fd_t {
     const flags: u32 = linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
     const rc = linux.accept4(listener, null, null, flags);
-    const err = posix.errno(rc);
+    const err = linux.errno(rc);
     return switch (err) {
         .SUCCESS => @intCast(rc),
         .AGAIN => error.WouldBlock,
@@ -297,9 +297,14 @@ fn fmtIpv6(ip: [16]u8, buf: []u8) []const u8 {
             i = best_start + best_len - 1; // loop will i += 1
             continue;
         }
-        if (i > 0 and notCompressed(best_start, best_len, i)) {
-            if (pos + 1 <= buf.len) buf[pos] = ':';
-            pos += 1;
+        // Separator between two printed groups only: never adjacent to
+        // the "::" compression (it already ends/starts with colons).
+        if (i > 0) {
+            const prev_compressed = best_len > 0 and (i - 1) >= best_start and (i - 1) < best_start + best_len;
+            if (!prev_compressed) {
+                if (pos + 1 <= buf.len) buf[pos] = ':';
+                pos += 1;
+            }
         }
         const group: u16 = @as(u16, ip[i * 2]) << 8 | ip[i * 2 + 1];
         const printed = std.fmt.bufPrint(buf[pos..], "{x}", .{group}) catch break;
@@ -310,10 +315,6 @@ fn fmtIpv6(ip: [16]u8, buf: []u8) []const u8 {
         return buf[0..2];
     }
     return buf[0..pos];
-}
-
-fn notCompressed(best_start: usize, best_len: usize, i: usize) bool {
-    return best_len == 0 or i < best_start or i >= best_start + best_len;
 }
 
 /// Enable TCP_NODELAY on a connected socket (accepted connections).
@@ -335,4 +336,70 @@ pub fn setTcpCork(fd: posix.fd_t) void {
 /// semantics (TCP_NODELAY remains in effect).
 pub fn clearTcpCork(fd: posix.fd_t) void {
     posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.CORK, &std.mem.toBytes(@as(c_int, 0))) catch {};
+}
+
+const testing = std.testing;
+
+test "sockets: fmtIp renders v4-mapped and v6 canonical forms" {
+    var buf: [64]u8 = undefined;
+    const v4 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 };
+    try testing.expect(isIPv4Mapped(v4));
+    try testing.expectEqualStrings("127.0.0.1", fmtIp(v4, &buf));
+    const v6zero = @as([16]u8, @splat(@as(u8, 0)));
+    try testing.expect(!isIPv4Mapped(v6zero));
+    try testing.expectEqualStrings("::", fmtIp(v6zero, &buf));
+    const loopback = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try testing.expectEqualStrings("::1", fmtIp(loopback, &buf));
+    // Single zero group is NOT compressed (needs 2+).
+    const single = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0x01, 0, 0x02, 0, 0x03, 0, 0x04, 0, 0x05 };
+    try testing.expectEqualStrings("2001:db8:0:1:2:3:4:5", fmtIp(single, &buf));
+    // Longest run wins; ties prefer the first (RFC 5952 §4.2.3).
+    const tied = [_]u8{ 0x20, 0x01, 0, 0, 0, 0, 0, 0x01, 0, 0x02, 0, 0, 0, 0, 0, 0x03 };
+    try testing.expectEqualStrings("2001::1:2:0:0:3", fmtIp(tied, &buf));
+    // Short buffer truncates without crashing.
+    var tiny: [4]u8 = undefined;
+    _ = fmtIp(v4, &tiny);
+}
+
+test "sockets: listeners bind ephemeral ports, peers resolve" {
+    const fd = try createListeningSocket(0, 8);
+    defer compat.close(fd);
+    const port = try boundPort(fd);
+    try testing.expect(port != 0);
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    defer compat.close(pair[1]);
+    // Socketpair peers are not INET: zeroes.
+    try testing.expectEqual([16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, peerIp(pair[0]));
+
+    // Connected TCP peer resolves to mapped 127.0.0.1.
+    const cfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer compat.close(cfd);
+    var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    addr[0] = 2;
+    addr[2] = @intCast(port >> 8);
+    addr[3] = @intCast(port & 0xff);
+    addr[4] = 127;
+    addr[7] = 1;
+    try compat.connect(cfd, @ptrCast(&addr), 16);
+    const afd = try acceptNonBlock(fd);
+    defer compat.close(afd);
+    const peer = peerIp(afd);
+    try testing.expect(isIPv4Mapped(peer));
+    var pbuf: [64]u8 = undefined;
+    try testing.expectEqualStrings("127.0.0.1", fmtIp(peer, &pbuf));
+
+    // No further backlog: WouldBlock, not an error.
+    try testing.expectError(error.WouldBlock, acceptNonBlock(fd));
+
+    // Socket options apply without error; NODELAY reads back set.
+    setTcpNoDelay(cfd);
+    var nodelay: [4]u8 = undefined;
+    try compat.getsockopt(cfd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &nodelay);
+    try testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, &nodelay, .little));
+    setTcpCork(cfd);
+    clearTcpCork(cfd);
+    try setNonBlock(cfd);
+    pinToCpu(0); // best-effort, must not crash
 }

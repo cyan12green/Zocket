@@ -287,3 +287,99 @@ test "cache_headers emits no-cache when max_age is zero" {
     try testing.expectEqual(Action.pass, try cache_headers.run(&ctx));
     try testing.expectEqualStrings("no-cache", resp.headers[0].value);
 }
+
+test "etagMatches handles star, weak tags and lists" {
+    try testing.expect(etagMatches("*", "\"abc\""));
+    try testing.expect(etagMatches("W/\"abc\"", "\"abc\""));
+    try testing.expect(etagMatches("\"x\", \"abc\", \"y\"", "\"abc\""));
+    try testing.expect(etagMatches("  \"abc\"  ", "\"abc\""));
+    try testing.expect(!etagMatches("\"other\"", "\"abc\""));
+    try testing.expect(!etagMatches("", "\"abc\""));
+    try testing.expect(!etagMatches("W/\"other\"", "\"abc\""));
+}
+
+test "conditional_get matches star and falls through to ims" {
+    const allocator = testing.allocator;
+    // Star matches any current representation.
+    var st = try parseRequest(allocator, "GET / HTTP/1.1\r\nIf-None-Match: *\r\n\r\n");
+    defer st.req.deinit();
+    defer st.parser.deinit();
+    defer st.buf.deinit(allocator);
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &st.req, .resp = &resp, .etag = "\"v9\"" };
+    try testing.expectEqual(Action.handled, try conditional_get.run(&ctx));
+    try testing.expectEqual(registry.Status.not_modified, resp.status);
+
+    // Non-matching tag plus a satisfying date still 304s via the date path.
+    var wire_buf: [256]u8 = undefined;
+    const wire = std.fmt.bufPrint(&wire_buf, "GET / HTTP/1.1\r\nIf-None-Match: \"nope\"\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:38 GMT\r\n\r\n", .{}) catch unreachable;
+    var st2 = try parseRequest(allocator, wire);
+    defer st2.req.deinit();
+    defer st2.parser.deinit();
+    defer st2.buf.deinit(allocator);
+    var resp2 = registry.Response.init(.ok);
+    var ctx2 = Context{ .req = &st2.req, .resp = &resp2, .etag = "\"v9\"", .last_modified = "Sun, 06 Nov 1994 08:49:37 GMT" };
+    try testing.expectEqual(Action.handled, try conditional_get.run(&ctx2));
+    try testing.expectEqual(registry.Status.not_modified, resp2.status);
+}
+
+test "conditional_get passes on unparseable dates" {
+    const allocator = testing.allocator;
+    var st = try parseRequest(allocator, "GET / HTTP/1.1\r\nIf-Modified-Since: not-a-date\r\n\r\n");
+    defer st.req.deinit();
+    defer st.parser.deinit();
+    defer st.buf.deinit(allocator);
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &st.req, .resp = &resp, .last_modified = "Sun, 06 Nov 1994 08:49:37 GMT" };
+    try testing.expectEqual(Action.pass, try conditional_get.run(&ctx));
+
+    // Entity date itself unparseable: also pass through.
+    var st2 = try parseRequest(allocator, "GET / HTTP/1.1\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n");
+    defer st2.req.deinit();
+    defer st2.parser.deinit();
+    defer st2.buf.deinit(allocator);
+    var resp2 = registry.Response.init(.ok);
+    var ctx2 = Context{ .req = &st2.req, .resp = &resp2, .last_modified = "garbage" };
+    try testing.expectEqual(Action.pass, try conditional_get.run(&ctx2));
+}
+
+test "parseHttpDate rejects out-of-range fields" {
+    try testing.expectEqual(@as(?u64, null), parseHttpDate("Sun, 06 Xyz 1994 08:49:37 GMT"));
+    try testing.expectEqual(@as(?u64, null), parseHttpDate("Sun, 00 Nov 1994 08:49:37 GMT"));
+    try testing.expectEqual(@as(?u64, null), parseHttpDate("Sun, 32 Nov 1994 08:49:37 GMT"));
+    try testing.expectEqual(@as(?u64, null), parseHttpDate("Sun, 06 Nov 1969 08:49:37 GMT"));
+    try testing.expectEqual(@as(?u64, null), parseHttpDate("Sun, 06 Nov 1994 24:49:37 GMT"));
+    try testing.expectEqual(@as(?u64, null), parseHttpDate("Sun, 06 Nov 1994 08:60:37 GMT"));
+    try testing.expectEqual(@as(?u64, null), parseHttpDate("Sun, 06 Nov 1994 08:49:60 GMT"));
+    try testing.expectEqual(@as(?u64, null), parseHttpDate("Sun, 06 Nov 1994 08:49:37 GM"));
+    try dateRoundtripLeapy();
+    var tiny: [5]u8 = undefined;
+    try testing.expect(formatHttpDate(0, &tiny) == null);
+}
+
+fn dateRoundtripLeapy() !void {
+    // 2024-02-29 exercises the leap-day path in both directions.
+    try dateRoundtrip(1709164800);
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("Thu, 29 Feb 2024 00:00:00 GMT", formatHttpDate(1709164800, &buf).?);
+}
+
+test "cache_headers passes with no route and emits etag-only" {
+    const allocator = testing.allocator;
+    var st = try parseRequest(allocator, "GET / HTTP/1.1\r\n\r\n");
+    defer st.req.deinit();
+    defer st.parser.deinit();
+    defer st.buf.deinit(allocator);
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &st.req, .resp = &resp };
+    try testing.expectEqual(Action.pass, try cache_headers.run(&ctx));
+    try testing.expectEqual(@as(usize, 0), resp.header_count);
+
+    // ETag without Last-Modified: exactly two headers.
+    const route = registry.Route{ .path = "/" };
+    var resp2 = registry.Response.init(.ok);
+    var ctx2 = Context{ .req = &st.req, .resp = &resp2, .route = &route, .etag = "\"e1\"" };
+    try testing.expectEqual(Action.pass, try cache_headers.run(&ctx2));
+    try testing.expectEqual(@as(usize, 2), resp2.header_count);
+    try testing.expectEqualStrings("ETag", resp2.headers[1].name);
+}

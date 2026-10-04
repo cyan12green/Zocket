@@ -299,3 +299,98 @@ test "encodeHead produces frames decode can read back" {
         try std.testing.expect(frame.fin);
     }
 }
+
+test "upgradeHead returns null when the buffer is too small" {
+    var tiny: [10]u8 = undefined;
+    try std.testing.expect(upgradeHead("websocket", "key", &tiny) == null);
+    // Empty buffer always fails.
+    try std.testing.expect(upgradeHead("h2c", "", &.{}) == null);
+}
+
+test "upgradeHead with websocket proto but no key skips the digest" {
+    var buf: [160]u8 = undefined;
+    const head = upgradeHead("websocket", "", &buf) orelse return error.NoSpace;
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        head,
+    );
+}
+
+test "isWebsocketProto trims surrounding whitespace" {
+    try std.testing.expect(isWebsocketProto("  websocket\t"));
+    try std.testing.expect(isWebsocketProto("WEBSOCKET"));
+    try std.testing.expect(!isWebsocketProto("websocketx"));
+    try std.testing.expect(!isWebsocketProto(""));
+}
+
+test "Opcode.isControl distinguishes control from data opcodes" {
+    try std.testing.expect(!Opcode.text.isControl());
+    try std.testing.expect(!Opcode.binary.isControl());
+    try std.testing.expect(!Opcode.continuation.isControl());
+    try std.testing.expect(Opcode.close.isControl());
+    try std.testing.expect(Opcode.ping.isControl());
+    try std.testing.expect(Opcode.pong.isControl());
+}
+
+test "decode reports incomplete for short inputs and truncated masks" {
+    var frame = Frame{};
+    var empty: [0]u8 = .{};
+    try std.testing.expectEqual(DecodeResult.incomplete, decode(&empty, &frame));
+    var one = [_]u8{0x81};
+    try std.testing.expectEqual(DecodeResult.incomplete, decode(&one, &frame));
+    // 16-bit length announced, header truncated.
+    var short16 = [_]u8{ 0x82, 0xFE, 0x01 };
+    try std.testing.expectEqual(DecodeResult.incomplete, decode(&short16, &frame));
+    // 64-bit length announced, header truncated.
+    var short64 = [_]u8{ 0x82, 0xFF, 0, 0, 0, 0 };
+    try std.testing.expectEqual(DecodeResult.incomplete, decode(&short64, &frame));
+    // Masked frame whose 4-byte mask key is truncated.
+    var shortmask = [_]u8{ 0x81, 0x85, 0x01, 0x02 };
+    try std.testing.expectEqual(DecodeResult.incomplete, decode(&shortmask, &frame));
+    // Payload shorter than announced.
+    var shortpay = [_]u8{ 0x82, 0x05, 'a', 'b' };
+    try std.testing.expectEqual(DecodeResult.incomplete, decodeUnmaskedOk(&shortpay, &frame));
+}
+
+test "decode handles masked extended-length frames" {
+    var frame = Frame{};
+    // Masked 16-bit-length binary frame: 130 bytes of 'z' xored with 0x11.
+    var wire: [4 + 4 + 130]u8 = undefined;
+    wire[0] = 0x82;
+    wire[1] = 0x80 | 126;
+    std.mem.writeInt(u16, wire[2..4], 130, .big);
+    @memset(wire[4..8], 0x11);
+    @memset(wire[8..], @as(u8, 'z') ^ @as(u8, 0x11));
+    try std.testing.expectEqual(DecodeResult.ok, decode(&wire, &frame));
+    try std.testing.expectEqual(@as(usize, 130), frame.payload.len);
+    for (frame.payload) |c| try std.testing.expectEqual(@as(u8, 'z'), c);
+}
+
+test "decode reads close and pong control frames" {
+    var frame = Frame{};
+    // Masked close frame with a 2-byte status payload.
+    const status_masked = [_]u8{ 0x88, 0x82, 0x01, 0x02, 0x03, 0x04, 0x03 ^ 0x01, 0xE8 ^ 0x02 };
+    var close_buf = status_masked;
+    try std.testing.expectEqual(DecodeResult.ok, decode(&close_buf, &frame));
+    try std.testing.expectEqual(Opcode.close, frame.opcode);
+    try std.testing.expectEqual(@as(usize, 2), frame.payload.len);
+    try std.testing.expectEqual(@as(u8, 0x03), frame.payload[0]);
+    try std.testing.expectEqual(@as(u8, 0xE8), frame.payload[1]);
+    // Empty unmasked pong.
+    var pong_buf = [_]u8{ 0x8A, 0x00 };
+    try std.testing.expectEqual(DecodeResult.ok, decodeUnmaskedOk(&pong_buf, &frame));
+    try std.testing.expectEqual(Opcode.pong, frame.opcode);
+    try std.testing.expectEqual(@as(usize, 0), frame.payload.len);
+}
+
+test "acceptKey is deterministic and key-sensitive" {
+    var a: [28]u8 = undefined;
+    var b: [28]u8 = undefined;
+    const ka = acceptKey("dGhlIHNhbXBsZSBub25jZQ==", &a);
+    const kb = acceptKey("dGhlIHNhbXBsZSBub25jZQ==", &b);
+    try std.testing.expectEqualStrings(ka, kb);
+    var c: [28]u8 = undefined;
+    const kc = acceptKey("AAAAAAAAAAAAAAAAAAAAAA==", &c);
+    try std.testing.expect(!std.mem.eql(u8, ka, kc));
+    try std.testing.expectEqual(@as(usize, 28), ka.len);
+}

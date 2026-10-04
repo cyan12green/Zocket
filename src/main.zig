@@ -414,7 +414,7 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
 /// process we may not signal (EPERM) counts as alive.
 fn processAlive(pid: posix_pid_t) bool {
     const rc = std.os.linux.syscall2(.kill, @as(usize, @bitCast(@as(isize, pid))), 0);
-    const err = std.posix.errno(rc);
+    const err = std.os.linux.errno(rc);
     return err == .SUCCESS or err == .PERM;
 }
 

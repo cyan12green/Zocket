@@ -288,3 +288,136 @@ test "connection pool recycles without allocation" {
     try testing.expectEqual(@as(usize, 0), c2.recv_buf.availableWrite() - 16384);
     pool.release(c2);
 }
+
+test "connection createWithLimits uses heap buffers for custom sizes" {
+    const allocator = testing.allocator;
+    const conn = try Connection.createWithLimits(allocator, 7, 4096, 8192, 65536);
+    defer conn.destroy();
+    try testing.expectEqual(@as(posix.fd_t, 7), conn.fd);
+    try testing.expectEqual(@as(usize, 4096), conn.recv_buf.data.len);
+    try testing.expectEqual(@as(usize, 8192), conn.send_buf.data.len);
+    try testing.expect(conn.recv_buf.owns_data);
+    try testing.expect(conn.send_buf.owns_data);
+    try testing.expectEqual(@as(usize, 65536), conn.max_recv_buf);
+    _ = conn.recv_buf.writeSlice("hi");
+    try testing.expectEqualStrings("hi", conn.recv_buf.peek());
+}
+
+test "connection reset clears timer, peer and ring state" {
+    const allocator = testing.allocator;
+    const conn = try Connection.create(allocator, 42);
+    defer conn.destroy();
+
+    conn.timer.active = true;
+    conn.timer_last_tick = 99;
+    conn.peer_ip = @as([16]u8, @splat(0xAB));
+    conn.read_pending = true;
+    conn.write_pending = true;
+    conn.closing = true;
+    conn.server_limit_conn_key = 1234;
+    conn.reset();
+
+    try testing.expectEqual(@as(posix.fd_t, -1), conn.fd);
+    try testing.expect(!conn.timer.active);
+    try testing.expectEqual(@as(u64, 0), conn.timer_last_tick);
+    try testing.expectEqual(@as([16]u8, @splat(@as(u8, 0))), conn.peer_ip);
+    try testing.expect(!conn.read_pending);
+    try testing.expect(!conn.write_pending);
+    try testing.expect(!conn.closing);
+    try testing.expect(conn.next == null);
+    try testing.expectEqual(@as(usize, 0), conn.recv_buf.availableRead());
+}
+
+test "connection recv and send round-trip over a socketpair" {
+    const allocator = testing.allocator;
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[1]);
+
+    const conn = try Connection.create(allocator, pair[0]);
+    defer conn.destroy();
+
+    // Nothing to read yet on a closed... write from the peer first.
+    _ = try compat.write(pair[1], "ping");
+    const n = try conn.recv();
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqualStrings("ping", conn.recv_buf.peek());
+
+    // Echo it back through the send path.
+    conn.enqueue("ping");
+    const m = try conn.send();
+    try testing.expectEqual(@as(usize, 4), m);
+    var echo: [4]u8 = undefined;
+    var got: usize = 0;
+    while (got < 4) {
+        const k = try posix.read(pair[1], echo[got..]);
+        if (k == 0) break;
+        got += k;
+    }
+    try testing.expectEqualStrings("ping", echo[0..got]);
+
+    // Sending with an empty send buffer is a zero no-op.
+    try testing.expectEqual(@as(usize, 0), try conn.send());
+    conn.close();
+}
+
+test "connection recv returns BufferFull at the growth cap" {
+    const allocator = testing.allocator;
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    defer compat.close(pair[1]);
+
+    // 8-byte buffer pinned at 8 bytes: once full, recv must refuse.
+    const conn = try Connection.createWithLimits(allocator, pair[0], 8, 8, 8);
+    defer conn.destroy();
+    _ = try compat.write(pair[1], "12345678");
+    try testing.expectEqual(@as(usize, 8), try conn.recv());
+    try testing.expectError(error.BufferFull, conn.recv());
+}
+
+test "connection recv grows the buffer below the cap" {
+    const allocator = testing.allocator;
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    defer compat.close(pair[1]);
+
+    const conn = try Connection.createWithLimits(allocator, pair[0], 8, 8, 64);
+    defer conn.destroy();
+    _ = try compat.write(pair[1], "12345678");
+    try testing.expectEqual(@as(usize, 8), try conn.recv());
+    // Buffer is full; next recv grows (8 -> 16, within the 64 cap).
+    _ = try compat.write(pair[1], "AB");
+    try testing.expectEqual(@as(usize, 2), try conn.recv());
+    try testing.expect(conn.recv_buf.data.len >= 10);
+    try testing.expectEqualStrings("12345678AB", conn.recv_buf.peek());
+}
+
+test "connection pool destroys overflow releases past the cap" {
+    const allocator = testing.allocator;
+    var pool = ConnectionPool.initWithConfig(allocator, 1, Connection.default_buf_size, Connection.default_buf_size, Connection.max_recv_buffer);
+    defer pool.deinit();
+
+    const c1 = try pool.acquire(11);
+    const c2 = try pool.acquire(12);
+    try testing.expect(c1 != c2);
+    pool.release(c1);
+    try testing.expectEqual(@as(usize, 1), pool.pooledCount());
+    // Pool is full: this release destroys instead of pooling.
+    pool.release(c2);
+    try testing.expectEqual(@as(usize, 1), pool.pooledCount());
+    // The survivor is still reusable.
+    const c3 = try pool.acquire(13);
+    try testing.expect(c3 == c1);
+    try testing.expectEqual(@as(posix.fd_t, 13), c3.fd);
+    pool.release(c3);
+}
+
+test "connection pool deinit drains multiple pooled connections" {
+    const allocator = testing.allocator;
+    var pool = ConnectionPool.init(allocator);
+    pool.release(try pool.acquire(1));
+    pool.release(try pool.acquire(2));
+    pool.release(try pool.acquire(3));
+    try testing.expectEqual(@as(usize, 3), pool.pooledCount());
+    pool.deinit();
+    try testing.expectEqual(@as(usize, 0), pool.pooledCount());
+}

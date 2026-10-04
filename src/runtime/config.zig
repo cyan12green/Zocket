@@ -255,3 +255,45 @@ test "comptimeValidate rejects an unknown module with a compile error" {
         Config.comptimeValidate(cfg, registry.default_registry);
     }
 }
+
+test "TlsConfig enables only with both cert and key" {
+    try testing.expect(!(TlsConfig{}).enabled());
+    try testing.expect(!(TlsConfig{ .cert = "c.pem" }).enabled());
+    try testing.expect(!(TlsConfig{ .key = "k.pem" }).enabled());
+    try testing.expect((TlsConfig{ .cert = "c.pem", .key = "k.pem" }).enabled());
+}
+
+test "default config carries compiled defaults for every section" {
+    const cfg = Config.default();
+    try testing.expectEqual(@as(?u16, null), cfg.listen_port);
+    try testing.expect(cfg.listen_spec == null);
+    try testing.expectEqual(@as(usize, 0), cfg.log_formats.len);
+    try testing.expectEqual(@as(usize, 0), cfg.servers.len);
+    try testing.expectEqual(@as(usize, 0), cfg.server_names.len);
+    try testing.expect(cfg.select_fn == null);
+    try testing.expect(cfg.host_select);
+    try testing.expect(!cfg.tls.enabled());
+    try testing.expectEqual(@as(usize, 32), cfg.limits.max_headers);
+}
+
+test "fromConfEmbedded parses a root-relative conf file" {
+    const cfg = comptime Config.fromConfEmbedded("src/testdata/config.example.conf");
+    try testing.expectEqual(@as(usize, 7), cfg.routes.len);
+    try testing.expectEqual(@as(usize, 2), cfg.servers.len);
+    // `listen` appears only inside server blocks: per-server ports, no top-level port.
+    try testing.expectEqual(@as(?u16, null), cfg.listen_port);
+    try testing.expectEqual(@as(?u16, 8080), cfg.servers[0].listen_port);
+    try testing.expectEqualStrings("example.com", cfg.servers[0].server_names[0]);
+    try cfg.validate(registry.default_registry);
+}
+
+test "log_format directives land on the config table" {
+    const cfg = Config.fromConfComptime(
+        \\log_format main "$host $status";
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 1), cfg.log_formats.len);
+    try testing.expectEqualStrings("main", cfg.log_formats[0].name);
+}

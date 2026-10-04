@@ -257,3 +257,76 @@ Tracked items (design notes recorded here; build later):
 DM1/DM2 (comptime JSON config validation, comptime config as primary
 path) shipped early and were superseded by M18.5's conf language.
 Their records moved to `docs/milestones.md`.
+
+---
+
+## Next feature batches (researched 2026-10, ranked by value/cost)
+
+Sized against this codebase (comptime config + 10-phase pipeline + bounded
+shmem zones). S = days, M = 1–2 weeks, L = month+.
+
+### Batch C1 — routing and resilience (S each, do first)
+
+- `try_files`: test file candidates in order, fall back to last
+  (proxy/named/`=404`). Needs an `internal_redirect` primitive (shared
+  with `error_page` below); unlocks SPA fallback and static-first sites.
+- `error_page` + `internal_redirect`: map status → alternate URI served
+  internally (depth-capped re-dispatch, `$status` preserved). Prerequisite
+  for `try_files` and auth→login chains.
+- `rewrite` (URI mutation): regex/prefix rewrite with
+  `last`/`break`/`redirect`/`permanent` flags. Regex NFA + `$1..$9`
+  captures already exist; ordering (rewrite before `find_config`) must be
+  fixed in the pipeline.
+- Upstream timeouts + `proxy_next_upstream`: `proxy_connect/read/send_timeout`
+  plus retry-on-error to the next peer. Biggest tail-latency lever; wire
+  into the async parked state machine.
+- Upstream keepalive tuning: `keepalive N` / timeout / requests per
+  upstream. Counters + idle sweeper on the existing pool.
+
+### Batch C2 — security and traffic control (S each)
+
+- `allow`/`deny` + `realip`: CIDR ACLs in `preaccess`; trusted-proxy
+  `set_real_ip_from` overwriting `client_ip` from XFF. Without realip,
+  `limit_req`/`ip_hash` are wrong behind any CDN/LB.
+- PROXY protocol inbound (v1+v2): per-`listen` opt-in, parsed before
+  HTTP/TLS; feeds the 16-byte `peer_ip` plumbing from B4.
+- `limit_rate` (per-connection bandwidth cap; sendfile path must honor
+  it) + `limit_req_status` / `limit_conn_status` (429 vs 503).
+- `map`: comptime key→value table setting a var (`vars.zig` + declared
+  directive schema).
+- `expires` / `etag` toggles + `gunzip` (inflate for non-gzip clients;
+  deflate side already used).
+- Ops: formal `config test` (`--validate` exit codes) + log reopen.
+
+### Batch C3 — cloud and protocol reach (M each)
+
+- DNS resolver (async, TTL-respecting): hostnames in `proxy_pass`/`upstream`.
+  Needs non-blocking DNS + hot-swap of comptime-frozen sockaddrs (first
+  runtime-mutated upstream table). Biggest adoption ceiling after C1.
+- Upstream TLS (`proxy_pass https://`): SNI, verify, client cert, session
+  reuse. `std.crypto.tls.Client` already used as test oracle; config
+  surface is the bulk; pool keyed by (host, port, tls).
+- `ws://` proxy passthrough (left open by M18): Upgrade forwarding +
+  byte-pipe handoff; needs the streaming escape hatch.
+- TCP stream proxy + SNI preread routing: L4 `stream {}` reusing
+  multireactor + LB + shmem health; ClientHello peek parser.
+- Prometheus `/metrics` + JSON access logs + status API (shmem counters
+  and the comptime-tokenized log renderer already exist).
+- Auth bundle: CORS helper, `secure_link` (HMAC-expiring URLs), JWT-lite
+  (static `jwks_file` first; reuse TLS ECDSA verify).
+- OCSP stapling + mTLS client-cert verify in the native TLS stack.
+- kTLS offload (attacks the ~15% TLS-over-h2c tax in `bench/BENCH.md`,
+  restores sendfile zero-copy under TLS).
+- ACME/auto-HTTPS (http-01 first; certs stay file-loaded, never
+  `@embedFile`).
+
+### Explicitly deferred
+
+- HTTP/3 + QUIC (M19): man-year without std support; revisit after async
+  upstreams + kTLS. Not started.
+- Runtime brotli/zstd encode: no std encoders; ship precompressed
+  `.br`/`.zstd` twins only. Runtime encode stays deferred.
+- gRPC, `slice`, full SSI, FastCGI, syslog: negative value/cost for a
+  speed-first server; say no until a user demands them.
+- Traffic `mirror`, OpenTelemetry spans: designed (async subrequest
+  clone; hook contract in shmem counters) but behind C1–C3.

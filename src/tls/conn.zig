@@ -229,3 +229,204 @@ pub const TlsConn = struct {
         }
     }
 };
+
+const testing = std.testing;
+const testdata = @import("testdata.zig");
+
+/// Minimal synthetic ClientHello record BODY offering one suite.
+fn helloBody(buf: []u8, suite: u16) []u8 {
+    buf[0] = 0x01; // client_hello
+    buf[1] = 0;
+    buf[2] = 0;
+    buf[3] = 0; // length patched below
+    buf[4] = 0x03;
+    buf[5] = 0x03; // legacy_version
+    @memset(buf[6..38], 0xAB); // random
+    buf[38] = 0; // session_id_len
+    buf[39] = 0;
+    buf[40] = 2; // cipher_suites_len
+    std.mem.writeInt(u16, buf[41..43], suite, .big);
+    buf[3] = @intCast(43 - 4);
+    return buf[0..43];
+}
+
+/// Full TLS handshake record framing a hello body: 5-byte record header
+/// (type 0x16, TLS 1.2 version bytes, length) + body. `TlsConn.feed`
+/// consumes records, not bare bodies.
+fn helloRecord(buf: []u8, suite: u16) []u8 {
+    const body = helloBody(buf[5..], suite);
+    buf[0] = 0x16; // handshake
+    buf[1] = 0x03;
+    buf[2] = 0x03;
+    std.mem.writeInt(u16, buf[3..5], @intCast(body.len), .big);
+    return buf[0 .. 5 + body.len];
+}
+
+test "conn: pickSuiteFromRecord rejects malformed hellos" {
+    var buf: [64]u8 = undefined;
+    try testing.expect(pickSuiteFromRecord(&.{}) == null);
+    try testing.expect(pickSuiteFromRecord(&.{ 0x01, 0, 0 }) == null);
+    var bad = helloBody(&buf, 0x1301);
+    bad[0] = 0x02; // server_hello type
+    try testing.expect(pickSuiteFromRecord(bad) == null);
+    try testing.expect(pickSuiteFromRecord(bad[0..10]) == null); // truncated
+    // Unknown suite -> no match.
+    try testing.expect(pickSuiteFromRecord(helloBody(&buf, 0x00ff)) == null);
+}
+
+test "conn: pickSuiteFromRecord accepts a minimal hello" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(@as(?u16, 0x1301), pickSuiteFromRecord(helloBody(&buf, 0x1301)));
+    try testing.expectEqual(@as(?u16, 0x1303), pickSuiteFromRecord(helloBody(&buf, 0x1303)));
+}
+
+test "conn: TlsConn buffers, chooses and drives a real hello" {
+    // Same captured openssl ClientHello exercised in handshake.zig, now
+    // driven through the connection wrapper end to end (framing +
+    // suite choice + ServerHello flight).
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    var conn = TlsConn.init(&creds);
+    defer conn.deinit();
+    try testing.expect(!conn.chosen);
+
+    const raw = [_]u8{
+        0x03, 0x03, 0xa4, 0xeb, 0x06, 0xdf, 0xbf, 0x46, 0xa1, 0xef, 0x72, 0x29,
+        0xf2, 0x3e, 0x74, 0x96, 0x46, 0x78, 0x04, 0x64, 0x09, 0x93, 0x0c, 0xc8,
+        0xf1, 0xbc, 0xe6, 0x46, 0xac, 0x44, 0x4b, 0xc3, 0x8b, 0xd5, 0x20, 0x51,
+        0x4b, 0x50, 0x93, 0x4a, 0x05, 0x02, 0x5b, 0xb2, 0xce, 0x58, 0xe6, 0x89,
+        0xfe, 0x8c, 0xd0, 0xd6, 0xac, 0x2d, 0xcc, 0x2f, 0x04, 0x51, 0xea, 0xa5,
+        0x21, 0x40, 0x8d, 0x99, 0x84, 0x37, 0xa1, 0x00, 0x08, 0x13, 0x02, 0x13,
+        0x03, 0x13, 0x01, 0x00, 0xff, 0x01, 0x00, 0x00, 0x99, 0x00, 0x0b, 0x00,
+        0x04, 0x03, 0x00, 0x01, 0x02, 0x00, 0x0a, 0x00, 0x16, 0x00, 0x14, 0x00,
+        0x1d, 0x00, 0x17, 0x00, 0x1e, 0x00, 0x19, 0x00, 0x18, 0x01, 0x00, 0x01,
+        0x01, 0x01, 0x02, 0x01, 0x03, 0x01, 0x04, 0x00, 0x23, 0x00, 0x00, 0x00,
+        0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74,
+        0x70, 0x2f, 0x31, 0x2e, 0x31, 0x00, 0x16, 0x00, 0x00, 0x00, 0x17, 0x00,
+        0x00, 0x00, 0x0d, 0x00, 0x1e, 0x00, 0x1c, 0x04, 0x03, 0x05, 0x03, 0x06,
+        0x03, 0x08, 0x07, 0x08, 0x08, 0x08, 0x09, 0x08, 0x0a, 0x08, 0x0b, 0x08,
+        0x04, 0x08, 0x05, 0x08, 0x06, 0x04, 0x01, 0x05, 0x01, 0x06, 0x01, 0x00,
+        0x2b, 0x00, 0x03, 0x02, 0x03, 0x04, 0x00, 0x2d, 0x00, 0x02, 0x01, 0x01,
+        0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20, 0x37, 0xe4,
+        0x6b, 0x62, 0xf7, 0x33, 0xa3, 0x0b, 0x67, 0x8f, 0x64, 0x78, 0x55, 0x92,
+        0xda, 0xb4, 0x75, 0xc8, 0x3f, 0xb3, 0x6b, 0x02, 0xd2, 0x32, 0x55, 0xe2,
+        0xfa, 0x9b, 0x7d, 0xe6, 0x00, 0x49,
+    };
+    var rec: [5 + 4 + raw.len]u8 = undefined;
+    rec[0] = 0x16;
+    rec[1] = 0x03;
+    rec[2] = 0x03;
+    std.mem.writeInt(u16, rec[3..5], @intCast(4 + raw.len), .big);
+    rec[5] = 0x01; // client_hello
+    rec[6] = @intCast(raw.len >> 16);
+    rec[7] = @intCast((raw.len >> 8) & 0xff);
+    rec[8] = @intCast(raw.len & 0xff);
+    @memcpy(rec[9..], &raw);
+
+    // Split delivery: header first, then the body.
+    try conn.feed(rec[0..3]);
+    try testing.expect(!conn.chosen);
+    try conn.feed(rec[3..]);
+    try testing.expect(conn.chosen);
+    var out: [16 * 1024]u8 = undefined;
+    const m = switch (conn.inner) {
+        inline else => |*s| s.takeOut(&out),
+    };
+    try testing.expect(m > 0);
+    try testing.expect(conn.stage() != .waiting_hello);
+}
+
+test "conn: TlsConn refuses an unsupported suite" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    var conn = TlsConn.init(&creds);
+    defer conn.deinit();
+    var buf: [128]u8 = undefined;
+    try testing.expectError(
+        error.UnsupportedCipherSuite,
+        conn.feed(helloRecord(&buf, 0x00ff)),
+    );
+}
+
+test "conn: sessionFor maps suites on both curves" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        var s = sessionFor(&creds, suite);
+        defer switch (s) {
+            inline else => |*x| x.deinit(),
+        };
+    }
+}
+
+test "conn: suite picker handles session ids and truncation" {
+    var buf: [80]u8 = undefined;
+    // Hello with a non-empty session id still parses.
+    buf[0] = 0x01;
+    buf[1] = 0;
+    buf[2] = 0;
+    buf[3] = 0;
+    buf[4] = 0x03;
+    buf[5] = 0x03;
+    @memset(buf[6..38], 0xAB);
+    buf[38] = 4; // session_id_len
+    @memset(buf[39..43], 0xCC);
+    buf[43] = 0;
+    buf[44] = 2;
+    std.mem.writeInt(u16, buf[45..47], 0x1303, .big);
+    buf[3] = @intCast(47 - 4);
+    try testing.expectEqual(@as(?u16, 0x1303), pickSuiteFromRecord(buf[0..47]));
+    // Truncated mid-suites and mid-session-id both fail.
+    try testing.expect(pickSuiteFromRecord(buf[0..40]) == null);
+    try testing.expect(pickSuiteFromRecord(buf[0..46]) == null);
+    // Body too short for the fixed prefix.
+    try testing.expect(pickSuiteFromRecord(buf[0..20]) == null);
+}
+
+test "conn: pre-handshake accessors are safe on the placeholder" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    var conn = TlsConn.init(&creds);
+    defer conn.deinit();
+    try testing.expectEqual(Stage.waiting_hello, conn.stage());
+    try testing.expectEqualStrings("", conn.alpn());
+    var tmp: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), conn.takeOut(&tmp));
+    try testing.expectEqual(@as(usize, 0), conn.takeOutSlice().len);
+    conn.consumeOut(0);
+    try testing.expectEqual(@as(usize, 0), conn.takePlaintext(&tmp));
+    try testing.expectEqual(@as(usize, 0), conn.plaintextSlice().len);
+    conn.consumePlaintext(0);
+    // Application writes are refused before the handshake.
+    try testing.expectError(error.TlsUnexpectedMessage, conn.write("hello"));
+    _ = conn.getPtr();
+}
+
+test "conn: wrapper drives negotiation state and post-hello errors" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    var conn = TlsConn.init(&creds);
+    defer conn.deinit();
+    var buf: [128]u8 = undefined;
+    const rec = helloRecord(&buf, 0x1301);
+    // The synthetic hello is truncated (no compression/extensions), so the
+    // suite is chosen but the inner handshake rejects it.
+    try testing.expectError(error.TlsDecodeError, conn.feed(rec));
+    try testing.expect(conn.chosen);
+    try testing.expectEqual(Stage.waiting_hello, conn.stage());
+    // The rejection emitted an alert into the output buffer.
+    try testing.expect(conn.takeOutSlice().len > 0);
+    var tmp: [16 * 1024]u8 = undefined;
+    const m = conn.takeOut(&tmp);
+    try testing.expect(m > 0);
+    try testing.expectEqual(@as(u8, 0x15), tmp[0]); // alert record
+    try testing.expectEqual(@as(usize, 0), conn.takeOutSlice().len);
+    // Writes are still refused (handshake not complete); shutdown works.
+    try testing.expectError(error.TlsUnexpectedMessage, conn.write("data"));
+    try conn.shutdown();
+}

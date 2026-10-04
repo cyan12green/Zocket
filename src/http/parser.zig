@@ -1464,3 +1464,70 @@ test "zero Content-Length POST with no body completes immediately" {
     try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
     try testing.expectEqualStrings("", req.body);
 }
+
+test "every method token parses to its variant" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { wire: []const u8, want: Method }{
+        .{ .wire = "PUT /r HTTP/1.1\r\n\r\n", .want = .put },
+        .{ .wire = "DELETE /r HTTP/1.1\r\n\r\n", .want = .delete },
+        .{ .wire = "OPTIONS * HTTP/1.1\r\n\r\n", .want = .options },
+        .{ .wire = "PATCH /r HTTP/1.1\r\n\r\n", .want = .patch },
+        .{ .wire = "HEAD /r HTTP/1.1\r\n\r\n", .want = .head },
+        .{ .wire = "get /r HTTP/1.1\r\n\r\n", .want = .get },
+        .{ .wire = "Post /r HTTP/1.1\r\n\r\n", .want = .post },
+    };
+    for (cases) |c| {
+        const buf = try fill(allocator, c.wire);
+        defer buf.deinit(allocator);
+        var req = Request.init(allocator);
+        defer req.deinit();
+        var parser = Parser.init(allocator);
+        defer parser.deinit();
+        try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+        try testing.expectEqual(c.want, req.method);
+    }
+    try testing.expectEqual(Method.put, Method.fromString("PUT"));
+    try testing.expectEqual(Method.delete, Method.fromString("DELETE"));
+    try testing.expectEqual(Method.options, Method.fromString("OPTIONS"));
+    try testing.expectEqual(Method.patch, Method.fromString("PATCH"));
+    try testing.expectEqual(@as(?Method, null), Method.fromString("BREW"));
+}
+
+test "version edge cases: malformed yields 501, HTTP/1.x accepted" {
+    const allocator = testing.allocator;
+    const bad = [_][]const u8{
+        "GET / FTP/1.1\r\n\r\n",
+        "GET / HTTP/\r\n\r\n",
+        "GET / HTTP/1\r\n\r\n",
+        "GET / HTTP/.1\r\n\r\n",
+        "GET / HTTP/1.\r\n\r\n",
+        "GET / HTTP/x.y\r\n\r\n",
+        "GET / HTTP/2.0\r\n\r\n",
+        "GET / HTTP/0.9\r\n\r\n",
+    };
+    for (bad) |wire| {
+        const buf = try fill(allocator, wire);
+        defer buf.deinit(allocator);
+        var req = Request.init(allocator);
+        defer req.deinit();
+        var parser = Parser.init(allocator);
+        defer parser.deinit();
+        try testing.expectEqual(Outcome.unsupported, parser.parse(buf, &req));
+    }
+    const good = [_]struct { wire: []const u8, major: u8, minor: u8 }{
+        .{ .wire = "GET / HTTP/1.0\r\n\r\n", .major = 1, .minor = 0 },
+        .{ .wire = "GET / HTTP/1.1\r\n\r\n", .major = 1, .minor = 1 },
+        .{ .wire = "GET / HTTP/1.10\r\n\r\n", .major = 1, .minor = 10 },
+    };
+    for (good) |c| {
+        const buf = try fill(allocator, c.wire);
+        defer buf.deinit(allocator);
+        var req = Request.init(allocator);
+        defer req.deinit();
+        var parser = Parser.init(allocator);
+        defer parser.deinit();
+        try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+        try testing.expectEqual(c.major, req.version.major);
+        try testing.expectEqual(c.minor, req.version.minor);
+    }
+}

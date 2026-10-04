@@ -145,3 +145,45 @@ test "tickets: NewSessionTicket message is well-formed" {
     try testing.expectEqual(@as(usize, n - 4), body_len);
     try testing.expect(msg[4 + 4 + 4] == 1); // ticket_nonce length
 }
+
+test "tickets: undersized buffers fail instead of truncating" {
+    var secret: [32]u8 = undefined;
+    compat.randomBytes(&secret);
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.OutOfMemory, seal(&secret, .{ 1, 2, 3, 4, 5, 6, 7, 8 }, &tiny));
+    var msg_tiny: [16]u8 = undefined;
+    try testing.expectError(error.OutOfMemory, buildNewSessionTicket(&msg_tiny, &secret, 0));
+}
+
+test "tickets: malformed tickets open to null, never garbage" {
+    var opened: [32]u8 = undefined;
+    // Too short to hold nonce + tag.
+    try testing.expect(open(&.{ 1, 2, 3 }, &opened) == null);
+    try testing.expect(open(&@as([23]u8, @splat(@as(u8, 0))), &opened) == null);
+    // Valid length but never sealed (random bytes fail the MAC).
+    var fake: [40]u8 = undefined;
+    compat.randomBytes(&fake);
+    try testing.expect(open(&fake, &opened) == null);
+    // The secret does not fit the caller's buffer.
+    var secret: [32]u8 = undefined;
+    compat.randomBytes(&secret);
+    var ticket: [max_ticket_len]u8 = undefined;
+    const n = try seal(&secret, .{ 9, 9, 9, 9, 9, 9, 9, 9 }, &ticket);
+    var small: [4]u8 = undefined;
+    try testing.expect(open(ticket[0..n], &small) == null);
+    // Truncated tickets fail too.
+    try testing.expect(open(ticket[0 .. n - 1], &opened) == null);
+}
+
+test "tickets: distinct nonces give distinct tickets" {
+    var secret: [32]u8 = undefined;
+    compat.randomBytes(&secret);
+    var t1: [max_ticket_len]u8 = undefined;
+    var t2: [max_ticket_len]u8 = undefined;
+    const n1 = try seal(&secret, .{ 1, 0, 0, 0, 0, 0, 0, 0 }, &t1);
+    const n2 = try seal(&secret, .{ 2, 0, 0, 0, 0, 0, 0, 0 }, &t2);
+    try testing.expectEqual(n1, n2);
+    try testing.expect(!std.mem.eql(u8, t1[0..n1], t2[0..n2]));
+    // Nonces round-trip through the ticket prefix.
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 0, 0 }, t1[0..8]);
+}

@@ -312,3 +312,55 @@ test "deadline arithmetic saturates instead of overflowing" {
     w.advanceTo(4096, &fired, Fired.onExpired);
     try testing.expectEqual(@as(usize, 0), fired.n);
 }
+
+test "tickForNs converts nanoseconds at the tick granularity" {
+    try testing.expectEqual(@as(u64, 0), test_wheel.tickForNs(0));
+    try testing.expectEqual(@as(u64, 999), test_wheel.tickForNs(999));
+    try testing.expectEqual(@as(usize, 4), test_wheel.slot_count);
+    try testing.expectEqual(@as(usize, 1024), default_wheel.max_advance);
+    try testing.expectEqual(@as(u64, 100 * std.time.ns_per_ms), default_wheel.tick_ns);
+}
+
+test "rearm on an idle entry arms it from scratch" {
+    var w = test_wheel.init();
+    var fired = Fired{};
+    var e = TimerEntry{};
+    // Never inserted: remove is a no-op, insert still arms.
+    w.rearm(&e, 0, 2);
+    try testing.expectEqual(@as(usize, 1), w.count());
+    w.advanceTo(2, &fired, Fired.onExpired);
+    try testing.expectEqual(@as(usize, 1), fired.n);
+}
+
+test "removing the middle of a slot chain keeps the neighbours linked" {
+    var w = test_wheel.init(); // 4 slots
+    var fired = Fired{};
+    var e1 = TimerEntry{};
+    var e2 = TimerEntry{};
+    var e3 = TimerEntry{};
+    // All land in slot 1; push prepends, so the chain is e3 -> e2 -> e1.
+    w.insert(&e1, 0, 1);
+    w.insert(&e2, 0, 5);
+    w.insert(&e3, 0, 9);
+    try testing.expectEqual(@as(usize, 3), w.count());
+    // e2 has both a predecessor and a successor: exercises both unlink arms.
+    w.remove(&e2);
+    try testing.expectEqual(@as(usize, 2), w.count());
+    w.advanceTo(9, &fired, Fired.onExpired);
+    try testing.expectEqual(@as(usize, 2), fired.n);
+    try testing.expectEqual(@as(*TimerEntry, &e1), fired.entries[0]);
+    try testing.expectEqual(@as(*TimerEntry, &e3), fired.entries[1]);
+}
+
+test "removing the head of a multi-entry slot leaves the tail" {
+    var w = test_wheel.init();
+    var fired = Fired{};
+    var e1 = TimerEntry{};
+    var e2 = TimerEntry{};
+    w.insert(&e1, 0, 1); // slot 1
+    w.insert(&e2, 0, 5); // slot 1, becomes head
+    w.remove(&e2); // head removal: slots[slot] = next arm
+    w.advanceTo(5, &fired, Fired.onExpired);
+    try testing.expectEqual(@as(usize, 1), fired.n);
+    try testing.expectEqual(@as(*TimerEntry, &e1), fired.entries[0]);
+}

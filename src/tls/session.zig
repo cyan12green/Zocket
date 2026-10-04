@@ -765,3 +765,204 @@ test "TLS 1.3 handshake and round trip against the std client" {
     server_thread.join();
     try testing.expect(server_err == null);
 }
+
+/// Test-only record/message framing: cleartext TLS records carrying one
+/// handshake message.
+fn testRecord(content_type: u8, payload: []const u8, out: []u8) []u8 {
+    out[0] = content_type;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    std.mem.writeInt(u16, out[3..5], @intCast(payload.len), .big);
+    @memcpy(out[5..][0..payload.len], payload);
+    return out[0 .. 5 + payload.len];
+}
+
+fn testHsMsg(msg_type: u8, body: []const u8, out: []u8) []u8 {
+    out[0] = msg_type;
+    std.mem.writeInt(u24, out[1..4], @intCast(body.len), .big);
+    @memcpy(out[4..][0..body.len], body);
+    return out[0 .. 4 + body.len];
+}
+
+/// Minimal TLS 1.3 ClientHello body advertising 0x1301 with supported_versions
+/// and supported_groups but NO key share (drives the HelloRetryRequest path).
+fn testHrrHelloBody(out: []u8) []u8 {
+    var pos: usize = 0;
+    out[pos] = 0x03;
+    out[pos + 1] = 0x03;
+    pos += 2;
+    @memset(out[pos..][0..32], 0xAB);
+    pos += 32;
+    out[pos] = 0; // session id
+    pos += 1;
+    out[pos] = 0;
+    out[pos + 1] = 2; // one suite
+    out[pos + 2] = 0x13;
+    out[pos + 3] = 0x01;
+    pos += 4;
+    out[pos] = 1;
+    out[pos + 1] = 0; // compression
+    pos += 2;
+    const ext_at = pos;
+    pos += 2;
+    // supported_versions: TLS 1.3.
+    out[pos] = 0x00;
+    out[pos + 1] = 0x2b;
+    out[pos + 2] = 0x00;
+    out[pos + 3] = 0x03;
+    out[pos + 4] = 0x02;
+    out[pos + 5] = 0x03;
+    out[pos + 6] = 0x04;
+    pos += 7;
+    // supported_groups: x25519.
+    out[pos] = 0x00;
+    out[pos + 1] = 0x0a;
+    out[pos + 2] = 0x00;
+    out[pos + 3] = 0x04;
+    out[pos + 4] = 0x00;
+    out[pos + 5] = 0x02;
+    out[pos + 6] = 0x00;
+    out[pos + 7] = 0x1d;
+    pos += 8;
+    std.mem.writeInt(u16, out[ext_at..][0..2], @intCast(pos - ext_at - 2), .big);
+    return out[0..pos];
+}
+
+test "session: missing key share triggers HelloRetryRequest, twice fails" {
+    var creds = try cert_mod.loadCredentials(testing.allocator, testdata.cert_pem, testdata.key_pem);
+    defer testing.allocator.free(creds.cert_der);
+    var sess = TestSession.init(testing.allocator, &creds);
+    defer sess.deinit();
+    var body_buf: [256]u8 = undefined;
+    const body = testHrrHelloBody(&body_buf);
+    var msg_buf: [320]u8 = undefined;
+    const msg = testHsMsg(0x01, body, &msg_buf);
+    var rec_buf: [340]u8 = undefined;
+    const rec = testRecord(@intFromEnum(tls.ContentType.handshake), msg, &rec_buf);
+    // Split delivery: a partial record waits without error.
+    try sess.feed(rec[0..3]);
+    try testing.expectEqual(Stage.waiting_hello, sess.currentStage());
+    try sess.feed(rec[3..]);
+    try testing.expectEqual(Stage.sent_hrr, sess.currentStage());
+    // The HRR ServerHello is cleartext handshake.
+    try testing.expect(sess.takeOutSlice().len > 0);
+    try testing.expectEqual(@as(u8, @intFromEnum(tls.ContentType.handshake)), sess.takeOutSlice()[0]);
+    // A second ClientHello still without a share is fatal.
+    try testing.expectError(error.NoUsableKeyShare, sess.feed(rec));
+    try testing.expect(sess.alert() != null);
+}
+
+test "session: legacy ClientHello version is rejected" {
+    var creds = try cert_mod.loadCredentials(testing.allocator, testdata.cert_pem, testdata.key_pem);
+    defer testing.allocator.free(creds.cert_der);
+    var sess = TestSession.init(testing.allocator, &creds);
+    defer sess.deinit();
+    // TLS 1.1 legacy_version with an otherwise minimal body.
+    var body: [41]u8 = undefined;
+    body[0] = 0x03;
+    body[1] = 0x02;
+    @memset(body[2..34], 0);
+    body[34] = 0;
+    body[35] = 0;
+    body[36] = 2;
+    body[37] = 0x13;
+    body[38] = 0x01;
+    body[39] = 1;
+    body[40] = 0;
+    var msg_buf: [64]u8 = undefined;
+    const msg = testHsMsg(0x01, &body, &msg_buf);
+    var rec_buf: [80]u8 = undefined;
+    try testing.expectError(error.TlsIllegalParameter, sess.feed(testRecord(@intFromEnum(tls.ContentType.handshake), msg, &rec_buf)));
+    try testing.expect(sess.alert() != null);
+}
+
+test "session: unknown record types and premature app data fail" {
+    var creds = try cert_mod.loadCredentials(testing.allocator, testdata.cert_pem, testdata.key_pem);
+    defer testing.allocator.free(creds.cert_der);
+    var sess = TestSession.init(testing.allocator, &creds);
+    defer sess.deinit();
+    var rec_buf: [16]u8 = undefined;
+    try testing.expectError(error.TlsUnexpectedMessage, sess.feed(testRecord(0x99, &.{}, &rec_buf)));
+    try testing.expect(sess.alert() != null);
+    var sess2 = TestSession.init(testing.allocator, &creds);
+    defer sess2.deinit();
+    try testing.expectError(error.TlsUnexpectedMessage, sess2.feed(testRecord(@intFromEnum(tls.ContentType.application_data), &.{}, &rec_buf)));
+    // Oversized record lengths are rejected once the record is buffered.
+    // (Fresh session: a failed feed leaves its bytes buffered for retry.)
+    var sess3 = TestSession.init(testing.allocator, &creds);
+    defer sess3.deinit();
+    const big_len: usize = tls.max_ciphertext_len + 1;
+    const big_rec = try testing.allocator.alloc(u8, 5 + big_len);
+    defer testing.allocator.free(big_rec);
+    @memset(big_rec, 0);
+    big_rec[0] = @intFromEnum(tls.ContentType.handshake);
+    big_rec[1] = 0x03;
+    big_rec[2] = 0x03;
+    std.mem.writeInt(u16, big_rec[3..5], @intCast(big_len), .big);
+    try testing.expectError(error.TlsRecordOverflow, sess3.feed(big_rec));
+}
+
+test "session: change_cipher_spec is ignored, alerts drive the stage" {
+    var creds = try cert_mod.loadCredentials(testing.allocator, testdata.cert_pem, testdata.key_pem);
+    defer testing.allocator.free(creds.cert_der);
+    var sess = TestSession.init(testing.allocator, &creds);
+    defer sess.deinit();
+    var rec_buf: [16]u8 = undefined;
+    // CCS: no error, no output, stage unchanged.
+    try sess.feed(testRecord(@intFromEnum(tls.ContentType.change_cipher_spec), &.{0x01}, &rec_buf));
+    try testing.expectEqual(Stage.waiting_hello, sess.currentStage());
+    try testing.expectEqual(@as(usize, 0), sess.takeOutSlice().len);
+    // Truncated alert record.
+    try testing.expectError(error.TlsDecodeError, sess.feed(testRecord(@intFromEnum(tls.ContentType.alert), &.{0x01}, &rec_buf)));
+    // Fatal alert from the peer surfaces as TlsAlert.
+    var sess2 = TestSession.init(testing.allocator, &creds);
+    defer sess2.deinit();
+    try testing.expectError(error.TlsAlert, sess2.feed(testRecord(@intFromEnum(tls.ContentType.alert), &.{ 0x02, 0x0a }, &rec_buf)));
+    // Warning close_notify moves a fresh session to closed, quietly.
+    var sess3 = TestSession.init(testing.allocator, &creds);
+    defer sess3.deinit();
+    try sess3.feed(testRecord(@intFromEnum(tls.ContentType.alert), &.{ 0x01, 0x00 }, &rec_buf));
+    try testing.expectEqual(Stage.closed, sess3.currentStage());
+}
+
+test "session: unexpected handshake messages fail cleanly" {
+    var creds = try cert_mod.loadCredentials(testing.allocator, testdata.cert_pem, testdata.key_pem);
+    defer testing.allocator.free(creds.cert_der);
+    var sess = TestSession.init(testing.allocator, &creds);
+    defer sess.deinit();
+    var msg_buf: [32]u8 = undefined;
+    var rec_buf: [48]u8 = undefined;
+    // A ServerHello arriving before any ClientHello.
+    const sh = testHsMsg(0x02, "hello", &msg_buf);
+    try testing.expectError(error.TlsUnexpectedMessage, sess.feed(testRecord(@intFromEnum(tls.ContentType.handshake), sh, &rec_buf)));
+    // A Finished arriving before the handshake ran.
+    var sess2 = TestSession.init(testing.allocator, &creds);
+    defer sess2.deinit();
+    const fin = testHsMsg(0x14, &.{}, &msg_buf);
+    try testing.expectError(error.TlsUnexpectedMessage, sess2.feed(testRecord(@intFromEnum(tls.ContentType.handshake), fin, &rec_buf)));
+}
+
+test "session: write/shutdown/take APIs before the handshake completes" {
+    var creds = try cert_mod.loadCredentials(testing.allocator, testdata.cert_pem, testdata.key_pem);
+    defer testing.allocator.free(creds.cert_der);
+    var sess = TestSession.init(testing.allocator, &creds);
+    defer sess.deinit();
+    // Nothing buffered yet.
+    var tmp: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), sess.takeOut(&tmp));
+    try testing.expectEqual(@as(usize, 0), sess.takePlaintext(&tmp));
+    try testing.expectEqual(@as(usize, 0), sess.plaintextSlice().len);
+    sess.consumeOut(0);
+    sess.consumePlaintext(0);
+    try testing.expectEqualStrings("", sess.negotiatedAlpn());
+    // Application data cannot be sent pre-handshake.
+    try testing.expectError(error.TlsUnexpectedMessage, sess.write("hello"));
+    // Shutdown queues a close_notify alert; twice is a no-op the second time.
+    try sess.shutdown();
+    try testing.expectEqual(Stage.closed, sess.currentStage());
+    const drained = sess.takeOut(&tmp);
+    try testing.expect(drained > 0);
+    try testing.expectEqual(@as(u8, @intFromEnum(tls.ContentType.alert)), tmp[0]);
+    try sess.shutdown();
+    try testing.expectEqual(@as(usize, 0), sess.takeOut(&tmp));
+}

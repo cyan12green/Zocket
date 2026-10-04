@@ -51,3 +51,26 @@ pub const Limits = struct {
     server_limit_conn: u32 = 0,
 };
 
+const testing = std.testing;
+
+test "limits compile to the documented defaults" {
+    const l = Limits{};
+    try testing.expectEqual(@as(usize, 0), l.proxy_cache_max_bytes);
+    try testing.expectEqual(@as(usize, 0), l.proxy_cache_max_entries);
+    try testing.expectEqual(@as(u64, 10), l.client_header_timeout_s);
+    try testing.expectEqual(@as(u64, 30), l.client_body_timeout_s);
+    try testing.expectEqual(@as(usize, 16384), l.recv_buffer_size);
+    try testing.expectEqual(@as(usize, 16384), l.send_buffer_size);
+    try testing.expectEqual(@as(usize, 1024 * 1024), l.max_body_spool);
+    try testing.expectEqual(@as(usize, 16 * 1024 * 1024), l.max_body);
+    try testing.expectEqual(@as(usize, 8 * 1024), l.max_line_bytes);
+    try testing.expectEqual(@as(usize, 32), l.max_headers);
+    try testing.expectEqual(@as(usize, 64 * 1024), l.max_chunked_body);
+    try testing.expectEqual(@as(usize, 16), l.static_cache_entries);
+    try testing.expectEqual(@as(u64, 1), l.static_cache_valid_seconds);
+    try testing.expectEqual(@as(usize, 16384), l.static_content_cache_max);
+    try testing.expectEqual(@as(usize, 1024), l.connection_pool_max);
+    try testing.expectEqual(@as(usize, 0), l.max_connections);
+    try testing.expectEqual(@as(u32, 0), l.server_limit_conn);
+}
+

@@ -69,7 +69,7 @@ pub const Arena = struct {
 
     /// The slice of arena memory allocated since `m` (contiguous: the
     /// renderer's fragments are back-to-back bumps).
-    pub fn since(self: *const Arena, m: Mark) []u8 {
+    pub fn since(self: *const Arena, m: Mark) []const u8 {
         if (self.cur_block) |b| {
             if (m.block_used != 0 or b.used > m.block_used) {
                 // Current allocation lives in the heap block.
@@ -232,4 +232,84 @@ test "arena reset rewinds and reuses capacity without allocation" {
     _ = a.alloc(64) orelse return error.SkipZigTest;
     try testing.expectEqual(@as(usize, 64), a.usedBytes());
     _ = a.alloc(used_before) orelse return error.SkipZigTest;
+}
+
+test "arena mark captures the bump cursor" {
+    const allocator = testing.allocator;
+    var a = Arena.init(allocator);
+    defer a.deinit();
+
+    const m0 = a.mark();
+    try testing.expectEqual(@as(usize, 0), m0.embedded_used);
+    try testing.expectEqual(@as(usize, 0), m0.block_used);
+    _ = a.alloc(16) orelse return error.SkipZigTest;
+    const m1 = a.mark();
+    try testing.expect(m1.embedded_used > m0.embedded_used);
+    try testing.expectEqual(@as(usize, 16), a.since(m0).len);
+    try testing.expectEqual(@as(usize, 0), a.since(m1).len);
+}
+
+test "arena mark observes heap-block usage too" {
+    const allocator = testing.allocator;
+    var a = Arena.init(allocator);
+    defer a.deinit();
+
+    _ = a.alloc(default_size) orelse return error.SkipZigTest; // fill embedded
+    const m = a.mark();
+    _ = a.alloc(6) orelse return error.SkipZigTest;
+    try testing.expect(m.block_used == 0 or a.cur_block != null);
+    try testing.expect(a.cur_block != null);
+}
+
+test "arena grows a second heap block when the first is full" {
+    const allocator = testing.allocator;
+    var a = Arena.init(allocator);
+    defer a.deinit();
+
+    _ = a.alloc(default_size) orelse return error.SkipZigTest; // embedded full
+    const b1 = (a.alloc(16000) orelse return error.SkipZigTest);
+    @memset(b1, 'x');
+    // 16000 used of 16384: 1000 more bytes do not fit -> second block,
+    // doubling from the current largest.
+    const b2 = (a.alloc(1000) orelse return error.SkipZigTest);
+    @memset(b2, 'y');
+    try testing.expectEqual(@as(usize, 1000), b2.len);
+    try testing.expect(a.blocks != null and a.blocks.?.next != null);
+    try testing.expectEqual(default_size + 16000 + 1000, a.usedBytes());
+    // Reset rewinds every block; deinit frees both.
+    a.reset();
+    try testing.expectEqual(@as(usize, 0), a.usedBytes());
+    const r = (a.alloc(10) orelse return error.SkipZigTest);
+    try testing.expectEqual(@as(usize, 10), r.len);
+}
+
+test "arena alignment gap spills to the heap" {
+    const allocator = testing.allocator;
+    var a = Arena.init(allocator);
+    defer a.deinit();
+
+    // Leave 3 bytes: the next bump is 8-aligned past the end, so the
+    // 3-byte tail is wasted and the allocation spills to the heap.
+    _ = a.alloc(default_size - 3) orelse return error.SkipZigTest;
+    const s = (a.alloc(3) orelse return error.SkipZigTest);
+    try testing.expectEqual(@as(usize, 3), s.len);
+    try testing.expect(a.blocks != null);
+}
+
+test "arena asAllocator allocates, frees (no-op) and survives reset" {
+    const allocator = testing.allocator;
+    var a = Arena.init(allocator);
+    defer a.deinit();
+
+    const al = a.asAllocator();
+    const mem1 = try al.alloc(u8, 32);
+    @memset(mem1, 0xAB);
+    const mem2 = try al.dupe(u8, "hello-allocator");
+    try testing.expectEqualStrings("hello-allocator", mem2);
+    try testing.expectEqual(@as(u8, 0xAB), mem1[0]);
+    al.free(mem1); // no-op for the arena (std poisons the bytes first)
+    al.free(mem2);
+    try testing.expect(!al.resize(mem2, 16)); // bump arenas never resize in place
+    a.reset();
+    try testing.expectEqual(@as(usize, 0), a.usedBytes());
 }

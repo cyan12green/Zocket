@@ -107,6 +107,7 @@ pub const Decoder = struct {
     /// Resolve a table index (static + dynamic). Index 1..61 static, then
     /// dynamic (most recent first).
     fn lookup(self: *const Decoder, index: usize) ?Field {
+        if (index == 0) return null; // wire index 0 is never valid
         if (index >= 1 and index <= static_table.len) {
             const e = static_table[index - 1];
             return .{ .name = e.name, .value = e.value, .value_len = e.value.len };
@@ -929,4 +930,170 @@ test "HPACK: RFC 7541 C.4.1 huffman-encoded string decodes correctly" {
     }
     try testing.expect(found_authority);
     freeFields(testing.allocator, &fields);
+}
+
+test "HPACK: indexed field errors" {
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
+    var fields = std.ArrayList(Field).empty;
+    defer fields.deinit(testing.allocator);
+    // Index 0 is never valid.
+    try testing.expectError(error.ProtocolError, d.decode(testing.allocator, &.{0x80}, &fields));
+    // Index past the tables (61 static, 0 dynamic).
+    try testing.expectError(error.ProtocolError, d.decode(testing.allocator, &.{0xe4}, &fields));
+    // Multi-byte index that overflows the shift budget.
+    const huge = [_]u8{ 0xff, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80 };
+    try testing.expectError(error.ProtocolError, d.decode(testing.allocator, &huge, &fields));
+    // Truncated continuation.
+    try testing.expectError(error.Truncated, d.decode(testing.allocator, &.{0xff}, &fields));
+    try testing.expectEqual(@as(usize, 0), fields.items.len);
+}
+
+test "HPACK: dynamic table size update rules" {
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
+    var fields = std.ArrayList(Field).empty;
+    defer fields.deinit(testing.allocator);
+    // A size update larger than the protocol limit is rejected.
+    // 5000 with a 5-bit prefix: 31 then 4969 as continuation (0xe9 0x26).
+    try testing.expectError(error.CompressionError, d.decode(testing.allocator, &.{ 0x3f, 0xe9, 0x26 }, &fields));
+    // A size update after a field is rejected, even a shrink to zero.
+    // (The first field's slices stay caller-owned: free them on error.)
+    try testing.expectError(error.CompressionError, d.decode(testing.allocator, &.{ 0x82, 0x20 }, &fields));
+    freeFields(testing.allocator, &fields);
+    // A size update first is legal (shrink then index).
+    var d2 = Decoder.init(testing.allocator);
+    defer d2.deinit();
+    var f2 = std.ArrayList(Field).empty;
+    defer f2.deinit(testing.allocator);
+    try d2.decode(testing.allocator, &.{ 0x20, 0x82 }, &f2);
+    try testing.expectEqual(@as(usize, 1), f2.items.len);
+    try testing.expectEqualStrings("GET", f2.items[0].value);
+    freeFields(testing.allocator, &f2);
+}
+
+test "HPACK: dynamic table eviction and oversized entries" {
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
+    var fields = std.ArrayList(Field).empty;
+    defer fields.deinit(testing.allocator);
+    d.setHeaderTableSize(60);
+    // Two 34-byte entries in a 60-byte table: the first is evicted.
+    const e1 = [_]u8{ 0x40, 0x01, 'a', 0x01, '1' };
+    const e2 = [_]u8{ 0x40, 0x01, 'b', 0x01, '2' };
+    try d.decode(testing.allocator, &e1, &fields);
+    try d.decode(testing.allocator, &e2, &fields);
+    try testing.expectEqual(@as(usize, 2), fields.items.len);
+    // Newest entry is at dynamic index 1 (table index 62).
+    const newest = d.lookup(62).?;
+    try testing.expectEqualStrings("b", newest.name);
+    try testing.expect(d.lookup(63) == null); // evicted
+    freeFields(testing.allocator, &fields);
+    fields.clearRetainingCapacity();
+    // An entry that can never fit clears the table.
+    d.setHeaderTableSize(32);
+    const big_entry = [_]u8{ 0x40, 0x01, 'c', 0x01, '3' };
+    try d.decode(testing.allocator, &big_entry, &fields);
+    try testing.expect(d.lookup(62) == null);
+    freeFields(testing.allocator, &fields);
+}
+
+test "HPACK: invalid huffman strings are rejected" {
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
+    var fields = std.ArrayList(Field).empty;
+    defer fields.deinit(testing.allocator);
+    // Literal without indexing, new name, huffman-coded length-1 0xFF byte:
+    // 8 ones leave a partial longer than the 7-bit padding allowance.
+    try testing.expectError(error.InvalidHuffman, d.decode(testing.allocator, &.{ 0x00, 0x81, 0xff, 0x81, 0xff }, &fields));
+    // The EOS code itself (30 ones) never appears on the wire.
+    try testing.expectError(error.InvalidHuffman, d.decode(testing.allocator, &.{ 0x00, 0x83, 0xff, 0xff, 0xff, 0xff, 0x81, 0xff }, &fields));
+}
+
+test "HPACK: bit reader primitives" {
+    var it = BitReader{ .bytes = &.{0b10110011} };
+    try testing.expect(!it.atEnd());
+    try testing.expectEqual(@as(u8, 0b101), try it.peekBits(3));
+    try testing.expectEqual(@as(u8, 0b101), try it.readBits(3));
+    try testing.expectError(error.Truncated, it.peekBits(6));
+    try testing.expectError(error.ProtocolError, it.takeBytes(1)); // misaligned
+    var aligned = BitReader{ .bytes = &.{0b10110011} };
+    const rest = try aligned.takeBytes(0);
+    try testing.expectEqual(@as(usize, 0), rest.len);
+    var done = BitReader{ .bytes = &.{} };
+    try testing.expect(done.atEnd());
+    try testing.expectError(error.Truncated, done.readBits(1));
+}
+
+test "HPACK: encoder indexed, named and literal paths" {
+    var sink = std.ArrayList(u8).empty;
+    defer sink.deinit(testing.allocator);
+    // Exact static match -> single indexed byte.
+    try encodeField(&sink, testing.allocator, ":method", "GET");
+    try testing.expectEqualSlices(u8, &.{0x82}, sink.items);
+    // Name-indexed literal (value not in the table): :method has no
+    // empty-value entry, so this falls back to a full literal (0x00).
+    sink.clearRetainingCapacity();
+    try encodeField(&sink, testing.allocator, ":method", "DELETE");
+    try testing.expect(sink.items.len > 2);
+    try testing.expectEqual(@as(u8, 0x00), sink.items[0]);
+    // Round-trips through the decoder.
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
+    var fields = std.ArrayList(Field).empty;
+    defer fields.deinit(testing.allocator);
+    try d.decode(testing.allocator, sink.items, &fields);
+    try testing.expectEqualStrings(":method", fields.items[0].name);
+    try testing.expectEqualStrings("DELETE", fields.items[0].value);
+    freeFields(testing.allocator, &fields);
+    fields.clearRetainingCapacity();
+    // A name with an empty-value static entry takes the name-indexed path:
+    // content-length is static index 28 (1-based), which needs the
+    // multi-byte integer form (28 >= 15).
+    sink.clearRetainingCapacity();
+    try encodeField(&sink, testing.allocator, "content-length", "5");
+    try testing.expectEqual(@as(u8, 0x0f), sink.items[0]);
+    try testing.expectEqual(@as(u8, 13), sink.items[1]);
+    try d.decode(testing.allocator, sink.items, &fields);
+    try testing.expectEqualStrings("content-length", fields.items[0].name);
+    try testing.expectEqualStrings("5", fields.items[0].value);
+    freeFields(testing.allocator, &fields);
+    fields.clearRetainingCapacity();
+    // Unknown name -> full literal; uppercase input is lower-cased.
+    sink.clearRetainingCapacity();
+    try encodeField(&sink, testing.allocator, "X-Custom-Foo", "bar");
+    try testing.expectEqual(@as(u8, 0x00), sink.items[0]);
+    try d.decode(testing.allocator, sink.items, &fields);
+    try testing.expectEqualStrings("x-custom-foo", fields.items[0].name);
+    freeFields(testing.allocator, &fields);
+    fields.clearRetainingCapacity();
+    // Oversized names pass through instead of touching the stack buffer.
+    sink.clearRetainingCapacity();
+    const long_name = @as([200]u8, @splat(@as(u8, 'a')));
+    try encodeField(&sink, testing.allocator, &long_name, "v");
+    try d.decode(testing.allocator, sink.items, &fields);
+    try testing.expectEqualStrings(&long_name, fields.items[0].name);
+    freeFields(testing.allocator, &fields);
+}
+
+test "HPACK: long values take the multi-byte integer path" {
+    var sink = std.ArrayList(u8).empty;
+    defer sink.deinit(testing.allocator);
+    const long_value = @as([200]u8, @splat(@as(u8, 'b')));
+    try encodeField(&sink, testing.allocator, "x-short", &long_value);
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
+    var fields = std.ArrayList(Field).empty;
+    defer fields.deinit(testing.allocator);
+    try d.decode(testing.allocator, sink.items, &fields);
+    try testing.expectEqualStrings(&long_value, fields.items[0].value);
+    freeFields(testing.allocator, &fields);
+}
+
+test "HPACK: static name index misses unknown names" {
+    try testing.expect(staticNameIndex("definitely-not-a-header") == null);
+    try testing.expect(staticNameIndex("") == null);
+    // Known names resolve (first :method entry).
+    try testing.expect(staticNameIndex(":method") != null);
+    try testing.expect(staticNameIndex("content-length") != null);
 }

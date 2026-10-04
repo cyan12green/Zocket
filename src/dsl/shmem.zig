@@ -389,6 +389,128 @@ test "LruStore remove invalidates exactly one key" {
     try testing.expectEqual(@as(usize, 1), store.stats().entries);
 }
 
+test "KeyedTable probes past collisions and reports misses" {
+    var t = KeyedTable(u32, 4){};
+    // Keys 4 and 8 share the start slot (both & 3 == 0): chaining works.
+    const s4 = t.upsert(4) orelse return error.UnexpectedFull;
+    s4.* = 40;
+    const s8 = t.upsert(8) orelse return error.UnexpectedFull;
+    s8.* = 80;
+    try testing.expectEqual(@as(u32, 40), t.get(4).?);
+    try testing.expectEqual(@as(u32, 80), t.get(8).?);
+    // Unknown keys miss (empty slot and full-table probe termination).
+    try testing.expect(t.get(12) == null);
+    _ = t.upsert(1) orelse return error.UnexpectedFull;
+    _ = t.upsert(2) orelse return error.UnexpectedFull;
+    try testing.expectEqual(@as(usize, 4), t.count());
+    try testing.expect(t.get(999) == null);
+    // upsertLocked distinguishes create from update.
+    const created = t.upsertLocked(4).?;
+    try testing.expect(created.existed);
+    created.slot.* = 44;
+    try testing.expectEqual(@as(u32, 44), t.get(4).?);
+    try testing.expect(t.upsertLocked(999) == null); // full, unknown
+}
+
+test "KeyedTable key zero aliases the empty sentinel" {
+    // keys[i] == 0 means "empty", so key 0 reads back the zero value even
+    // when never inserted. Callers must never use key 0 (all production
+    // keys are hashes/tags, never bare zero). Double-inserting key 0 also
+    // double-counts `filled` (probe always lands on the zeroed slot).
+    // Reported; this test pins the current behavior.
+    var t = KeyedTable(u32, 4){};
+    try testing.expectEqual(@as(?u32, 0), t.get(0));
+    const s = t.upsert(0) orelse return error.UnexpectedFull;
+    s.* = 7;
+    try testing.expectEqual(@as(?u32, 7), t.get(0));
+}
+
+test "LruStore getCopy copies bytes under the lock" {
+    var store = try LruStore.init(testing.allocator, 100, 4);
+    defer store.deinit();
+    _ = store.put(1, "payload", 7, 8);
+    const found = store.getCopy(1, testing.allocator) orelse return error.Missing;
+    defer testing.allocator.free(found.bytes);
+    try testing.expectEqualSlices(u8, "payload", found.bytes);
+    try testing.expectEqual(@as(u64, 7), found.meta);
+    try testing.expectEqual(@as(u64, 8), found.meta2);
+    try testing.expect(store.getCopy(2, testing.allocator) == null);
+}
+
+test "LruStore put over an existing key replaces in place" {
+    var store = try LruStore.init(testing.allocator, 100, 4);
+    defer store.deinit();
+    _ = store.put(1, "aa", 0, 0);
+    _ = store.put(1, "bbbb", 1, 2); // same key: old bytes released first
+    try testing.expectEqual(@as(usize, 1), store.stats().entries);
+    try testing.expectEqual(@as(usize, 4), store.stats().bytes);
+    const found = store.lookup(1).?;
+    try testing.expectEqualSlices(u8, "bbbb", found.bytes);
+    try testing.expectEqual(@as(u64, 1), found.meta);
+}
+
+test "LruStore evicts entries when the slot count is exhausted" {
+    var store = try LruStore.init(testing.allocator, 10000, 2);
+    defer store.deinit();
+    _ = store.put(1, "a", 0, 0);
+    _ = store.put(2, "b", 0, 0);
+    // No free slot left: the LRU entry is evicted to make room.
+    _ = store.put(3, "c", 0, 0);
+    try testing.expectEqual(@as(usize, 2), store.stats().entries);
+    try testing.expect(store.lookup(1) == null); // least recently used
+    try testing.expect(store.lookup(2) != null);
+    try testing.expect(store.lookup(3) != null);
+}
+
+test "LruStore evicts oldest bytes when the budget overflows" {
+    var store = try LruStore.init(testing.allocator, 10, 8);
+    defer store.deinit();
+    _ = store.put(1, "123456", 0, 0);
+    _ = store.put(2, "abcdef", 0, 0); // 12 > 10: key 1 evicted
+    try testing.expect(store.lookup(1) == null);
+    try testing.expect(store.lookup(2) != null);
+    try testing.expect(store.stats().bytes <= 10);
+}
+
+test "LruStore remove of a missing key is a no-op" {
+    var store = try LruStore.init(testing.allocator, 100, 4);
+    defer store.deinit();
+    _ = store.put(1, "a", 0, 0);
+    store.remove(999);
+    try testing.expectEqual(@as(usize, 1), store.stats().entries);
+    try testing.expect(store.lookup(1) != null);
+}
+
+test "LruStore unlinks a mid-chain entry correctly" {
+    // Force three keys into one bucket: with 8 buckets the mask is 7, so
+    // scan for keys whose fibonacci hash lands in bucket 0.
+    var store = try LruStore.init(testing.allocator, 10000, 8);
+    defer store.deinit();
+    var keys: [3]u64 = undefined;
+    var found: usize = 0;
+    var k: u64 = 1;
+    while (found < 3) : (k += 1) {
+        const h = k *% 0x9E3779B97F4A7C15;
+        if ((h >> 32) & 7 == 0) {
+            keys[found] = k;
+            found += 1;
+        }
+    }
+    _ = store.put(keys[0], "a", 0, 0);
+    _ = store.put(keys[1], "b", 0, 0);
+    _ = store.put(keys[2], "c", 0, 0);
+    // Remove the middle link (prev >= 0 unlink arm).
+    store.remove(keys[1]);
+    try testing.expect(store.lookup(keys[1]) == null);
+    try testing.expect(store.lookup(keys[0]) != null);
+    try testing.expect(store.lookup(keys[2]) != null);
+    try testing.expectEqual(@as(usize, 2), store.stats().entries);
+    // Removing the head exercises the other unlink arm.
+    store.remove(keys[2]);
+    try testing.expect(store.lookup(keys[0]) != null);
+    try testing.expectEqual(@as(usize, 1), store.stats().entries);
+}
+
 /// Mmap-backed variant of KeyedTable: same semantics, but keys/vals/filled
 /// live in a memfd region instead of inline arrays. This allows the zone to
 /// survive exec across --reload-hard (memfds pass through without CLOEXEC).
@@ -509,6 +631,62 @@ test "MmapKeyedTable upsert/get round-trips and survives init" {
     const slot = t2.upsert(101) orelse return error.LostSlot;
     slot.* += 1;
     try testing.expectEqual(@as(u32, 11), t2.get(101).?);
+}
+
+test "MmapKeyedTable misses, clear and locking semantics" {
+    const K = MmapKeyedTable(u32, 4);
+    try testing.expectEqual(@as(usize, @sizeOf([4]u64) + @sizeOf([4]u32) + @sizeOf(u64)), K.mmapSize());
+    const region = try memfd_mod.map(try memfd_mod.create("test-kv-miss", K.mmapSize()), K.mmapSize());
+    defer std.posix.munmap(region);
+
+    var t = K.init(region);
+    try testing.expect(t.get(1) == null);
+    try testing.expectEqual(@as(usize, 0), t.count());
+    const s = t.upsert(1) orelse return error.UnexpectedFull;
+    s.* = 11;
+    const locked = t.upsertLocked(1).?;
+    try testing.expect(locked.existed);
+    const fresh = t.upsertLocked(2).?;
+    try testing.expect(!fresh.existed);
+    try testing.expectEqual(@as(usize, 2), t.count());
+    t.clear();
+    try testing.expectEqual(@as(usize, 0), t.count());
+    try testing.expect(t.get(1) == null);
+    // Usable again after clear.
+    const s2 = t.upsert(1) orelse return error.UnexpectedFull;
+    try testing.expectEqual(@as(u32, 0), s2.*); // zeroed on create
+}
+
+test "ZoneRegistry acquire, reuse, descriptors and bad-fd adopt" {
+    var reg = ZoneRegistry.init(testing.allocator);
+    defer reg.deinit();
+
+    const r1 = try reg.acquire("test-zone-a", 4096);
+    try testing.expectEqual(@as(usize, 4096), r1.len);
+    // Same name returns the identical region (no duplicate memfd).
+    const r1b = try reg.acquire("test-zone-a", 4096);
+    try testing.expectEqual(r1.ptr, r1b.ptr);
+    const r2 = try reg.acquire("test-zone-b", 8192);
+    try testing.expect(r2.ptr != r1.ptr);
+
+    const descs = try reg.descriptors();
+    defer testing.allocator.free(descs);
+    try testing.expectEqual(@as(usize, 2), descs.len);
+    for (descs) |d| {
+        try testing.expect(d.fd >= 0);
+        try testing.expect(d.size == 4096 or d.size == 8192);
+    }
+
+    // Adopting a closed fd is refused instead of panicking in mmap.
+    try testing.expectError(error.BadFd, reg.adopt("test-zone-bad", -1, 4096));
+    // Adopting an already-known name returns the existing region.
+    const r1c = try reg.adopt("test-zone-a", -1, 4096);
+    try testing.expectEqual(r1.ptr, r1c.ptr);
+}
+
+test "adoptInherited with no zones is a global no-op" {
+    // Empty input returns before touching the process-global registry.
+    try adoptInherited(testing.allocator, &.{});
 }
 
 /// Zone descriptor carried in the state file across --reload-hard.

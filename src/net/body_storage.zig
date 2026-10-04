@@ -270,3 +270,56 @@ test "readAll can be called repeatedly" {
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualSlices(u8, first, second);
 }
+
+test "BodySpool empty writes and empty reads round-trip" {
+    var spool = try BodySpool.create();
+    defer spool.deinit();
+    try spool.writeAll("");
+    try std.testing.expectEqual(@as(usize, 0), spool.size);
+    const output = try spool.readAll(std.testing.allocator);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqual(@as(usize, 0), output.len);
+}
+
+test "BodyStorage reset clears the in-memory body but keeps capacity" {
+    var body = BodyStorage.init(std.testing.allocator, 1024);
+    defer body.deinit();
+    try body.write("hello");
+    try std.testing.expectEqualStrings("hello", body.items());
+    body.reset();
+    try std.testing.expectEqual(@as(usize, 0), body.size());
+    try std.testing.expectEqual(@as(usize, 0), body.items().len);
+    switch (body.storage) {
+        .memory => {},
+        .spool => return error.ExpectedMemory,
+    }
+    // Usable again after reset.
+    try body.write("again");
+    try std.testing.expectEqualStrings("again", body.items());
+}
+
+test "BodyStorage items is empty once spooled" {
+    var body = BodyStorage.init(std.testing.allocator, 4);
+    defer body.deinit();
+    try body.write("hello world, spooled");
+    try std.testing.expectEqual(@as(usize, 0), body.items().len);
+    try std.testing.expectEqual(@as(usize, 20), body.size());
+}
+
+test "BodyStorage with zero max_memory spills any non-empty write" {
+    var body = BodyStorage.init(std.testing.allocator, 0);
+    defer body.deinit();
+    try body.write("");
+    switch (body.storage) {
+        .memory => {},
+        .spool => return error.ExpectedMemory,
+    }
+    try body.write("x");
+    switch (body.storage) {
+        .memory => return error.ExpectedSpool,
+        .spool => {},
+    }
+    const output = try body.readAll(std.testing.allocator);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualSlices(u8, "x", output);
+}

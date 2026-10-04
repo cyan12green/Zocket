@@ -704,3 +704,59 @@ test "graceful drain hands off to a sibling server under concurrent load" {
     // The old daemon's reactors exited through the drain (join succeeded
     // above without a force-stop); its counters prove it accepted work.
 }
+
+test "multireactor constructor variants bind without running" {
+    // NOTE: like the other tests in this file this uses page_allocator:
+    // initWithThreadsAndHandlerGroup leaks its `listeners` tracking array
+    // on success (initWithThreadsAndSpec frees it). Reported, not fixed.
+    const allocator = std.heap.page_allocator;
+    // init() uses the CPU count with the default idle timeout; port 0
+    // binds an ephemeral port. No threads start until run().
+    var srv = try Server.init(allocator, 0);
+    defer srv.deinit();
+    try testing.expect(srv.threadCount() >= 1);
+    try testing.expectEqual(@as(usize, 0), srv.accepted());
+    try testing.expectEqual(reactor.default_idle_timeout_seconds, srv.idle_timeout_seconds);
+    try testing.expect(srv.http_handler == null);
+    try testing.expect(srv.server_group == null);
+    const port = try srv.boundPort();
+    try testing.expect(port != 0);
+
+    // Zero threads clamps to one; zero idle timeout disables reaping.
+    var one = try Server.initWithThreadsAndHandlerTimeout(allocator, 0, 0, .echo, null, 0);
+    defer one.deinit();
+    try testing.expectEqual(@as(usize, 1), one.threadCount());
+    try testing.expectEqual(@as(u32, 0), one.idle_timeout_seconds);
+}
+
+test "multireactor initWithThreadsAndSpec binds a ListenSpec" {
+    const spec = sockets.ListenSpec{
+        .family = .ipv4,
+        .addr = .{ 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        .port = 0, // ephemeral
+    };
+    var srv = try Server.initWithThreadsAndSpec(std.heap.page_allocator, spec, 2, .echo, null, null, 0);
+    defer srv.deinit();
+    try testing.expectEqual(@as(usize, 2), srv.threadCount());
+    try testing.expectEqual(@as(u16, 0), srv.port);
+    try testing.expect((try srv.boundPort()) != 0);
+}
+
+test "multireactor initWithThreadsAndHandlerGroup wires the server group" {
+    const rsrv = runtime_server.Server.init(runtime_server.Config.default());
+    var arr = [_]runtime_server.Server{rsrv};
+    const group = runtime_server.ServerGroup{ .servers = &arr };
+    var srv = try Server.initWithThreadsAndHandlerGroup(std.heap.page_allocator, 0, 1, .http, null, &group, 30);
+    defer srv.deinit();
+    try testing.expect(srv.server_group != null);
+    try testing.expectEqual(@as(u32, 30), srv.idle_timeout_seconds);
+    try testing.expectEqual(reactor.Mode.http, srv.mode);
+}
+
+test "multireactor stop before run is safe and idempotent" {
+    var srv = try Server.initWithThreads(std.heap.page_allocator, 0, 1, .echo);
+    defer srv.deinit();
+    srv.stop();
+    srv.stop(); // second write coalesces in the eventfd counter
+    try testing.expect(!srv.running.load(.acquire));
+}

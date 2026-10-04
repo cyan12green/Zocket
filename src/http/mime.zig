@@ -100,3 +100,25 @@ test "extension table has no duplicates" {
         try seen.append(testing.allocator, entry.ext);
     }
 }
+
+test "every table entry resolves to its own MIME type" {
+    inline for (table) |entry| {
+        try testing.expectEqualStrings(entry.mime, mimeForExtension(entry.ext));
+    }
+    // Case-sensitive: upper-case extensions miss (callers lowercase first).
+    try testing.expectEqualStrings("application/octet-stream", mimeForExtension("HTML"));
+    try testing.expectEqualStrings("application/octet-stream", mimeForExtension("Text"));
+}
+
+test "mimeForPath edge cases: long extensions, dots and queries" {
+    // Extension longer than the lowercase scratch falls back to default.
+    try testing.expectEqualStrings("application/octet-stream", mimeForPath("/dir/file.abcdefghijklmnopq"));
+    // Query strings strip before lookup; case folds.
+    try testing.expectEqualStrings("text/html", mimeForPath("/dir/page.HTML?v=2"));
+    // A dotfile with a real extension still resolves.
+    try testing.expectEqualStrings("text/plain", mimeForPath("/dir/.hidden.txt"));
+    // Trailing dot means an empty extension.
+    try testing.expectEqualStrings("application/octet-stream", mimeForPath("/dir/file."));
+    // Multi-dot paths use the last extension.
+    try testing.expectEqualStrings("application/gzip", mimeForPath("/dir/archive.tar.gz"));
+}

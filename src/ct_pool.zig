@@ -64,6 +64,9 @@ pub fn CtPool(comptime T: type, comptime N: usize) type {
         /// Only valid once the pool is a comptime constant (e.g. broken out
         /// of a `comptime blk`); a by-pointer slice would reference the
         /// comptime var and Zig forbids that escaping into runtime values.
+        /// NOTE: do NOT call freeze on a runtime pool and retain the slice
+        /// past the call — the slice dangles over the dead by-value copy.
+        /// Runtime code should use slice(); freeze is for comptime builds.
         pub fn freeze(self: @This()) []const T {
             return self.items[0..self.len];
         }
@@ -72,54 +75,72 @@ pub fn CtPool(comptime T: type, comptime N: usize) type {
 
 const testing = std.testing;
 
-test "create appends and freeze yields the used slice in order" {
-    const built = comptime blk: {
+test "create appends and slice yields the used portion in order" {
+    // create() is comptime-only (capacity overflow is a @compileError, so
+    // the length check only fires at comptime); build at comptime, then
+    // assert on the runtime slice (borrows the live pool — no dangle).
+    var p = comptime blk: {
+        var q = CtPool(u32, 8){};
+        _ = q.create(10);
+        _ = q.create(20);
+        _ = q.create(30);
+        break :blk q;
+    };
+    try testing.expectEqual(@as(usize, 3), p.slice().len);
+    try testing.expectEqualSlices(u32, &.{ 10, 20, 30 }, p.slice());
+}
+
+test "freeze escapes a comptime pool into .rodata" {
+    // freeze() takes the pool by value: inside a comptime block the copy
+    // is comptime-known, so the slice legally escapes into .rodata.
+    // (Calling freeze on a RUNTIME pool dangles over the dead parameter
+    // copy — runtime code must use slice().)
+    const frozen = comptime blk: {
         var p = CtPool(u32, 8){};
         _ = p.create(10);
         _ = p.create(20);
         _ = p.create(30);
-        break :blk p;
+        break :blk p.freeze();
     };
-    const frozen = built.freeze();
     try testing.expectEqual(@as(usize, 3), frozen.len);
     try testing.expectEqualSlices(u32, &.{ 10, 20, 30 }, frozen);
 }
 
 test "create pointers are stable and point into the pool array" {
-    const built = comptime blk: {
-        var p = CtPool(u32, 4){};
-        const a = p.create(1);
-        const b = p.create(2);
-        std.debug.assert(a == &p.items[0]);
-        std.debug.assert(b == &p.items[1]);
+    var p = comptime blk: {
+        var q = CtPool(u32, 4){};
+        const a = q.create(1);
+        const b = q.create(2);
+        std.debug.assert(a == &q.items[0]);
+        std.debug.assert(b == &q.items[1]);
         a.* = 100; // mutate through the returned pointer
-        break :blk p;
+        break :blk q;
     };
-    try testing.expectEqualSlices(u32, &.{ 100, 2 }, built.freeze());
+    try testing.expectEqualSlices(u32, &.{ 100, 2 }, p.slice());
 }
 
 test "create captures its own index for index-based structures" {
-    const built = comptime blk: {
-        var p = CtPool(u32, 8){};
-        const idx0 = p.len;
-        _ = p.create(7);
-        const idx1 = p.len;
-        _ = p.create(8);
+    var p = comptime blk: {
+        var q = CtPool(u32, 8){};
+        const idx0 = q.len;
+        _ = q.create(7);
+        const idx1 = q.len;
+        _ = q.create(8);
         std.debug.assert(idx0 == 0 and idx1 == 1);
-        break :blk p;
+        break :blk q;
     };
-    try testing.expectEqual(@as(usize, 2), built.freeze().len);
+    try testing.expectEqual(@as(usize, 2), p.slice().len);
 }
 
 test "slice exposes the used portion for in-place builders" {
-    const built = comptime blk: {
-        var p = CtPool(u32, 8){};
-        _ = p.create(1);
-        p.slice()[0] = 99; // write through the slice
-        _ = p.create(2);
-        break :blk p;
+    var p = comptime blk: {
+        var q = CtPool(u32, 8){};
+        _ = q.create(1);
+        q.slice()[0] = 99; // write through the slice
+        _ = q.create(2);
+        break :blk q;
     };
-    try testing.expectEqualSlices(u32, &.{ 99, 2 }, built.freeze());
+    try testing.expectEqualSlices(u32, &.{ 99, 2 }, p.slice());
 }
 
 test "multiple typed pools in one builder (RouterBuilder pattern)" {
@@ -130,17 +151,45 @@ test "multiple typed pools in one builder (RouterBuilder pattern)" {
         edges: CtPool(Edge, 64) = .{},
     };
 
-    const built = comptime blk: {
-        var b = Builder{};
-        const root = b.nodes.create(.{ .tag = 0, .edges_start = 0 });
-        _ = b.edges.create(.{ .byte = 'a', .child = root.*.tag });
-        _ = b.nodes.create(.{ .tag = 1, .edges_start = 0 });
-        break :blk b;
+    var b = comptime blk: {
+        var bb = Builder{};
+        const root = bb.nodes.create(.{ .tag = 0, .edges_start = 0 });
+        _ = bb.edges.create(.{ .byte = 'a', .child = root.*.tag });
+        _ = bb.nodes.create(.{ .tag = 1, .edges_start = 0 });
+        break :blk bb;
     };
 
-    try testing.expectEqual(@as(usize, 2), built.nodes.freeze().len);
-    try testing.expectEqual(@as(usize, 1), built.edges.freeze().len);
-    try testing.expectEqual(@as(u8, 'a'), built.edges.freeze()[0].byte);
-    try testing.expectEqual(@as(u8, 0), built.nodes.freeze()[0].tag);
+    try testing.expectEqual(@as(usize, 2), b.nodes.slice().len);
+    try testing.expectEqual(@as(usize, 1), b.edges.slice().len);
+    try testing.expectEqual(@as(u8, 'a'), b.edges.slice()[0].byte);
+    try testing.expectEqual(@as(u8, 0), b.nodes.slice()[0].tag);
     // Exhaustion would be a compile error: p.create() beyond capacity.
+}
+
+test "empty pool slices to zero length and exposes its type constants" {
+    var p = comptime blk: {
+        break :blk CtPool(u32, 8){};
+    };
+    try testing.expectEqual(@as(usize, 0), p.slice().len);
+    try testing.expectEqual(@as(usize, 0), p.len);
+    try testing.expectEqual(@as(usize, 8), @TypeOf(p).capacity);
+    try testing.expectEqual(u32, @TypeOf(p).Elem);
+    const frozen = comptime blk: {
+        var q = CtPool(u32, 8){};
+        break :blk q.freeze();
+    };
+    try testing.expectEqual(@as(usize, 0), frozen.len);
+}
+
+test "pool fills exactly to capacity" {
+    var p = comptime blk: {
+        var q = CtPool(u8, 4){};
+        _ = q.create('a');
+        _ = q.create('b');
+        _ = q.create('c');
+        _ = q.create('d');
+        break :blk q;
+    };
+    try testing.expectEqual(@as(usize, 4), p.slice().len);
+    try testing.expectEqualSlices(u8, "abcd", p.slice());
 }

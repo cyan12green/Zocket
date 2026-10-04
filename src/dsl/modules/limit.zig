@@ -338,3 +338,67 @@ test "different client keys have independent budgets" {
     try testing.expectEqual(Action.handled, try runReq(&a.ctx)); // own bucket exhausted
     try testing.expectEqual(Action.pass, try runReq(&b.ctx)); // separate bucket
 }
+
+test "client ip hashing is stable and separates addresses" {
+    const ip_a = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 7, 7, 7, 7 };
+    const ip_b = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8 };
+    try testing.expectEqual(hashClientIp(ip_a), hashClientIp(ip_a));
+    try testing.expect(hashClientIp(ip_a) != hashClientIp(ip_b));
+    try testing.expect(hashClientIp(ip_a) != hashClientIp(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }));
+}
+
+test "limit modules pass through with no route" {
+    try lifecycleInit(null);
+    var c: Case = undefined;
+    makeCtx(&c, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 7, 7, 7, 7 }, T0);
+    defer c.req.deinit();
+    try testing.expectEqual(Action.pass, try runReq(&c.ctx));
+    try testing.expectEqual(Action.pass, try runConn(&c.ctx));
+    try testing.expectEqual(Action.pass, try runConnRelease(&c.ctx));
+    // Second init is a no-op once zones exist.
+    try lifecycleInit(null);
+    ensureConnZoneInit();
+}
+
+test "limit_req with a rate of one sheds the immediate second request" {
+    try lifecycleInit(null);
+    const route = Route{ .path = "/", .limit_req_rate = 1 };
+    var c: Case = undefined;
+    makeCtx(&c, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 11, 11, 11, 11 }, T0);
+    defer c.req.deinit();
+    c.ctx.route = &route;
+    // per-shard burst defaults to 1 when unconfigured: first passes.
+    try testing.expectEqual(Action.pass, try runReq(&c.ctx));
+    try testing.expectEqual(Action.handled, try runReq(&c.ctx));
+    try testing.expectEqual(Status.service_unavailable, c.ctx.resp.status);
+    // Same instant, no time elapsed: still shedding (no refill branch).
+    try testing.expectEqual(Action.handled, try runReq(&c.ctx));
+    // One per-shard interval later the bucket refills exactly once.
+    c.ctx.now_ns = T0 + std.time.ns_per_s;
+    try testing.expectEqual(Action.pass, try runReq(&c.ctx));
+    try testing.expectEqual(Action.handled, try runReq(&c.ctx));
+}
+
+test "limit_conn double release is safe and rejections carry 503" {
+    try lifecycleInit(null);
+    const route = Route{ .path = "/", .limit_conn_max = 1 };
+    var a: Case = undefined;
+    makeCtx(&a, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 12, 12, 12, 12 }, T0);
+    defer a.req.deinit();
+    a.ctx.route = &route;
+    try testing.expectEqual(Action.pass, try runConn(&a.ctx));
+
+    var b: Case = undefined;
+    makeCtx(&b, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 12, 12, 12, 12 }, T0);
+    defer b.req.deinit();
+    b.ctx.route = &route;
+    try testing.expectEqual(Action.handled, try runConn(&b.ctx));
+    try testing.expectEqual(Status.service_unavailable, b.ctx.resp.status);
+    try testing.expectEqualStrings("Service Unavailable", b.ctx.resp.body);
+
+    // Releasing twice only decrements once: a new request fits exactly once.
+    try testing.expectEqual(Action.pass, try runConnRelease(&a.ctx));
+    try testing.expectEqual(Action.pass, try runConnRelease(&a.ctx));
+    try testing.expectEqual(Action.pass, try runConn(&b.ctx));
+    try testing.expectEqual(Action.pass, try runConnRelease(&b.ctx));
+}

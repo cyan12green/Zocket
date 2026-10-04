@@ -805,3 +805,204 @@ test "wireSize matches written bytes across configurations" {
     try testing.expectEqual(out2.len, resp2.wireSize());
     try testing.expectEqualStrings("HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n", out2);
 }
+
+test "every status maps to its reason phrase" {
+    const cases = [_]struct { status: Status, phrase: []const u8 }{
+        .{ .status = .switching_protocols, .phrase = "Switching Protocols" },
+        .{ .status = .ok, .phrase = "OK" },
+        .{ .status = .partial_content, .phrase = "Partial Content" },
+        .{ .status = .moved_permanently, .phrase = "Moved Permanently" },
+        .{ .status = .found, .phrase = "Found" },
+        .{ .status = .not_modified, .phrase = "Not Modified" },
+        .{ .status = .unauthorized, .phrase = "Unauthorized" },
+        .{ .status = .forbidden, .phrase = "Forbidden" },
+        .{ .status = .bad_request, .phrase = "Bad Request" },
+        .{ .status = .range_not_satisfiable, .phrase = "Range Not Satisfiable" },
+        .{ .status = .not_found, .phrase = "Not Found" },
+        .{ .status = .payload_too_large, .phrase = "Payload Too Large" },
+        .{ .status = .header_too_large, .phrase = "Request Header Fields Too Large" },
+        .{ .status = .internal_error, .phrase = "Internal Server Error" },
+        .{ .status = .not_implemented, .phrase = "Not Implemented" },
+        .{ .status = .bad_gateway, .phrase = "Bad Gateway" },
+        .{ .status = .service_unavailable, .phrase = "Service Unavailable" },
+    };
+    for (cases) |c| {
+        try testing.expectEqualStrings(c.phrase, c.status.reasonPhrase());
+    }
+    // Comptime code phrases, with a fallback for unknown codes.
+    try testing.expectEqualStrings("OK", reasonPhraseForCode(200));
+    try testing.expectEqualStrings("Partial Content", reasonPhraseForCode(206));
+    try testing.expectEqualStrings("Moved Permanently", reasonPhraseForCode(301));
+    try testing.expectEqualStrings("Found", reasonPhraseForCode(302));
+    try testing.expectEqualStrings("Not Modified", reasonPhraseForCode(304));
+    try testing.expectEqualStrings("Bad Request", reasonPhraseForCode(400));
+    try testing.expectEqualStrings("Forbidden", reasonPhraseForCode(403));
+    try testing.expectEqualStrings("Not Found", reasonPhraseForCode(404));
+    try testing.expectEqualStrings("Payload Too Large", reasonPhraseForCode(413));
+    try testing.expectEqualStrings("Range Not Satisfiable", reasonPhraseForCode(416));
+    try testing.expectEqualStrings("Request Header Fields Too Large", reasonPhraseForCode(431));
+    try testing.expectEqualStrings("Internal Server Error", reasonPhraseForCode(500));
+    try testing.expectEqualStrings("Not Implemented", reasonPhraseForCode(501));
+    try testing.expectEqualStrings("Unknown", reasonPhraseForCode(418));
+    try testing.expectEqualStrings("Unknown", reasonPhraseForCode(599));
+}
+
+test "replaceHeader swaps the first match or appends" {
+    var resp = Response.init(.ok);
+    resp.setHeader("X-Tag", "one");
+    resp.setHeader("X-Tag", "two");
+    resp.replaceHeader("x-tag", "only"); // case-insensitive replace of first
+    try testing.expectEqual(@as(usize, 2), resp.header_count);
+    try testing.expectEqualStrings("only", resp.headers[0].value);
+    try testing.expectEqualStrings("two", resp.headers[1].value);
+    resp.replaceHeader("X-New", "fresh"); // absent -> append
+    try testing.expectEqual(@as(usize, 3), resp.header_count);
+    try testing.expectEqualStrings("fresh", resp.headers[2].value);
+}
+
+test "removeHeader drops every match and reports the count" {
+    var resp = Response.init(.ok);
+    resp.setHeader("X-Drop", "1");
+    resp.setHeader("X-Keep", "k");
+    resp.setHeader("x-drop", "2");
+    resp.setHeader("X-Drop", "3");
+    try testing.expectEqual(@as(usize, 3), resp.removeHeader("X-DROP"));
+    try testing.expectEqual(@as(usize, 1), resp.header_count);
+    try testing.expectEqualStrings("X-Keep", resp.headers[0].name);
+    try testing.expectEqual(@as(usize, 0), resp.removeHeader("X-Absent"));
+}
+
+test "setHeaderFmt formats into scratch and drops on exhaustion" {
+    var resp = Response.init(.ok);
+    resp.setHeaderFmt("Cache-Control", "max-age={d}", .{3600});
+    try testing.expectEqual(@as(usize, 1), resp.header_count);
+    try testing.expectEqualStrings("max-age=3600", resp.headers[0].value);
+    // Scratch is 96 bytes: 12 used above, 60 more here (72 total).
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        resp.setHeaderFmt("X-Pad", "0123456789", .{});
+    }
+    try testing.expectEqual(@as(usize, 7), resp.header_count);
+    // 30 more bytes do not fit: the header is silently dropped.
+    resp.setHeaderFmt("X-Overflow", "012345678901234567890123456789", .{});
+    try testing.expectEqual(@as(usize, 7), resp.header_count);
+}
+
+test "digitCount and formatUInt agree on boundary values" {
+    const vals = [_]u64{ 0, 1, 9, 10, 99, 100, 999, 1000, 9999, 10000, 12345, 123456789, 1000000000000, std.math.maxInt(u64) };
+    for (vals) |v| {
+        var buf: [24]u8 = undefined;
+        const end = formatUInt(&buf, 0, v);
+        try testing.expectEqual(digitCount(v), end);
+        try testing.expectEqual(v, try std.fmt.parseInt(u64, buf[0..end], 10));
+    }
+    // Offset writes land at the right position.
+    var buf: [24]u8 = undefined;
+    @memset(&buf, '-');
+    const end = formatUInt(&buf, 5, 42);
+    try testing.expectEqual(@as(usize, 7), end);
+    try testing.expectEqualStrings("42", buf[5..7]);
+}
+
+test "formatHexUInt and hexDigitCount cover hex boundaries" {
+    try testing.expectEqual(@as(usize, 0), hexDigitCount(0));
+    try testing.expectEqual(@as(usize, 1), hexDigitCount(15));
+    try testing.expectEqual(@as(usize, 2), hexDigitCount(16));
+    try testing.expectEqual(@as(usize, 2), hexDigitCount(255));
+    try testing.expectEqual(@as(usize, 3), hexDigitCount(256));
+    try testing.expectEqual(@as(usize, 16), hexDigitCount(std.math.maxInt(u64)));
+    const cases = [_]struct { v: u64, want: []const u8 }{
+        .{ .v = 0, .want = "0" },
+        .{ .v = 5, .want = "5" },
+        .{ .v = 15, .want = "f" },
+        .{ .v = 16, .want = "10" },
+        .{ .v = 255, .want = "ff" },
+        .{ .v = 4096, .want = "1000" },
+        .{ .v = 65535, .want = "ffff" },
+        .{ .v = 65536, .want = "10000" },
+    };
+    for (cases) |c| {
+        var buf: [16]u8 = undefined;
+        const end = formatHexUInt(&buf, 0, c.v);
+        try testing.expectEqualStrings(c.want, buf[0..end]);
+    }
+}
+
+test "writeHeadToBufferWithLength uses the explicit length" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.ok);
+    resp.setHeader("Content-Type", "text/plain");
+
+    const buf = try buffer_mod.Buffer.init(allocator);
+    defer buf.deinit(allocator);
+    try resp.writeHeadToBufferWithLength(buf, 9999);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 9999\r\n\r\n",
+        buf.peek(),
+    );
+    // Too small a buffer fails without touching it.
+    const tiny = try buffer_mod.Buffer.initFixed(allocator, 8);
+    defer tiny.deinit(allocator);
+    try testing.expectError(error.BufferFull, resp.writeHeadToBufferWithLength(tiny, 9999));
+    try testing.expectError(error.BufferFull, resp.writeHeadToBuffer(tiny));
+    try testing.expectEqual(@as(usize, 0), tiny.availableRead());
+}
+
+test "writeChunkedHeadToBuffer fails cleanly on a tiny buffer" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.ok);
+    resp.setBody("hello");
+
+    const tiny = try buffer_mod.Buffer.initFixed(allocator, 8);
+    defer tiny.deinit(allocator);
+    var tail: [8]u8 = undefined;
+    try testing.expectError(error.BufferFull, resp.writeChunkedHeadToBuffer(tiny, resp.body.len, &tail));
+    try testing.expectEqual(@as(usize, 0), tiny.availableRead());
+}
+
+test "writevHeadParts skips empty segments" {
+    var resp = Response.init(.ok);
+    resp.setBody("");
+    var parts: [max_writev_parts]posix.iovec_const = undefined;
+    const n = resp.writevHeadParts(&parts, 0, &.{});
+    // Status(5) + no empty body part: every part is non-empty.
+    for (parts[0..n]) |p| try testing.expect(p.len > 0);
+    var total: usize = 0;
+    for (parts[0..n]) |p| total += p.len;
+    var head_buf: [256]u8 = undefined;
+    @memcpy(head_buf[0.."HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".len], "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    try testing.expectEqual(head_buf[0.."HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".len].len, total);
+}
+
+test "BufferSink writes and reports BufferFull" {
+    const allocator = testing.allocator;
+    const buf = try buffer_mod.Buffer.initFixed(allocator, 8);
+    defer buf.deinit(allocator);
+    const sink = BufferSink{ .buf = buf };
+    try sink.writeAll("12345678");
+    try testing.expectError(error.BufferFull, sink.writeAll("x"));
+    try testing.expectEqualStrings("12345678", buf.peek());
+}
+
+test "responses with every redirect/auth status serialize" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { status: Status, want: []const u8 }{
+        .{ .status = .switching_protocols, .want = "HTTP/1.1 101 Switching Protocols\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .partial_content, .want = "HTTP/1.1 206 Partial Content\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .moved_permanently, .want = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .found, .want = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .not_modified, .want = "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .unauthorized, .want = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .forbidden, .want = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .range_not_satisfiable, .want = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .bad_gateway, .want = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .service_unavailable, .want = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n" },
+    };
+    for (cases) |c| {
+        var resp = Response.init(c.status);
+        const out = try serialize(allocator, &resp);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        try testing.expectEqual(out.len, resp.wireSize());
+    }
+}

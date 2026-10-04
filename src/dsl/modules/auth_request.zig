@@ -140,3 +140,95 @@ test "missing hook or unconfigured route stays inert or errors safely" {
     ctx2.route = &.{ .path = "/" };
     try testing.expectEqual(Action.pass, try run(&ctx2));
 }
+
+test "subrequest verdicts map to client-facing statuses" {
+    const cases = [_]struct { code: u16, want: registry.Status }{
+        .{ .code = 200, .want = .ok },
+        .{ .code = 299, .want = .ok },
+        .{ .code = 400, .want = .bad_request },
+        .{ .code = 401, .want = .unauthorized },
+        .{ .code = 403, .want = .forbidden },
+        .{ .code = 404, .want = .not_found },
+        .{ .code = 413, .want = .payload_too_large },
+        .{ .code = 429, .want = .service_unavailable },
+        .{ .code = 500, .want = .bad_gateway },
+        .{ .code = 503, .want = .bad_gateway },
+        .{ .code = 199, .want = .forbidden },
+    };
+    for (cases) |c| {
+        fake_status = c.code;
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.subrequest = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
+        ctx.route = &.{ .path = "/", .auth_request_uri = "/_auth" };
+        if (c.code >= 200 and c.code <= 299) {
+            try testing.expectEqual(Action.pass, try run(&ctx));
+        } else {
+            try testing.expectEqual(Action.handled, try run(&ctx));
+            try testing.expectEqual(c.want, resp.status);
+            try testing.expectEqualStrings(c.want.reasonPhrase(), resp.body);
+        }
+    }
+    // mappedStatus unit-pins every arm.
+    try testing.expectEqual(registry.Status.bad_request, mappedStatus(400));
+    try testing.expectEqual(registry.Status.unauthorized, mappedStatus(401));
+    try testing.expectEqual(registry.Status.forbidden, mappedStatus(403));
+    try testing.expectEqual(registry.Status.not_found, mappedStatus(404));
+    try testing.expectEqual(registry.Status.payload_too_large, mappedStatus(413));
+    try testing.expectEqual(registry.Status.service_unavailable, mappedStatus(429));
+    try testing.expectEqual(registry.Status.bad_gateway, mappedStatus(500));
+    try testing.expectEqual(registry.Status.bad_gateway, mappedStatus(599));
+    try testing.expectEqual(registry.Status.forbidden, mappedStatus(302));
+}
+
+fn failHook(
+    impl: *const anyopaque,
+    src_req: *const Request,
+    target: []const u8,
+    out_status: *u16,
+) anyerror!void {
+    _ = impl;
+    _ = src_req;
+    _ = target;
+    _ = out_status;
+    return error.HookBlewUp;
+}
+
+test "a failing hook and recursion both fail safe to 500" {
+    // Hook returns an error: 500, never admit.
+    {
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.subrequest = .{ .impl = @ptrCast(&fake_state), .call = failHook };
+        ctx.route = &.{ .path = "/", .auth_request_uri = "/_auth" };
+        try testing.expectEqual(Action.handled, try run(&ctx));
+        try testing.expectEqual(registry.Status.internal_error, resp.status);
+    }
+    // Already inside our own subrequest: refuse to recurse.
+    {
+        fake_status = 204;
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.subrequest = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
+        ctx.route = &.{ .path = "/", .auth_request_uri = "/_auth" };
+        var marker: u8 = 0;
+        ctx.setState("auth_request", @ptrCast(&marker));
+        defer ctx.setState("auth_request", null);
+        try testing.expectEqual(Action.handled, try run(&ctx));
+        try testing.expectEqual(registry.Status.internal_error, resp.status);
+    }
+    // No route at all: inert.
+    {
+        var req = Request.init(testing.allocator);
+        defer req.deinit();
+        var resp = Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        try testing.expectEqual(Action.pass, try run(&ctx));
+    }
+}

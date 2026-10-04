@@ -134,3 +134,40 @@ test "bcrypt round-trips through strHash" {
     try testing.expect(verify(entry, "s3cr3t"));
     try testing.expect(!verify(entry, "wrong"));
 }
+
+test "parse tolerates blanks, whitespace and empty fields" {
+    const entries = comptime parse(
+        \\   # indented comment
+        \\:no-user-here
+        \\no-secret-here:
+        \\   spaced  :trimmed
+        \\$2x:not-bcrypt-too-short
+        \\{SHA}
+        \\
+    );
+    // Only the well-formed lines survive: "spaced" and the short-$2x line
+    // (classified plain — too short for the bcrypt prefix rule). Note the
+    // parser trims the line, not the fields: the user keeps its spaces.
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("spaced  ", entries[0].user);
+    try testing.expectEqualStrings("trimmed", entries[0].secret);
+    try testing.expectEqual(Kind.plain, entries[0].kind);
+    try testing.expectEqual(Kind.plain, entries[1].kind);
+    try testing.expectEqualStrings("$2x", entries[1].user);
+}
+
+test "verify rejects mismatched secrets without timing splits" {
+    // sha1 entry with a truncated (wrong-length) secret never verifies.
+    const short_sha = Entry{ .user = "bob", .kind = .sha1, .secret = "W6ph5Mm5Pz8GgiULbPgzG37mj9g" };
+    try testing.expect(!verify(short_sha, "password"));
+    // sha1 entry with a well-formed but wrong digest.
+    const wrong_sha = Entry{ .user = "bob", .kind = .sha1, .secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAA=" };
+    try testing.expect(!verify(wrong_sha, "password"));
+    // Malformed bcrypt strings fail closed.
+    const bad_bcrypt = Entry{ .user = "c", .kind = .bcrypt, .secret = "$2a$05$not-a-real-hash" };
+    try testing.expect(!verify(bad_bcrypt, "anything"));
+    const truncated = Entry{ .user = "c", .kind = .bcrypt, .secret = "$2a$05$short" };
+    try testing.expect(!verify(truncated, "anything"));
+    // Empty table authenticates nobody.
+    try testing.expect(!authenticate(&.{}, "alice", "password123"));
+}

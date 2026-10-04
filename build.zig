@@ -174,6 +174,45 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Code coverage via zig-cov (https://github.com/ericsssan/zcov):
+    // `-Dcoverage` instruments both test binaries with SanitizerCoverage
+    // counters (LLVM backend + fuzz tables + libc atexit runtime). Run the
+    // report with `zig-cov test` (it passes -Dcoverage itself), or
+    // `zig build cov` once `zig-cov` + `zig-cov-rt.o` are on PATH
+    // (see bench/coverage.sh). Without -Dcoverage this is a no-op.
+    const coverage = b.option(bool, "coverage", "Enable zig-cov SanitizerCoverage instrumentation") orelse false;
+    const coverage_rt = b.option([]const u8, "coverage-rt", "Path to zig-cov-rt.o (required with -Dcoverage)") orelse null;
+    if (coverage) {
+        // NOTE: rt.o goes on the library module ONLY. exe_tests shares
+        // exe.root_module, which imports zocket — adding it to both roots
+        // links zig_cov_ctor twice into the exe test binary (duplicate
+        // symbol). Via the zocket import, exe_tests still gets exactly
+        // one copy.
+        mod_tests.use_llvm = true;
+        mod_tests.root_module.fuzz = true;
+        mod_tests.root_module.link_libc = true;
+        exe_tests.use_llvm = true;
+        exe_tests.root_module.fuzz = true;
+        exe_tests.root_module.link_libc = true;
+        if (coverage_rt) |p| {
+            // zig-cov passes an absolute rt path; b.path() only
+            // accepts build-root-relative paths in 0.18.
+            const lp: std.Build.LazyPath = if (std.fs.path.isAbsolute(p))
+                .{ .cwd_relative = p }
+            else
+                b.path(p);
+            mod.addObjectFile(lp);
+        }
+    }
+
+    // `zig build cov`: full coverage report in one command. Delegates to
+    // bench/coverage.sh, which prefers zig-cov (exact, SanitizerCoverage)
+    // and falls back to a per-area kcov run where available.
+    const cov_step = b.step("cov", "Run tests under coverage and print the report (needs zig-cov on PATH)");
+    const run_cov = b.addSystemCommand(&.{ "bash", "bench/coverage.sh" });
+    run_cov.setCwd(b.path("."));
+    cov_step.dependOn(&run_cov.step);
+
     // Milestone 16: HTTP/2 end-to-end integration tests against a live
     // server — curl --http2-prior-knowledge and the h2spec RFC-conformance
     // suite. Requires curl with nghttp2 and h2spec on PATH; see bench/h2test.sh.
@@ -197,9 +236,67 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(fuzz_exe);
+    // NOTE: fuzz_exe is deliberately NOT instrumented here: -ffuzz on a
+    // main-binary cannot link (test-runner symbols). The campaign runs
+    // instrumented via the `fuzzcov` test step below instead.
     const fuzz_step = b.step("fuzz", "Run the deterministic fuzz campaign (HTTP/1 + HPACK + HTTP/2 + reactor)");
     const run_fuzz = b.addRunArtifact(fuzz_exe);
     fuzz_step.dependOn(&run_fuzz.step);
+    // Coverage fuzz driver (see src/cov_fuzz.zig): the full deterministic
+    // campaign as tests. Separate `fuzzcov` step (minutes-long; NOT part
+    // of `test`). Under -Dcoverage it is instrumented and its .zcov merges
+    // with the unit tests' via `zig-cov report *.zcov`.
+    const fuzzcov_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cov_fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "embeds", .module = embeds_mod },
+                .{ .name = "config_options", .module = config_options_mod },
+            },
+        }),
+    });
+    if (coverage) {
+        fuzzcov_tests.use_llvm = true;
+        fuzzcov_tests.root_module.fuzz = true;
+        fuzzcov_tests.root_module.link_libc = true;
+        // cov_fuzz imports fuzz.zig relatively, NOT via the zocket module,
+        // so rt.o must be linked directly (single root here — no
+        // duplicate-symbol hazard like exe_tests had).
+        if (coverage_rt) |p| {
+            const lp: std.Build.LazyPath = if (std.fs.path.isAbsolute(p))
+                .{ .cwd_relative = p }
+            else
+                b.path(p);
+            fuzzcov_tests.root_module.addObjectFile(lp);
+        }
+    }
+    const run_fuzzcov = b.addRunArtifact(fuzzcov_tests);
+    const fuzzcov_step = b.step("fuzzcov", "Run the full fuzz campaign as instrumented tests (for coverage merging)");
+    fuzzcov_step.dependOn(&run_fuzzcov.step);
+
+    // Instrumented SERVER binary for end-to-end coverage: `-ffuzz` on a
+    // main-binary fails to link (libfuzzer expects the test runner's
+    // `runner_*` symbols), so under -Dcoverage the never-called stubs in
+    // src/cov_stubs.zig are linked in. Only the sancov counters and the
+    // zig-cov atexit writer are live (rt.o arrives via the zocket import).
+    // Drive traffic, then SIGTERM (graceful stop returns from main) to
+    // flush the .zcov; merge with `zig-cov report *.zcov`.
+    if (coverage) {
+        const stubs = b.addObject(.{
+            .name = "covstubs",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/cov_stubs.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addObjectFile(stubs.getEmittedBin());
+        exe.use_llvm = true;
+        exe.root_module.fuzz = true;
+        exe.root_module.link_libc = true;
+    }
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

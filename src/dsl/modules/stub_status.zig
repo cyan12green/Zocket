@@ -71,3 +71,35 @@ test "stub status renders from a stats struct" {
         resp.body,
     );
 }
+
+test "stub status passes through without stats" {
+    const allocator = testing.allocator;
+    var req = registry.Request.init(allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp, .allocator = allocator };
+    try testing.expectEqual(Action.pass, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqual(@as(usize, 0), resp.body.len);
+}
+
+test "stub status renders zero counters" {
+    const allocator = testing.allocator;
+    const Stats = registry.ServerStats;
+    var stats = Stats.init();
+    var req = registry.Request.init(allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.not_found);
+    var ctx = Context{ .req = &req, .resp = &resp, .allocator = allocator, .stats = &stats };
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings(
+        "Active connections: 0\nserver accepts handled requests\n 0 0 0\nReading: 0 Writing: 0 Waiting: 0\n",
+        resp.body,
+    );
+    var ctype: ?[]const u8 = null;
+    for (resp.headers[0..resp.header_count]) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Content-Type")) ctype = h.value;
+    }
+    try testing.expectEqualStrings("text/plain", ctype.?);
+}

@@ -98,6 +98,18 @@ pub const Route = struct {
 
     /// `^~` prefix flag (still .prefix; only precedence differs, M-D).
     no_regex: bool = false,
+    /// `rewrite` rules in declaration order (rewrite phase; `last`
+    /// re-walks matching, `break` stays, redirect/permanent answer 3xx).
+    rewrites: []const RewriteRule = &.{},
+    /// `error_page` table: status -> alternate URI (or `=code`). The
+    /// error_page module reads it in the log phase; a URI target becomes an
+    /// internal redirect (Server.handleRequest re-walks against it), a bare
+    /// `=code` target rewrites the status in place.
+    error_pages: []const ErrorPage = &.{},
+    /// `try_files` candidates, in test order. The try_files module probes
+    /// each against `root` and internally redirects to the first that
+    /// exists; the last entry is the fallback (`=code` or a URI).
+    try_files: []const []const u8 = &.{},
     /// Comptime-compiled NFA for .regex / .regex_ci locations (M-D).
     pattern_regex: ?Regex = null,
     /// User variables declared with `set` in this location (M-C).
@@ -245,6 +257,40 @@ pub const Balance = enum {
         if (std.mem.eql(u8, s, "least_time")) return .least_time;
         return null;
     }
+};
+
+/// One `error_page` entry: which status it serves, and what to serve.
+/// `target` is either a URI (internal redirect, nginx `error_page 404 /404.html`)
+/// or `=<code>` (rewrite the status in place, nginx `error_page 404 =200`).
+pub const ErrorPage = struct {
+    status: u16,
+    target: []const u8,
+
+    /// True for the `=code` form (no URI to redirect to).
+    pub fn isCodeForm(self: ErrorPage) bool {
+        return self.target.len > 0 and self.target[0] == '=';
+    }
+
+    /// The status code of the `=code` form (`=503` -> 503); 0 otherwise.
+    pub fn codeOf(self: ErrorPage) u16 {
+        if (!self.isCodeForm()) return 0;
+        return std.fmt.parseInt(u16, self.target[1..], 10) catch 0;
+    }
+};
+
+/// One `rewrite` rule: match `pattern` against the decoded path, render
+/// `replacement` (`$1..$9` from the match), act by `flag`.
+pub const RewriteFlag = enum {
+    last,
+    @"break",
+    redirect,
+    permanent,
+};
+
+pub const RewriteRule = struct {
+    pattern: Regex,
+    replacement: []const vars.Frag,
+    flag: RewriteFlag = .last,
 };
 
 /// One proxy backend. The `sockaddr` is pre-computed: at
@@ -864,4 +910,109 @@ test "nginx precedence: first regex in declaration order wins" {
     var rtr = Router{ .routes = &routes, .trie = trie, .regex_routes = regex_tbl };
     // Both match /a/b/c; declaration order picks ^/a/.
     try testing.expectEqualStrings("^/a/", rtr.match("/a/b/c", null).?.path);
+}
+
+test "Router.match records captures into MatchCaps" {
+    const routes = comptime [_]Route{
+        .{ .path = "^/api/([0-9]+)/$", .match = .regex, .pattern_regex = regex_mod.compileRegex("^/api/([0-9]+)/$") },
+        .{ .path = "/", .match = .prefix },
+    };
+    const trie = buildTrie(&routes);
+    const regex_tbl = buildRegexTable(&routes);
+    var rtr = Router{ .routes = &routes, .trie = trie, .regex_routes = regex_tbl };
+    var caps = MatchCaps{ .subject = "" };
+    const r = rtr.match("/api/42/", &caps).?;
+    try testing.expectEqualStrings("^/api/([0-9]+)/$", r.path);
+    try testing.expectEqual(@as(u8, 2), caps.count);
+    // Whole match (group 0) spans the full match; groups below are exact.
+    try testing.expectEqualStrings("/api/42/", caps.subject[caps.ranges[0].start..caps.ranges[0].end]);
+    try testing.expectEqualStrings("42", caps.subject[caps.ranges[1].start..caps.ranges[1].end]);
+    // Without caps the same route still matches.
+    try testing.expectEqualStrings("^/api/([0-9]+)/$", rtr.match("/api/42/", null).?.path);
+    // Non-matching target falls through to the prefix route.
+    try testing.expectEqualStrings("/", rtr.match("/api/xyz/", null).?.path);
+}
+
+test "Router.match serves case-insensitive (~*) regex routes" {
+    // ~* folds the subject to lowercase: the pattern is written lowercase.
+    const routes = comptime [_]Route{
+        .{ .path = "\\.png$", .match = .regex_ci, .pattern_regex = regex_mod.compileRegex("\\.png$") },
+        .{ .path = "/", .match = .prefix },
+    };
+    const trie = buildTrie(&routes);
+    const regex_tbl = buildRegexTable(&routes);
+    var rtr = Router{ .routes = &routes, .trie = trie, .regex_routes = regex_tbl };
+    try testing.expectEqualStrings("\\.png$", rtr.match("/img/photo.png", null).?.path);
+    try testing.expectEqualStrings("\\.png$", rtr.match("/img/photo.PNG", null).?.path);
+    try testing.expectEqualStrings("/", rtr.match("/img/photo.jpg", null).?.path);
+}
+
+test "Router.match skips regex routes without a compiled pattern" {
+    const routes = [_]Route{
+        .{ .path = "^/x/", .match = .regex, .pattern_regex = null },
+        .{ .path = "/", .match = .prefix },
+    };
+    const trie = buildTrie(&routes);
+    // Hand-built table (buildRegexTable would reject the null pattern).
+    const tbl = [_]RegexRoute{.{ .re = undefined, .route = 0, .ci = false }};
+    var rtr = Router{ .routes = &routes, .trie = trie, .regex_routes = &tbl };
+    // The patternless regex route is skipped; the prefix serves.
+    try testing.expectEqualStrings("/", rtr.match("/x/1", null).?.path);
+    rtr.deinit(testing.allocator); // no-op, keeps the allocator param covered
+}
+
+test "matchRoutes skips regex routes in the linear fallback" {
+    const rs = [_]Route{
+        .{ .path = "^/api/", .match = .regex, .pattern_regex = null },
+        .{ .path = "^/img/", .match = .regex_ci, .pattern_regex = null },
+    };
+    try testing.expectEqual(@as(?*const Route, null), matchRoutes(&rs, "/api/1"));
+}
+
+const distinct_routes = [_]Route{
+    .{ .path = "/", .match = .prefix },
+    .{ .path = "/", .match = .exact }, // same path, different kind: fine
+    .{ .path = "/a", .match = .prefix },
+};
+
+test "same path with different kinds is not ambiguous" {
+    // NOTE: do not call comptimeCheckAmbiguous directly here. A direct
+    // call from test context misfires @compileError for this table in
+    // this Zig snapshot (pairwise dump proves every guard is false), while
+    // the identical call inside buildTrieImpl's explicit `comptime` block
+    // evaluates correctly. All production tables go through buildTrie, so
+    // only the direct-call shape is affected. This test pins the
+    // production path: same path + different kind builds fine.
+    const trie = buildTrie(&distinct_routes);
+    try testing.expect(trie.nodes.len > 0);
+    // And the routes still match with exact-beats-prefix semantics.
+    var rtr = Router{ .routes = &distinct_routes, .trie = trie };
+    try testing.expectEqualStrings("/", rtr.match("/", null).?.path);
+}
+
+test "Upstream.makeSockaddr parses IPv4 literals and rejects the rest" {
+    const good = Upstream.makeSockaddr("127.0.0.1", 9000).?;
+    try testing.expectEqual(std.posix.AF.INET, good.family);
+    try testing.expectEqual(@as(u16, 9000), std.mem.readInt(u16, good.data[0..2], .big));
+    try testing.expectEqual(@as(u32, 0x7F000001), std.mem.readInt(u32, good.data[2..6], .big));
+    try testing.expect(Upstream.makeSockaddr("10.0.0", 80) == null); // too few
+    try testing.expect(Upstream.makeSockaddr("10.0.0.1.5", 80) == null); // too many
+    try testing.expect(Upstream.makeSockaddr("10.0.x.1", 80) == null); // non-numeric
+    try testing.expect(Upstream.makeSockaddr("10.0.0.300", 80) == null); // out of range
+    try testing.expect(Upstream.makeSockaddr("", 80) == null);
+    try testing.expect(Upstream.makeSockaddr("example.com", 80) == null);
+}
+
+test "template serialisation covers statuses and header lists" {
+    const t = comptime ResponseTemplate{
+        .status = 301,
+        .headers = &.{
+            .{ .name = "Location", .value = "/new" },
+            .{ .name = "Cache-Control", .value = "no-cache" },
+        },
+        .body = "",
+    };
+    const fb = serializeResponseTemplate(t);
+    try testing.expectEqualStrings("HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nCache-Control: no-cache\r\n", fb.head);
+    try testing.expectEqualStrings("", fb.body);
 }

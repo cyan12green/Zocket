@@ -172,3 +172,28 @@ test "classify is comptime-evaluable" {
     const t: TestTag = comptime @enumFromInt(test_dfa.classify("Host"));
     try testing.expectEqual(TestTag.host, t);
 }
+
+test "empty name set classifies everything as unknown" {
+    const empty = build(&.{});
+    try testing.expectEqual(@as(u16, 0), empty.classify("host"));
+    try testing.expectEqual(@as(u16, 0), empty.classify(""));
+}
+
+test "digit and dash names build and classify case-insensitively" {
+    const Tag = enum(u16) { unknown = 0, x1 = 1, range = 2 };
+    const dfa = build(&.{
+        .{ .name = "x-1", .tag = @intFromEnum(Tag.x1) },
+        .{ .name = "x-2", .tag = @intFromEnum(Tag.range) },
+    });
+    const asTag = struct {
+        fn tag(name: []const u8) Tag {
+            return @enumFromInt(dfa.classify(name));
+        }
+    }.tag;
+    try testing.expectEqual(Tag.x1, asTag("x-1"));
+    try testing.expectEqual(Tag.x1, asTag("X-1"));
+    try testing.expectEqual(Tag.range, asTag("x-2"));
+    try testing.expectEqual(Tag.unknown, asTag("x-"));
+    try testing.expectEqual(Tag.unknown, asTag("x-12"));
+    try testing.expectEqual(Tag.unknown, asTag("y-1"));
+}

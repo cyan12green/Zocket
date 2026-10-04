@@ -101,6 +101,9 @@ comptime {
     _ = @import("dsl/modules/precompressed.zig");
     _ = @import("dsl/modules/auth_request.zig");
     _ = @import("dsl/modules/proxy_cache.zig");
+    _ = @import("dsl/modules/error_page.zig");
+    _ = @import("dsl/modules/try_files.zig");
+    _ = @import("dsl/modules/rewrite.zig");
     _ = @import("dsl/htpasswd.zig");
     _ = @import("http/arena.zig");
     _ = @import("http2/hpack.zig");
@@ -112,6 +115,7 @@ comptime {
     _ = @import("ct_pool.zig");
     _ = @import("compat.zig");
     _ = @import("net/iouring.zig");
+    _ = @import("net/body_storage.zig");
     _ = @import("version.zig");
     _ = @import("dsl/phase.zig");
     _ = @import("dsl/router.zig");
@@ -136,6 +140,7 @@ comptime {
     _ = @import("tls/cert.zig");
     _ = @import("tls/handshake.zig");
     _ = @import("tls/session.zig");
+    _ = @import("tls/tickets.zig");
 }
 
 comptime {

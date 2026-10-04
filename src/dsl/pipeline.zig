@@ -110,6 +110,18 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
     };
     // The log phase runs as post-processing: every log-bound module, in
     // declaration order (gzip transforms, access/error logs).
+    // `effective_status` is what the request is heading out with: the
+    // response status, or 404 when no module claimed it (the reactor's
+    // default 404 is applied later, by the caller). error_page matches on
+    // it; without it an unclaimed request would look like a 200.
+    ctx.effective_status = blk: {
+        if (outcome != .not_handled) break :blk @intFromEnum(ctx.resp.status);
+        // Unclaimed: the response is the route's template when it has one
+        // (applied just below), else the caller's default 404.
+        if (r.response) |t| break :blk t.status;
+        if (r.response_cv) |t| break :blk t.status;
+        break :blk 404;
+    };
     for (r.modules) |b| {
         if (b.phase != .log) continue;
         const run_fn = Registry.resolve(b.module).?;
@@ -856,4 +868,214 @@ test "module failure maps through central taxonomy" {
         else => {},
     };
     try testing.expectEqual(registry.Status.bad_gateway, ctx.resp.status);
+}
+
+test "route chunked and tcp_nopush flags travel on the response" {
+    const routes = comptime &[_]router.Route{.{
+        .path = "/",
+        .chunked = true,
+        .tcp_nopush = true,
+        .modules = &.{.{ .phase = .content, .module = "content_mod" }},
+    }};
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/";
+    req.decoded_target = "/";
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    // content_mod passes: not_handled, but the flags were still applied.
+    try testing.expectEqual(Outcome.not_handled, try run(OrderRegistry, routes, &ctx));
+    try testing.expect(resp.chunked);
+    try testing.expect(resp.tcp_nopush);
+}
+
+test "loop walk falls back to the literal response template" {
+    const routes = comptime &[_]router.Route{.{
+        .path = "/",
+        .modules = &.{.{ .phase = .content, .module = "content_mod" }},
+        .response = .{ .status = 404, .body = "template-fallback" },
+    }};
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/";
+    req.decoded_target = "/";
+    const res = try runWith(OrderRegistry, routes, &req);
+    try testing.expectEqual(Outcome.handled, res.outcome);
+    try testing.expectEqual(Status.not_found, res.resp.status);
+    try testing.expectEqualStrings("template-fallback", res.resp.body);
+}
+
+test "dispatch walk falls back to literal and dynamic templates" {
+    const routes = comptime &[_]router.Route{
+        .{
+            .path = "/lit",
+            .modules = &.{.{ .phase = .content, .module = "content_mod" }},
+            .response = .{ .status = 503, .body = "literal" },
+        },
+        .{
+            .path = "/dyn",
+            .modules = &.{.{ .phase = .content, .module = "content_mod" }},
+            .response_cv = .{
+                .status = 200,
+                .headers = &.{.{ .name = "X-Dyn", .value = vars.parseComplexValue("h=$host", &.{}) }},
+                .body = vars.parseComplexValue("b=$host", &.{}),
+            },
+        },
+    };
+    const dispatched = comptime assignDispatch(OrderRegistry, routes);
+
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/lit";
+    req.decoded_target = "/lit";
+    const res_lit = try runWith(OrderRegistry, &dispatched, &req);
+    try testing.expectEqual(Outcome.handled, res_lit.outcome);
+    try testing.expectEqual(Status.service_unavailable, res_lit.resp.status);
+    try testing.expectEqualStrings("literal", res_lit.resp.body);
+
+    var req2 = Request.init(testing.allocator);
+    defer req2.deinit();
+    req2.target = "/dyn";
+    req2.decoded_target = "/dyn";
+    req2.addHeaderParsed("host", "example.com") catch unreachable;
+    var resp2 = Response.init(.ok);
+    var ctx2 = Context{ .req = &req2, .resp = &resp2 };
+    try testing.expectEqual(Outcome.handled, try run(OrderRegistry, &dispatched, &ctx2));
+    try testing.expectEqualStrings("b=example.com", resp2.body);
+    try testing.expectEqualStrings("h=example.com", resp2.headers[1].value);
+}
+
+test "applyResponseFilters runs the route filters directly" {
+    // applyResponseFilters dispatches through default_registry, so this
+    // uses the real `headers` filter with two add-ops on the route.
+    const first_frags = comptime vars.parseComplexValue("first", &.{});
+    const last_frags = comptime vars.parseComplexValue("last", &.{});
+    var route = router.Route{
+        .path = "/",
+        .headers_ops = &.{
+            .{ .kind = .add, .name = "X-F", .value = first_frags },
+            .{ .kind = .add, .name = "X-F", .value = last_frags },
+        },
+        .filters = &.{.{ .phase = .log, .module = "headers" }},
+    };
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp, .route = &route };
+    try applyResponseFilters(&route, &ctx);
+    try testing.expectEqual(@as(usize, 2), resp.header_count);
+    try testing.expectEqualStrings("first", resp.headers[0].value);
+    try testing.expectEqualStrings("last", resp.headers[1].value);
+}
+
+test "applyResponseFilters skips unknown filter names" {
+    const first_frags = comptime vars.parseComplexValue("first", &.{});
+    var route = router.Route{
+        .path = "/",
+        .headers_ops = &.{.{ .kind = .add, .name = "X-F", .value = first_frags }},
+        .filters = &.{
+            .{ .phase = .log, .module = "nope_missing" },
+            .{ .phase = .log, .module = "headers" },
+        },
+    };
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp, .route = &route };
+    try applyResponseFilters(&route, &ctx);
+    try testing.expectEqual(@as(usize, 1), resp.header_count);
+    try testing.expectEqualStrings("first", resp.headers[0].value);
+}
+
+const stream_impl = struct {
+    fn run(ctx: *Context) anyerror!Action {
+        ctx.resp.setBody("streamed");
+        return .handled;
+    }
+}.run;
+
+const StreamRegistry = registry.Registry(.{
+    registry.Module{ .name = "stream", .phase = .content, .run = stream_impl, .streams_response = true },
+    filter_mod.make("f_first", "first"),
+});
+
+test "streaming handlers bypass response filters" {
+    const routes = comptime &[_]router.Route{.{
+        .path = "/",
+        .modules = &.{.{ .phase = .content, .module = "stream" }},
+        .filters = &.{.{ .phase = .log, .module = "f_first" }},
+    }};
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/";
+    req.decoded_target = "/";
+    const res = try runWith(StreamRegistry, routes, &req);
+    try testing.expectEqual(Outcome.handled, res.outcome);
+    try testing.expectEqualStrings("streamed", res.resp.body);
+    try testing.expectEqual(@as(usize, 0), res.resp.header_count); // filter skipped
+}
+
+const async_impl = struct {
+    fn parked(ctx: *Context) anyerror!Action {
+        _ = ctx;
+        return .async;
+    }
+    fn pending(ctx: *Context) anyerror!Action {
+        _ = ctx;
+        return error.AsyncPending;
+    }
+};
+
+const AsyncRegistry = registry.Registry(.{
+    registry.Module{ .name = "parked", .phase = .content, .run = async_impl.parked },
+    registry.Module{ .name = "pending", .phase = .content, .run = async_impl.pending },
+});
+
+test "async action and AsyncPending error propagate without logging" {
+    const routes = comptime &[_]router.Route{.{
+        .path = "/parked",
+        .modules = &.{.{ .phase = .content, .module = "parked" }},
+    }};
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/parked";
+    req.decoded_target = "/parked";
+    // Loop walk: .async becomes error.AsyncPending (no std.log.err).
+    try testing.expectError(error.AsyncPending, runWith(AsyncRegistry, routes, &req));
+
+    const routes2 = comptime &[_]router.Route{.{
+        .path = "/pending",
+        .modules = &.{.{ .phase = .content, .module = "pending" }},
+    }};
+    var req2 = Request.init(testing.allocator);
+    defer req2.deinit();
+    req2.target = "/pending";
+    req2.decoded_target = "/pending";
+    try testing.expectError(error.AsyncPending, runWith(AsyncRegistry, routes2, &req2));
+
+    // Dispatch walk takes the same AsyncPending exits.
+    const dispatched = comptime assignDispatch(AsyncRegistry, routes);
+    var req3 = Request.init(testing.allocator);
+    defer req3.deinit();
+    req3.target = "/parked";
+    req3.decoded_target = "/parked";
+    try testing.expectError(error.AsyncPending, runWith(AsyncRegistry, &dispatched, &req3));
+}
+
+test "router-backed walk with no match is not_handled" {
+    const routes = comptime &[_]router.Route{.{
+        .path = "/only",
+        .match = .exact,
+        .modules = &.{.{ .phase = .content, .module = "content_mod" }},
+    }};
+    const trie = router.buildTrie(routes);
+    var rtr = router.Router{ .routes = routes, .trie = trie };
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/elsewhere";
+    req.decoded_target = "/elsewhere";
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(Outcome.not_handled, try runWithRouter(PassThroughRegistry, routes, &rtr, &ctx));
+    try testing.expect(ctx.route == null);
 }
