@@ -129,7 +129,7 @@ test "bcrypt round-trips through strHash" {
         .allocator = allocator,
         .params = .{ .rounds_log = 4, .silently_truncate_password = true },
         .encoding = .crypt,
-    }, &hash_buf);
+    }, &hash_buf, std.testing.io);
     const entry = Entry{ .user = "dave", .kind = .bcrypt, .secret = hash };
     try testing.expect(verify(entry, "s3cr3t"));
     try testing.expect(!verify(entry, "wrong"));

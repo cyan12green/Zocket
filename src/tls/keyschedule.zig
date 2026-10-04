@@ -52,7 +52,7 @@ pub fn Secrets(comptime Su: type) type {
         /// the resumed session's master secret: early_secret extracts it
         /// instead of zeros.
         pub fn deriveHandshake(self: *Self, ecdhe: []const u8, client_hello_hash: [Su.hash_length]u8, psk: ?[]const u8) void {
-            const zeroes = [1]u8{0} ** Su.hash_length;
+            const zeroes = @as([Su.hash_length]u8, @splat(@as(u8, 0)));
             const empty_hash = tls.emptyHash(Su.Hash);
             const early_secret = if (psk) |p| Su.Hkdf.extract(&[1]u8{0}, p) else Su.Hkdf.extract(&[1]u8{0}, &zeroes);
             const hs_derived = tls.hkdfExpandLabel(Su.Hkdf, early_secret, "derived", &empty_hash, Su.hash_length);

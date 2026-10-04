@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -49,8 +50,8 @@ pub const ListenSpec = struct {
 };
 
 pub fn setNonBlock(fd: posix.fd_t) !void {
-    const flags = try posix.fcntl(fd, F_GETFL, 0);
-    _ = try posix.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    const flags = try compat.fcntl(fd, F_GETFL, 0);
+    _ = try compat.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 /// Create a non-blocking IPv4 TCP listener bound to 127.0.0.1:port with
@@ -71,8 +72,8 @@ pub fn createListeningSocketReusePort(port: u16, backlog: usize) !posix.fd_t {
 /// default when family is .ipv6.
 pub fn createListeningSocketFromSpec(spec: ListenSpec, backlog: usize, reuse_port: bool) !posix.fd_t {
     const family: u16 = if (spec.family == .ipv6) AF_INET6 else AF_INET;
-    const listener = try posix.socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    errdefer posix.close(listener);
+    const listener = try compat.socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    errdefer compat.close(listener);
     try posix.setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     if (reuse_port) {
         try posix.setsockopt(listener, SOL_SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
@@ -93,23 +94,23 @@ pub fn createListeningSocketFromSpec(spec: ListenSpec, backlog: usize, reuse_por
             .sin6_addr = spec.addr,
             .sin6_scope_id = 0,
         };
-        try posix.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in6));
+        try compat.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in6));
     } else {
         const addr = sockaddr_in{
             .sin_family = AF_INET,
             .sin_port = std.mem.nativeToBig(u16, spec.port),
             .sin_addr = std.mem.nativeToBig(u32, @as(u32, @intCast(spec.addr[0])) << 24 | @as(u32, @intCast(spec.addr[1])) << 16 | @as(u32, @intCast(spec.addr[2])) << 8 | @as(u32, @intCast(spec.addr[3]))),
-            .sin_zero = [_]u8{0} ** 8,
+            .sin_zero = @as([8]u8, @splat(@as(u8, 0))),
         };
-        try posix.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in));
+        try compat.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in));
     }
-    try posix.listen(listener, @intCast(backlog));
+    try compat.listen(listener, @intCast(backlog));
     return listener;
 }
 
 fn createListeningSocketFlags(port: u16, backlog: usize, reuse_port: bool) !posix.fd_t {
-    const listener = try posix.socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    errdefer posix.close(listener);
+    const listener = try compat.socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    errdefer compat.close(listener);
     try posix.setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     if (reuse_port) {
         try posix.setsockopt(listener, SOL_SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
@@ -121,11 +122,11 @@ fn createListeningSocketFlags(port: u16, backlog: usize, reuse_port: bool) !posi
         .sin_port = std.mem.nativeToBig(u16, port),
         // 127.0.0.1: memory bytes 7f 00 00 01.
         .sin_addr = std.mem.nativeToBig(u32, 0x7f000001),
-        .sin_zero = [_]u8{0} ** 8,
+        .sin_zero = @as([8]u8, @splat(@as(u8, 0))),
     };
 
-    try posix.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in));
-    try posix.listen(listener, @intCast(backlog));
+    try compat.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in));
+    try compat.listen(listener, @intCast(backlog));
     return listener;
 }
 
@@ -171,7 +172,7 @@ pub fn boundPort(fd: posix.fd_t) !u16 {
     var buf: [28]u8 align(@alignOf(u16)) = undefined;
     var len: posix.socklen_t = 28;
     const sa_ptr: *posix.sockaddr = @ptrCast(&buf);
-    try posix.getsockname(fd, sa_ptr, &len);
+    try compat.getsockname(fd, sa_ptr, &len);
     const family: u16 = @intCast(@as(u16, sa_ptr.family));
     if (family == AF_INET6) {
         const addr: *const sockaddr_in6 = @ptrCast(@alignCast(&buf));

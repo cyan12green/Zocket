@@ -438,7 +438,7 @@ const Compiler = struct {
 
     fn parseClass(self: *Compiler) RegexErr!Frag {
         // self.pos points just after '['.
-        var bitmap = [_]u32{0} ** 32;
+        var bitmap = @as([32]u32, @splat(@as(u32, 0)));
         var negate = false;
         if (self.peek() == '^') {
             negate = true;
@@ -501,14 +501,14 @@ const Compiler = struct {
 };
 
 const classesDigits = blk: {
-    var bm = [_]u32{0} ** 32;
+    var bm = @as([32]u32, @splat(@as(u32, 0)));
     var b: u8 = '0';
     while (b <= '9') : (b += 1) bm[b / 32] |= @as(u32, 1) << @intCast(b % 32);
     break :blk bm;
 };
 
 const classesWord = blk: {
-    var bm = [_]u32{0} ** 32;
+    var bm = @as([32]u32, @splat(@as(u32, 0)));
     var b: u8 = 'a';
     while (b <= 'z') : (b += 1) bm[b / 32] |= @as(u32, 1) << @intCast(b % 32);
     b = 'A';
@@ -520,7 +520,7 @@ const classesWord = blk: {
 };
 
 const classesSpace = blk: {
-    var bm = [_]u32{0} ** 32;
+    var bm = @as([32]u32, @splat(@as(u32, 0)));
     for ([_]u8{ ' ', '\t', '\r', '\n' }) |b| bm[b / 32] |= @as(u32, 1) << @intCast(b % 32);
     break :blk bm;
 };
@@ -607,7 +607,7 @@ pub fn match(re: *const Regex, subject: []const u8, caps: []CaptureRange, start:
 }
 
 fn emptyCaps() [max_groups + 1]CaptureRange {
-    return [_]CaptureRange{.{ .start = 0, .end = 0 }} ** (max_groups + 1);
+    return @as([max_groups + 1]CaptureRange, @splat(@as(CaptureRange, .{ .start = 0, .end = 0 })));
 }
 
 fn findMatch(set: []Thread, len: usize) ?Thread {

@@ -506,7 +506,7 @@ test "handshake: selectAlpn prefers h2" {
 
 test "handshake: message builders produce self-consistent frames" {
     var buf: [4096]u8 = undefined;
-    const sh = try buildServerHello(&buf, [_]u8{7} ** 32, &.{ 0x20, 0x01 }, 0x1301, false, &([_]u8{1} ** 32), null);
+    const sh = try buildServerHello(&buf, @as([32]u8, @splat(@as(u8, 7))), &.{ 0x20, 0x01 }, 0x1301, false, &(@as([32]u8, @splat(@as(u8, 1)))), null);
     // type 2, valid length, ends with the keyshare
     try testing.expectEqual(@as(u8, 0x02), buf[0]);
     try testing.expect(sh < buf.len);
@@ -514,7 +514,7 @@ test "handshake: message builders produce self-consistent frames" {
     try testing.expectEqual(@as(u8, 0x08), buf[sh]);
     const cert = try buildCertificate(buf[sh + ee ..], "certs");
     try testing.expectEqual(@as(u8, 0x0b), buf[sh + ee]);
-    const f = try buildFinished(buf[sh + ee + cert ..], &([_]u8{0xaa} ** 12));
+    const f = try buildFinished(buf[sh + ee + cert ..], &(@as([12]u8, @splat(@as(u8, 0xaa)))));
     try testing.expectEqual(@as(u8, 0x14), buf[sh + ee + cert]);
     try testing.expectEqual(@as(usize, 12 + 4), f);
 }

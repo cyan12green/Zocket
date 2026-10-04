@@ -168,7 +168,7 @@ test "buffer compact" {
     defer buf.deinit(allocator);
 
     _ = buf.writeSlice("hello");
-    var zeroes = [_]u8{0} ** 5;
+    var zeroes: [5]u8 = @splat(0);
     _ = buf.readSlice(&zeroes);
 
     try testing.expectEqual(0, buf.availableRead());
@@ -212,7 +212,7 @@ test "buffer grow preserves unread contents" {
     try buf.grow(allocator, 65536);
     try testing.expect(buf.data.len >= 65536);
     try testing.expectEqualStrings("fix", buf.peek());
-    const written = buf.writeSlice(&[_]u8{'x'} ** 1000);
+    const written = buf.writeSlice(&@as([1000]u8, @splat(@as(u8, 'x'))));
     try testing.expectEqual(1000, written);
     try testing.expectEqual(1003, buf.availableRead());
 }

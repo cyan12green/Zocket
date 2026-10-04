@@ -6,6 +6,7 @@
 //! usable for 1-RTT resumption only.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const tls = std.crypto.tls;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 
@@ -19,7 +20,7 @@ var g_key_iv: ?[Aes128Gcm.nonce_length]u8 = null;
 fn key() *const [Aes128Gcm.key_length]u8 {
     if (g_key == null) {
         var k: [Aes128Gcm.key_length]u8 = undefined;
-        std.crypto.random.bytes(&k);
+        compat.randomBytes(&k);
         g_key = k;
     }
     return &g_key.?;
@@ -28,7 +29,7 @@ fn key() *const [Aes128Gcm.key_length]u8 {
 fn iv() *const [Aes128Gcm.nonce_length]u8 {
     if (g_key_iv == null) {
         var k: [Aes128Gcm.nonce_length]u8 = undefined;
-        std.crypto.random.bytes(&k);
+        compat.randomBytes(&k);
         g_key_iv = k;
     }
     return &g_key_iv.?;
@@ -86,7 +87,7 @@ pub fn buildNewSessionTicket(
     std.mem.writeInt(u32, out[pos..][0..4], lifetime_seconds, .big);
     pos += 4;
     var age_add: [4]u8 = undefined;
-    std.crypto.random.bytes(&age_add);
+    compat.randomBytes(&age_add);
     @memcpy(out[pos..][0..4], &age_add);
     pos += 4;
     out[pos] = 1; // ticket_nonce length
@@ -111,7 +112,7 @@ const testing = std.testing;
 
 test "tickets: seal/open round trip" {
     var secret: [32]u8 = undefined;
-    std.crypto.random.bytes(&secret);
+    compat.randomBytes(&secret);
     var ticket: [max_ticket_len]u8 = undefined;
     const n = try seal(&secret, .{ 1, 2, 3, 4, 5, 6, 7, 8 }, &ticket);
     var opened: [32]u8 = undefined;
@@ -122,7 +123,7 @@ test "tickets: seal/open round trip" {
 
 test "tickets: tampering and wrong nonce fail" {
     var secret: [32]u8 = undefined;
-    std.crypto.random.bytes(&secret);
+    compat.randomBytes(&secret);
     var ticket: [max_ticket_len]u8 = undefined;
     const n = try seal(&secret, .{ 0, 0, 0, 0, 0, 0, 0, 1 }, &ticket);
     ticket[12] ^= 0xff;
@@ -136,7 +137,7 @@ test "tickets: tampering and wrong nonce fail" {
 
 test "tickets: NewSessionTicket message is well-formed" {
     var secret: [32]u8 = undefined;
-    std.crypto.random.bytes(&secret);
+    compat.randomBytes(&secret);
     var msg: [128]u8 = undefined;
     const n = try buildNewSessionTicket(&msg, &secret, 0);
     try testing.expectEqual(@as(u8, 0x04), msg[0]);

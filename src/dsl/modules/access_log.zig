@@ -48,7 +48,7 @@ fn run(ctx: *Context) anyerror!Action {
     try vars.renderComplex(ctx, frags, &sink);
     try line.append(allocator, '\n');
 
-    std.log.info("{s}", .{std.mem.trimRight(u8, line.items, &.{'\n'})});
+    std.log.info("{s}", .{std.mem.trimEnd(u8, line.items, &.{'\n'})});
     return .pass;
 }
 

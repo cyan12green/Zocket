@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const posix = std.posix;
 
 /// nginx `open_file_cache` equivalent for the static module (per-reactor, no
@@ -32,7 +33,7 @@ pub const Entry = struct {
     content: []u8 = &.{},
     content_cached: bool = false,
     /// When the entry was last revalidated.
-    refreshed: std.time.Instant = undefined,
+    refreshed: compat.Instant = undefined,
 };
 
 pub const StaticCache = struct {
@@ -72,7 +73,7 @@ pub const StaticCache = struct {
     /// Find (and if stale, revalidate) the entry for `path`. Returns null on
     /// miss or when the file changed on disk.
     pub fn lookup(self: *StaticCache, path: []const u8) ?*Entry {
-        const now = std.time.Instant.now() catch return null;
+        const now = compat.Instant.now() catch return null;
         for (self.entries) |*e| {
             if (!e.in_use) continue;
             if (!std.mem.eql(u8, e.path, path)) continue;
@@ -133,16 +134,16 @@ pub const StaticCache = struct {
         e.etag_len = etag.len;
         const lm = cache_date(mtime_secs, &e.lm) orelse return null;
         e.lm_len = lm.len;
-        e.refreshed = std.time.Instant.now() catch return null;
+        e.refreshed = compat.Instant.now() catch return null;
         e.in_use = true;
         return e;
     }
 
     /// The path's current (size, mtime) must match the cached metadata;
     /// evicts and returns false when the file changed (or vanished).
-    fn revalidate(self: *StaticCache, e: *Entry, now: std.time.Instant) bool {
-        var st: std.fs.File.Stat = undefined;
-        if (std.fs.cwd().statFile(e.path)) |s| {
+    fn revalidate(self: *StaticCache, e: *Entry, now: compat.Instant) bool {
+        var st: compat.FileStat = undefined;
+        if (compat.statFile(e.path)) |s| {
             st = s;
         } else |_| {
             self.evict(e);
@@ -159,7 +160,7 @@ pub const StaticCache = struct {
 
     fn evict(self: *StaticCache, e: *Entry) void {
         if (!e.in_use) return;
-        if (e.fd >= 0) posix.close(e.fd);
+        if (e.fd >= 0) compat.close(e.fd);
         self.allocator.free(e.path);
         if (e.content_cached) self.allocator.free(e.content);
         e.* = .{};
@@ -204,8 +205,8 @@ test "static cache insert and lookup" {
     const allocator = testing.allocator;
     var cache = StaticCache.init(allocator);
     defer cache.deinit();
-    const src = std.fs.cwd().openFile("testdata/hello.txt", .{}) catch return error.SkipZigTest;
-    const fd = posix.dup(src.handle) catch return error.SkipZigTest;
+    const src = compat.openFile("testdata/hello.txt") catch return error.SkipZigTest;
+    const fd = compat.dup(src) catch return error.SkipZigTest;
 
     const e = cache.insert("testdata/hello.txt", fd, 19, 123) orelse return error.SkipZigTest;
     try testing.expectEqual(fd, e.fd);
@@ -222,13 +223,13 @@ test "static cache evicts when full" {
     const allocator = testing.allocator;
     var cache = StaticCache.init(allocator);
     defer cache.deinit();
-    const src = std.fs.cwd().openFile("testdata/hello.txt", .{}) catch return error.SkipZigTest;
+    const src = compat.openFile("testdata/hello.txt") catch return error.SkipZigTest;
     var i: usize = 0;
     while (i < 20) : (i += 1) {
         const buf = std.fmt.allocPrint(allocator, "testdata/f{d}", .{i}) catch return error.SkipZigTest;
         defer allocator.free(buf);
         // Each entry needs a real fd (eviction closes them); dup the file.
-        const dup = posix.dup(src.handle) catch return error.SkipZigTest;
+        const dup = compat.dup(src) catch return error.SkipZigTest;
         _ = cache.insert(buf, dup, 1, 1) orelse return error.SkipZigTest;
     }
     var used: usize = 0;
@@ -244,20 +245,20 @@ test "static cache revalidates a changed file" {
     defer cache.deinit();
 
     const path = "testdata/cache-refresh-tmp";
-    std.fs.cwd().writeFile(.{ .sub_path = path, .data = "one" }) catch return error.SkipZigTest;
-    defer std.fs.cwd().deleteFile(path) catch {};
+    compat.writeFile(path, "one") catch return error.SkipZigTest;
+    defer compat.deleteFile(path) catch {};
 
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.SkipZigTest;
-    const st = file.stat() catch return error.SkipZigTest;
+    const file = compat.openFile(path) catch return error.SkipZigTest;
+    const st = compat.fstat(file) catch return error.SkipZigTest;
     const mtime: u64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-    _ = cache.insert(path, file.handle, st.size, mtime) orelse return error.SkipZigTest;
+    _ = cache.insert(path, file, st.size, mtime) orelse return error.SkipZigTest;
 
     const first = cache.lookup(path) orelse return error.SkipZigTest;
-    try testing.expectEqual(file.handle, first.fd);
+    try testing.expectEqual(file, first.fd);
 
     // The file changes on disk: once the entry is stale, the next lookup
     // must evict (new size/mtime). Force staleness past the 1 s window.
-    std.fs.cwd().writeFile(.{ .sub_path = path, .data = "two three four" }) catch return error.SkipZigTest;
+    compat.writeFile(path, "two three four") catch return error.SkipZigTest;
     const stale = cache.lookup(path) orelse return error.SkipZigTest;
     stale.refreshed = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
     try testing.expect(cache.lookup(path) == null);

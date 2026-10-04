@@ -5,6 +5,7 @@
 //! handshake and application traffic both use the same code.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const tls = std.crypto.tls;
 
 pub const header_len = 5;
@@ -25,7 +26,7 @@ pub fn nonce(fixed_iv: []const u8, seq: u64) [12]u8 {
     var seq_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &seq_bytes, seq, .big);
     const V = @Vector(12, u8);
-    const operand: V = ([1]u8{0} ** (12 - 8)) ++ seq_bytes;
+    const operand: V = (@as([4]u8, @splat(@as(u8, 0))) ++ seq_bytes);
     return @as(V, fixed_iv[0..12].*) ^ operand;
 }
 
@@ -103,8 +104,8 @@ const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 test "record: encrypt then decrypt round-trips the fragment and content type" {
     var key: [Aes128Gcm.key_length]u8 = undefined;
     var iv: [Aes128Gcm.nonce_length]u8 = undefined;
-    std.crypto.random.bytes(&key);
-    std.crypto.random.bytes(&iv);
+    compat.randomBytes(&key);
+    compat.randomBytes(&iv);
     const fragment = "GET / HTTP/1.1\r\nHost: x\r\n\r\n" ++ "0123456789abcdef";
     var out: [256]u8 = undefined;
     const n = try encrypt(Aes128Gcm, key, iv, 0, @intFromEnum(tls.ContentType.handshake), fragment, &out);
@@ -116,8 +117,8 @@ test "record: encrypt then decrypt round-trips the fragment and content type" {
 }
 
 test "record: sequence numbers produce distinct nonces" {
-    const n0 = nonce(&[_]u8{0} ** 12, 0);
-    const n1 = nonce(&[_]u8{0} ** 12, 1);
+    const n0 = nonce(&@as([12]u8, @splat(@as(u8, 0))), 0);
+    const n1 = nonce(&@as([12]u8, @splat(@as(u8, 0))), 1);
     try testing.expect(!std.mem.eql(u8, &n0, &n1));
 }
 
@@ -125,9 +126,9 @@ test "record: wrong key fails the MAC" {
     var key: [Aes128Gcm.key_length]u8 = undefined;
     var other: [Aes128Gcm.key_length]u8 = undefined;
     var iv: [Aes128Gcm.nonce_length]u8 = undefined;
-    std.crypto.random.bytes(&key);
-    std.crypto.random.bytes(&other);
-    std.crypto.random.bytes(&iv);
+    compat.randomBytes(&key);
+    compat.randomBytes(&other);
+    compat.randomBytes(&iv);
     var out: [128]u8 = undefined;
     const n = try encrypt(Aes128Gcm, key, iv, 7, 0, "hello", &out);
     try testing.expectError(error.TlsBadRecordMac, decryptInPlace(Aes128Gcm, other, iv, 7, out[0..n]));
@@ -138,8 +139,8 @@ test "record: wrong key fails the MAC" {
 test "record: truncated and oversized records fail cleanly" {
     var key: [Aes128Gcm.key_length]u8 = undefined;
     var iv: [Aes128Gcm.nonce_length]u8 = undefined;
-    std.crypto.random.bytes(&key);
-    std.crypto.random.bytes(&iv);
+    compat.randomBytes(&key);
+    compat.randomBytes(&iv);
     var out: [128]u8 = undefined;
     const n = try encrypt(Aes128Gcm, key, iv, 0, 0, "hello", &out);
     try testing.expectError(error.TlsConnectionTruncated, decryptInPlace(Aes128Gcm, key, iv, 0, out[0 .. n - 2]));

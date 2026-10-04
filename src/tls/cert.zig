@@ -210,7 +210,7 @@ const tls_cert_pem = testdata.cert_pem;
 const tls_key_pem = testdata.key_pem;
 
 test "cert: loads the ECDSA P-256 test credentials" {
-    var creds = try loadCredentials(testing.allocator, tls_cert_pem, tls_key_pem);
+    const creds = try loadCredentials(testing.allocator, tls_cert_pem, tls_key_pem);
     defer testing.allocator.free(creds.cert_der);
     try testing.expectEqual(Curve.p256, creds.key.curve);
     try testing.expectEqual(@as(usize, 32), creds.key.secret_len);

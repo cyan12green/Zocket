@@ -398,7 +398,7 @@ fn parseVersion(tok: []const u8) ?Version {
 /// Comptime `%XX` hex decode table: hex value of a byte, or 0xff when the
 /// byte is not a hex digit.
 const hex_value: [256]u8 = blk: {
-    var table = [_]u8{0xff} ** 256;
+    var table: [256]u8 = @splat(0xff);
     for ("0123456789abcdefABCDEF") |c| {
         const v = if (c >= '0' and c <= '9')
             c - '0'
@@ -1275,7 +1275,8 @@ test "query string split" {
 
 test "oversized header line yields 431" {
     const allocator = testing.allocator;
-    const big_value = "x" ** (max_line_bytes + 100);
+    const big_value_arr: [max_line_bytes + 100]u8 = @splat(@as(u8, 'x'));
+    const big_value = big_value_arr[0..];
     var wire_buf: [max_line_bytes + 256]u8 = undefined;
     const wire = std.fmt.bufPrint(&wire_buf, "GET / HTTP/1.1\r\nX-Big: {s}\r\n\r\n", .{big_value}) catch unreachable;
 

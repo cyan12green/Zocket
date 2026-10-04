@@ -153,6 +153,16 @@ fn applyFilters(comptime Registry: type, route: *const router.Route, ctx: *Conte
     }
 }
 
+/// Runtime entry point for post-hoc filter application. Parked proxy
+/// completions build their response outside the pipeline walk (reactor
+/// pump), so without this they would skip every response filter
+/// (proxy_cache_store, gzip, headers, access_log). Runs the route's
+/// response filters in reverse declaration order; filter actions are
+/// ignored (transform-only, exactly like the normal walk).
+pub fn applyResponseFilters(route: *const router.Route, ctx: *Context) !void {
+    try applyFilters(default_registry, route, ctx);
+}
+
 /// Runtime application of a response template (JSON-config routes, whose
 /// templates cannot be pre-serialised at compile time). Comptime routes with
 /// modules use this too; module-less comptime routes take the reactor fast

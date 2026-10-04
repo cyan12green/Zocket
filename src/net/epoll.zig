@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -16,12 +17,12 @@ pub const Epoll = struct {
     fd: posix.fd_t,
 
     pub fn create() !Epoll {
-        const fd = try posix.epoll_create1(EPOLL_CLOEXEC);
+        const fd = try compat.epoll_create1(EPOLL_CLOEXEC);
         return Epoll{ .fd = fd };
     }
 
     pub fn close(self: Epoll) void {
-        posix.close(self.fd);
+        compat.close(self.fd);
     }
 
     pub fn add(self: Epoll, fd: posix.fd_t, events: u32, data: posix.fd_t) !void {
@@ -29,7 +30,7 @@ pub const Epoll = struct {
             .events = events,
             .data = .{ .ptr = @intCast(data) },
         };
-        try posix.epoll_ctl(self.fd, EPOLL_CTL_ADD, fd, &event);
+        try compat.epoll_ctl(self.fd, EPOLL_CTL_ADD, fd, &event);
     }
 
     pub fn modify(self: Epoll, fd: posix.fd_t, events: u32, data: posix.fd_t) !void {
@@ -37,11 +38,11 @@ pub const Epoll = struct {
             .events = events,
             .data = .{ .ptr = @intCast(data) },
         };
-        try posix.epoll_ctl(self.fd, EPOLL_CTL_MOD, fd, &event);
+        try compat.epoll_ctl(self.fd, EPOLL_CTL_MOD, fd, &event);
     }
 
     pub fn remove(self: Epoll, fd: posix.fd_t) !void {
-        try posix.epoll_ctl(self.fd, EPOLL_CTL_DEL, fd, null);
+        try compat.epoll_ctl(self.fd, EPOLL_CTL_DEL, fd, null);
     }
 
     pub fn wait(self: *Epoll, events: []linux.epoll_event, timeout_ms: i32) !usize {

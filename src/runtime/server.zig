@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const config_mod = @import("config.zig");
 const pipeline = @import("../dsl/pipeline.zig");
 const registry = @import("../dsl/registry.zig");
@@ -39,9 +40,9 @@ pub const Server = struct {
     /// files once at startup — nginx reads `ssl_certificate` at startup too).
     pub fn loadTls(self: *Server, allocator: std.mem.Allocator) !void {
         if (self.cfg.tls.enabled()) {
-            const cert_pem = try std.fs.cwd().readFileAlloc(self.cfg.tls.cert, allocator, .limited(1 << 20));
+            const cert_pem = try compat.readFileAlloc(allocator, self.cfg.tls.cert, 1 << 20);
             defer allocator.free(cert_pem);
-            const key_pem = try std.fs.cwd().readFileAlloc(self.cfg.tls.key, allocator, .limited(1 << 20));
+            const key_pem = try compat.readFileAlloc(allocator, self.cfg.tls.key, 1 << 20);
             defer allocator.free(key_pem);
             self.tls_creds = try tls_cert.loadCredentials(allocator, cert_pem, key_pem);
         }
@@ -67,10 +68,14 @@ pub const Server = struct {
         const routes = pipeline.assignDispatch(registry.default_registry, cfg.routes);
         const trie = router_mod.buildTrie(&routes);
         const regex_routes = router_mod.buildRegexTable(&routes);
-        return .{
-            .cfg = .{ .routes = &routes, .limits = cfg.limits, .tls = cfg.tls, .listen_port = cfg.listen_port, .log_formats = cfg.log_formats },
+        var s: Server = .{
+            .cfg = cfg,
             .router = .{ .routes = &routes, .trie = trie, .regex_routes = regex_routes },
         };
+        // Swap in the dispatch-specialised routes, keeping every other
+        // config field (server_names, host_select, ...) intact.
+        s.cfg.routes = &routes;
+        return s;
     }
     /// The default server: echo module on the catch-all route, the pre-pipeline
     /// Matches the original hardcoded handler. Built at compile time (trie + dispatch specialisation).
@@ -104,17 +109,17 @@ pub const Server = struct {
         var prepared_len: usize = 0;
         errdefer for (routes[0..prepared_len]) |r| {
             if (r.root_real) |rr| allocator.free(rr);
-            if (r.root_fd >= 0) std.posix.close(r.root_fd);
+            if (r.root_fd >= 0) compat.close(r.root_fd);
         };
         for (base.cfg.routes, 0..) |r, i| {
             var copy = r;
             if (r.root) |root| {
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
-                const resolved = std.fs.cwd().realpath(root, &buf) catch null;
+                const resolved = compat.realpath(root, &buf) catch null;
                 if (resolved) |rp| {
                     copy.root_real = try allocator.dupe(u8, rp);
                 }
-                copy.root_fd = std.posix.open(root, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true, .CLOEXEC = true }, 0) catch -1;
+                copy.root_fd = compat.open(root, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true, .CLOEXEC = true }, 0) catch -1;
             }
             routes[i] = copy;
             prepared_len += 1;
@@ -125,7 +130,12 @@ pub const Server = struct {
         errdefer allocator.destroy(stats);
         stats.* = .{};
         var s = base;
-        s.cfg = .{ .routes = routes, .limits = base.cfg.limits, .tls = base.cfg.tls, .listen_port = base.cfg.listen_port, .log_formats = base.cfg.log_formats };
+        // Preserve the whole config (server_name, host_select, select_fn,
+        // listen_spec, ...), swapping only the routes for the prepared
+        // copy with resolved root_real/root_fd. Dropping fields here
+        // silently disables vhost selection downstream.
+        s.cfg = base.cfg;
+        s.cfg.routes = routes;
         s.router.routes = routes;
         s.stats = stats;
         return s;
@@ -138,7 +148,7 @@ pub const Server = struct {
     pub fn deinitPrepared(self: *Server, allocator: std.mem.Allocator) void {
         for (self.cfg.routes) |r| {
             if (r.root_real) |rr| allocator.free(rr);
-            if (r.root_fd >= 0) std.posix.close(r.root_fd);
+            if (r.root_fd >= 0) compat.close(r.root_fd);
         }
         allocator.free(self.cfg.routes);
         // Free per-server stats only if they were allocated (not the global default).
@@ -212,8 +222,8 @@ pub const Server = struct {
 const testing = std.testing;
 
 test "ServerGroup selectServer matches exact and wildcard server_names" {
-    const s1 = Server.init(.{ .server_name = "example.com" });
-    const s2 = Server.init(.{ .server_name = "*.api.com" });
+    const s1 = Server.init(.{ .server_names = &.{"example.com"} });
+    const s2 = Server.init(.{ .server_names = &.{"*.api.com"} });
     const servers = [_]Server{ s1, s2 };
     const group = ServerGroup{ .servers = &servers, .default_idx = 0 };
     // Exact match.
@@ -223,6 +233,17 @@ test "ServerGroup selectServer matches exact and wildcard server_names" {
     try testing.expectEqual(&servers[1], group.selectServer("v1.api.com", null));
     try testing.expectEqual(&servers[1], group.selectServer("foo.api.com:9000", null));
     // No match -> default.
+    try testing.expectEqual(&servers[0], group.selectServer("other.com", null));
+}
+
+test "ServerGroup selectServer matches every name on a multi-name server" {
+    const s1 = Server.init(.{ .server_names = &.{"example.com"} });
+    const s2 = Server.init(.{ .server_names = &.{ "api.example.com", "*.api.example.com" } });
+    const servers = [_]Server{ s1, s2 };
+    const group = ServerGroup{ .servers = &servers, .default_idx = 0 };
+    try testing.expectEqual(&servers[1], group.selectServer("api.example.com", null));
+    try testing.expectEqual(&servers[1], group.selectServer("v1.api.example.com", null));
+    try testing.expectEqual(&servers[0], group.selectServer("example.com", null));
     try testing.expectEqual(&servers[0], group.selectServer("other.com", null));
 }
 
@@ -852,7 +873,7 @@ pub const ServerGroup = struct {
                     .tls = cfg.tls,
                     .listen_port = spec.listen_port,
                     .log_formats = cfg.log_formats,
-                    .server_name = spec.server_name,
+                    .server_names = spec.server_names,
                 };
                 arr[i] = Server.comptimeInit(sub_cfg);
             }
@@ -881,7 +902,7 @@ pub const ServerGroup = struct {
                 .tls = cfg.tls,
                 .listen_port = spec.listen_port,
                 .log_formats = cfg.log_formats,
-                .server_name = spec.server_name,
+                .server_names = spec.server_names,
             };
             srvs[i] = Server.init(sub_cfg);
             srvs[i].stats = stats;
@@ -913,7 +934,7 @@ pub const ServerGroup = struct {
                 .tls = cfg.tls,
                 .listen_port = spec.listen_port,
                 .log_formats = cfg.log_formats,
-                .server_name = spec.server_name,
+                .server_names = spec.server_names,
             };
             srvs[i] = try Server.embeddedInitWithTls(allocator, sub_cfg);
         }
@@ -946,12 +967,12 @@ pub const ServerGroup = struct {
         // Fallback: runtime matching (for JSON-loaded or test configs).
         const h = if (std.mem.lastIndexOfScalar(u8, host, ':')) |pos| host[0..pos] else host;
         for (self.servers) |*srv| {
-            if (srv.cfg.server_name) |name| {
+            for (srv.cfg.server_names) |name| {
                 if (std.mem.eql(u8, h, name)) return srv;
             }
         }
         for (self.servers) |*srv| {
-            if (srv.cfg.server_name) |name| {
+            for (srv.cfg.server_names) |name| {
                 if (name.len > 2 and name[0] == '*' and name[1] == '.') {
                     if (h.len > name.len - 1 and std.mem.endsWith(u8, h, name[1..])) return srv;
                 }

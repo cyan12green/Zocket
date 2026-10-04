@@ -13,6 +13,8 @@
 //! access (the same trade-off nginx makes with its zone locks).
 
 const std = @import("std");
+const compat = @import("../compat.zig");
+const linux = std.os.linux;
 
 /// A fixed-capacity open-addressing map: u64 key -> V. `cap` must be a
 /// power of two. `upsert` returns null when the table is full AND the key
@@ -28,9 +30,9 @@ pub fn KeyedTable(comptime V: type, comptime cap: usize) type {
 
         const zero_val: V = std.mem.zeroes(V);
 
-        mutex: std.Thread.Mutex = .{},
-        keys: [cap]u64 = [_]u64{0} ** cap,
-        vals: [cap]V = [_]V{zero_val} ** cap,
+        mutex: compat.Mutex = .{},
+        keys: [cap]u64 = @as([cap]u64, @splat(@as(u64, 0))),
+        vals: [cap]V = @as([cap]V, @splat(zero_val)),
         filled: usize = 0,
 
         /// Probe at most `cap` slots: open addressing without tombstones
@@ -83,8 +85,8 @@ pub fn KeyedTable(comptime V: type, comptime cap: usize) type {
         pub fn clear(self: *Self) void {
             self.mutex.lock();
             defer self.mutex.unlock();
-            self.keys = [_]u64{0} ** cap;
-            self.vals = [_]V{zero_val} ** cap;
+            self.keys = @as([cap]u64, @splat(@as(u64, 0)));
+            self.vals = @as([cap]V, @splat(zero_val));
             self.filled = 0;
         }
 
@@ -120,7 +122,7 @@ pub const LruStore = struct {
         bytes: []u8,
     };
 
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
     allocator: std.mem.Allocator,
     max_bytes: usize,
     entries: []Entry,
@@ -401,7 +403,7 @@ pub fn MmapKeyedTable(comptime V: type, comptime cap: usize) type {
 
         const zero_val: V = std.mem.zeroes(V);
 
-        mutex: std.Thread.Mutex = .{},
+        mutex: compat.Mutex = .{},
         keys: [*]u64,
         vals: [*]V,
         filled_ptr: *u64,
@@ -528,20 +530,20 @@ pub const ZoneRegistry = struct {
         region: []align(std.heap.page_size_min) u8,
     };
 
-    zones: std.StringArrayHashMap(Zone),
+    zones: std.array_hash_map.String(Zone),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) ZoneRegistry {
-        return .{ .zones = std.StringArrayHashMap(Zone).init(allocator), .allocator = allocator };
+        return .{ .zones = .empty, .allocator = allocator };
     }
 
     pub fn deinit(self: *ZoneRegistry) void {
         for (self.zones.values()) |z| {
             posix.munmap(z.region);
-            posix.close(z.fd);
+            compat.close(z.fd);
             self.allocator.free(z.name);
         }
-        self.zones.deinit();
+        self.zones.deinit(self.allocator);
     }
 
     /// Acquire or create a named zone of `size` bytes. If the zone already
@@ -550,17 +552,17 @@ pub const ZoneRegistry = struct {
     pub fn acquire(self: *ZoneRegistry, name: []const u8, size: usize) ![]align(std.heap.page_size_min) u8 {
         if (self.zones.getPtr(name)) |z| return z.region;
         const fd = try posix.memfd_create(name, 0);
-        try posix.ftruncate(fd, @intCast(size));
+        try compat.ftruncate(fd, @intCast(size));
         const region = try posix.mmap(
             null,
             size,
-            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             posix.MAP{ .TYPE = .SHARED },
             fd,
             0,
         );
         const duped_name = try self.allocator.dupe(u8, name);
-        try self.zones.put(duped_name, .{
+        try self.zones.put(self.allocator, duped_name, .{
             .name = duped_name,
             .fd = fd,
             .size = size,
@@ -571,18 +573,23 @@ pub const ZoneRegistry = struct {
 
     /// Adopt an inherited fd (survived exec from the parent daemon). The
     /// new process mmaps it and registers it under the given name.
+    /// A state-file fd that is not open here (spawn does not inherit
+    /// memfds) is refused: 0.18 posix.mmap panics on EBADF instead of
+    /// returning an error, so validate first and let the caller fall
+    /// back to a fresh zone.
     pub fn adopt(self: *ZoneRegistry, name: []const u8, fd: posix.fd_t, size: usize) ![]align(std.heap.page_size_min) u8 {
         if (self.zones.getPtr(name)) |z| return z.region;
+        _ = compat.fcntl(fd, linux.F.GETFD, 0) catch return error.BadFd;
         const region = try posix.mmap(
             null,
             size,
-            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             posix.MAP{ .TYPE = .SHARED },
             fd,
             0,
         );
         const duped_name = try self.allocator.dupe(u8, name);
-        try self.zones.put(duped_name, .{
+        try self.zones.put(self.allocator, duped_name, .{
             .name = duped_name,
             .fd = fd,
             .size = size,

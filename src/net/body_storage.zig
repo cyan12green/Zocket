@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const posix = std.posix;
 
 const limits_mod = @import("../dsl/limits.zig");
@@ -18,7 +19,7 @@ pub const BodySpool = struct {
     pub fn writeAll(self: *BodySpool, bytes: []const u8) !void {
         var written: usize = 0;
         while (written < bytes.len) {
-            const n = try posix.write(self.fd, bytes[written..]);
+            const n = try compat.write(self.fd, bytes[written..]);
             if (n == 0) return error.WriteZero;
             written += n;
         }
@@ -28,10 +29,10 @@ pub const BodySpool = struct {
     pub fn readAll(self: *const BodySpool, gpa: std.mem.Allocator) ![]u8 {
         const result = try gpa.alloc(u8, self.size);
         errdefer gpa.free(result);
-        try posix.lseek_SET(self.fd, 0);
+        try compat.lseek_SET(self.fd, 0);
         var offset: usize = 0;
         while (offset < result.len) {
-            const n = try posix.pread(self.fd, result[offset..], offset);
+            const n = try compat.pread(self.fd, result[offset..], offset);
             if (n == 0) return error.UnexpectedEndOfFile;
             offset += n;
         }
@@ -39,7 +40,7 @@ pub const BodySpool = struct {
     }
 
     pub fn deinit(self: *BodySpool) void {
-        posix.close(self.fd);
+        compat.close(self.fd);
         self.* = undefined;
     }
 };

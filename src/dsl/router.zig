@@ -253,7 +253,7 @@ pub const Balance = enum {
 pub const Upstream = struct {
     host: []const u8,
     port: u16,
-    sockaddr: std.posix.sockaddr = .{ .family = 0, .data = [_]u8{0} ** 14 },
+    sockaddr: std.posix.sockaddr = .{ .family = 0, .data = @as([14]u8, @splat(@as(u8, 0))) },
 
     /// Build the kernel sockaddr for an IPv4 host literal ("127.0.0.1").
     /// Works at comptime (struct-literal configs) and at runtime (JSON).
@@ -270,7 +270,7 @@ pub const Upstream = struct {
         if (i != 4) return null;
         var addr: std.posix.sockaddr = .{
             .family = std.posix.AF.INET,
-            .data = [_]u8{0} ** 14,
+            .data = @as([14]u8, @splat(@as(u8, 0))),
         };
         std.mem.writeInt(u16, addr.data[0..2], port, .big);
         std.mem.writeInt(u32, addr.data[2..6], std.mem.readInt(u32, &octets, .big), .big);
@@ -564,7 +564,7 @@ pub fn trieMatch(trie: *const Trie, target: []const u8) ?u32 {
 /// whole match; `count` = number of populated ranges.
 pub const MatchCaps = struct {
     subject: []const u8,
-    ranges: [9]CaptureRange = [_]CaptureRange{.{ .start = 0, .end = 0 }} ** 9,
+    ranges: [9]CaptureRange = @as([9]CaptureRange, @splat(@as(CaptureRange, .{ .start = 0, .end = 0 }))),
     count: u8 = 0,
 };
 

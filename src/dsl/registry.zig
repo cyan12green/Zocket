@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const phase_mod = @import("phase.zig");
 const router = @import("router.zig");
 const http_parser = @import("../http/parser.zig");
@@ -172,24 +173,24 @@ pub const Context = struct {
     limits: ?*const limits_mod.Limits = null,
     /// Regex capture ranges into `capture_subject` (decoded target,
     /// arena-stable) — M-D. Index 0 = whole match; 1..9 = groups.
-    captures: [9]CaptureRange = [_]CaptureRange{.{ .start = 0, .end = 0 }} ** 9,
+    captures: [9]CaptureRange = @as([9]CaptureRange, @splat(@as(CaptureRange, .{ .start = 0, .end = 0 }))),
     capture_count: u8 = 0,
     capture_subject: []const u8 = "",
     /// Lazy-rendered user-variable slots (set $var), slices into req.arena.
-    user_slots: [max_user_vars]?[]const u8 = .{null} ** max_user_vars,
+    user_slots: [max_user_vars]?[]const u8 = @as([max_user_vars]?[]const u8, @splat(@as(?[]const u8, null))),
     /// Named log formats (config `log_format`); the access_log module reads
     /// the route's `log_format` index into this table. Null in tests and
     /// module-level invocation (the module falls back to `combined`).
     formats: ?[]const LogFormat = null,
     /// Per-request start instant for `$request_time`.
-    started: std.time.Instant = undefined,
+    started: compat.Instant = undefined,
     /// Monotonic request timestamp in ns (reactor clock; 0 when unset, e.g.
     /// unit tests set it explicitly). Rate buckets and LB timing read this.
     now_ns: u64 = 0,
     /// Named per-module request-state slots, keyed by registry index
     /// (compile-time checked via `state`/`setState`). Each module owns its
     /// slot for the duration of one walk — no cross-module collisions.
-    module_states: [max_module_states]?*anyopaque = [_]?*anyopaque{null} ** max_module_states,
+    module_states: [max_module_states]?*anyopaque = @as([max_module_states]?*anyopaque, @splat(@as(?*anyopaque, null))),
     /// .async payload: upstream handle parked for reactor registration.
     async_handle: ?*const IoHandle = null,
     /// Legacy raw-fd mirror of async_handle (reactor fast path).

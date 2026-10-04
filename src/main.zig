@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const zocket = @import("zocket");
+const compat = zocket.compat;
 const build_options = @import("build_options");
 const shmem_mod = zocket.dsl.shmem;
 
@@ -164,25 +165,72 @@ fn runServer(
         break :blk ports_buf[0..count];
     };
 
+    // Per-port server subgroups: each multireactor serves only the
+    // servers listening on its port (nginx: the first block on a listen
+    // socket is that socket's default). Host selection runs within the
+    // subgroup, so a request can never land on another port's routes.
+    // Shallow copies sharing the parent's route tables and stats; the
+    // parent group owns all deinit.
+    var sub_servers: [16][16]zocket.runtime.server.Server = undefined;
+    var subgroups: [16]zocket.runtime.server.ServerGroup = undefined;
+    const global_listen = if (embedded) |cfg| cfg.listen_port else null;
+    for (ports, 0..) |p, pi| {
+        var nsub: usize = 0;
+        for (http_group.servers) |*srv| {
+            // --port overrides every block (legacy single-reactor path).
+            if (opts.port_set) {
+                sub_servers[pi][nsub] = srv.*;
+                nsub += 1;
+                continue;
+            }
+            const ep = srv.cfg.listen_port orelse global_listen orelse effective_port;
+            if (ep == p) {
+                sub_servers[pi][nsub] = srv.*;
+                nsub += 1;
+            }
+        }
+        if (nsub == 0) { // cannot happen (ports derive from servers); stay safe
+            sub_servers[pi][0] = http_group.servers[0];
+            nsub = 1;
+        }
+        subgroups[pi] = .{
+            .servers = sub_servers[pi][0..nsub],
+            .default_idx = 0,
+            .host_select = http_group.host_select,
+            .servers_owned = false,
+        };
+    }
+
     // Create one multireactor per unique port.
     var reactors_buf: [16]zocket.multireactor.Server = undefined;
     var reactors_len: usize = 0;
     errdefer for (reactors_buf[0..reactors_len]) |*r| r.deinit();
-    for (ports) |p| {
+    for (ports, 0..) |p, pi| {
+        const group = &subgroups[pi];
+        // ListenSpec from this port's own servers (IPv6/dual-stack when
+        // configured there); bare port otherwise. A dual-stack [::] spec
+        // covers v4-mapped clients too unless ipv6_only is set.
+        var first_spec: ?zocket.sockets.ListenSpec = null;
+        for (group.servers) |*srv| {
+            if (srv.cfg.listen_spec) |s| {
+                if (first_spec == null) first_spec = s;
+                if (s.family == .ipv6) {
+                    first_spec = s;
+                    break;
+                }
+            }
+        }
         // Use ListenSpec when available (IPv6 / address-bound), fall back to
         // the legacy port-only path for backward compatibility.
-        const spec: ?zocket.sockets.ListenSpec = if (embedded) |cfg|
-            if (cfg.listen_spec) |s| s else .{ .port = p }
-        else
-            .{ .port = p };
+        const spec: ?zocket.sockets.ListenSpec = if (first_spec) |s| s else .{ .port = p };
         if (spec) |s| {
             reactors_buf[reactors_len] = try zocket.multireactor.Server.initWithThreadsAndSpec(
                 allocator,
                 s,
                 n,
                 opts.mode,
-                &http_group.servers[0],
-                &http_group,
+                &group.servers[0],
+                group,
                 opts.idle_timeout,
             );
         } else {
@@ -191,8 +239,8 @@ fn runServer(
                 p,
                 n,
                 opts.mode,
-                &http_group.servers[0],
-                &http_group,
+                &group.servers[0],
+                group,
                 opts.idle_timeout,
             );
         }
@@ -246,11 +294,11 @@ fn runServer(
 }
 
 fn writePidfile(path: []const u8, pid: posix_pid_t) !void {
-    const f = try std.fs.cwd().createFile(path, .{});
-    defer f.close();
+    const f = try compat.createFile(path);
+    defer compat.close(f);
     var buf: [32]u8 = undefined;
     const s = try std.fmt.bufPrint(&buf, "{d}\n", .{pid});
-    try f.writeAll(s);
+    try compat.writeAll(f, s);
 }
 
 const posix_pid_t = std.posix.pid_t;
@@ -258,7 +306,7 @@ const posix_pid_t = std.posix.pid_t;
 fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u8) !void {
     // Readiness handshake: the child writes 'R' once the listeners are
     // bound; the parent exits 0 on 'R', non-zero on EOF (child died).
-    const fds = try std.posix.pipe();
+    const fds = try compat.pipe();
     // State for --reload-hard, built before the fork (the child inherits it
     // and writes it out at ready time). The config path is normalized to
     // project-root-relative: the comptime embed (`@embedFile`) resolves
@@ -268,7 +316,7 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
     if (project_root) |root| {
         if (recorded_config) |p| {
             if (std.fs.path.isAbsolute(p)) {
-                recorded_config = std.fs.path.relative(allocator, root, p) catch p;
+                recorded_config = compat.relativePath(allocator, root, p) catch p;
             }
         }
     }
@@ -288,19 +336,19 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
         .embedded = embedded_cfg != null,
         .project_root = project_root,
     };
-    const pid = try std.posix.fork();
+    const pid = try compat.fork();
     if (pid == 0) {
         // ---- child: detach, then run the server ----
-        std.posix.close(fds[0]);
-        _ = std.posix.setsid() catch 0;
+        compat.close(fds[0]);
+        _ = compat.setsid() catch 0;
         // stdio to /dev/null: the daemon logs nowhere (a logfile flag could
         // redirect here later).
-        const devnull = std.posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch -1;
+        const devnull = compat.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch -1;
         if (devnull >= 0) {
-            std.posix.dup2(devnull, 0) catch {};
-            std.posix.dup2(devnull, 1) catch {};
-            std.posix.dup2(devnull, 2) catch {};
-            if (devnull > 2) std.posix.close(devnull);
+            compat.dup2(devnull, 0) catch {};
+            compat.dup2(devnull, 1) catch {};
+            compat.dup2(devnull, 2) catch {};
+            if (devnull > 2) compat.close(devnull);
         }
         const Daemon = struct {
             pipe_fd: std.posix.fd_t,
@@ -320,14 +368,14 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
                 writeStateFile(std.heap.page_allocator, d.pidfile, state_with_zones) catch {};
                 if (state_with_zones.zone_fds.len > 0)
                     std.heap.page_allocator.free(state_with_zones.zone_fds);
-                _ = std.posix.write(d.pipe_fd, "R") catch {};
+                _ = compat.write(d.pipe_fd, "R") catch {};
             }
         };
         var daemon = Daemon{
             .pipe_fd = fds[1],
             .pidfile = pidfile,
             .state = state,
-            .pid = std.posix.getpid(),
+            .pid = compat.getpid(),
         };
         // On --reload-hard the new daemon inherits memfd fds from the old
         // one (memfd_create has no CLOEXEC). Adopt them before module
@@ -337,21 +385,22 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
         if (inherited) |*s| {
             shmem_mod.adoptInherited(std.heap.page_allocator, s.zone_fds) catch {};
         }
-        runServer(allocator, opts, &Daemon.ready, &daemon) catch {
-            std.posix.exit(1);
+        runServer(allocator, opts, &Daemon.ready, &daemon) catch |e| {
+            std.debug.print("zocket: server error: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
         };
         // Graceful stop (--stop / SIGTERM): remove the pid + state files,
         // but only while we still own them — a --reload-hard swap may have
         // already overwritten them with the new daemon's (same path).
         _ = cleanupOwnedFiles(allocator, pidfile);
-        std.posix.exit(0);
+        std.process.exit(0);
     }
 
     // ---- parent: wait for readiness ----
-    std.posix.close(fds[1]);
+    compat.close(fds[1]);
     var b: [1]u8 = undefined;
     const n = std.posix.read(fds[0], &b) catch 0;
-    std.posix.close(fds[0]);
+    compat.close(fds[0]);
     if (n == 1 and b[0] == 'R') {
         std.debug.print("zocket started (pid {d}, pidfile {s})\n", .{ pid, pidfile });
         return;
@@ -370,7 +419,7 @@ fn processAlive(pid: posix_pid_t) bool {
 }
 
 fn readPidfile(allocator: std.mem.Allocator, pidfile: []const u8) !posix_pid_t {
-    const data = try std.fs.cwd().readFileAlloc(pidfile, allocator, .limited(64));
+    const data = try compat.readFileAlloc(allocator, pidfile, 64);
     defer allocator.free(data);
     return std.fmt.parseInt(posix_pid_t, std.mem.trim(u8, data, " \t\r\n"), 10);
 }
@@ -381,10 +430,10 @@ fn readPidfile(allocator: std.mem.Allocator, pidfile: []const u8) !posix_pid_t {
 /// wrote the same pidfile path, and must not delete the new daemon's files.
 fn cleanupOwnedFiles(allocator: std.mem.Allocator, pidfile: []const u8) bool {
     if (readPidfile(allocator, pidfile)) |pf| {
-        if (pf == std.posix.getpid()) {
-            std.fs.cwd().deleteFile(pidfile) catch {};
+        if (pf == compat.getpid()) {
+            compat.deleteFile(pidfile) catch {};
             if (stateFilePath(allocator, pidfile)) |sp| {
-                std.fs.cwd().deleteFile(sp) catch {};
+                compat.deleteFile(sp) catch {};
                 allocator.free(sp);
             } else |_| {}
             return true;
@@ -397,8 +446,10 @@ test "daemon cleanup only removes pid/state files it still owns (reload-hard rac
     const allocator = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_abs = try tmp.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_abs);
+    var rel_buf: [256]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = try compat.realpath(rel, &abs_buf);
     const pidfile = try std.fmt.allocPrint(allocator, "{s}/pid", .{tmp_abs});
     defer allocator.free(pidfile);
     // State file next to the pidfile.
@@ -406,25 +457,25 @@ test "daemon cleanup only removes pid/state files it still owns (reload-hard rac
     defer allocator.free(state_path);
 
     // Case 1: the pidfile names us -> cleanup removes pid + state files.
-    try writePidfile(pidfile, std.posix.getpid());
+    try writePidfile(pidfile, compat.getpid());
     try writeStateFile(allocator, pidfile, .{});
     try testing.expect(cleanupOwnedFiles(allocator, pidfile));
-    try testing.expectError(error.FileNotFound, std.fs.cwd().access(pidfile, .{}));
-    try testing.expectError(error.FileNotFound, std.fs.cwd().access(state_path, .{}));
+    try testing.expectError(error.FileNotFound, compat.statFile(pidfile));
+    try testing.expectError(error.FileNotFound, compat.statFile(state_path));
 
     // Case 2: a reload-hard swap already overwrote the pidfile with the NEW
     // daemon's pid -> the exiting old daemon must leave both files alone.
-    try writePidfile(pidfile, std.posix.getpid() + 1);
+    try writePidfile(pidfile, compat.getpid() + 1);
     try writeStateFile(allocator, pidfile, .{});
     try testing.expect(!cleanupOwnedFiles(allocator, pidfile));
-    try std.fs.cwd().access(pidfile, .{});
-    try std.fs.cwd().access(state_path, .{});
+    _ = try compat.statFile(pidfile);
+    _ = try compat.statFile(state_path);
     // The new daemon's files survive the old daemon's exit.
-    const data = try std.fs.cwd().readFileAlloc(pidfile, allocator, .limited(64));
+    const data = try compat.readFileAlloc(allocator, pidfile, 64);
     defer allocator.free(data);
     // The pid file still names the NEW daemon (our pid + 1).
     const new_pid = try std.fmt.parseInt(posix_pid_t, std.mem.trim(u8, data, " \t\r\n"), 10);
-    try testing.expectEqual(std.posix.getpid() + 1, new_pid);
+    try testing.expectEqual(compat.getpid() + 1, new_pid);
 }
 
 fn stopDaemon(allocator: std.mem.Allocator, pidfile: []const u8) !void {
@@ -434,9 +485,9 @@ fn stopDaemon(allocator: std.mem.Allocator, pidfile: []const u8) !void {
     };
     if (!processAlive(pid)) {
         // Stale pid file: the daemon is gone.
-        std.fs.cwd().deleteFile(pidfile) catch {};
+        compat.deleteFile(pidfile) catch {};
         if (stateFilePath(allocator, pidfile)) |sp| {
-            std.fs.cwd().deleteFile(sp) catch {};
+            compat.deleteFile(sp) catch {};
             allocator.free(sp);
         } else |_| {}
         std.debug.print("not running (stale pid file {s} removed)\n", .{pidfile});
@@ -447,15 +498,15 @@ fn stopDaemon(allocator: std.mem.Allocator, pidfile: []const u8) !void {
     // drain cap is 30 s, so allow up to 35 s).
     var exited = false;
     for (0..700) |_| {
-        std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+        compat.nanosleep(0, 50 * std.time.ns_per_ms);
         if (!processAlive(pid)) {
             exited = true;
             break;
         }
     }
-    std.fs.cwd().deleteFile(pidfile) catch {};
+    compat.deleteFile(pidfile) catch {};
     if (stateFilePath(allocator, pidfile)) |sp| {
-        std.fs.cwd().deleteFile(sp) catch {};
+        compat.deleteFile(sp) catch {};
         allocator.free(sp);
     } else |_| {}
     if (exited) {
@@ -516,9 +567,9 @@ fn writeStateFile(allocator: std.mem.Allocator, pidfile: []const u8, state: Stat
     defer allocator.free(path);
     const json = try std.json.Stringify.valueAlloc(allocator, state, .{});
     defer allocator.free(json);
-    const f = try std.fs.cwd().createFile(path, .{});
-    defer f.close();
-    try f.writeAll(json);
+    const f = try compat.createFile(path);
+    defer compat.close(f);
+    try compat.writeAll(f, json);
 }
 
 /// Read the state file; strings are duped into `allocator` (free with
@@ -526,7 +577,7 @@ fn writeStateFile(allocator: std.mem.Allocator, pidfile: []const u8, state: Stat
 fn readStateFile(allocator: std.mem.Allocator, pidfile: []const u8) !StateFile {
     const path = try stateFilePath(allocator, pidfile);
     defer allocator.free(path);
-    const json = try std.fs.cwd().readFileAlloc(path, allocator, .limited(8192));
+    const json = try compat.readFileAlloc(allocator, path, 8192);
     defer allocator.free(json);
     var parsed = try std.json.parseFromSlice(StateFile, allocator, json, .{});
     defer parsed.deinit();
@@ -565,12 +616,12 @@ fn freeStateFile(allocator: std.mem.Allocator, state: *StateFile) void {
 /// is impossible.
 fn resolveProjectRoot(allocator: std.mem.Allocator) ?[]const u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = std.posix.readlink("/proc/self/exe", &buf) catch return null;
+    const exe = compat.readlink("/proc/self/exe", &buf) catch return null;
     var dir = std.fs.path.dirname(exe) orelse return null;
     while (true) {
         const marker = std.fs.path.join(allocator, &.{ dir, "build.zig.zon" }) catch return null;
         defer allocator.free(marker);
-        if (std.fs.cwd().access(marker, .{})) |_| {
+        if (compat.statFile(marker)) |_| {
             return allocator.dupe(u8, dir) catch null;
         } else |_| {}
         dir = std.fs.path.dirname(dir) orelse return null;
@@ -582,17 +633,21 @@ fn resolveProjectRoot(allocator: std.mem.Allocator) ?[]const u8 {
 /// from PATH; compile errors go to the terminal). The config is validated
 /// by the comptime JSON parser: compile errors are config errors and abort
 /// the reload — the old daemon keeps serving untouched.
-fn rebuild(allocator: std.mem.Allocator, project_root: []const u8, config_path: []const u8, optimize: []const u8) !void {
+fn rebuild(allocator: std.mem.Allocator, project_root: []const u8, config_path: []const u8, optimize: []const u8, environ: std.process.Environ) !void {
     const opt_flag = try std.fmt.allocPrint(allocator, "-Doptimize={s}", .{optimize});
     defer allocator.free(opt_flag);
     const cfg_flag = try std.fmt.allocPrint(allocator, "-Dconfig={s}", .{config_path});
     defer allocator.free(cfg_flag);
     const argv = [_][]const u8{ "zig", "build", opt_flag, cfg_flag };
-    var child = std.process.Child.init(&argv, allocator);
-    child.cwd = project_root;
-    const term = try child.spawnAndWait();
+    // The Io carries the real process environment: with an empty environ
+    // the child would inherit no PATH and `zig` would not resolve.
+    var threaded = std.Io.Threaded.init(allocator, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var child = try std.process.spawn(io, .{ .argv = &argv, .cwd = .{ .path = project_root } });
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.RebuildFailed;
         },
         else => return error.RebuildFailed,
@@ -605,7 +660,7 @@ fn rebuild(allocator: std.mem.Allocator, project_root: []const u8, config_path: 
 /// finishes its connections within the 30 s cap) and exits. Zero downtime
 /// for new connections: both daemons bind the port via SO_REUSEPORT while
 /// the old one drains. Invalid configs abort at compile time.
-fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u8) !void {
+fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u8, environ: std.process.Environ) !void {
     _ = opts;
     const old_pid = readPidfile(allocator, pidfile) catch {
         std.debug.print("zocket: no pid file at {s} — nothing to reload\n", .{pidfile});
@@ -634,7 +689,7 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
         return;
     };
     if (std.fs.path.isAbsolute(config_path)) {
-        const rel = std.fs.path.relative(allocator, project_root, config_path) catch config_path;
+        const rel = compat.relativePath(allocator, project_root, config_path) catch config_path;
         if (std.fs.path.isAbsolute(rel) or std.mem.startsWith(u8, rel, "../")) {
             std.debug.print("zocket: config {s} lies outside the project tree ({s}) — a comptime embed cannot reach it\n", .{ config_path, project_root });
             return;
@@ -643,7 +698,7 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
     }
 
     std.debug.print("zocket: rebuilding with -Dconfig={s} (config validated at compile time)...\n", .{config_path});
-    rebuild(allocator, project_root, config_path, state.optimize) catch |e| {
+    rebuild(allocator, project_root, config_path, state.optimize, environ) catch |e| {
         std.debug.print("zocket: rebuild failed ({s}) — old daemon untouched\n", .{@errorName(e)});
         std.process.exit(1);
     };
@@ -686,10 +741,13 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
     } else {
         try argv.append(allocator, if (std.mem.eql(u8, state.mode, "echo")) "--echo" else "--http");
     }
-    var new_child = std.process.Child.init(argv.items, allocator);
-    const term = try new_child.spawnAndWait();
+    var threaded = std.Io.Threaded.init(allocator, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var new_child = try std.process.spawn(io, .{ .argv = argv.items });
+    const term = try new_child.wait(io);
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.NewDaemonFailed;
         },
         else => return error.NewDaemonFailed,
@@ -704,7 +762,7 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
     };
     var exited = false;
     for (0..800) |_| {
-        std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+        compat.nanosleep(0, 50 * std.time.ns_per_ms);
         if (!processAlive(old_pid)) {
             exited = true;
             break;
@@ -717,7 +775,7 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
     }
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = std.heap.page_allocator;
 
     var opts = ServerOpts{};
@@ -730,7 +788,7 @@ pub fn main() !void {
     var do_status = false;
     var do_reload_hard = false;
 
-    var args = std.process.args();
+    var args = init.args.iterate();
     var arg_index: usize = 0;
     while (args.next()) |arg| {
         arg_index += 1;
@@ -805,7 +863,7 @@ pub fn main() !void {
         return;
     }
     if (do_reload_hard) {
-        try hardReload(allocator, opts, pidfile);
+        try hardReload(allocator, opts, pidfile, init.environ);
         return;
     }
     if (do_start) {

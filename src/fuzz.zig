@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("./compat.zig");
 const parser = @import("http/parser.zig");
 const hpack = @import("http2/hpack.zig");
 const session = @import("http2/session.zig");
@@ -298,12 +299,12 @@ pub fn fuzzReactor(allocator: std.mem.Allocator, prng: *Prng, iterations: usize)
         r.join();
     }
 
-    const pair = std.posix.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch return;
-    defer std.posix.close(pair[0]);
+    const pair = compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch return;
+    defer compat.close(pair[0]);
     sockets.setNonBlock(pair[0]) catch {};
     sockets.setNonBlock(pair[1]) catch {};
     const conn = connection.Connection.create(allocator, pair[1]) catch {
-        std.posix.close(pair[1]);
+        compat.close(pair[1]);
         return;
     };
     r.attach(conn);
@@ -322,9 +323,9 @@ pub fn fuzzReactor(allocator: std.mem.Allocator, prng: *Prng, iterations: usize)
         var off: usize = 0;
         while (off < slice.len) {
             const chunk = @min(slice.len - off, prng.range(1, 128));
-            _ = std.posix.write(pair[0], slice[off .. off + chunk]) catch {};
+            _ = compat.write(pair[0], slice[off .. off + chunk]) catch {};
             off += chunk;
-            std.posix.nanosleep(0, 10 * std.time.ns_per_us);
+            compat.nanosleep(0, 10 * std.time.ns_per_us);
         }
         // Drain whatever came back so the socket buffer never deadlocks.
         var drain: [4096]u8 = undefined;
@@ -334,8 +335,8 @@ pub fn fuzzReactor(allocator: std.mem.Allocator, prng: *Prng, iterations: usize)
         }
         // Occasionally a real HTTP/1 request to exercise the happy path.
         if (prng.range(0, 9) == 0) {
-            _ = std.posix.write(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n") catch {};
-            std.posix.nanosleep(0, 50 * std.time.ns_per_us);
+            _ = compat.write(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n") catch {};
+            compat.nanosleep(0, 50 * std.time.ns_per_us);
             while (true) {
                 const n = std.posix.read(pair[0], &drain) catch break;
                 if (n <= 0) break;

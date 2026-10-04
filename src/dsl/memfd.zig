@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -8,7 +9,7 @@ const linux = std.os.linux;
 /// passes through to the child process on exec.
 pub fn create(name: []const u8, size: usize) !posix.fd_t {
     const fd = try posix.memfd_create(name, 0);
-    try posix.ftruncate(fd, @intCast(size));
+    try compat.ftruncate(fd, @intCast(size));
     return fd;
 }
 
@@ -19,7 +20,7 @@ pub fn map(fd: posix.fd_t, size: usize) ![]align(std.heap.page_size_min) u8 {
     return try posix.mmap(
         null,
         size,
-        posix.PROT.READ | posix.PROT.WRITE,
+        .{ .READ = true, .WRITE = true },
         posix.MAP{ .TYPE = .SHARED },
         fd,
         0,
@@ -35,7 +36,7 @@ pub fn inheritAndMap(fd: posix.fd_t, size: usize) ![]align(std.heap.page_size_mi
 test "memfd create and map round-trips" {
     const size = std.heap.page_size_min;
     const fd = try create("test-zone", size);
-    defer posix.close(fd);
+    defer compat.close(fd);
 
     const region = try map(fd, size);
     defer posix.munmap(region);

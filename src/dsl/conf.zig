@@ -479,10 +479,12 @@ const Builder = struct {
     server_seen: bool = false,
     /// Per-server state: accumulated across multiple server blocks.
     server_count: usize = 0,
-    server_listen_ports: [max_servers]?u16 = [_]?u16{null} ** max_servers,
-    server_listen_specs: [max_servers]?sockets_mod.ListenSpec = [_]?sockets_mod.ListenSpec{null} ** max_servers,
-    server_names: [max_servers]?Str = [_]?Str{null} ** max_servers,
-    server_routes_start: [max_servers]usize = [_]usize{0} ** max_servers,
+    server_listen_ports: [max_servers]?u16 = @as([max_servers]?u16, @splat(@as(?u16, null))),
+    server_listen_specs: [max_servers]?sockets_mod.ListenSpec = @as([max_servers]?sockets_mod.ListenSpec, @splat(@as(?sockets_mod.ListenSpec, null))),
+    server_name_pool: ct_pool.CtPool(Str, 64) = .{},
+    server_name_starts: [max_servers]usize = @as([max_servers]usize, @splat(@as(usize, 0))),
+    server_name_lens: [max_servers]usize = @as([max_servers]usize, @splat(@as(usize, 0))),
+    server_routes_start: [max_servers]usize = @as([max_servers]usize, @splat(@as(usize, 0))),
     /// Current server index being parsed (incremented on each `server {}`).
     current_server: usize = 0,
     /// Parse cost in §9 units (recomputed from the built Config at the end).
@@ -502,6 +504,29 @@ fn ensureModuleBound(b: *Builder, spec: *LocationSpec, phase: Phase, comptime mo
     if (spec.modules_len == 0) spec.modules_start = b.modules.len;
     _ = b.modules.create(.{ .phase = phase, .module = module_name });
     spec.modules_len += 1;
+}
+
+/// Move an already-bound module before another bound module within one
+/// location's bindings (stable bubble of a single entry). Used where
+/// declaration order is load-bearing but must not silently break the
+/// feature: the proxy_cache lookup has to run before proxy (a HIT
+/// short-circuits upstream contact; a MISS passes through), no matter
+/// which directive the user wrote first.
+fn moveModuleBefore(b: *Builder, spec: *LocationSpec, comptime first: []const u8, comptime second: []const u8) void {
+    const slice = b.modules.items[spec.modules_start..][0..spec.modules_len];
+    var fi: ?usize = null;
+    var si: ?usize = null;
+    for (slice, 0..) |mb, i| {
+        if (std.mem.eql(u8, mb.module, first)) fi = i;
+        if (std.mem.eql(u8, mb.module, second)) si = i;
+    }
+    const f = fi orelse return;
+    const s = si orelse return;
+    if (f < s) return; // already ordered
+    const tmp = slice[f];
+    var i: usize = f;
+    while (i > s) : (i -= 1) slice[i] = slice[i - 1];
+    slice[s] = tmp;
 }
 
 fn appendFilterBinding(b: *Builder, spec: *LocationSpec, fname: []const u8) void {
@@ -1139,6 +1164,9 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             if (spec.cache_enabled) {
                 ensureModuleBound(b, spec, .rewrite, "proxy_cache");
                 ensureFilterBound(b, spec, "proxy_cache_store");
+                // The lookup must run before proxy regardless of which
+                // directive came first (a HIT short-circuits upstream).
+                moveModuleBefore(b, spec, "proxy_cache", "proxy");
             }
             b.cost += 8;
         },
@@ -1415,7 +1443,10 @@ fn parseServer(lx: *Lexer, b: *Builder) void {
         }
         if (keyHash(dn) == H_server_name) {
             const name = lx.token() orelse lx.fail("server_name: expected a hostname");
-            b.server_names[b.current_server] = name;
+            const si = b.current_server;
+            if (b.server_name_lens[si] == 0) b.server_name_starts[si] = b.server_name_pool.len;
+            _ = b.server_name_pool.create(name);
+            b.server_name_lens[si] += 1;
             lx.expectTerminator("server_name");
             continue;
         }
@@ -1791,6 +1822,17 @@ fn build(b: *const Builder) Config {
 
     // Build the multi-server spec array. Each server block gets its own
     // listen port, server_name, and route range within the flat routes array.
+    const NameTable = struct { items: [64][]const u8, len: usize };
+    const name_table: NameTable = comptime blk: {
+        var items: [64][]const u8 = undefined;
+        var pos: usize = 0;
+        for (b.server_name_pool.freeze()) |s| {
+            items[pos] = resolve(s, strings);
+            pos += 1;
+        }
+        break :blk .{ .items = items, .len = pos };
+    };
+
     const Servers = struct { items: [max_servers]Config.ServerSpec, len: usize };
     const servers_built: Servers = comptime blk: {
         var items: [max_servers]Config.ServerSpec = undefined;
@@ -1799,10 +1841,12 @@ fn build(b: *const Builder) Config {
         while (i < b.server_count) : (i += 1) {
             const start = b.server_routes_start[i];
             const end = if (i + 1 < b.server_count) b.server_routes_start[i + 1] else routes_built.len;
+            const ns = b.server_name_starts[i];
+            const nl = b.server_name_lens[i];
             items[len] = .{
                 .listen_port = b.server_listen_ports[i] orelse b.listen_port,
                 .listen_spec = b.server_listen_specs[i] orelse b.listen_spec,
-                .server_name = if (b.server_names[i]) |n| resolve(n, strings) else null,
+                .server_names = name_table.items[ns..][0..nl],
                 .routes_start = start,
                 .routes_len = end - start,
             };
@@ -1816,15 +1860,16 @@ fn build(b: *const Builder) Config {
     // exact-match scan (comptime-unrolled for small server counts) followed
     // by wildcard suffix matching (*.domain patterns).
     const select_fn: ?Config.ServerSelectFn = if (servers_built.len > 1) comptime blk: {
-        // Collect exact names and wildcard patterns at comptime.
+        // Collect exact names and wildcard patterns at comptime (all
+        // server_name directives, in declaration order).
         const SName = struct { name: []const u8, idx: u8 };
         const SWild = struct { suffix: []const u8, idx: u8 };
-        var exact_arr: [max_servers]SName = [_]SName{.{ .name = "", .idx = 0 }} ** max_servers;
-        var wild_arr: [max_servers]SWild = [_]SWild{.{ .suffix = "", .idx = 0 }} ** max_servers;
+        var exact_arr: [64]SName = @as([64]SName, @splat(@as(SName, .{ .name = "", .idx = 0 })));
+        var wild_arr: [64]SWild = @as([64]SWild, @splat(@as(SWild, .{ .suffix = "", .idx = 0 })));
         var exact_n: usize = 0;
         var wild_n: usize = 0;
         for (servers_built.items[0..servers_built.len], 0..) |spec, i| {
-            if (spec.server_name) |name| {
+            for (spec.server_names) |name| {
                 if (name.len > 2 and name[0] == '*' and name[1] == '.') {
                     wild_arr[wild_n] = .{ .suffix = name[1..], .idx = @intCast(i) };
                     wild_n += 1;
@@ -1844,12 +1889,12 @@ fn build(b: *const Builder) Config {
                 // Strip port: "example.com:8080" -> "example.com"
                 const h = if (std.mem.lastIndexOfScalar(u8, host, ':')) |pos| host[0..pos] else host;
                 // Exact match: comptime-unrolled scan over known names.
-                inline for (0..max_servers) |i| {
+                inline for (0..64) |i| {
                     if (i >= exact_count) break;
                     if (std.mem.eql(u8, h, exact_names[i].name)) return exact_names[i].idx;
                 }
                 // Wildcard suffix match (comptime-unrolled).
-                inline for (0..max_servers) |i| {
+                inline for (0..64) |i| {
                     if (i >= wildcard_count) break;
                     if (h.len > wildcard_pats[i].suffix.len and std.mem.endsWith(u8, h, wildcard_pats[i].suffix)) {
                         return wildcard_pats[i].idx;
@@ -2073,6 +2118,29 @@ test "conf: filters inherit http > server > location all-or-nothing" {
     );
     try testing.expectEqual(@as(usize, 1), cfg2.routes[0].filters.len);
     try testing.expectEqualStrings("gzip", cfg2.routes[0].filters[0].module);
+}
+
+test "conf: proxy_cache lookup orders before proxy whatever the declaration order" {
+    // Declared proxy-first: the lookup must still come first or a HIT
+    // could never short-circuit upstream contact.
+    const cfg = parse(
+        \\server {
+        \\    location /a {
+        \\        rewrite proxy;
+        \\        proxy_pass 127.0.0.1:9000;
+        \\        proxy_cache on;
+        \\    }
+        \\}
+    );
+    const mods = cfg.routes[0].modules;
+    var cache_idx: ?usize = null;
+    var proxy_idx: ?usize = null;
+    for (mods, 0..) |m, i| {
+        if (std.mem.eql(u8, m.module, "proxy_cache")) cache_idx = i;
+        if (std.mem.eql(u8, m.module, "proxy")) proxy_idx = i;
+    }
+    try testing.expect(cache_idx != null and proxy_idx != null);
+    try testing.expect(cache_idx.? < proxy_idx.?);
 }
 
 test "conf: server-level header ops are inherited by bare locations" {
@@ -2364,14 +2432,33 @@ test "conf: multiple server blocks with server_name and listen" {
     try testing.expectEqual(@as(usize, 2), cfg.servers.len);
     // First server: port 80, example.com, 1 route starting at 0.
     try testing.expectEqual(@as(?u16, 80), cfg.servers[0].listen_port);
-    try testing.expectEqualStrings("example.com", cfg.servers[0].server_name.?);
+    try testing.expectEqual(@as(usize, 1), cfg.servers[0].server_names.len);
+    try testing.expectEqualStrings("example.com", cfg.servers[0].server_names[0]);
     try testing.expectEqual(@as(usize, 0), cfg.servers[0].routes_start);
     try testing.expectEqual(@as(usize, 1), cfg.servers[0].routes_len);
     // Second server: port 8080, api.example.com, 1 route starting at 1.
     try testing.expectEqual(@as(?u16, 8080), cfg.servers[1].listen_port);
-    try testing.expectEqualStrings("api.example.com", cfg.servers[1].server_name.?);
+    try testing.expectEqual(@as(usize, 1), cfg.servers[1].server_names.len);
+    try testing.expectEqualStrings("api.example.com", cfg.servers[1].server_names[0]);
     try testing.expectEqual(@as(usize, 1), cfg.servers[1].routes_start);
     try testing.expectEqual(@as(usize, 1), cfg.servers[1].routes_len);
+}
+
+test "conf: repeated server_name directives accumulate on one server" {
+    const cfg = parse(
+        \\server {
+        \\    listen 8080;
+        \\    server_name api.example.com;
+        \\    server_name *.api.example.com;
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 1), cfg.servers.len);
+    try testing.expectEqual(@as(usize, 2), cfg.servers[0].server_names.len);
+    try testing.expectEqualStrings("api.example.com", cfg.servers[0].server_names[0]);
+    try testing.expectEqualStrings("*.api.example.com", cfg.servers[0].server_names[1]);
 }
 
 test "conf: single server block with no server_name" {
@@ -2386,7 +2473,7 @@ test "conf: single server block with no server_name" {
     try testing.expectEqual(@as(usize, 1), cfg.routes.len);
     try testing.expectEqual(@as(usize, 1), cfg.servers.len);
     try testing.expectEqual(@as(?u16, 9000), cfg.servers[0].listen_port);
-    try testing.expect(cfg.servers[0].server_name == null);
+    try testing.expectEqual(@as(usize, 0), cfg.servers[0].server_names.len);
 }
 
 test "conf: listen with IPv6 bracket syntax" {

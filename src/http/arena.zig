@@ -214,8 +214,8 @@ test "arena spills into heap blocks and keeps slices stable" {
     const big = (a.alloc(default_size) orelse return error.SkipZigTest);
     @memset(big, 'b');
     const tail = (a.alloc(50) orelse return error.SkipZigTest);
-    try testing.expectEqualStrings(&[_]u8{'a'} ** 100, s1);
-    try testing.expectEqualStrings(&[_]u8{'b'} ** default_size, big);
+    try testing.expectEqualStrings(&@as([100]u8, @splat(@as(u8, 'a'))), s1);
+    try testing.expectEqualStrings(&@as([default_size]u8, @splat(@as(u8, 'b'))), big);
     try testing.expectEqual(@as(usize, 50), tail.len);
 }
 

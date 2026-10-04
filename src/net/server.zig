@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 const epoll = @import("epoll.zig");
@@ -10,8 +11,8 @@ const F_SETFL = 4;
 const O_NONBLOCK = 2048;
 
 fn setNonBlock(fd: posix.fd_t) !void {
-    const flags = try posix.fcntl(fd, F_GETFL, 0);
-    _ = try posix.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    const flags = try compat.fcntl(fd, F_GETFL, 0);
+    _ = try compat.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 pub const Server = struct {
@@ -44,7 +45,7 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.running = false;
         self.epoll.close();
-        posix.close(self.listener);
+        compat.close(self.listener);
         var iter = self.connections.valueIterator();
         while (iter.next()) |conn| {
             conn.*.destroy();

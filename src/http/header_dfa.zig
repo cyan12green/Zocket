@@ -23,7 +23,7 @@ pub const invalid_class: u8 = alphabet_width - 1;
 pub const no_state: u16 = 0xFFFF;
 
 pub const Node = struct {
-    next: [alphabet_width]u16 = [_]u16{no_state} ** alphabet_width,
+    next: [alphabet_width]u16 = @as([alphabet_width]u16, @splat(no_state)),
     /// Tag of the known name ending at this node (accept state); 0 when no
     /// known name ends here.
     tag: u16 = 0,

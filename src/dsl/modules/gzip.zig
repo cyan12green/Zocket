@@ -88,7 +88,7 @@ pub fn gzipCompressShared(ctx: *Context, input: []const u8) ![]const u8 {
         flate.Compress.Options.fastest,
     );
     try deflate_w.writer.writeAll(input);
-    try deflate_w.writer.flush();
+    try deflate_w.finish();
     const written = out.written();
     const copy = ctx.sharedAlloc(written.len) orelse return error.OutOfMemory;
     @memcpy(copy, written);
@@ -112,7 +112,7 @@ pub fn gzipCompress(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         flate.Compress.Options.fastest,
     );
     try deflate_w.writer.writeAll(input);
-    try deflate_w.writer.flush();
+    try deflate_w.finish();
     var owned = out.toArrayList();
     return owned.toOwnedSlice(allocator);
 }
@@ -154,7 +154,7 @@ fn parseAcceptRequest(allocator: std.mem.Allocator, accept: []const u8) !struct 
 
 test "gzip compresses a compressible body and round-trips" {
     const allocator = testing.allocator;
-    const body = "the quick brown fox jumps over the lazy dog. " ** 4;
+    const body = "the quick brown fox jumps over the lazy dog. " ++ "the quick brown fox jumps over the lazy dog. " ++ "the quick brown fox jumps over the lazy dog. " ++ "the quick brown fox jumps over the lazy dog. ";
 
     var ctx_state = try parseAcceptRequest(allocator, "gzip, br");
     defer ctx_state.req.deinit();
@@ -207,7 +207,7 @@ test "gzip skips tiny bodies, absent accept headers, 304s and non-shrinking bodi
         defer st.parser.deinit();
         defer st.buf.deinit(allocator);
         var resp = registry.Response.init(.ok);
-        resp.setBody("a body that is long enough to compress well " ** 2);
+        resp.setBody("a body that is long enough to compress well " ++ "a body that is long enough to compress well ");
         var ctx = Context{ .req = &st.req, .resp = &resp, .allocator = allocator };
         try testing.expectEqual(Action.pass, try run(&ctx));
         try testing.expect(!resp.body_owned);
@@ -219,7 +219,7 @@ test "gzip skips tiny bodies, absent accept headers, 304s and non-shrinking bodi
         defer st.parser.deinit();
         defer st.buf.deinit(allocator);
         var resp = registry.Response.init(.not_modified);
-        resp.setBody("a body that is long enough to compress well " ** 2);
+        resp.setBody("a body that is long enough to compress well " ++ "a body that is long enough to compress well ");
         var ctx = Context{ .req = &st.req, .resp = &resp, .allocator = allocator };
         try testing.expectEqual(Action.pass, try run(&ctx));
         try testing.expect(!resp.body_owned);

@@ -751,7 +751,7 @@ const HuffTrieNode = struct {
 const TrieBuild = struct { nodes: [1024]HuffTrieNode, len: usize };
 const trie_build: TrieBuild = blk: {
     @setEvalBranchQuota(1000000);
-    var nodes = [_]HuffTrieNode{.{}} ** 1024;
+    var nodes = @as([1024]HuffTrieNode, @splat(@as(HuffTrieNode, .{})));
     var count: usize = 1; // root at 0
     for (huffman_codes, 0..) |h, sym| {
         var node: usize = 0;

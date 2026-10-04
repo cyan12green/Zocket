@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../../compat.zig");
 const registry = @import("../registry.zig");
 const sockets = @import("../../net/sockets.zig");
 const router = @import("../router.zig");
@@ -126,7 +127,7 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
     // here at sync-driver cost; only real blocks park.
     var sent: usize = 0;
     while (sent < request.len) {
-        const n = std.posix.write(fd, request[sent..]) catch |e| switch (e) {
+        const n = compat.write(fd, request[sent..]) catch |e| switch (e) {
             error.WouldBlock => {
                 return parkRemainder(ctx, route, .{
                     .fd = fd,
@@ -222,7 +223,7 @@ const max_backends = 8;
 /// At 100 concurrent connections, this reduces pool misses dramatically.
 const pool_per_backend = 8;
 
-threadlocal var epoch: std.time.Instant = undefined;
+threadlocal var epoch: compat.Instant = undefined;
 threadlocal var epoch_set = false;
 
 /// Monotonic nanoseconds since this thread's first proxy use (the retry
@@ -234,10 +235,10 @@ pub fn currentNs() u64 {
 
 fn nowNs() u64 {
     if (!epoch_set) {
-        epoch = std.time.Instant.now() catch return 0;
+        epoch = compat.Instant.now() catch return 0;
         epoch_set = true;
     }
-    return (std.time.Instant.now() catch return 0).since(epoch);
+    return (compat.Instant.now() catch return 0).since(epoch);
 }
 /// Upstream sockets receive-timed out after this long (avoids hanging the
 /// reactor on a silent upstream).
@@ -253,9 +254,9 @@ const posix = std.posix;
 const posix_fd = std.posix.fd_t;
 
 // Per-reactor state (thread-local: each reactor owns its upstream sockets).
-threadlocal var pool: [max_backends][pool_per_backend]PoolEntry = [_][pool_per_backend]PoolEntry{[_]PoolEntry{.{}} ** pool_per_backend} ** max_backends;
-threadlocal var pool_lens: [max_backends]u32 = [_]u32{0} ** max_backends;
-threadlocal var active: [max_backends]u32 = [_]u32{0} ** max_backends;
+threadlocal var pool: [max_backends][pool_per_backend]PoolEntry = @as([max_backends][pool_per_backend]PoolEntry, @splat(@as([pool_per_backend]PoolEntry, @splat(@as(PoolEntry, .{})))));
+threadlocal var pool_lens: [max_backends]u32 = @as([max_backends]u32, @splat(@as(u32, 0)));
+threadlocal var active: [max_backends]u32 = @as([max_backends]u32, @splat(@as(u32, 0)));
 /// Per-backend liveness, SHARED across reactors (and with the active
 /// health-checker thread) via a shmem zone. Keyed by (route pointer,
 /// backend index); routes are compile-time immortal pointers.
@@ -281,7 +282,7 @@ fn backendKey(route: *const registry.Route, idx: usize) u64 {
 var probeFn: *const fn (up: *const router.Upstream, path: []const u8, timeout_s: u32) bool = tcpProbe;
 
 /// Registered health-checked routes (process-immortal route pointers).
-var hc_mutex: std.Thread.Mutex = .{};
+var hc_mutex: compat.Mutex = .{};
 var hc_routes: std.ArrayList(*const registry.Route) = .empty;
 var hc_thread_started: bool = false;
 
@@ -289,7 +290,7 @@ var hc_thread_started: bool = false;
 /// which also seeds the entry), then every request touches the *BackendState
 /// directly — zero locking on the hot path.
 threadlocal var hc_cached_route: ?*const registry.Route = null;
-threadlocal var hc_cached_slots: [max_backends]?*BackendState = [_]?*BackendState{null} ** max_backends;
+threadlocal var hc_cached_slots: [max_backends]?*BackendState = @as([max_backends]?*BackendState, @splat(@as(?*BackendState, null)));
 
 fn healthSlot(route: *const registry.Route, idx: usize) ?*BackendState {
     if (hc_cached_route != route) {
@@ -309,7 +310,7 @@ fn healthSlot(route: *const registry.Route, idx: usize) ?*BackendState {
 threadlocal var rr_counter: usize = 0;
 /// least_time: exponential weighted moving average of upstream response
 /// latency per backend, in ns (1/8 weight per sample).
-threadlocal var ewma_ns: [max_backends]u64 = [_]u64{0} ** max_backends;
+threadlocal var ewma_ns: [max_backends]u64 = @as([max_backends]u64, @splat(@as(u64, 0)));
 /// xorshift state for the random strategy.
 var rng_state: u64 = 0x9E3779B97F4A7C15;
 
@@ -646,16 +647,16 @@ fn ensureHealthChecker(route: *const registry.Route) void {
     t.detach();
 }
 
-var epoch_zero: std.time.Instant = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+var epoch_zero: compat.Instant = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
 
 fn healthThread() void {
     while (true) {
-        const t = std.time.Instant.now() catch {
-            std.posix.nanosleep(1, 0);
+        const t = compat.Instant.now() catch {
+            compat.nanosleep(1, 0);
             continue;
         };
         runHealthChecksOnce(t.since(epoch_zero));
-        std.posix.nanosleep(0, 250 * std.time.ns_per_ms);
+        compat.nanosleep(0, 250 * std.time.ns_per_ms);
     }
 }
 
@@ -670,17 +671,17 @@ fn tcpProbe(up: *const router.Upstream, path: []const u8, timeout_s: u32) bool {
     const req = std.fmt.bufPrint(&req_buf, "HEAD {s} HTTP/1.1\r\nHost: zocket-hc\r\nConnection: close\r\n\r\n", .{path}) catch return false;
     var sent: usize = 0;
     while (sent < req.len) {
-        sent += std.posix.write(fd, req[sent..]) catch return false;
+        sent += compat.write(fd, req[sent..]) catch return false;
     }
     var buf: [128]u8 = undefined;
     var got: usize = 0;
     const timeout_ns: u64 = @as(u64, if (timeout_s == 0) 1 else timeout_s) * std.time.ns_per_s;
-    const deadline = std.time.Instant.now() catch return false;
+    const deadline = compat.Instant.now() catch return false;
     while (got < 12) {
         const n = std.posix.read(fd, buf[got..]) catch return false;
         if (n == 0) break;
         got += n;
-        const now = std.time.Instant.now() catch return false;
+        const now = compat.Instant.now() catch return false;
         if (now.since(deadline) > timeout_ns) return false;
     }
     if (got < 12) return false;
@@ -766,10 +767,10 @@ fn connectUpstream(up: *const router.Upstream) !posix_fd {
     // Non-blocking + CLOEXEC: the connect completes under a bounded poll,
     // and every later read/write on this fd gets EAGAIN handling instead
     // of parking the reactor thread on a slow backend.
-    const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
+    const fd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
     errdefer posix_close(fd);
     sockets.setTcpNoDelay(fd);
-    std.posix.connect(fd, &up.sockaddr, 16) catch |e| switch (e) {
+    compat.connect(fd, &up.sockaddr, 16) catch |e| switch (e) {
         error.WouldBlock => {}, // EINPROGRESS: finish under poll below
         else => return e,
     };
@@ -777,7 +778,7 @@ fn connectUpstream(up: *const router.Upstream) !posix_fd {
     const ready = std.posix.poll(&pfds, upstream_connect_timeout_ms) catch return error.ConnectTimeout;
     if (ready == 0) return error.ConnectTimeout;
     var err_bytes: [4]u8 = undefined;
-    std.posix.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, &err_bytes) catch return error.ConnectFailed;
+    compat.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, &err_bytes) catch return error.ConnectFailed;
     if (std.mem.readInt(i32, &err_bytes, .little) != 0) return error.ConnectFailed;
     return fd;
 }
@@ -795,7 +796,7 @@ fn setRecvTimeout(fd: posix_fd) void {
 }
 
 fn posix_close(fd: posix_fd) void {
-    std.posix.close(fd);
+    compat.close(fd);
 }
 
 // ---- upstream request forwarding ----
@@ -806,7 +807,7 @@ fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream) 
     const req = try buildUpstreamRequest(ctx, up);
     var remaining = req;
     while (remaining.len > 0) {
-        const n = std.posix.write(fd, remaining) catch |e| switch (e) {
+        const n = compat.write(fd, remaining) catch |e| switch (e) {
             error.WouldBlock => {
                 var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
                 const ready = std.posix.poll(&pfds, upstream_connect_timeout_ms) catch return error.UpstreamWriteFailed;
@@ -1041,6 +1042,12 @@ pub const UpstreamReader = struct {
     headers: [max_upstream_headers]UpstreamHeader = undefined,
     header_count: usize = 0,
     body: []const u8 = &.{},
+    /// Retained parse progress across fills. The header block is parsed
+    /// exactly once: without this, a response split across segments would
+    /// re-parse already-consumed lines as a fresh status line (502) or
+    /// compact away the headers and stall on the body forever.
+    headers_complete: bool = false,
+    content_length: usize = 0,
 
     fn init() UpstreamReader {
         return .{};
@@ -1059,33 +1066,50 @@ pub const UpstreamReader = struct {
 
     /// Parse strictly from the buffer; error.Incomplete when more bytes are
     /// needed (caller fills and retries). Never touches the socket.
+    /// Idempotent on Incomplete: a retry re-parses from the same point
+    /// (pos/headers rewound), so split delivery converges instead of
+    /// corrupting the parse.
     pub fn tryParse(self: *UpstreamReader) !Parsed {
-        const status_line = self.lineFromBuffer() orelse return error.Incomplete;
-        var it = std.mem.tokenizeAny(u8, status_line, " ");
-        _ = it.next(); // HTTP/1.x
-        const code_tok = it.next() orelse return error.BadUpstreamResponse;
-        self.status = std.fmt.parseInt(u16, code_tok, 10) catch return error.BadUpstreamResponse;
-
-        while (true) {
-            const line = self.lineFromBuffer() orelse return error.Incomplete;
-            if (line.len == 0) break;
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadUpstreamResponse;
-            if (self.header_count >= max_upstream_headers) return error.BadUpstreamResponse;
-            self.headers[self.header_count] = .{
-                .name = std.mem.trim(u8, line[0..colon], " \t"),
-                .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
-            };
-            self.header_count += 1;
-        }
-
-        var content_length: usize = 0;
-        for (self.headers[0..self.header_count]) |h| {
-            if (http_parser.header_hasher.hash(h.name) == comptime http_parser.header_hasher.hash("content-length")) {
-                content_length = std.fmt.parseInt(usize, h.value, 10) catch return error.BadUpstreamResponse;
+        if (!self.headers_complete) {
+            const saved_pos = self.pos;
+            const saved_count = self.header_count;
+            const saved_status = self.status;
+            errdefer {
+                self.pos = saved_pos;
+                self.header_count = saved_count;
+                self.status = saved_status;
             }
+            const status_line = self.lineFromBuffer() orelse return error.Incomplete;
+            var it = std.mem.tokenizeAny(u8, status_line, " ");
+            _ = it.next(); // HTTP/1.x
+            const code_tok = it.next() orelse return error.BadUpstreamResponse;
+            self.status = std.fmt.parseInt(u16, code_tok, 10) catch return error.BadUpstreamResponse;
+
+            while (true) {
+                const line = self.lineFromBuffer() orelse return error.Incomplete;
+                if (line.len == 0) break;
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadUpstreamResponse;
+                if (self.header_count >= max_upstream_headers) return error.BadUpstreamResponse;
+                self.headers[self.header_count] = .{
+                    .name = std.mem.trim(u8, line[0..colon], " \t"),
+                    .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
+                };
+                self.header_count += 1;
+            }
+
+            var content_length: usize = 0;
+            for (self.headers[0..self.header_count]) |h| {
+                if (http_parser.header_hasher.hash(h.name) == comptime http_parser.header_hasher.hash("content-length")) {
+                    content_length = std.fmt.parseInt(usize, h.value, 10) catch return error.BadUpstreamResponse;
+                }
+            }
+            self.content_length = content_length;
+            self.headers_complete = true;
         }
-        if (self.used - self.pos < content_length) {
-            // Compact so the next fill appends at a sane offset.
+        if (self.used - self.pos < self.content_length) {
+            // Compact so the next fill appends at a sane offset. Safe now:
+            // headers live in the struct fields (and content_length is
+            // retained), so moving body bytes cannot lose parse state.
             if (self.pos > 0) {
                 const remaining = self.buf[self.pos..self.used];
                 std.mem.copyForwards(u8, self.buf[0..remaining.len], remaining);
@@ -1094,9 +1118,15 @@ pub const UpstreamReader = struct {
             }
             return error.Incomplete;
         }
-        const body = self.buf[self.pos .. self.pos + content_length];
-        self.pos += content_length;
-        return .{ .status = self.status, .headers = self.headers[0..self.header_count], .body = body };
+        const body = self.buf[self.pos .. self.pos + self.content_length];
+        self.pos += self.content_length;
+        const res: Parsed = .{ .status = self.status, .headers = self.headers[0..self.header_count], .body = body };
+        // Reset for a pipelined next response on a reused reader.
+        self.headers_complete = false;
+        self.content_length = 0;
+        self.header_count = 0;
+        self.status = 0;
+        return res;
     }
 
     pub fn read(self: *UpstreamReader, fd: posix_fd) !Parsed {
@@ -1155,6 +1185,31 @@ pub const UpstreamReader = struct {
 };
 
 const testing = std.testing;
+
+test "upstream reader converges on byte-split delivery" {
+    // A response arriving in awkward splits (status only, then headers in
+    // two pieces, then body in two pieces) must parse exactly once, with
+    // byte-identical status/headers/body — no double-consumed lines, no
+    // lost wakeups, no stalls.
+    const wire = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nX-A: b\r\n\r\nhello world";
+    const splits = [_]usize{ 10, 30, 45, wire.len };
+    var reader = UpstreamReader{};
+    var prev: usize = 0;
+    for (splits) |end| {
+        @memcpy(reader.buf[reader.used .. reader.used + (end - prev)], wire[prev..end]);
+        reader.used += end - prev;
+        prev = end;
+        if (end < wire.len) {
+            try testing.expectError(error.Incomplete, reader.tryParse());
+        }
+    }
+    const res = try reader.tryParse();
+    try testing.expectEqual(@as(u16, 200), res.status);
+    try testing.expectEqual(@as(usize, 2), res.headers.len);
+    try testing.expectEqualStrings("Content-Length", res.headers[0].name);
+    try testing.expectEqualStrings("11", res.headers[0].value);
+    try testing.expectEqualStrings("hello world", res.body);
+}
 
 test "upstream sockaddr matches a runtime-built one byte for byte" {
     const comptime_addr = router.Upstream.makeSockaddr("127.0.0.1", 9090).?;
@@ -1367,13 +1422,13 @@ fn intervalNsFor(route: *const registry.Route) u64 {
 }
 
 fn nowForHc() u64 {
-    const t = std.time.Instant.now() catch return 0;
+    const t = compat.Instant.now() catch return 0;
     return t.since(epoch_zero);
 }
 
 test "tcpProbe distinguishes a live listener from a dead port" {
     const listener = try sockets.createListeningSocket(18933, 4);
-    defer posix.close(listener);
+    defer compat.close(listener);
     // Accept the probe connection on a side thread (connect-only probe
     // sends nothing and closes).
     const accept_thread = try std.Thread.spawn(.{}, struct {
@@ -1382,7 +1437,7 @@ test "tcpProbe distinguishes a live listener from a dead port" {
             _ = std.posix.poll(&fds, 2000) catch return;
             if (fds[0].revents & std.posix.POLL.IN != 0) {
                 const c = sockets.acceptNonBlock(lfd) catch return;
-                posix.close(c);
+                compat.close(c);
             }
         }
     }.run, .{listener});
@@ -1397,7 +1452,7 @@ test "tcpProbe distinguishes a live listener from a dead port" {
     for (0..4) |_| {
         const tmp_listener = try sockets.createListeningSocket(0, 4);
         const dead_port = try sockets.boundPort(tmp_listener);
-        posix.close(tmp_listener);
+        compat.close(tmp_listener);
         const dead = mkUp("127.0.0.1", dead_port);
         if (!tcpProbe(&dead, "", 1)) {
             dead_ok_checked = true;

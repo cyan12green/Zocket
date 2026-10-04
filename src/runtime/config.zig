@@ -50,8 +50,10 @@ pub const Config = struct {
     /// server_name, and route range. When empty (single-server), the top-
     /// level listen_port + routes are used directly.
     servers: []const ServerSpec = &.{},
-    /// Virtual host name for this server block (null = catch-all default).
-    server_name: ?[]const u8 = null,
+    /// Virtual host names for this server block (empty = catch-all
+    /// default). Multiple `server_name` directives accumulate; exact
+    /// names win over `*.domain` wildcards at match time.
+    server_names: []const []const u8 = &.{},
     /// Comptime-generated server selection function. Maps a Host header
     /// value to a server index into the `servers` array. Built at compile
     /// time from the server_name directives — the function body is a
@@ -66,7 +68,7 @@ pub const Config = struct {
     pub const ServerSpec = struct {
         listen_port: ?u16 = null,
         listen_spec: ?sockets.ListenSpec = null,
-        server_name: ?[]const u8 = null,
+        server_names: []const []const u8 = &.{},
         routes_start: usize = 0,
         routes_len: usize = 0,
     };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 const epoll = @import("epoll.zig");
@@ -100,7 +101,7 @@ pub const Server = struct {
             errdefer {
                 for (reactors_list.items) |r| r.deinit();
                 reactors_list.deinit(allocator);
-                for (listeners.items) |l| posix.close(l);
+                for (listeners.items) |l| compat.close(l);
                 listeners.deinit(allocator);
             }
             try reactors_list.ensureTotalCapacity(allocator, n);
@@ -125,7 +126,7 @@ pub const Server = struct {
         const accepted_counter = try allocator.create(std.atomic.Value(usize));
         accepted_counter.* = std.atomic.Value(usize).init(0);
 
-        var self = Server{
+        const self = Server{
             .allocator = allocator,
             .port = port,
             .stop_ev = stop_ev,
@@ -181,7 +182,7 @@ pub const Server = struct {
             errdefer {
                 for (reactors_list.items) |r| r.deinit();
                 reactors_list.deinit(allocator);
-                for (listeners.items) |l| posix.close(l);
+                for (listeners.items) |l| compat.close(l);
                 listeners.deinit(allocator);
             }
             try reactors_list.ensureTotalCapacity(allocator, n);
@@ -205,7 +206,7 @@ pub const Server = struct {
         listeners.deinit(allocator);
         const accepted_counter = try allocator.create(std.atomic.Value(usize));
         accepted_counter.* = .init(0);
-        var self = Server{
+        const self = Server{
             .allocator = allocator,
             .port = spec.port,
             .stop_ev = stop_ev,
@@ -265,7 +266,7 @@ pub const Server = struct {
                 self.running.store(false, .release);
             }
             self.stop_ev.read();
-            std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+            compat.nanosleep(0, 50 * std.time.ns_per_ms);
         }
 
         self.shutdownReactors();
@@ -335,11 +336,11 @@ const Client = struct {
     tag: usize,
 
     fn run(c: *Client) void {
-        const stream = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch {
+        const stream = compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch {
             _ = c.failures.fetchAdd(1, .monotonic);
             return;
         };
-        defer std.posix.close(stream);
+        defer compat.close(stream);
         std.posix.setsockopt(stream, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
         // sockaddr_in laid out inside posix.sockaddr: family(2) port(2) addr(4).
@@ -347,12 +348,12 @@ const Client = struct {
         // byte order).
         var addr: std.posix.sockaddr = .{
             .family = std.posix.AF.INET,
-            .data = [_]u8{0} ** 14,
+            .data = @as([14]u8, @splat(@as(u8, 0))),
         };
         std.mem.writeInt(u16, addr.data[0..2], c.port, .big);
         std.mem.writeInt(u32, addr.data[2..6], 0x7f000001, .big);
 
-        std.posix.connect(stream, &addr, 16) catch {
+        compat.connect(stream, &addr, 16) catch {
             _ = c.failures.fetchAdd(1, .monotonic);
             return;
         };
@@ -365,7 +366,7 @@ const Client = struct {
 
         var remaining = payload;
         while (remaining.len > 0) {
-            const n = std.posix.write(stream, remaining) catch {
+            const n = compat.write(stream, remaining) catch {
                 _ = c.failures.fetchAdd(1, .monotonic);
                 return;
             };
@@ -375,12 +376,12 @@ const Client = struct {
         var echo_buf: [96]u8 = undefined;
         var got: usize = 0;
         const deadline_ns = 5000 * std.time.ns_per_ms;
-        const start = std.time.Instant.now() catch {
+        const start = compat.Instant.now() catch {
             _ = c.failures.fetchAdd(1, .monotonic);
             return;
         };
         while (got < payload.len) {
-            const now = std.time.Instant.now() catch {
+            const now = compat.Instant.now() catch {
                 _ = c.failures.fetchAdd(1, .monotonic);
                 return;
             };
@@ -389,7 +390,7 @@ const Client = struct {
                 return;
             }
             const n = std.posix.read(stream, echo_buf[got..]) catch {
-                std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+                compat.nanosleep(0, 1 * std.time.ns_per_ms);
                 continue;
             };
             if (n == 0) {
@@ -422,7 +423,7 @@ test "multi-reactor accepts under concurrent connections and echoes correctly" {
     }
 
     // Give reactors a moment to reach epoll_wait before client traffic.
-    std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+    compat.nanosleep(0, 50 * std.time.ns_per_ms);
 
     const clients = 16;
     var failures = std.atomic.Value(usize).init(0);
@@ -443,23 +444,23 @@ test "multi-reactor accepts under concurrent connections and echoes correctly" {
 }
 
 fn tcpConnect(port: u16) !posix.fd_t {
-    const stream = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    errdefer posix.close(stream);
+    const stream = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer compat.close(stream);
     var addr: posix.sockaddr = .{
         .family = posix.AF.INET,
-        .data = [_]u8{0} ** 14,
+        .data = @as([14]u8, @splat(@as(u8, 0))),
     };
     std.mem.writeInt(u16, addr.data[0..2], port, .big);
     std.mem.writeInt(u32, addr.data[2..6], 0x7f000001, .big);
-    try posix.connect(stream, &addr, 16);
+    try compat.connect(stream, &addr, 16);
     return stream;
 }
 
 fn httpWriteAll(sock: posix.fd_t, bytes: []const u8) !void {
     var remaining = bytes;
     while (remaining.len > 0) {
-        const n = posix.write(sock, remaining) catch {
-            std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+        const n = compat.write(sock, remaining) catch {
+            compat.nanosleep(0, 1 * std.time.ns_per_ms);
             continue;
         };
         remaining = remaining[n..];
@@ -468,13 +469,13 @@ fn httpWriteAll(sock: posix.fd_t, bytes: []const u8) !void {
 
 fn httpReadUntil(sock: posix.fd_t, buf: []u8, expected_len: usize, timeout_ms: u64) !usize {
     var total: usize = 0;
-    const start = std.time.Instant.now() catch return error.Timeout;
+    const start = compat.Instant.now() catch return error.Timeout;
     while (total < expected_len) {
-        if ((std.time.Instant.now() catch return error.Timeout).since(start) > timeout_ms * std.time.ns_per_ms) {
+        if ((compat.Instant.now() catch return error.Timeout).since(start) > timeout_ms * std.time.ns_per_ms) {
             return error.Timeout;
         }
         const n = posix.read(sock, buf[total..expected_len]) catch {
-            std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+            compat.nanosleep(0, 1 * std.time.ns_per_ms);
             continue;
         };
         if (n == 0) return error.Eof;
@@ -492,7 +493,7 @@ const cache_mod = @import("../dsl/modules/cache.zig");
 /// Expected "Date: ...\r\nServer: Zocket\r\n" for the current wall
 /// second (the reactor caches the date and refreshes it once per second).
 fn testDateLine(buf: []u8) []const u8 {
-    const ts = posix.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
+    const ts = compat.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
     const date = cache_mod.formatHttpDate(@intCast(ts.sec), buf) orelse unreachable;
     return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Zocket/" ++ @import("../version.zig").version ++ "\r\n", .{date}) catch unreachable;
 }
@@ -522,10 +523,10 @@ test "multi-reactor HTTP with conf config echoes via the pipeline" {
     }
 
     // Let reactors reach epoll_wait before the first connection.
-    std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+    compat.nanosleep(0, 50 * std.time.ns_per_ms);
 
     const sock = try tcpConnect(port);
-    defer posix.close(sock);
+    defer compat.close(sock);
 
     // POST with a body: the echo module answers with the body echoed.
     try httpWriteAll(sock, "POST /echo HTTP/1.1\r\nContent-Length: 12\r\n\r\nhello-e2e-ok");
@@ -594,7 +595,7 @@ const HttpClient = struct {
                 _ = c.failures.fetchAdd(1, .monotonic);
                 continue;
             };
-            defer posix.close(sock);
+            defer compat.close(sock);
             httpWriteAll(sock, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n") catch {
                 _ = c.failures.fetchAdd(1, .monotonic);
                 continue;
@@ -616,13 +617,13 @@ const HttpClient = struct {
 /// Read until EOF (the server closes after a `Connection: close` response).
 fn httpReadUntilEof(sock: posix.fd_t, buf: []u8, timeout_ms: u64) !usize {
     var total: usize = 0;
-    const start = std.time.Instant.now() catch return error.Timeout;
+    const start = compat.Instant.now() catch return error.Timeout;
     while (total < buf.len) {
-        if ((std.time.Instant.now() catch return error.Timeout).since(start) > timeout_ms * std.time.ns_per_ms) {
+        if ((compat.Instant.now() catch return error.Timeout).since(start) > timeout_ms * std.time.ns_per_ms) {
             return error.Timeout;
         }
         const n = posix.read(sock, buf[total..]) catch {
-            std.posix.nanosleep(0, 1 * std.time.ns_per_ms);
+            compat.nanosleep(0, 1 * std.time.ns_per_ms);
             continue;
         };
         if (n == 0) return total;
@@ -651,7 +652,7 @@ test "graceful drain hands off to a sibling server under concurrent load" {
             s.run() catch {};
         }
     }.f, .{&old});
-    std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+    compat.nanosleep(0, 50 * std.time.ns_per_ms);
 
     var stop = std.atomic.Value(bool).init(false);
     var failures = std.atomic.Value(usize).init(0);
@@ -665,7 +666,7 @@ test "graceful drain hands off to a sibling server under concurrent load" {
     }
 
     // Phase 1: traffic on the old daemon only.
-    std.posix.nanosleep(0, 300 * std.time.ns_per_ms);
+    compat.nanosleep(0, 300 * std.time.ns_per_ms);
 
     // Phase 2: the new daemon binds the same port (SO_REUSEPORT); the kernel
     // balances connections across both while the old one is still up.
@@ -676,12 +677,12 @@ test "graceful drain hands off to a sibling server under concurrent load" {
             s.run() catch {};
         }
     }.f, .{&new});
-    std.posix.nanosleep(0, 300 * std.time.ns_per_ms);
+    compat.nanosleep(0, 300 * std.time.ns_per_ms);
 
     // Phase 3: the handoff — the old daemon drains while the new one serves.
     old.requestGracefulStop();
     old_run.join(); // returns only once every old reactor drained (in-flight done)
-    std.posix.nanosleep(0, 200 * std.time.ns_per_ms);
+    compat.nanosleep(0, 200 * std.time.ns_per_ms);
 
     // Stop the load, then the new daemon.
     stop.store(true, .release);

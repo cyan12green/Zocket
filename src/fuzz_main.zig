@@ -1,5 +1,5 @@
 const std = @import("std");
-const fuzz = @import("fuzz.zig");
+const fuzz = @import("zocket").fuzz;
 
 /// Long-running fuzz campaign (`zig build fuzz`): pounds the HTTP/1 parser,
 /// HPACK decoder, HTTP/2 session and the reactor's HTTP path with
@@ -16,10 +16,10 @@ pub fn main() !void {
     };
     std.posix.sigaction(std.posix.SIG.PIPE, &act, null);
 
-    const iterations_http1: usize = if (@import("builtin").mode == .Debug) 200_000 else 2_000_000;
-    const iterations_hpack: usize = if (@import("builtin").mode == .Debug) 500_000 else 5_000_000;
-    const iterations_session: usize = if (@import("builtin").mode == .Debug) 500_000 else 5_000_000;
-    const iterations_reactor: usize = if (@import("builtin").mode == .Debug) 3_000 else 20_000;
+    const iterations_http1: usize = if (@import("builtin").mode == .debug) 200_000 else 2_000_000;
+    const iterations_hpack: usize = if (@import("builtin").mode == .debug) 500_000 else 5_000_000;
+    const iterations_session: usize = if (@import("builtin").mode == .debug) 500_000 else 5_000_000;
+    const iterations_reactor: usize = if (@import("builtin").mode == .debug) 3_000 else 20_000;
 
     {
         var alloc = std.heap.DebugAllocator(.{}){};

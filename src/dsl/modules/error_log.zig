@@ -63,11 +63,11 @@ fn run(ctx: *Context) anyerror!Action {
         ctx.resp.status.reasonPhrase(),
     }) catch return .pass;
     if (severity == .err) {
-        std.log.err("{s}", .{std.mem.trimRight(u8, line, &.{'\n'})});
+        std.log.err("{s}", .{std.mem.trimEnd(u8, line, &.{'\n'})});
     } else if (severity == .warn) {
-        std.log.warn("{s}", .{std.mem.trimRight(u8, line, &.{'\n'})});
+        std.log.warn("{s}", .{std.mem.trimEnd(u8, line, &.{'\n'})});
     } else {
-        std.log.info("{s}", .{std.mem.trimRight(u8, line, &.{'\n'})});
+        std.log.info("{s}", .{std.mem.trimEnd(u8, line, &.{'\n'})});
     }
     return .pass;
 }

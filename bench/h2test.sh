@@ -23,6 +23,7 @@ echo "== h2test: building server (example config, ReleaseFast) =="
 (cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=config.example.conf)
 
 echo "== h2test: starting server on :$PORT =="
+mkdir -p "$ROOT/bench/.cache"
 "$BIN" --http --threads 2 --port "$PORT" >"$ROOT/bench/.cache/h2test-server.log" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT
@@ -57,11 +58,14 @@ ok "GET /static serves content"
 [ "$(curl -s -o /dev/null -w '%{http_code}' --http2-prior-knowledge "http://127.0.0.1:$H2PORT/old")" = "301" ] || fail "/old not 301"
 ok "GET /old -> 301 redirect"
 
-CONN=$(curl -s -v --http2-prior-knowledge \
+OUT10=$(curl -s -o /dev/null -w '%{http_code} %{num_connects}\n' --http2-prior-knowledge \
   "http://127.0.0.1:$H2PORT/a" "http://127.0.0.1:$H2PORT/b" "http://127.0.0.1:$H2PORT/c" \
   "http://127.0.0.1:$H2PORT/d" "http://127.0.0.1:$H2PORT/e" "http://127.0.0.1:$H2PORT/f" \
   "http://127.0.0.1:$H2PORT/g" "http://127.0.0.1:$H2PORT/h" "http://127.0.0.1:$H2PORT/i" \
-  "http://127.0.0.1:$H2PORT/j" 2>&1 | grep -c "Connected to")
+  "http://127.0.0.1:$H2PORT/j" || true)
+BAD=$(echo "$OUT10" | awk '$1 != 200 {bad++} END {print bad+0}')
+CONN=$(echo "$OUT10" | awk '{s+=$2} END {print s+0}')
+[ "$BAD" = "0" ] || fail "multiplexed requests not all 200: $OUT10"
 [ "$CONN" = "1" ] || fail "expected 1 connection for 10 multiplexed requests, got $CONN"
 ok "10 requests multiplexed on 1 connection"
 

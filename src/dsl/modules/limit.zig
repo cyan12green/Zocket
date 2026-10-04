@@ -244,6 +244,9 @@ fn makeCtx(c: *Case, ip: [16]u8, now_ns: u64) void {
 }
 
 test "limit_req admits the burst then sheds load, recovering over time" {
+    // Zones are process-global memfd regions; unit tests must initialise
+    // them explicitly (the reactor does this at startup in production).
+    try lifecycleInit(null);
     // Use a very high total rate so per-shard rate is still large enough
     // for the burst test to work cleanly. Each shard gets rate/num_shards.
     const route = Route{ .path = "/", .limit_req_rate = 800, .limit_req_burst = 80 };
@@ -280,6 +283,7 @@ test "limit_req passes through when unconfigured" {
 }
 
 test "limit_conn caps concurrency and releases through the log phase" {
+    try lifecycleInit(null);
     const route = Route{ .path = "/", .limit_conn_max = 2 };
     const other = Route{ .path = "/", .limit_conn_max = 0 };
 
@@ -318,6 +322,7 @@ test "limit_conn caps concurrency and releases through the log phase" {
 }
 
 test "different client keys have independent budgets" {
+    try lifecycleInit(null);
     const route = Route{ .path = "/", .limit_req_rate = 800, .limit_req_burst = 8 };
     var a: Case = undefined;
     makeCtx(&a, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 }, T0);

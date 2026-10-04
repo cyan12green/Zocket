@@ -68,7 +68,7 @@ test "dispatcher round-robins across reactors" {
     var disp = Dispatcher.init(raws);
     try testing.expectEqual(n, disp.count());
 
-    var counts = [_]usize{0} ** n;
+    var counts: [n]usize = @splat(@as(usize, 0));
     const picks = 1000;
     for (0..picks) |_| {
         const r = disp.pick();
@@ -89,7 +89,7 @@ test "dispatcher picks stay balanced under concurrent threads" {
 
     const threads = 8;
     const picks_per = 2000;
-    var counts = [_]std.atomic.Value(usize){std.atomic.Value(usize).init(0)} ** n;
+    var counts: [n]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0));
     var handles: [threads]std.Thread = undefined;
 
     var workers: [threads]Worker = undefined;

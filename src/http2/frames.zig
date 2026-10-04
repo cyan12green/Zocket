@@ -29,7 +29,7 @@ pub const FrameType = enum(u8) {
     /// (RFC 9113 §4.1: they MUST be ignored and discarded).
     pub const decode_table: [256]FrameType = blk: {
         @setEvalBranchQuota(100000);
-        var t = [_]FrameType{.unknown} ** 256;
+        var t = @as([256]FrameType, @splat(@as(FrameType, .unknown)));
         for (0..10) |i| t[i] = @enumFromInt(i);
         break :blk t;
     };
@@ -236,7 +236,7 @@ test "writeSettings emits correct payload" {
 test "writeHeaders splits large HPACK blocks into CONTINUATION" {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(testing.allocator);
-    const block = [_]u8{0x82} ** 40; // 40 bytes
+    const block = @as([40]u8, @splat(@as(u8, 0x82))); // 40 bytes
     try writeHeaders(&buf, testing.allocator, 5, &block, true, 16);
     // First HEADERS frame: 9 header + 16 payload. Then CONTINUATION frames.
     try testing.expect(buf.items.len > 9 + 16);

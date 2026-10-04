@@ -44,7 +44,7 @@ pub fn Wheel(comptime slots: usize, comptime tick_duration: u64) type {
         /// walks an unbounded range, and continues on the next call.
         pub const max_advance = 1024;
 
-        slots: [slot_count]?*TimerEntry = [_]?*TimerEntry{null} ** slot_count,
+        slots: [slot_count]?*TimerEntry = @as([slot_count]?*TimerEntry, @splat(@as(?*TimerEntry, null))),
         /// Last tick `advanceTo` was called with.
         current: u64 = 0,
 

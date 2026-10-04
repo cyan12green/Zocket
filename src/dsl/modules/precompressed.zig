@@ -13,6 +13,8 @@
 //!   }
 
 const std = @import("std");
+const posix = std.posix;
+const compat = @import("../../compat.zig");
 const registry = @import("../registry.zig");
 const mime_mod = @import("../../http/mime.zig");
 
@@ -44,16 +46,16 @@ fn run(ctx: *Context) anyerror!Action {
     var path_buf: [520]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.gz", .{ root, target }) catch return .pass;
 
-    const file = std.fs.cwd().openFile(path, .{}) catch return .pass; // no twin
-    defer file.close();
-    const stat = file.stat() catch return .pass;
+    const file = compat.openFile(path) catch return .pass; // no twin
+    defer compat.close(file);
+    const stat = compat.fstat(file) catch return .pass;
     if (stat.kind != .file) return .pass;
     if (stat.size > max_buffered) return .pass;
 
     const bytes = ctx.sharedAlloc(@intCast(stat.size)) orelse return error.OutOfMemory;
     var filled: usize = 0;
     while (filled < bytes.len) {
-        const n = file.read(bytes[filled..]) catch return .pass;
+        const n = posix.read(file, bytes[filled..]) catch return .pass;
         if (n == 0) break;
         filled += n;
     }
@@ -101,7 +103,7 @@ test "no accept-encoding or no gz twin passes through" {
 test "serves the gz twin with the original content type" {
     // Fixture: testdata/hello.txt.gz holds a tiny valid gzip of hello.txt.
     try makeTwin("testdata/hello.txt", "testdata/hello.txt.gz");
-    defer std.fs.cwd().deleteFile("testdata/hello.txt.gz") catch {};
+    defer compat.deleteFile("testdata/hello.txt.gz") catch {};
 
     var req = Request.init(testing.allocator);
     defer req.deinit();
@@ -129,9 +131,9 @@ test "serves the gz twin with the original content type" {
 fn makeTwin(src: []const u8, dst: []const u8) !void {
     const gzip_mod = @import("gzip.zig");
     const allocator = testing.allocator;
-    const raw = try std.fs.cwd().readFileAlloc(src, allocator, .limited(1 << 20));
+    const raw = try compat.readFileAlloc(allocator, src, 1 << 20);
     defer allocator.free(raw);
     const compressed = try gzip_mod.gzipCompress(allocator, raw);
     defer allocator.free(compressed);
-    try std.fs.cwd().writeFile(.{ .sub_path = dst, .data = compressed });
+    try compat.writeFile(dst, compressed);
 }

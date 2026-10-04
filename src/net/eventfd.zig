@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -9,19 +10,19 @@ pub const EventFd = struct {
     fd: posix.fd_t,
 
     pub fn create() !EventFd {
-        const fd = try posix.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+        const fd = try compat.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
         return .{ .fd = fd };
     }
 
     pub fn close(self: EventFd) void {
-        posix.close(self.fd);
+        compat.close(self.fd);
     }
 
     /// Signal the fd. Non-blocking write of one 8-byte counter value; if the
     /// counter is already saturated this is a no-op.
     pub fn write(self: EventFd) void {
         const value: u64 = 1;
-        _ = posix.write(self.fd, std.mem.asBytes(&value)) catch {};
+        _ = compat.write(self.fd, std.mem.asBytes(&value)) catch {};
     }
 
     /// Drain the counter, resetting it to 0 so the fd stops reporting readable.

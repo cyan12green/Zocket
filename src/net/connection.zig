@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const posix = std.posix;
 const buffer = @import("buffer.zig");
 const timer_wheel = @import("timer_wheel.zig");
@@ -118,7 +119,7 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
-        posix.close(self.fd);
+        compat.close(self.fd);
     }
 
     pub fn recv(self: *Connection) !usize {
@@ -154,7 +155,7 @@ pub const Connection = struct {
         }
 
         const slice = self.send_buf.peek();
-        const n = posix.write(self.fd, slice) catch |e| return e;
+        const n = compat.write(self.fd, slice) catch |e| return e;
         if (n > 0) {
             self.send_buf.read_pos += @intCast(n);
             self.send_buf.compact();

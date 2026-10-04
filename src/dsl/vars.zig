@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const registry = @import("registry.zig");
 const http_parser = @import("../http/parser.zig");
 const arena_mod = @import("../http/arena.zig");
@@ -372,7 +373,7 @@ fn getBuiltin(ctx: *Context, id: VarId, scratch: *GetterScratch) []const u8 {
         .scheme => return "http",
         .request_time => {
             // Instant.now can fail (hostile seccomp); started zeroed → 0.
-            const now = std.time.Instant.now() catch return "0";
+            const now = compat.Instant.now() catch return "0";
             const us = if (ctx.started.timestamp.sec == 0 and ctx.started.timestamp.nsec == 0)
                 0
             else
@@ -382,12 +383,12 @@ fn getBuiltin(ctx: *Context, id: VarId, scratch: *GetterScratch) []const u8 {
         .content_length => return scratch.fmt("{d}", .{req.content_length}),
         .content_type => return req.header("content-type") orelse "",
         .date, .time_local => {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch std.posix.timespec{ .sec = 0, .nsec = 0 };
+            const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch std.posix.timespec{ .sec = 0, .nsec = 0 };
             var buf: [64]u8 = undefined;
             return scratch.set(logDate(@intCast(@max(0, ts.sec)), &buf));
         },
         .time_iso8601 => {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch std.posix.timespec{ .sec = 0, .nsec = 0 };
+            const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch std.posix.timespec{ .sec = 0, .nsec = 0 };
             var buf: [64]u8 = undefined;
             return scratch.set(iso8601Date(@intCast(@max(0, ts.sec)), &buf));
         },

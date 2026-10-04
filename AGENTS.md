@@ -1,7 +1,7 @@
 ## Project
 
-Zocket — high-performance HTTP/TCP server in Zig 0.16.0-dev (pinned in
-`build.zig.zon`). Multi-reactor epoll transport, HTTP/1.1 + HTTP/2
+Zocket — high-performance HTTP/TCP server in Zig 0.18.0-dev (pinned in
+`build.zig.zon`; ported from 0.16 — see `src/compat.zig`). Multi-reactor epoll transport, HTTP/1.1 + HTTP/2
 (h2spec-verified) + native TLS 1.3 (`src/tls/`, no OpenSSL; ECDSA, X25519,
 ALPN h2/http1.1, session tickets), WebSocket upgrade, nginx-style conf
 language compiled entirely at comptime (`-Dconfig=<file>`), a 10-phase
@@ -17,7 +17,7 @@ for a hot-reloadable, nginx-style config-driven HTTP server.
 
 ## Commands
 
-- `zig build test` — run all tests (two parallel execs: library module + exe tests). **Known broken on this snapshot** (see "Known stdlib quirks" below). Always run `./zig-cache/o/<hash>/test` directly before finishing work instead.
+- `zig build test` — run all tests (two parallel execs: library module + exe tests). Green on 0.18 (`363/363`); the old 0.16 `--listen=-` failure mode is gone.
 - `zig build h2test` — HTTP/2 end-to-end integration tests: builds the server and verifies it with `curl --http2-prior-knowledge` (GET/POST/HEAD, byte-exact 200 KB round-trip, static, redirect, 10-request multiplexing, HTTP/1.1 regression) plus `h2spec` RFC conformance (must pass ≥130/145). Requires curl with nghttp2 and `h2spec` (go install github.com/summerwind/h2spec/cmd/h2spec@latest). Run after any HTTP/2 or reactor change.
 - `zig build run` — run server (`src/main.zig`, default multi-reactor HTTP mode, port 8080).
 - `zig build run -- --single` — run the single-threaded echo server (A/B baseline).
@@ -68,13 +68,31 @@ for a hot-reloadable, nginx-style config-driven HTTP server.
 - Docs split: `docs/ROADMAP.md` is forward-looking only (status table + open items); per-milestone delivery history lives in `docs/milestones.md`; `docs/config.md` is the conf-language reference. Source comments must not cite milestone numbers — they explain behavior/reasoning directly.
 - Refer to `/home/sid/Personal/zig` for stdlib reference details.
 
-## Known stdlib quirks (pinned 0.16.0-dev snapshot)
+## Known stdlib quirks (pinned 0.18.0-dev snapshot; ported from 0.16)
 
-- `std.posix.accept` is unusable (its `AcceptError` omits `error.SocketNotListening` which its own body returns). Use `sockets.acceptNonBlock` (raw `accept4`).
-- `std.posix.epoll_ctl` panics (`unreachable`) on EBADF — never call `epoll_ctl(DEL)` after closing the epoll fd (close connections before closing the epoll fd).
+`src/compat.zig` shims what 0.18 removed: the `std.posix` socket layer
+(socket/bind/listen/connect/close/write/writev/fcntl/open/dup/pipe/fork/
+eventfd/epoll_*/clock_gettime/nanosleep/ftruncate/pread — all re-implemented
+over `std.os.linux` with the old error names),
+`std.time.Instant` (BOOTTIME `now()` + `since()`), `std.Thread.Mutex`
+(futex-backed, no-Io call shape), `std.process.args()` (now
+`main(init: Init.Minimal)` + `init.args.iterate()`), `std.StringArrayHashMap`
+(now unmanaged: `std.array_hash_map.String` + per-call allocator),
+`std.fs.Dir/File` (fd-based helpers over `openat`/`statx`/`getdents64`),
+`std.crypto.random.bytes` (getrandom), `std.ascii.indexOfIgnoreCase`,
+`Mem.trimRight` (now `trimEnd`), `X25519.KeyPair.generate()` (now needs
+`io:` — use `generateDeterministic` + getrandom seed), `Child.init/
+spawnAndWait` (now `process.spawn(io, …)` + `child.wait(io)`),
+`builtin.mode == .Debug` (now lowercase `.debug`), `b.args` in build.zig
+(now `run_cmd.addPassthruArgs()`), and the `[_]T{v} ** N` array-repeat
+operator (removed — use `@as([N]T, @splat(v))`). `var` that is never
+reassigned is now a hard error; `posix.mmap` panics on EBADF (validate
+state-file fds before adopt). `zig build test` works again on 0.18 (the
+0.16 `--listen=-` protocol failure is gone).
+
+Carried over (still true on 0.18):
+- `sockets.acceptNonBlock` (raw `accept4`) instead of any std accept wrapper.
 - `std.ArrayList` is the unmanaged `array_list.Aligned`: use `.empty`, `append(gpa, item)`, `deinit(gpa)`.
-- `std.time.sleep` / `std.time.milliTimestamp` do not exist; use `std.posix.nanosleep` (nsec must be < 1e9) and `std.time.Instant`.
+- `std.time.sleep` / `std.time.milliTimestamp` / `std.time.timestamp()` do not exist; wall seconds come from `clock_gettime(REALTIME)` (the reactor's Date cache).
 - Network sockaddr: `posix.sockaddr` = `{ family: u16, data: [14]u8 }`; `sockaddr_in` layout has NO BSD `sin_len`; `sockaddr_in6` is 28 bytes with `scope_id: u32`. Ports/addresses must be written as raw big-endian bytes (`writeInt(..., .big)`, NOT `nativeToBig` + `writeInt` — that double-swaps). IPv6 addresses use `AF_INET6` (30) with `IPV6_V6ONLY` for dual-stack control.
-- `std.time.timestamp()` does not exist either — wall seconds come from `posix.clock_gettime(posix.CLOCK.REALTIME)` (the reactor's Date cache) and `std.time.Instant` is BOOTTIME (monotonic).
 - io_uring: `std.os.linux.IoUring` — `copy_cqes` already advances the CQ head (do NOT call `cq_advance` again); iovec arrays passed to readv/writev SQEs must outlive the op (store them in the session/connection, never the flush stack); CQ overflow parks completions until an `enter(GETEVENTS)` — `drain` must not skip that flush; ring ops on O_NONBLOCK fds block instead of EAGAIN-ing (that is the point); closing an fd does not cancel in-flight ops — use `cancel()` + a deferred close, and capture the fd before destroying the connection (use-after-free).
-- `zig build test` `--listen=-` failure (pre-existing, confirmed on clean HEAD 2026-09-08): `zig build test` always reports `failed command` on the library-module test binary when run via the build system's `--listen=-` protocol. Running the same binary directly (`./zig-cache/o/<hash>/test`) passes 358/358 tests, 5/5 consecutive runs. Root cause: the Zig 0.16.0-dev build system's test runner uses a stdin/stdout binary protocol (`std.zig.Server`); the test binary's stderr output from reactor tests (`[error]`, `[warn]`, `GET /x HTTP/1.1 200`) interleaves with the protocol stream in a way the build system interprets as failure. This is a Zig stdlib issue, not a Zocket regression — **`zig build test` is NOT the gate; use `./zig-cache/o/<hash>/test` directly for verification**. When adding to the Zig source to fix: the `std.zig.Server` protocol in `/home/sid/.local/lib/zig/std/zig/Server.zig` needs stderr/stdout separation so test-process stderr output doesn't corrupt the binary protocol on fd 1; the test runner in `/home/sid/.local/lib/zig/compiler/test_runner.zig` (L77-78) creates `File.stdin().readerStreaming()` and `File.stdout().writerStreaming()` but the test's own `std.debug.print` calls go to fd 2 which is fine, however the Zig build system's `addRunArtifact` pipe handling conflates stdout and stderr captures.

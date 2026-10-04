@@ -228,7 +228,7 @@ test "decode reports incomplete for truncated frames" {
     try std.testing.expectEqual(DecodeResult.incomplete, decode(&buf, &frame));
 
     // 16-bit length announced but payload missing.
-    var big = [_]u8{ 0x82, 0xFE, 0x01, 0x00, 0xAA, 0xBB, 0xCC, 0xDD } ++ [_]u8{0} ** 200;
+    var big = [_]u8{ 0x82, 0xFE, 0x01, 0x00, 0xAA, 0xBB, 0xCC, 0xDD } ++ @as([200]u8, @splat(@as(u8, 0)));
     big[2] = 0x01;
     big[3] = 0x00;
     try std.testing.expectEqual(DecodeResult.incomplete, decode(big[0 .. 8 + 100], &frame));
@@ -238,7 +238,7 @@ test "decode rejects reserved bits, bare frames and oversized control frames" {
     var frame = Frame{};
 
     // RSV1 set.
-    var rsv = [_]u8{ 0xC1, 0x85, 0, 0, 0, 0 } ++ [_]u8{0} ** 5;
+    var rsv = [_]u8{ 0xC1, 0x85, 0, 0, 0, 0 } ++ @as([5]u8, @splat(@as(u8, 0)));
     try std.testing.expectEqual(DecodeResult.malformed, decode(&rsv, &frame));
 
     // Unmasked client frame (§5.1 violation).
@@ -247,7 +247,7 @@ test "decode rejects reserved bits, bare frames and oversized control frames" {
     try std.testing.expectEqual(DecodeResult.ok, decodeUnmaskedOk(&bare, &frame));
 
     // Control frame with a 200-byte payload (cap is 125).
-    var huge_ping = [_]u8{ 0x89, 0xFE, 0x00, 0xC8, 0, 0, 0, 0 } ++ [_]u8{0} ** 200;
+    var huge_ping = [_]u8{ 0x89, 0xFE, 0x00, 0xC8, 0, 0, 0, 0 } ++ @as([200]u8, @splat(@as(u8, 0)));
     try std.testing.expectEqual(DecodeResult.malformed, decode(&huge_ping, &frame));
 
     // Fragmented ping (FIN clear on a control frame).

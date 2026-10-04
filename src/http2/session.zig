@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../compat.zig");
 const parser = @import("../http/parser.zig");
 const response_mod = @import("../http/response.zig");
 const hpack = @import("hpack.zig");
@@ -589,7 +590,7 @@ pub const Session = struct {
         var content_length: usize = 0;
         var content_length_set = false;
         var saw_regular_header = false;
-        var pseudo_seen = [_]bool{false} ** 4; // method, scheme, authority, path
+        var pseudo_seen = @as([4]bool, @splat(false)); // method, scheme, authority, path
         for (st.headers.items) |f| {
             const is_pseudo = f.name.len > 0 and f.name[0] == ':';
             if (is_pseudo and saw_regular_header) {
@@ -803,7 +804,7 @@ pub const Session = struct {
             file_buf = buf;
             var read_total: usize = 0;
             while (read_total < size) {
-                const n = std.posix.pread(resp.file_fd, buf[read_total..], resp.file_offset + read_total) catch break;
+                const n = compat.pread(resp.file_fd, buf[read_total..], resp.file_offset + read_total) catch break;
                 if (n == 0) break;
                 read_total += n;
             }
@@ -1040,7 +1041,7 @@ test "session: an allocator-owned module body is freed (gzip path, no leak)" {
     try req_bytes.appendSlice(testing.allocator, &hdr);
     try req_bytes.appendSlice(testing.allocator, hb.items);
     // Compressible body (>= min_compress_bytes) as a DATA frame with END_STREAM.
-    const body = "compressible-body-" ** 20;
+    const body = "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-" ++ "compressible-body-";
     var dfh = frames.FrameHeader{
         .length = @intCast(body.len),
         .type = .data,
