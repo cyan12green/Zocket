@@ -106,7 +106,7 @@ pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_nam
 fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router.Upstream, pick: usize, started_ns: u64, offer_sticky: bool) anyerror!Action {
     ensureHealthChecker(route);
     const up = &upstreams[pick];
-    var fd = acquirePooled(pick, started_ns);
+    var fd = acquirePooled(pick, started_ns, keepaliveIdleNs(route));
     if (fd < 0) {
         fd = connectUpstream(up, connectTimeoutMs(route)) catch {
             markFailure(pick, route, started_ns);
@@ -155,7 +155,7 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
     while (true) {
         if (reader.tryParse()) |res| {
             try adoptUpstream(ctx, res, offer_sticky, route.sticky_cookie orelse "", pick);
-            upstreamSuccess(pick, fd, nowNs());
+            upstreamSuccess(pick, fd, nowNs(), route);
             return .handled; // normal serialization follows; NO event hop
         } else |e| switch (e) {
             error.Incomplete => {},
@@ -218,10 +218,29 @@ fn parkRemainder(
 }
 
 const max_backends = 8;
-/// Number of pooled keepalive connections per backend per reactor thread.
-/// With N reactors and M backends, total pooled conns = N * M * pool_per_backend.
-/// At 100 concurrent connections, this reduces pool misses dramatically.
-const pool_per_backend = 8;
+/// Pooled keepalive connections per backend per reactor thread.
+/// `proxy_keepalive` tunes the effective size (default 8); the array is
+/// dimensioned at the hard cap so a large directive cannot blow the
+/// threadlocals. With N reactors and M backends, total pooled conns =
+/// N * M * effective_cap.
+const pool_default_max: u32 = 8;
+const pool_hard_cap: u32 = 32;
+/// Default idle expiry for pooled connections (overridden per route by
+/// `proxy_keepalive_timeout`).
+const pool_default_idle_s: u64 = 60;
+
+/// Effective pool size for a route: explicit setting clamped to the hard
+/// cap (0 = default).
+fn keepaliveMax(route: *const registry.Route) u32 {
+    const m = if (route.proxy_keepalive_max != 0) route.proxy_keepalive_max else pool_default_max;
+    return @min(m, pool_hard_cap);
+}
+
+/// Effective idle expiry for a route in ns (0 = default).
+fn keepaliveIdleNs(route: *const registry.Route) u64 {
+    const s = if (route.proxy_keepalive_timeout_s != 0) route.proxy_keepalive_timeout_s else pool_default_idle_s;
+    return s * std.time.ns_per_s;
+}
 
 threadlocal var epoch: compat.Instant = undefined;
 threadlocal var epoch_set = false;
@@ -240,9 +259,6 @@ fn nowNs() u64 {
     }
     return (compat.Instant.now() catch return 0).since(epoch);
 }
-/// Upstream sockets receive-timed out after this long (avoids hanging the
-/// reactor on a silent upstream).
-const upstream_timeout_ms = 5000;
 /// Compiled defaults for the proxy_*_timeout directives (0 = default):
 /// connect and send are tight (a half-dead backend must not park a reactor
 /// thread); read matches the historical 5 s sync-driver cap.
@@ -269,9 +285,6 @@ fn readTimeoutS(route: *const registry.Route) u32 {
     if (route.proxy_read_timeout_s != 0) return route.proxy_read_timeout_s;
     return default_read_timeout_s;
 }
-/// Pooled upstream sockets idle longer than this are closed on the next use.
-const pool_idle_ns = 60 * std.time.ns_per_s;
-
 const PoolEntry = struct {
     fd: posix_fd = -1,
     last_used_ns: u64 = 0,
@@ -281,7 +294,7 @@ const linux = std.os.linux;
 const posix_fd = std.posix.fd_t;
 
 // Per-reactor state (thread-local: each reactor owns its upstream sockets).
-threadlocal var pool: [max_backends][pool_per_backend]PoolEntry = @as([max_backends][pool_per_backend]PoolEntry, @splat(@as([pool_per_backend]PoolEntry, @splat(@as(PoolEntry, .{})))));
+threadlocal var pool: [max_backends][pool_hard_cap]PoolEntry = @as([max_backends][pool_hard_cap]PoolEntry, @splat(@as([pool_hard_cap]PoolEntry, @splat(@as(PoolEntry, .{})))));
 threadlocal var pool_lens: [max_backends]u32 = @as([max_backends]u32, @splat(@as(u32, 0)));
 threadlocal var active: [max_backends]u32 = @as([max_backends]u32, @splat(@as(u32, 0)));
 /// Per-backend liveness, SHARED across reactors (and with the active
@@ -443,7 +456,7 @@ fn attemptForward(
     offer_sticky: bool,
 ) anyerror!Action {
     const up = &upstreams[pick];
-    var fd = acquirePooled(pick, started_ns);
+    var fd = acquirePooled(pick, started_ns, keepaliveIdleNs(route));
     if (fd < 0) {
         fd = connectUpstream(up, connectTimeoutMs(route)) catch {
             markFailure(pick, route, started_ns);
@@ -479,7 +492,7 @@ fn attemptForward(
         slot.last_fail_ns.store(0, .monotonic);
     }
     active[pick] -|= 1;
-    releasePooled(pick, fd, started_ns);
+    releasePooled(pick, fd, started_ns, keepaliveMax(route));
     const elapsed = nowNs() -% started_ns;
     ewma_ns[pick] = if (ewma_ns[pick] == 0)
         elapsed
@@ -762,9 +775,9 @@ fn tcpProbe(up: *const router.Upstream, path: []const u8, timeout_s: u32) bool {
 
 /// Reactor-side success bookkeeping (same threadlocals the sync path uses;
 /// completions run on the client's reactor thread).
-pub fn upstreamSuccess(idx: usize, fd: posix_fd, now_ns: u64) void {
+pub fn upstreamSuccess(idx: usize, fd: posix_fd, now_ns: u64, route: *const registry.Route) void {
     active[idx] -|= 1;
-    releasePooled(idx, fd, now_ns);
+    releasePooled(idx, fd, now_ns, keepaliveMax(route));
 }
 
 pub fn upstreamFail(idx: usize, route: *const registry.Route, now_ns: u64) void {
@@ -774,7 +787,7 @@ pub fn upstreamFail(idx: usize, route: *const registry.Route, now_ns: u64) void 
 
 // ---- upstream connection lifecycle ----
 
-fn acquirePooled(idx: usize, now_ns: u64) posix_fd {
+fn acquirePooled(idx: usize, now_ns: u64, idle_ns: u64) posix_fd {
     // Try to acquire from the pool for this backend (most recently used first).
     const entries = &pool[idx];
     const len = &pool_lens[idx];
@@ -783,7 +796,7 @@ fn acquirePooled(idx: usize, now_ns: u64) posix_fd {
         i -= 1;
         const e = &entries[i];
         if (e.fd < 0) continue;
-        if (now_ns -| e.last_used_ns > pool_idle_ns) {
+        if (now_ns -| e.last_used_ns > idle_ns) {
             // Idle reap.
             posix_close(e.fd);
             e.fd = -1;
@@ -808,10 +821,10 @@ fn acquirePooled(idx: usize, now_ns: u64) posix_fd {
 }
 
 /// Return a connection to the pool (keepalive). Drops the oldest if full.
-fn releasePooled(idx: usize, fd: posix_fd, now_ns: u64) void {
+fn releasePooled(idx: usize, fd: posix_fd, now_ns: u64, max_conns: u32) void {
     const entries = &pool[idx];
     const len = &pool_lens[idx];
-    if (len.* < pool_per_backend) {
+    if (len.* < max_conns) {
         entries[len.*] = .{ .fd = fd, .last_used_ns = now_ns };
         len.* += 1;
     } else {
@@ -1610,7 +1623,7 @@ const FakeUpstream = struct {
 /// test must never leak into another's backend idx 0).
 fn drainPool(idx: usize) void {
     while (true) {
-        const fd = acquirePooled(idx, nowNs());
+        const fd = acquirePooled(idx, nowNs(), pool_default_idle_s * std.time.ns_per_s);
         if (fd < 0) break;
         posix_close(fd);
     }
@@ -1648,7 +1661,7 @@ test "proxy round-trips through the sync forward path with pool reuse" {
     const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
     try compat.connect(seed, &ups[0].sockaddr, 16);
     setRecvTimeout(seed, default_read_timeout_s);
-    releasePooled(0, seed, nowNs());
+    releasePooled(0, seed, nowNs(), pool_default_max);
 
     var i: usize = 0;
     while (i < 2) : (i += 1) {
@@ -1799,7 +1812,7 @@ test "proxy_next_upstream on: failover serves from the live backend" {
     const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
     try compat.connect(seed, &ups[1].sockaddr, 16);
     setRecvTimeout(seed, default_read_timeout_s);
-    releasePooled(1, seed, nowNs());
+    releasePooled(1, seed, nowNs(), pool_default_max);
 
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
@@ -1843,4 +1856,41 @@ test "proxy_next_upstream on: all backends dead still answers 502" {
     ctx.route = &route;
     try testing.expectEqual(Action.handled, try run(&ctx));
     try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+test "proxy keepalive caps resolve defaults and clamp to the hard cap" {
+    const def = registry.Route{ .path = "/" };
+    try testing.expectEqual(pool_default_max, keepaliveMax(&def));
+    try testing.expectEqual(pool_default_idle_s * std.time.ns_per_s, keepaliveIdleNs(&def));
+    const tuned = registry.Route{ .path = "/", .proxy_keepalive_max = 4, .proxy_keepalive_timeout_s = 30 };
+    try testing.expectEqual(@as(u32, 4), keepaliveMax(&tuned));
+    try testing.expectEqual(@as(u64, 30) * std.time.ns_per_s, keepaliveIdleNs(&tuned));
+    const huge = registry.Route{ .path = "/", .proxy_keepalive_max = 1000 };
+    try testing.expectEqual(pool_hard_cap, keepaliveMax(&huge));
+}
+
+test "proxy pool reaps idle entries and returns fresh ones" {
+    // Backend 7: unused by other tests (they pin idx 0/1).
+    const idx = 7;
+    drainPool(idx);
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    // Stale entry (last_used = 0): reaped on acquire, pool stays empty.
+    releasePooled(idx, pair[0], 0, pool_default_max);
+    releasePooled(idx, pair[1], 0, pool_default_max);
+    try testing.expectEqual(@as(posix_fd, -1), acquirePooled(idx, nowNs(), 1));
+    // Fresh entry: returned as-is.
+    const live = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    releasePooled(idx, live[0], nowNs(), pool_default_max);
+    compat.close(live[1]);
+    try testing.expectEqual(live[0], acquirePooled(idx, nowNs(), pool_default_idle_s * std.time.ns_per_s));
+    compat.close(live[0]);
+    // Overflow past max_conns closes instead of growing the pool.
+    var i: u32 = 0;
+    while (i < pool_default_max + 2) : (i += 1) {
+        const sp = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+        releasePooled(idx, sp[0], nowNs(), 2);
+        compat.close(sp[1]);
+    }
+    try testing.expectEqual(@as(u32, 2), pool_lens[idx]);
+    drainPool(idx);
 }

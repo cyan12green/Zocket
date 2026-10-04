@@ -1073,7 +1073,7 @@ pub const Reactor = struct {
             };
         }
 
-        proxy_mod.upstreamSuccess(tx.backend_idx, up_fd, upstreamNowNs());
+        proxy_mod.upstreamSuccess(tx.backend_idx, up_fd, upstreamNowNs(), tx.route);
         _ = self.upstream_conns.remove(up_fd);
         if (self.io_mode == .epoll) self.ep.remove(up_fd) catch {}; // pooled fd kept open
         session.up = null;

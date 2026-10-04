@@ -100,6 +100,13 @@ pub const Route = struct {
     /// failures. Sync forward path only (the parked/async path marks the
     /// failure and answers 502 as before).
     proxy_next_upstream: bool = false,
+    /// Keepalive pool tuning (proxy module): max pooled connections per
+    /// backend per reactor thread (default 8, clamped to a hard cap of 32)
+    /// and pooled-connection idle expiry in seconds (default 60; an idle
+    /// connection is closed on next use past the deadline). 0 selects the
+    /// default for both.
+    proxy_keepalive_max: u32 = 0,
+    proxy_keepalive_timeout_s: u32 = 0,
     /// Route opt-in for chunked transfer encoding (HTTP/1.1 only): responses
     /// on this route are framed as a single chunk with
     /// `Transfer-Encoding: chunked` instead of Content-Length. Off by

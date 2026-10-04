@@ -126,6 +126,8 @@ const H_proxy_connect_timeout = keyHash("proxy_connect_timeout");
 const H_proxy_send_timeout = keyHash("proxy_send_timeout");
 const H_proxy_read_timeout = keyHash("proxy_read_timeout");
 const H_proxy_next_upstream = keyHash("proxy_next_upstream");
+const H_proxy_keepalive = keyHash("proxy_keepalive");
+const H_proxy_keepalive_timeout = keyHash("proxy_keepalive_timeout");
 const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
 const H_access_log = keyHash("access_log");
@@ -425,6 +427,9 @@ const LocationSpec = struct {
     /// `proxy_next_upstream on|off;` — retry transport failures on the next
     /// backend (default off: retries re-send the request body).
     proxy_next_upstream: bool = false,
+    /// `proxy_keepalive N;` / `proxy_keepalive_timeout S;` (0 = default).
+    proxy_keepalive_max: u32 = 0,
+    proxy_keepalive_timeout: u32 = 0,
     /// `error_page 404 500 /50x;` / `error_page 503 =200;`: range into the
     /// builder's error-page pool (status -> target URI or =code).
     error_pages_start: usize = 0,
@@ -1236,6 +1241,14 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             spec.proxy_next_upstream = lx.boolOnOff("proxy_next_upstream");
             lx.expectTerminator("proxy_next_upstream");
         },
+        H_proxy_keepalive => {
+            spec.proxy_keepalive_max = lx.number("proxy_keepalive", u32);
+            lx.expectTerminator("proxy_keepalive");
+        },
+        H_proxy_keepalive_timeout => {
+            spec.proxy_keepalive_timeout = lx.number("proxy_keepalive_timeout", u32);
+            lx.expectTerminator("proxy_keepalive_timeout");
+        },
         H_proxy_set_header => {
             // `proxy_set_header <name> "<cv>";` (M-E): an upstream request
             // header override; the value is a complex value.
@@ -2010,6 +2023,8 @@ fn build(b: *const Builder) Config {
                 .proxy_send_timeout_s = spec.proxy_send_timeout,
                 .proxy_read_timeout_s = spec.proxy_read_timeout,
                 .proxy_next_upstream = spec.proxy_next_upstream,
+                .proxy_keepalive_max = spec.proxy_keepalive_max,
+                .proxy_keepalive_timeout_s = spec.proxy_keepalive_timeout,
                 .chunked = spec.chunked,
                 .tcp_nopush = spec.tcp_nopush,
                 .log_format = logFormatIndex(spec.log_format, log_table.items[0..log_table.len], strings),
@@ -3105,4 +3120,25 @@ test "conf: proxy_next_upstream parses on/off with off default" {
     );
     try testing.expect(cfg.routes[0].proxy_next_upstream);
     try testing.expect(!cfg.routes[1].proxy_next_upstream);
+}
+
+test "conf: proxy_keepalive directives parse with zero defaults" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite proxy;
+        \\        upstream 127.0.0.1:8001;
+        \\        proxy_keepalive 4;
+        \\        proxy_keepalive_timeout 30;
+        \\    }
+        \\    location /plain {
+        \\        rewrite proxy;
+        \\        upstream 127.0.0.1:8002;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(u32, 4), cfg.routes[0].proxy_keepalive_max);
+    try testing.expectEqual(@as(u32, 30), cfg.routes[0].proxy_keepalive_timeout_s);
+    try testing.expectEqual(@as(u32, 0), cfg.routes[1].proxy_keepalive_max);
+    try testing.expectEqual(@as(u32, 0), cfg.routes[1].proxy_keepalive_timeout_s);
 }
