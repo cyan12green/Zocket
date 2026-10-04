@@ -265,23 +265,33 @@ Their records moved to `docs/milestones.md`.
 Sized against this codebase (comptime config + 10-phase pipeline + bounded
 shmem zones). S = days, M = 1–2 weeks, L = month+.
 
-### Batch C1 — routing and resilience (S each, do first)
+### Batch C1 — routing and resilience (SHIPPED 2026-10)
 
-- `try_files`: test file candidates in order, fall back to last
-  (proxy/named/`=404`). Needs an `internal_redirect` primitive (shared
-  with `error_page` below); unlocks SPA fallback and static-first sites.
-- `error_page` + `internal_redirect`: map status → alternate URI served
-  internally (depth-capped re-dispatch, `$status` preserved). Prerequisite
-  for `try_files` and auth→login chains.
-- `rewrite` (URI mutation): regex/prefix rewrite with
-  `last`/`break`/`redirect`/`permanent` flags. Regex NFA + `$1..$9`
-  captures already exist; ordering (rewrite before `find_config`) must be
-  fixed in the pipeline.
-- Upstream timeouts + `proxy_next_upstream`: `proxy_connect/read/send_timeout`
-  plus retry-on-error to the next peer. Biggest tail-latency lever; wire
-  into the async parked state machine.
-- Upstream keepalive tuning: `keepalive N` / timeout / requests per
-  upstream. Counters + idle sweeper on the existing pool.
+- `try_files` ✅: `try_files $uri $uri/ /fallback;` / `=404` (content
+  phase, root-contained probes; named locations not supported — the
+  fallback is a URI or `=code`).
+- `error_page` + `internal_redirect` ✅: `error_page 404 500 /50x;` /
+  `=200` (log phase, matches the outgoing status incl. unclaimed-404;
+  non-GET/HEAD downgraded to GET on URI targets). Redirect loop in
+  `Server.handleRequest`, capped at 8 hops (`redirect_hops` published,
+  `effective_status` set before the log phase).
+- `rewrite` ✅: `rewrite <pattern> <replacement> [last|break|redirect|
+  permanent]` (rewrite phase, NFA patterns, `$1..$9`; directive shadows
+  the `rewrite <module>` phase binding by arity). Regex `match()` went
+  longest-wins so greedy captures extend.
+- Upstream timeouts ✅: `proxy_connect/send/read_timeout` (seconds,
+  0 = 1s/1s/5s defaults), threaded through connect/send/recv in both the
+  sync and parked paths; probes bound by their own timeout.
+- `proxy_next_upstream` ✅: `on|off` (default off — retries re-send the
+  body); transport failures retry each usable backend once with sticky
+  re-tagging on failover. 5xx from a live backend is final; sync path
+  only.
+- Upstream keepalive tuning ✅: `proxy_keepalive N` (default 8, hard cap
+  32) / `proxy_keepalive_timeout S` (default 60s idle reap).
+  Slice of the original plan deferred: per-request query preservation in
+  rewrites is minimal (query re-appended, no `?`-override args handling);
+  `proxy_next_upstream` has no `http_502`-style status retry and does not
+  cover the parked path.
 
 ### Batch C2 — security and traffic control (S each)
 
