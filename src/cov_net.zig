@@ -13,4 +13,5 @@ comptime {
     _ = @import("net/dispatcher.zig");
     _ = @import("net/iouring.zig");
     _ = @import("net/body_storage.zig");
+    _ = @import("net/proxy_proto.zig");
 }

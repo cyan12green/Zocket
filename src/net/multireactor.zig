@@ -198,6 +198,7 @@ pub const Server = struct {
                 };
                 r.* = init_res;
                 r.accepted_counter = &shared_accepted;
+                r.proxy_protocol = spec.proxy_protocol;
                 reactors_list.appendAssumeCapacity(r);
             }
         }

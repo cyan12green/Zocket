@@ -22,6 +22,7 @@ const buffer_mod = @import("buffer.zig");
 const http2_frames = @import("../http2/frames.zig");
 const websocket_mod = @import("../http/websocket.zig");
 const proxy_mod = @import("../dsl/modules/proxy.zig");
+const proxy_proto = @import("proxy_proto.zig");
 const dsl_registry = @import("../dsl/registry.zig");
 const default_registry = dsl_registry.default_registry;
 
@@ -114,6 +115,10 @@ const HttpSession = struct {
     /// Stub-status accounting state which shared counter the
     /// connection currently contributes to.
     stat_state: enum { waiting, reading, writing } = .waiting,
+    /// PROXY protocol header already consumed on this connection (only
+    /// meaningful when the reactor's `proxy_protocol` is set; fresh
+    /// sessions start false and consume exactly one header).
+    proxy_consumed: bool = false,
     /// sendfile state while `file_remaining > 0` the body is
     /// pushed from this fd into the socket.
     file_fd: posix.fd_t = -1,
@@ -244,6 +249,10 @@ pub const Reactor = struct {
     /// Per-reactor listener when set, this
     /// reactor accepts connections directly from the kernel; -1 otherwise.
     listener: posix.fd_t = -1,
+    /// PROXY protocol expected on accepted connections (set post-init from
+    /// the listen spec; `listen ... proxy_protocol`). The header is consumed
+    /// in processHttp before any protocol sniffing.
+    proxy_protocol: bool = false,
     /// Total accepted counter shared with the server (bumped per accept).
     accepted_counter: ?*std.atomic.Value(usize) = null,
     /// Last wall tick the request-timeout sweep ran (1 Hz gating).
@@ -783,6 +792,25 @@ pub const Reactor = struct {
         while (true) {
             const session = self.http_sessions.getPtr(fd) orelse return;
             const conn = self.connections.get(fd) orelse return;
+            // PROXY protocol: on opted-in listeners the first bytes are the
+            // proxy header — consume before any sniffing (TLS/h2/preface all
+            // look past it). Incomplete waits for more bytes; malformed
+            // drops the connection (nginx closes it too).
+            if (self.proxy_protocol and !session.proxy_consumed) {
+                const slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
+                switch (proxy_proto.parse(slice)) {
+                    .incomplete => return,
+                    .invalid => {
+                        self.removeConnection(fd);
+                        return;
+                    },
+                    .done => |d| {
+                        if (d.ip) |ip| conn.peer_ip = ip;
+                        conn.recv_buf.consume(d.consumed);
+                        session.proxy_consumed = true;
+                    },
+                }
+            }
             // Framework v2: an upstream transaction is in flight — client
             // bytes stay buffered until it completes.
             if (session.up != null) return;
@@ -3881,4 +3909,96 @@ test "reactor parked proxy to a dead upstream yields 502" {
     var buf: [4096]u8 = undefined;
     const res = try readHeadBody(pair[0], &buf);
     try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 502 Bad Gateway"));
+}
+
+test "reactor PROXY protocol sets the client IP before access checks" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    const cfg = comptime runtime_server.Config.fromConfComptime(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        allow 203.0.113.9;
+        \\        deny all;
+        \\    }
+        \\}
+    );
+    const srv = runtime_server.Server.init(cfg);
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.handler = &srv;
+    r.proxy_protocol = true;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Claimed 203.0.113.9 matches `allow` -> echo answers 200.
+    try writeAll(pair[0], "PROXY TCP4 203.0.113.9 10.0.0.1 1234 80\r\nGET / HTTP/1.1\r\nHost: test\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    const res = try readHeadBody(pair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
+
+    // Same connection, second request without a new header: the header is
+    // consumed exactly once (keep-alive continues as plain HTTP).
+    try writeAll(pair[0], "GET /again HTTP/1.1\r\nHost: test\r\n\r\n");
+    const res2 = try readHeadBody(pair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res2.head_len], "HTTP/1.1 200 OK"));
+}
+
+test "reactor PROXY protocol denies unlisted sources and drops garbage" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    const cfg = comptime runtime_server.Config.fromConfComptime(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        allow 203.0.113.9;
+        \\        deny all;
+        \\    }
+        \\}
+    );
+    const srv = runtime_server.Server.init(cfg);
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.handler = &srv;
+    r.proxy_protocol = true;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    // Unlisted source IP: header parses, access denies -> 403.
+    {
+        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer compat.close(pair[0]);
+        try sockets.setNonBlock(pair[0]);
+        try sockets.setNonBlock(pair[1]);
+        const conn = try connection.Connection.create(allocator, pair[1]);
+        r.attach(conn);
+        try writeAll(pair[0], "PROXY TCP4 198.51.100.7 10.0.0.1 1234 80\r\nGET / HTTP/1.1\r\nHost: test\r\n\r\n");
+        var buf: [4096]u8 = undefined;
+        const res = try readHeadBody(pair[0], &buf);
+        try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 403 Forbidden"));
+    }
+    // Garbage where the header belongs: connection dropped, EOF, no reply.
+    {
+        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer compat.close(pair[0]);
+        try sockets.setNonBlock(pair[0]);
+        try sockets.setNonBlock(pair[1]);
+        const conn = try connection.Connection.create(allocator, pair[1]);
+        r.attach(conn);
+        try writeAll(pair[0], "GARBAGE BYTES\r\n");
+        var buf: [4096]u8 = undefined;
+        const res = readHeadBody(pair[0], &buf);
+        try testing.expectError(error.Eof, res);
+    }
 }

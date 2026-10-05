@@ -47,6 +47,10 @@ pub const ListenSpec = struct {
     /// When true, the IPv6 socket has IPV6_V6ONLY=1 (no IPv4-mapped
     /// addresses). When false (default), the IPv6 socket is dual-stack.
     ipv6_only: bool = false,
+    /// When true, every accepted connection starts with a PROXY protocol
+    /// header (v1 or v2) that the reactor consumes before any HTTP/TLS/h2
+    /// sniffing; the header source address becomes the peer IP.
+    proxy_protocol: bool = false,
 };
 
 pub fn setNonBlock(fd: posix.fd_t) !void {

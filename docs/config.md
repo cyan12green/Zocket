@@ -145,6 +145,7 @@ peer (the realip module runs in `post_read`, before every access check).
 | `listen 8080;` | Bind to all interfaces on port 8080 (IPv4). |
 | `listen [::]:8080;` | Bind to all interfaces on port 8080 (IPv6, dual-stack). |
 | `listen 127.0.0.1:3000;` | Bind to a specific IPv4 address and port. |
+| `listen 8080 proxy_protocol;` | Expect a PROXY protocol header (v1 or v2) on every accepted connection; the header source becomes the peer IP before any HTTP/TLS/h2 parsing. Malformed headers drop the connection. Combines with `ipv6only=` in any order. |
 | `listen 8080 ipv6only=on;` | Bare port with IPv6-only flag (no IPv4-mapped). |
 
 The `listen` directive is valid in `server {}` blocks. If omitted, defaults

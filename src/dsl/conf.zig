@@ -178,19 +178,7 @@ fn parseListenValue(lx: *Lexer, b: *Builder, is_server: bool) void {
             b.listen_port = port;
             b.listen_spec = spec;
         }
-        if (lx.peek() == 'i') {
-            const flag = lx.token() orelse lx.fail("listen: expected ipv6only flag");
-            const fraw = flag.srcOf("listen");
-            if (mem.eql(u8, fraw, "ipv6only=on")) {
-                if (is_server) {
-                    b.server_listen_specs[b.current_server].?.ipv6_only = true;
-                } else {
-                    b.listen_spec.?.ipv6_only = true;
-                }
-            } else if (!mem.eql(u8, fraw, "ipv6only=off")) {
-                lx.fail("listen: unknown flag");
-            }
-        }
+        parseListenFlags(lx, b, is_server, port);
     } else if (mem.indexOfScalar(u8, raw, ':')) |colon| {
         const addr_str = raw[0..colon];
         const port_str = raw[colon + 1 ..];
@@ -207,6 +195,7 @@ fn parseListenValue(lx: *Lexer, b: *Builder, is_server: bool) void {
             b.listen_port = port;
             b.listen_spec = spec;
         }
+        parseListenFlags(lx, b, is_server, port);
     } else {
         const port = std.fmt.parseInt(u16, raw, 10) catch lx.fail("listen: invalid port");
         if (is_server) {
@@ -214,24 +203,57 @@ fn parseListenValue(lx: *Lexer, b: *Builder, is_server: bool) void {
         } else {
             b.listen_port = port;
         }
-        if (lx.peek() == 'i') {
-            const flag = lx.token() orelse lx.fail("listen: expected ipv6only flag");
-            const fraw = flag.srcOf("listen");
-            if (mem.eql(u8, fraw, "ipv6only=on")) {
-                if (is_server) {
-                    b.server_listen_specs[b.current_server] = .{ .family = .ipv6, .port = port, .ipv6_only = true };
-                } else {
-                    b.listen_spec = .{ .family = .ipv6, .port = port, .ipv6_only = true };
-                }
-            } else if (!mem.eql(u8, fraw, "ipv6only=off")) {
-                lx.fail("listen: unknown flag");
-            }
-        }
+        parseListenFlags(lx, b, is_server, port);
     }
 }
 
 /// Parse a dotted-decimal IPv4 address at comptime. Returns the 4-byte
 /// address in network byte order, or null on failure.
+
+/// Trailing `listen` flags, shared by all three address forms:
+/// `ipv6only=on|off` and bare `proxy_protocol` (PROXY-protocol header
+/// expected on every accepted connection). Applies to the just-stored spec,
+/// creating a wildcard one when the form stored none (bare port).
+fn parseListenFlags(lx: *Lexer, b: *Builder, is_server: bool, port: u16) void {
+    while (true) {
+        const c = lx.peek();
+        if (c != 'i' and c != 'p') break;
+        const flag = lx.token() orelse lx.fail("listen: expected a flag");
+        const fraw = flag.srcOf("listen");
+        if (mem.eql(u8, fraw, "ipv6only=on") or mem.eql(u8, fraw, "ipv6only=off")) {
+            const on = mem.eql(u8, fraw, "ipv6only=on");
+            if (is_server) {
+                if (b.server_listen_specs[b.current_server]) |*s| {
+                    s.ipv6_only = on;
+                } else {
+                    b.server_listen_specs[b.current_server] = .{ .family = .ipv6, .port = port, .ipv6_only = on };
+                }
+            } else {
+                if (b.listen_spec) |*s| {
+                    s.ipv6_only = on;
+                } else {
+                    b.listen_spec = .{ .family = .ipv6, .port = port, .ipv6_only = on };
+                }
+            }
+        } else if (mem.eql(u8, fraw, "proxy_protocol")) {
+            if (is_server) {
+                if (b.server_listen_specs[b.current_server]) |*s| {
+                    s.proxy_protocol = true;
+                } else {
+                    b.server_listen_specs[b.current_server] = .{ .port = port, .proxy_protocol = true };
+                }
+            } else {
+                if (b.listen_spec) |*s| {
+                    s.proxy_protocol = true;
+                } else {
+                    b.listen_spec = .{ .port = port, .proxy_protocol = true };
+                }
+            }
+        } else lx.fail("listen: unknown flag");
+    }
+}
+
+/// Parse a dotted-decimal IPv4 address at comptime.
 /// A value argument as parsed: either a zero-copy slice into the conf source
 /// (unquoted tokens, quoted strings without escapes) or a reference into the
 /// comptime decode pool (quoted strings with escapes).
@@ -3182,4 +3204,44 @@ test "conf: allow/deny and realip directives parse and bind" {
     }
     try testing.expect(found_access);
     try testing.expect(found_realip);
+}
+
+test "conf: listen accepts the proxy_protocol flag in all forms" {
+    // Bare port + flag (global scope).
+    const c1 = parse(
+        \\listen 8080 proxy_protocol;
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    try testing.expect(c1.listen_spec != null);
+    try testing.expect(c1.listen_spec.?.proxy_protocol);
+    // addr:port + flag (this form previously ignored all flags).
+    const c2 = parse(
+        \\listen 127.0.0.1:3000 proxy_protocol;
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    try testing.expect(c2.listen_spec != null);
+    try testing.expect(c2.listen_spec.?.proxy_protocol);
+    try testing.expectEqual(@as(u16, 3000), c2.listen_spec.?.port);
+    // Bracket form + combined flags, server scope.
+    const c3 = parse(
+        \\server {
+        \\    listen [::]:8080 proxy_protocol ipv6only=on;
+        \\    location / { content echo; }
+        \\}
+    );
+    try testing.expect(c3.servers[0].listen_spec != null);
+    try testing.expect(c3.servers[0].listen_spec.?.proxy_protocol);
+    try testing.expect(c3.servers[0].listen_spec.?.ipv6_only);
+    // No flag: off everywhere.
+    const c4 = parse(
+        \\server {
+        \\    listen 8080;
+        \\    location / { content echo; }
+        \\}
+    );
+    try testing.expect(c4.servers[0].listen_spec == null or !c4.servers[0].listen_spec.?.proxy_protocol);
 }
