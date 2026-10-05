@@ -293,20 +293,33 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
   `proxy_next_upstream` has no `http_502`-style status retry and does not
   cover the parked path.
 
-### Batch C2 — security and traffic control (S each)
+### Batch C2 — security and traffic control (SHIPPED 2026-10)
 
-- `allow`/`deny` + `realip`: CIDR ACLs in `preaccess`; trusted-proxy
-  `set_real_ip_from` overwriting `client_ip` from XFF. Without realip,
-  `limit_req`/`ip_hash` are wrong behind any CDN/LB.
-- PROXY protocol inbound (v1+v2): per-`listen` opt-in, parsed before
-  HTTP/TLS; feeds the 16-byte `peer_ip` plumbing from B4.
-- `limit_rate` (per-connection bandwidth cap; sendfile path must honor
-  it) + `limit_req_status` / `limit_conn_status` (429 vs 503).
-- `map`: comptime key→value table setting a var (`vars.zig` + declared
-  directive schema).
-- `expires` / `etag` toggles + `gunzip` (inflate for non-gzip clients;
-  deflate side already used).
-- Ops: formal `config test` (`--validate` exit codes) + log reopen.
+- `allow`/`deny` + `realip` ✅: CIDR ACLs in the access phase
+  (first-match-wins, 403); `set_real_ip_from` + `real_ip_header`
+  (default X-Forwarded-For) + `real_ip_recursive` restore `client_ip` in
+  `post_read`. Shared v4/v6 + CIDR parsing in `sockets.zig`.
+- PROXY protocol inbound (v1+v2) ✅: `listen ... proxy_protocol`
+  (unified trailing-flag parser, all address forms); one header consumed
+  per connection before TLS/h2/HTTP sniffing, source becomes the peer IP;
+  garbage drops the connection.
+- `limit_rate` + `limit_req_status` / `limit_conn_status` ✅: 429 joins the
+  Status enum; refusal statuses configurable (429|503); per-connection
+  token-bucket pacing (memory + sendfile bodies, shared pump helper,
+  per-loop kick list) with a live pacing proof. Plain HTTP/1.1 only.
+- `map` ✅: top-level blocks desugaring dests into synthetic per-route
+  sets; lazy per-request eval with caching and a cyclic backstop.
+  Sources/values see builtins + http/arg/cookie + captures (no set vars,
+  no chaining); max_user_vars raised 8→16 for the slot budget.
+- `expires` / `etag` + `gunzip` ✅: off/epoch/max/duration stamps (+
+  max-age override semantics); `etag off` suppresses emission only;
+  gunzip filter inflates for non-gzip clients (memory bodies,
+  pass-through on corrupt/file bodies).
+- Ops ✅: `--validate` exits 0/1 (TLS files load, listen port dry-binds);
+  `--logfile` with SIGHUP reopen, recorded for `--reload-hard`.
+  Slice deferred: per-request query override in rewrites, status-based
+  `proxy_next_upstream` retry, parked-path retry, Prometheus/JSON logs
+  (moved to C3).
 
 ### Batch C3 — cloud and protocol reach (M each)
 
