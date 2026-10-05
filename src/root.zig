@@ -119,7 +119,8 @@ comptime {
     _ = @import("compat.zig");
     _ = @import("net/iouring.zig");
     _ = @import("net/body_storage.zig");
-    _ = @import("net/body_storage.zig");
+    _ = @import("net/proxy_proto.zig");
+    _ = @import("net/dns.zig");
     _ = @import("version.zig");
     _ = @import("dsl/phase.zig");
     _ = @import("dsl/router.zig");
