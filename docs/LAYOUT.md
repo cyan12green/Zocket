@@ -25,7 +25,7 @@ src/
   net/                transport + lifecycle (M1/M2/M5/M13/M14/M15/M16)
     server.zig        M1 single-threaded epoll echo (kept for A/B)
     multireactor.zig  SO_REUSEPORT accept + reactor lifecycle + graceful
-                      stop (SIGTERM/SIGINT); no SIGHUP (comptime-only confs)
+                      stop (SIGTERM/SIGINT); SIGHUP only reopens --logfile
     reactor.zig       per-core epoll/io_uring thread: connection queue via
                       mutex+eventfd, HTTP/1.1 + h2c protocol detection,
                       epoll and io_uring I/O paths, static/sendfile flush

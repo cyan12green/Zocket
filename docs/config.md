@@ -12,8 +12,8 @@ zig build -Dconfig=config.example.conf -Doptimize=ReleaseFast  # benchmarking
 zig build -Dconfig=config.example.conf run -- --validate       # print route table
 ```
 
-The only reload is `--reload-hard` (rebuild + zero-downtime swap). SIGHUP is
-not handled. Comptime embeds (`@embedFile`) can only reach project-tree files.
+The only reload is `--reload-hard` (rebuild + zero-downtime swap). SIGHUP only
+reopens `--logfile` (log rotation). Comptime embeds (`@embedFile`) can only reach project-tree files.
 
 ## Grammar
 

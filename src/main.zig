@@ -29,6 +29,9 @@ const ServerOpts = struct {
     mode: zocket.reactor.Mode = .http,
     idle_timeout: u32 = zocket.reactor.default_idle_timeout_seconds,
     uring: bool = false,
+    /// `--logfile <path>`: stdout/stderr append here (daemon and
+    /// foreground). Reopened on SIGHUP for rotation without restart.
+    logfile: ?[]const u8 = null,
 };
 
 fn printUsage() void {
@@ -59,6 +62,9 @@ fn printUsage() void {
         \\  --uring              use the io_uring I/O backend (experimental)
         \\  --pidfile <file>     pid file for --start/--stop/--status/
         \\                       --reload-hard (default /tmp/zocket.pid)
+        \\  --logfile <file>     append stdout/stderr here (default: inherit).
+        \\                       Reopened on SIGHUP (log rotation); recorded
+        \\                       for --reload-hard
         \\
         \\Utilities:
         \\  --validate           validate the build-time config (compile-time
@@ -68,6 +74,40 @@ fn printUsage() void {
         \\  --help, -h           this help
         \\
     , .{});
+}
+
+/// Validate runtime concerns --validate checks beyond the comptime conf
+/// parse: TLS credential files load (PEM parse + key match) and the
+/// effective listen port binds (dry bind, closed immediately). Pure enough
+/// to unit-test: pass an explicit loopback port, never a fixed one.
+pub const ValidateError = error{
+    TlsFilesUnreadable,
+    TlsCredentialsInvalid,
+    PortBindFailed,
+};
+
+fn validateConfig(cfg: zocket.runtime.config.Config, opts: ServerOpts, allocator: std.mem.Allocator) ValidateError!void {
+    if (cfg.tls.enabled()) {
+        const cert_pem = compat.readFileAlloc(allocator, cfg.tls.cert, 1 << 20) catch return error.TlsFilesUnreadable;
+        defer allocator.free(cert_pem);
+        const key_pem = compat.readFileAlloc(allocator, cfg.tls.key, 1 << 20) catch return error.TlsFilesUnreadable;
+        defer allocator.free(key_pem);
+        const creds = zocket.tls.cert.loadCredentials(allocator, cert_pem, key_pem) catch return error.TlsCredentialsInvalid;
+        defer allocator.free(creds.cert_der);
+    }
+    // Effective listen port (CLI wins, else conf, else default), resolved
+    // the same way runServer resolves it.
+    const port = if (opts.port_set) opts.port else (cfg.listen_port orelse opts.port);
+    const fd = compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch return error.PortBindFailed;
+    defer compat.close(fd);
+    var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    addr[0] = 2; // AF_INET
+    addr[2] = @intCast(port >> 8);
+    addr[3] = @intCast(port & 0xff);
+    addr[4] = 127;
+    addr[7] = 1;
+    compat.bind(fd, @ptrCast(&addr), 16) catch return error.PortBindFailed;
+    compat.listen(fd, 8) catch return error.PortBindFailed;
 }
 
 fn printConfigSummary(cfg: zocket.runtime.config.Config) void {
@@ -103,6 +143,16 @@ fn runServer(
     ready: ?*const fn (ctx: *anyopaque) void,
     ready_ctx: ?*anyopaque,
 ) !void {
+    // Log routing for foreground and daemon-child serving alike (the
+    // daemon child re-applies this after its own stdio setup; harmless).
+    if (opts.logfile) |lf| {
+        sighup_logfile = lf;
+        installHupHandler();
+        redirectLogs(lf) catch |e| {
+            std.debug.print("zocket: cannot open --logfile {s}: {s}\n", .{ lf, @errorName(e) });
+            return e;
+        };
+    }
     if (opts.single) {
         // Single-threaded echo server, kept for A/B comparison.
         var s = try zocket.server.Server.init(allocator, opts.port);
@@ -303,6 +353,39 @@ fn writePidfile(path: []const u8, pid: posix_pid_t) !void {
 
 const posix_pid_t = std.posix.pid_t;
 
+/// Path SIGHUP reopens (set once at startup from --logfile; argv memory
+/// lives for the process lifetime, so the handler never frees).
+var sighup_logfile: ?[]const u8 = null;
+
+fn handleHup(_: std.posix.SIG) callconv(.c) void {
+    // Best-effort log rotation: reopen the file onto stdout/stderr. Done
+    // inline (not deferred to the event loop) like traditional daemons;
+    // only open/dup2 run here, and failures keep the old fds.
+    const path = sighup_logfile orelse return;
+    const fd = compat.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644) catch return;
+    defer compat.close(fd);
+    compat.dup2(fd, 1) catch {};
+    compat.dup2(fd, 2) catch {};
+}
+
+fn installHupHandler() void {
+    var act = std.posix.Sigaction{
+        .handler = .{ .handler = handleHup },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.HUP, &act, null);
+}
+
+/// Redirect stdout/stderr to `path` (append, created if missing). Used for
+/// --logfile in the daemon child and in the foreground server alike.
+fn redirectLogs(path: []const u8) !void {
+    const fd = try compat.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644);
+    defer compat.close(fd);
+    try compat.dup2(fd, 1);
+    try compat.dup2(fd, 2);
+}
+
 fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u8) !void {
     // Readiness handshake: the child writes 'R' once the listeners are
     // bound; the parent exits 0 on 'R', non-zero on EOF (child died).
@@ -329,6 +412,7 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
         else
             opts.port,
         .threads = opts.threads,
+        .logfile = opts.logfile,
         .mode = @tagName(opts.mode),
         .idle_timeout = opts.idle_timeout,
         .uring = opts.uring,
@@ -341,15 +425,20 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
         // ---- child: detach, then run the server ----
         compat.close(fds[0]);
         _ = compat.setsid() catch 0;
-        // stdio to /dev/null: the daemon logs nowhere (a logfile flag could
-        // redirect here later).
+        // stdin to /dev/null always; stdout/stderr to --logfile when set
+        // (SIGHUP reopens it for rotation), else /dev/null.
         const devnull = compat.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch -1;
-        if (devnull >= 0) {
-            compat.dup2(devnull, 0) catch {};
+        if (devnull >= 0) compat.dup2(devnull, 0) catch {};
+        if (opts.logfile) |lf| redirectLogs(lf) catch {
+            if (devnull >= 0) {
+                compat.dup2(devnull, 1) catch {};
+                compat.dup2(devnull, 2) catch {};
+            }
+        } else if (devnull >= 0) {
             compat.dup2(devnull, 1) catch {};
             compat.dup2(devnull, 2) catch {};
-            if (devnull > 2) compat.close(devnull);
         }
+        if (devnull > 2) compat.close(devnull);
         const Daemon = struct {
             pipe_fd: std.posix.fd_t,
             pidfile: []const u8,
@@ -553,6 +642,8 @@ const StateFile = struct {
     /// daemons started from a build; --reload-hard is the only reload.
     embedded: bool = false,
     project_root: ?[]const u8 = null,
+    /// --logfile path (reproduced across --reload-hard like the port).
+    logfile: ?[]const u8 = null,
     /// Memfd zone descriptors for reload-surviving shared-memory zones.
     /// The new daemon inherits these fds across exec and mmaps them.
     zone_fds: []const ZoneInfo = &.{},
@@ -735,6 +826,10 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
     try argv.append(allocator, idle_str);
     try argv.append(allocator, "--pidfile");
     try argv.append(allocator, pidfile);
+    if (state.logfile) |lf| {
+        try argv.append(allocator, "--logfile");
+        try argv.append(allocator, lf);
+    }
     if (state.uring) try argv.append(allocator, "--uring");
     if (state.single) {
         try argv.append(allocator, "--single");
@@ -805,6 +900,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             opts.idle_timeout = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, arg, "--pidfile")) {
             pidfile = args.next() orelse return error.MissingPidfileArgument;
+        } else if (std.mem.eql(u8, arg, "--logfile")) {
+            opts.logfile = args.next() orelse return error.MissingLogfileArgument;
         } else if (std.mem.eql(u8, arg, "--single")) {
             opts.single = true;
         } else if (std.mem.eql(u8, arg, "--echo")) {
@@ -845,13 +942,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     if (validate) {
-        // Configs are compile-time validated by `-Dconfig`; --validate prints
-        // the built route table (the embedded config, or the default).
-        if (embedded_cfg) |cfg| {
-            printConfigSummary(cfg);
-        } else {
-            printConfigSummary(zocket.runtime.config.Config.default());
-        }
+        // Compile-time validation (conf parse) already passed or the build
+        // would have failed; here the runtime concerns are checked: TLS
+        // files load and the listen port binds. Exit 0 on success, 1 with
+        // a reason on stderr otherwise.
+        const cfg = embedded_cfg orelse zocket.runtime.config.Config.default();
+        printConfigSummary(cfg);
+        validateConfig(cfg, opts, allocator) catch |e| {
+            std.debug.print("zocket: validate: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
+        std.debug.print("zocket: validate: OK\n", .{});
         return;
     }
     if (do_stop) {
@@ -872,4 +973,46 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     try runServer(allocator, opts, null, null);
+}
+
+test "validate accepts a bindable port and rejects missing TLS files" {
+    // Port 0 (ephemeral loopback): always bindable, never collides.
+    const opts = ServerOpts{ .port = 0, .port_set = true };
+    try validateConfig(zocket.runtime.config.Config.default(), opts, testing.allocator);
+    // Missing TLS files fail distinctly from bad credential content.
+    const bad_tls = zocket.runtime.config.Config{
+        .tls = .{ .cert = "/nonexistent-dir/cert.pem", .key = "/nonexistent-dir/key.pem" },
+    };
+    try testing.expectError(error.TlsFilesUnreadable, validateConfig(bad_tls, ServerOpts{}, testing.allocator));
+    // Present-but-garbage PEM fails credential parsing, not file IO.
+    const dir = "/tmp";
+    try compat.writeFile(dir ++ "/zocket-bad-cert.pem", "not a certificate\n");
+    defer compat.deleteFile(dir ++ "/zocket-bad-cert.pem") catch {};
+    try compat.writeFile(dir ++ "/zocket-bad-key.pem", "not a key\n");
+    defer compat.deleteFile(dir ++ "/zocket-bad-key.pem") catch {};
+    const garbage_tls = zocket.runtime.config.Config{
+        .tls = .{ .cert = dir ++ "/zocket-bad-cert.pem", .key = dir ++ "/zocket-bad-key.pem" },
+    };
+    try testing.expectError(error.TlsCredentialsInvalid, validateConfig(garbage_tls, ServerOpts{}, testing.allocator));
+}
+
+test "redirectLogs appends stdout/stderr to the file" {
+    const path = "/tmp/zocket-logfile-test.log";
+    compat.deleteFile(path) catch {};
+    defer compat.deleteFile(path) catch {};
+    // Save the console fds: redirectLogs steals 1/2, and the runner's own
+    // progress output must keep flowing after this test.
+    const save1 = try compat.dup(1);
+    defer compat.close(save1);
+    const save2 = try compat.dup(2);
+    defer compat.close(save2);
+    try redirectLogs(path);
+    // Something lands in the file while redirected...
+    std.debug.print("logfile-probe-line\n", .{});
+    // ...then console output is restored before any assertion output.
+    try compat.dup2(save1, 1);
+    try compat.dup2(save2, 2);
+    const data = try compat.readFileAlloc(testing.allocator, path, 1 << 20);
+    defer testing.allocator.free(data);
+    try testing.expect(std.mem.indexOf(u8, data, "logfile-probe-line\n") != null);
 }
