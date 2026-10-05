@@ -31,4 +31,9 @@ comptime {
     _ = @import("dsl/modules/limit.zig");
     _ = @import("dsl/modules/precompressed.zig");
     _ = @import("dsl/modules/proxy_cache.zig");
+    _ = @import("dsl/modules/error_page.zig");
+    _ = @import("dsl/modules/try_files.zig");
+    _ = @import("dsl/modules/rewrite.zig");
+    _ = @import("dsl/modules/access.zig");
+    _ = @import("dsl/modules/realip.zig");
 }

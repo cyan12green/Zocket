@@ -128,6 +128,11 @@ const H_proxy_read_timeout = keyHash("proxy_read_timeout");
 const H_proxy_next_upstream = keyHash("proxy_next_upstream");
 const H_proxy_keepalive = keyHash("proxy_keepalive");
 const H_proxy_keepalive_timeout = keyHash("proxy_keepalive_timeout");
+const H_allow = keyHash("allow");
+const H_deny = keyHash("deny");
+const H_set_real_ip_from = keyHash("set_real_ip_from");
+const H_real_ip_header = keyHash("real_ip_header");
+const H_real_ip_recursive = keyHash("real_ip_recursive");
 const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
 const H_access_log = keyHash("access_log");
@@ -163,7 +168,7 @@ fn parseListenValue(lx: *Lexer, b: *Builder, is_server: bool) void {
         const port = std.fmt.parseInt(u16, port_str, 10) catch lx.fail("listen: invalid port");
         const spec = sockets_mod.ListenSpec{
             .family = .ipv6,
-            .addr = parseIpv6Addr(addr_str) orelse lx.fail("listen: invalid IPv6 address"),
+            .addr = sockets_mod.parseIpv6(addr_str) orelse lx.fail("listen: invalid IPv6 address"),
             .port = port,
         };
         if (is_server) {
@@ -192,7 +197,7 @@ fn parseListenValue(lx: *Lexer, b: *Builder, is_server: bool) void {
         const port = std.fmt.parseInt(u16, port_str, 10) catch lx.fail("listen: invalid port");
         const spec = sockets_mod.ListenSpec{
             .family = .ipv4,
-            .addr = parseIpv4Addr(addr_str) orelse lx.fail("listen: invalid IPv4 address"),
+            .addr = sockets_mod.parseIpv4(addr_str) orelse lx.fail("listen: invalid IPv4 address"),
             .port = port,
         };
         if (is_server) {
@@ -227,109 +232,6 @@ fn parseListenValue(lx: *Lexer, b: *Builder, is_server: bool) void {
 
 /// Parse a dotted-decimal IPv4 address at comptime. Returns the 4-byte
 /// address in network byte order, or null on failure.
-fn parseIpv4Addr(s: []const u8) ?[16]u8 {
-    var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 };
-    var i: usize = 0;
-    var octet_idx: usize = 0;
-    while (octet_idx < 4) : (octet_idx += 1) {
-        if (i >= s.len) return null;
-        var val: u16 = 0;
-        var digits: usize = 0;
-        while (i < s.len and s[i] != '.') : (i += 1) {
-            if (s[i] < '0' or s[i] > '9') return null;
-            val = val * 10 + (s[i] - '0');
-            digits += 1;
-        }
-        if (digits == 0 or val > 255) return null;
-        result[12 + octet_idx] = @intCast(val);
-        if (octet_idx < 3) {
-            if (i >= s.len or s[i] != '.') return null;
-            i += 1;
-        }
-    }
-    if (i != s.len) return null;
-    return result;
-}
-
-/// Parse an IPv6 address at comptime. Returns the 16-byte address in
-/// network byte order, or null on failure. Supports full form, compressed
-/// (::), and IPv4-mapped (::ffff:a.b.c.d).
-fn parseIpv6Addr(s: []const u8) ?[16]u8 {
-    // Handle the :: compression by splitting on "::" and parsing both sides.
-    if (mem.indexOf(u8, s, "::")) |dbl| {
-        const left_str = s[0..dbl];
-        const right_str = s[dbl + 2 ..];
-        // Count groups on each side.
-        var left_groups: usize = 0;
-        if (left_str.len > 0) {
-            var tmp = left_str;
-            while (mem.indexOfScalar(u8, tmp, ':')) |pos| {
-                left_groups += 1;
-                tmp = tmp[pos + 1 ..];
-            }
-            left_groups += 1; // last group
-        }
-        var right_groups: usize = 0;
-        if (right_str.len > 0) {
-            var tmp = right_str;
-            while (mem.indexOfScalar(u8, tmp, ':')) |pos| {
-                right_groups += 1;
-                tmp = tmp[pos + 1 ..];
-            }
-            right_groups += 1;
-        }
-        const missing = 8 - left_groups - right_groups;
-        if (missing < 0) return null;
-        var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-        var idx: usize = 0;
-        // Parse left groups.
-        if (left_str.len > 0) {
-            idx = parseIpv6Groups(left_str, &result, 0);
-        }
-        // Fill compressed groups with zeros.
-        for (0..missing * 2) |_| {
-            if (idx < 16) {
-                result[idx] = 0;
-                idx += 1;
-            }
-        }
-        // Parse right groups.
-        if (right_str.len > 0) {
-            _ = parseIpv6Groups(right_str, &result, idx);
-        }
-        return result;
-    }
-    // No :: — parse up to 8 hex groups.
-    var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    _ = parseIpv6Groups(s, &result, 0);
-    return result;
-}
-
-/// Parse hex groups from an IPv6 address string into `result` starting at
-/// byte offset `start`. Returns the number of bytes written.
-fn parseIpv6Groups(s: []const u8, result: *[16]u8, start: usize) usize {
-    var pos = start;
-    var i: usize = 0;
-    while (i < s.len) {
-        // Read up to 4 hex chars.
-        var val: u16 = 0;
-        var digits: usize = 0;
-        while (i < s.len and s[i] != ':') : (i += 1) {
-            const c = s[i];
-            const d = if (c >= '0' and c <= '9') c - '0' else if (c >= 'a' and c <= 'f') c - 'a' + 10 else if (c >= 'A' and c <= 'F') c - 'A' + 10 else return 0;
-            val = val * 16 + d;
-            digits += 1;
-        }
-        if (digits > 0 and pos + 1 < 16) {
-            result[pos] = @intCast(val >> 8);
-            result[pos + 1] = @intCast(val & 0xff);
-            pos += 2;
-        }
-        if (i < s.len and s[i] == ':') i += 1;
-    }
-    return pos;
-}
-
 /// A value argument as parsed: either a zero-copy slice into the conf source
 /// (unquoted tokens, quoted strings without escapes) or a reference into the
 /// comptime decode pool (quoted strings with escapes).
@@ -430,6 +332,18 @@ const LocationSpec = struct {
     /// `proxy_keepalive N;` / `proxy_keepalive_timeout S;` (0 = default).
     proxy_keepalive_max: u32 = 0,
     proxy_keepalive_timeout: u32 = 0,
+    /// `allow` / `deny` rules in declaration order: range into the
+    /// builder's access-rule pool (allow flag + raw value, CIDR-parsed at
+    /// build).
+    access_start: usize = 0,
+    access_len: usize = 0,
+    /// `set_real_ip_from` prefixes: range into the trusted-proxy pool.
+    realip_start: usize = 0,
+    realip_len: usize = 0,
+    /// `real_ip_header <name>;` (null = X-Forwarded-For) /
+    /// `real_ip_recursive on|off;`.
+    real_ip_header: ?Str = null,
+    real_ip_recursive: bool = false,
     /// `error_page 404 500 /50x;` / `error_page 503 =200;`: range into the
     /// builder's error-page pool (status -> target URI or =code).
     error_pages_start: usize = 0,
@@ -480,6 +394,13 @@ const LogFormatSpec = struct {
     value: Str = .{ .src = "" },
 };
 
+/// One `allow`/`deny` entry as parsed (CIDR-parsed at build; the raw
+/// value stays a Str so build can @compileError on garbage).
+const AccessSpec = struct {
+    allow: bool,
+    value: Str = .{ .src = "" },
+};
+
 /// One `error_page` entry as parsed (target unresolved until build).
 const ErrorPageSpec = struct {
     status: u16,
@@ -503,6 +424,8 @@ const Builder = struct {
     error_pages: ct_pool.CtPool(ErrorPageSpec, 256) = .{},
     try_files: ct_pool.CtPool(Str, 1024) = .{},
     rewrites: ct_pool.CtPool(RewriteSpec, 256) = .{},
+    access_rules: ct_pool.CtPool(AccessSpec, 256) = .{},
+    realip_from: ct_pool.CtPool(Str, 64) = .{},
     strings: ct_pool.CtPool(u8, string_cap) = .{},
     log_formats: ct_pool.CtPool(LogFormatSpec, 16) = .{},
     set_vars: ct_pool.CtPool(SetSpec, 1024) = .{},
@@ -1249,6 +1172,38 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             spec.proxy_keepalive_timeout = lx.number("proxy_keepalive_timeout", u32);
             lx.expectTerminator("proxy_keepalive_timeout");
         },
+        H_allow, H_deny => {
+            // `allow 192.168.1.0/24;` / `deny all;` — first match wins.
+            // Validated at build (CIDR parse); stored raw here.
+            const v = lx.value(b, name);
+            lx.expectTerminator(name);
+            if (spec.access_len == 0) spec.access_start = b.access_rules.len;
+            _ = b.access_rules.create(.{ .allow = keyHash(name) == H_allow, .value = v });
+            spec.access_len += 1;
+            ensureModuleBound(b, spec, .access, "access");
+            b.cost += 8;
+        },
+        H_set_real_ip_from => {
+            const v = lx.value(b, "set_real_ip_from");
+            lx.expectTerminator("set_real_ip_from");
+            if (spec.realip_len == 0) spec.realip_start = b.realip_from.len;
+            _ = b.realip_from.create(v);
+            spec.realip_len += 1;
+            ensureModuleBound(b, spec, .post_read, "realip");
+            b.cost += 8;
+        },
+        H_real_ip_header => {
+            spec.real_ip_header = lx.value(b, "real_ip_header");
+            lx.expectTerminator("real_ip_header");
+            ensureModuleBound(b, spec, .post_read, "realip");
+            b.cost += 8;
+        },
+        H_real_ip_recursive => {
+            spec.real_ip_recursive = lx.boolOnOff("real_ip_recursive");
+            lx.expectTerminator("real_ip_recursive");
+            ensureModuleBound(b, spec, .post_read, "realip");
+            b.cost += 8;
+        },
         H_proxy_set_header => {
             // `proxy_set_header <name> "<cv>";` (M-E): an upstream request
             // header override; the value is a complex value.
@@ -1773,6 +1728,44 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .ranges = ranges };
     };
 
+    // `allow`/`deny` rules per route (M-C2): values CIDR-parse here so a
+    // bad prefix is a compile error naming the route, not a silent miss.
+    const AccessTable = struct { items: [256]router.AccessRule, ranges: [route_cap]Range };
+    const access_table: AccessTable = comptime blk: {
+        var items: [256]router.AccessRule = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.access_len };
+            for (b.access_rules.items[spec.access_start..][0..spec.access_len]) |as| {
+                const text = resolve(as.value, strings);
+                const cidr = sockets_mod.parseCidr(text) orelse
+                    @compileError("allow/deny: invalid CIDR, IP or 'all'");
+                items[pos] = .{ .allow = as.allow, .cidr = cidr };
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
+    // `set_real_ip_from` prefixes per route (same fail-fast validation).
+    const RealipTable = struct { items: [64]router.Cidr, ranges: [route_cap]Range };
+    const realip_table: RealipTable = comptime blk: {
+        var items: [64]router.Cidr = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.realip_len };
+            for (b.realip_from.items[spec.realip_start..][0..spec.realip_len]) |rs| {
+                const text = resolve(rs, strings);
+                items[pos] = sockets_mod.parseCidr(text) orelse
+                    @compileError("set_real_ip_from: invalid CIDR, IP or 'all'");
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
     // `try_files` candidates per route (M-C1): each resolves to a string.
     const TryTable = struct { items: [1024][]const u8, ranges: [route_cap]Range };
     const try_table: TryTable = comptime blk: {
@@ -2025,6 +2018,10 @@ fn build(b: *const Builder) Config {
                 .proxy_next_upstream = spec.proxy_next_upstream,
                 .proxy_keepalive_max = spec.proxy_keepalive_max,
                 .proxy_keepalive_timeout_s = spec.proxy_keepalive_timeout,
+                .access_rules = access_table.items[access_table.ranges[ri].start..][0..access_table.ranges[ri].len],
+                .realip_from = realip_table.items[realip_table.ranges[ri].start..][0..realip_table.ranges[ri].len],
+                .real_ip_header = if (spec.real_ip_header) |h| resolve(h, strings) else null,
+                .real_ip_recursive = spec.real_ip_recursive,
                 .chunked = spec.chunked,
                 .tcp_nopush = spec.tcp_nopush,
                 .log_format = logFormatIndex(spec.log_format, log_table.items[0..log_table.len], strings),
@@ -3141,4 +3138,48 @@ test "conf: proxy_keepalive directives parse with zero defaults" {
     try testing.expectEqual(@as(u32, 30), cfg.routes[0].proxy_keepalive_timeout_s);
     try testing.expectEqual(@as(u32, 0), cfg.routes[1].proxy_keepalive_max);
     try testing.expectEqual(@as(u32, 0), cfg.routes[1].proxy_keepalive_timeout_s);
+}
+
+test "conf: allow/deny and realip directives parse and bind" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        allow 192.168.1.0/24;
+        \\        allow 10.0.0.5;
+        \\        deny all;
+        \\        set_real_ip_from 10.0.0.0/8;
+        \\        real_ip_header X-Real-IP;
+        \\        real_ip_recursive on;
+        \\    }
+        \\    location /open {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 3), cfg.routes[0].access_rules.len);
+    try testing.expect(cfg.routes[0].access_rules[0].allow);
+    try testing.expectEqual(@as(u8, 24), cfg.routes[0].access_rules[0].cidr.bits);
+    try testing.expect(cfg.routes[0].access_rules[1].allow);
+    try testing.expectEqual(@as(u8, 32), cfg.routes[0].access_rules[1].cidr.bits);
+    try testing.expect(!cfg.routes[0].access_rules[2].allow);
+    try testing.expectEqual(@as(u8, 0), cfg.routes[0].access_rules[2].cidr.bits);
+    try testing.expectEqual(@as(usize, 1), cfg.routes[0].realip_from.len);
+    try testing.expectEqual(@as(u8, 8), cfg.routes[0].realip_from[0].bits);
+    try testing.expectEqualStrings("X-Real-IP", cfg.routes[0].real_ip_header.?);
+    try testing.expect(cfg.routes[0].real_ip_recursive);
+    // Untouched route: empty tables, defaults.
+    try testing.expectEqual(@as(usize, 0), cfg.routes[1].access_rules.len);
+    try testing.expectEqual(@as(usize, 0), cfg.routes[1].realip_from.len);
+    try testing.expect(cfg.routes[1].real_ip_header == null);
+    try testing.expect(!cfg.routes[1].real_ip_recursive);
+    // Directive presence bound both modules.
+    var found_access = false;
+    var found_realip = false;
+    for (cfg.routes[0].modules) |mb| {
+        if (std.mem.eql(u8, mb.module, "access")) found_access = true;
+        if (std.mem.eql(u8, mb.module, "realip")) found_realip = true;
+    }
+    try testing.expect(found_access);
+    try testing.expect(found_realip);
 }

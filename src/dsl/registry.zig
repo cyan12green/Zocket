@@ -464,6 +464,8 @@ pub const default_registry = Registry(.{
     @import("modules/error_page.zig").error_page,
     @import("modules/try_files.zig").try_files,
     @import("modules/rewrite.zig").rewrite,
+    @import("modules/access.zig").access,
+    @import("modules/realip.zig").realip,
 });
 
 const testing = std.testing;

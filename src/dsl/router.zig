@@ -7,6 +7,7 @@ const ct_pool = @import("../ct_pool.zig");
 const vars = @import("vars.zig");
 const htpasswd_mod = @import("htpasswd.zig");
 const regex_mod = @import("regex.zig");
+const sockets_mod = @import("../net/sockets.zig");
 
 pub const Phase = phase_mod.Phase;
 pub const Frag = vars.Frag;
@@ -107,6 +108,19 @@ pub const Route = struct {
     /// default for both.
     proxy_keepalive_max: u32 = 0,
     proxy_keepalive_timeout_s: u32 = 0,
+    /// Access control (`allow`/`deny`, first match wins; no match allows):
+    /// ordered CIDR rules evaluated in the access phase.
+    access_rules: []const AccessRule = &.{},
+    /// Trusted-proxy prefixes (`set_real_ip_from`): when the peer matches,
+    /// `client_ip` is replaced from `real_ip_header` (default
+    /// X-Forwarded-For) in the post_read phase, so downstream access
+    /// decisions see the real client.
+    realip_from: []const Cidr = &.{},
+    /// Header to read the real client IP from (null = X-Forwarded-For).
+    real_ip_header: ?[]const u8 = null,
+    /// Walk the header chain right-to-left past trusted proxies instead of
+    /// taking the last entry (`real_ip_recursive on`).
+    real_ip_recursive: bool = false,
     /// Route opt-in for chunked transfer encoding (HTTP/1.1 only): responses
     /// on this route are framed as a single chunk with
     /// `Transfer-Encoding: chunked` instead of Content-Length. Off by
@@ -314,6 +328,15 @@ pub const RewriteRule = struct {
     pattern: Regex,
     replacement: []const vars.Frag,
     flag: RewriteFlag = .last,
+};
+
+/// A CIDR prefix for access control and trusted-proxy lists.
+pub const Cidr = sockets_mod.Cidr;
+
+/// One `allow`/`deny` rule: first match in declaration order wins.
+pub const AccessRule = struct {
+    allow: bool,
+    cidr: Cidr,
 };
 
 /// One proxy backend. The `sockaddr` is pre-computed: at

@@ -403,3 +403,204 @@ test "sockets: listeners bind ephemeral ports, peers resolve" {
     try setNonBlock(cfd);
     pinToCpu(0); // best-effort, must not crash
 }
+
+/// IP literal parsers (shared by conf `listen` and the access/realip
+/// CIDR machinery). v4 yields IPv4-mapped IPv6 (`::ffff:a.b.c.d`), so one
+/// 16-byte compare covers both families.
+
+pub fn parseIpv4(s: []const u8) ?[16]u8 {
+    var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0 };
+    var i: usize = 0;
+    var octet_idx: usize = 0;
+    while (octet_idx < 4) : (octet_idx += 1) {
+        if (i >= s.len) return null;
+        var val: u16 = 0;
+        var digits: usize = 0;
+        while (i < s.len and s[i] != '.') : (i += 1) {
+            if (s[i] < '0' or s[i] > '9') return null;
+            val = val * 10 + (s[i] - '0');
+            digits += 1;
+        }
+        if (digits == 0 or val > 255) return null;
+        result[12 + octet_idx] = @intCast(val);
+        if (octet_idx < 3) {
+            if (i >= s.len or s[i] != '.') return null;
+            i += 1;
+        }
+    }
+    if (i != s.len) return null;
+    return result;
+}
+
+/// Parse an IPv6 address literal. Returns the 16-byte address in
+/// network byte order, or null on failure. Supports full form, compressed
+/// (::), and IPv4-mapped (::ffff:a.b.c.d).
+pub fn parseIpv6(s: []const u8) ?[16]u8 {
+    // Handle the :: compression by splitting on "::" and parsing both sides.
+    if (std.mem.indexOf(u8, s, "::")) |dbl| {
+        const left_str = s[0..dbl];
+        const right_str = s[dbl + 2 ..];
+        // Count groups on each side.
+        var left_groups: usize = 0;
+        if (left_str.len > 0) {
+            var tmp = left_str;
+            while (std.mem.indexOfScalar(u8, tmp, ':')) |pos| {
+                left_groups += 1;
+                tmp = tmp[pos + 1 ..];
+            }
+            left_groups += 1; // last group
+        }
+        var right_groups: usize = 0;
+        if (right_str.len > 0) {
+            var tmp = right_str;
+            while (std.mem.indexOfScalar(u8, tmp, ':')) |pos| {
+                right_groups += 1;
+                tmp = tmp[pos + 1 ..];
+            }
+            right_groups += 1;
+        }
+        const missing = 8 - left_groups - right_groups;
+        if (missing < 0) return null;
+        var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        var idx: usize = 0;
+        // Parse left groups.
+        if (left_str.len > 0) {
+            idx = parseIpv6Groups(left_str, &result, 0);
+        }
+        // Fill compressed groups with zeros.
+        for (0..missing * 2) |_| {
+            if (idx < 16) {
+                result[idx] = 0;
+                idx += 1;
+            }
+        }
+        // Parse right groups.
+        if (right_str.len > 0) {
+            _ = parseIpv6Groups(right_str, &result, idx);
+        }
+        return result;
+    }
+    // No :: — parse up to 8 hex groups.
+    var result: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    _ = parseIpv6Groups(s, &result, 0);
+    return result;
+}
+
+/// Parse hex groups from an IPv6 address string into `result` starting at
+/// byte offset `start`. Returns the number of bytes written.
+fn parseIpv6Groups(s: []const u8, result: *[16]u8, start: usize) usize {
+    var pos = start;
+    var i: usize = 0;
+    while (i < s.len) {
+        // Read up to 4 hex chars.
+        var val: u16 = 0;
+        var digits: usize = 0;
+        while (i < s.len and s[i] != ':') : (i += 1) {
+            const c = s[i];
+            const d = if (c >= '0' and c <= '9') c - '0' else if (c >= 'a' and c <= 'f') c - 'a' + 10 else if (c >= 'A' and c <= 'F') c - 'A' + 10 else return 0;
+            val = val * 16 + d;
+            digits += 1;
+        }
+        if (digits > 0 and pos + 1 < 16) {
+            result[pos] = @intCast(val >> 8);
+            result[pos + 1] = @intCast(val & 0xff);
+            pos += 2;
+        }
+        if (i < s.len and s[i] == ':') i += 1;
+    }
+    return pos;
+}
+
+
+/// A CIDR prefix over the 16-byte address space (v4 stored mapped).
+pub const Cidr = struct {
+    addr: [16]u8 = @as([16]u8, @splat(@as(u8, 0))),
+    bits: u8 = 0,
+};
+
+/// Parse `all`, a bare IP literal, or `addr/bits`. `all` is the /0 catch-all.
+/// Bare v4 defaults to /32, bare v6 to /128. Returns null on garbage.
+pub fn parseCidr(s: []const u8) ?Cidr {
+    if (std.mem.eql(u8, s, "all")) return .{ .bits = 0 };
+    if (std.mem.indexOfScalar(u8, s, '/')) |slash| {
+        const addr = parseIp(s[0..slash]) orelse return null;
+        const bits = std.fmt.parseInt(u8, s[slash + 1 ..], 10) catch return null;
+        const max: u8 = if (isIPv4Mapped(addr)) 32 else 128;
+        if (bits > max) return null;
+        return .{ .addr = addr, .bits = bits };
+    }
+    const addr = parseIp(s) orelse return null;
+    return .{ .addr = addr, .bits = if (isIPv4Mapped(addr)) 32 else 128 };
+}
+
+/// Parse a v4 or v6 literal (v6 takes precedence when both could match —
+/// in practice dotted form only parses v4, colon form only v6).
+pub fn parseIp(s: []const u8) ?[16]u8 {
+    if (std.mem.indexOfScalar(u8, s, ':') != null) return parseIpv6(s);
+    return parseIpv4(s);
+}
+
+/// True when `ip` falls inside `cidr` (prefix compare, network order).
+/// v4-mapped addresses compare their last 4 bytes (a v4 /24 is bits of the
+/// dotted quad, not of the leading zeroes); mismatched families only match
+/// a /0.
+pub fn cidrContains(cidr: Cidr, ip: [16]u8) bool {
+    if (cidr.bits == 0) return true;
+    const base: usize = if (isIPv4Mapped(cidr.addr)) 12 else 0;
+    if (isIPv4Mapped(ip) != (base == 12)) return false;
+    var bits = cidr.bits;
+    var i: usize = base;
+    while (bits >= 8) : (i += 1) {
+        if (cidr.addr[i] != ip[i]) return false;
+        bits -= 8;
+    }
+    if (bits > 0) {
+        const mask: u8 = @truncate(@as(u16, 0xff00) >> @intCast(bits));
+        if ((cidr.addr[i] & mask) != (ip[i] & mask)) return false;
+    }
+    return true;
+}
+
+test "sockets: parseCidr covers all, bare IPs and prefixes" {
+    const all = parseCidr("all").?;
+    try testing.expectEqual(@as(u8, 0), all.bits);
+    const v4 = parseCidr("10.1.2.3").?;
+    try testing.expectEqual(@as(u8, 32), v4.bits);
+    try testing.expect(isIPv4Mapped(v4.addr));
+    const net24 = parseCidr("192.168.1.0/24").?;
+    try testing.expectEqual(@as(u8, 24), net24.bits);
+    const v6 = parseCidr("2001:db8::1").?;
+    try testing.expectEqual(@as(u8, 128), v6.bits);
+    const v664 = parseCidr("2001:db8::/32").?;
+    try testing.expectEqual(@as(u8, 32), v664.bits);
+    try testing.expect(parseCidr("10.0.0.0/33") == null); // v4 overflow
+    try testing.expect(parseCidr("::/129") == null); // v6 overflow
+    try testing.expect(parseCidr("not-an-ip") == null);
+    try testing.expect(parseCidr("10.0.0.1/abc") == null);
+    try testing.expect(parseCidr("") == null);
+}
+
+test "sockets: cidrContains matches prefixes and boundaries" {
+    const net24 = parseCidr("192.168.1.0/24").?;
+    try testing.expect(cidrContains(net24, parseIp("192.168.1.1").?));
+    try testing.expect(cidrContains(net24, parseIp("192.168.1.254").?));
+    try testing.expect(!cidrContains(net24, parseIp("192.168.2.1").?));
+    try testing.expect(!cidrContains(net24, parseIp("10.0.0.1").?));
+    // Partial-byte boundary: /25 splits .0-.127 / .128-.255.
+    const net25 = parseCidr("192.168.1.0/25").?;
+    try testing.expect(cidrContains(net25, parseIp("192.168.1.127").?));
+    try testing.expect(!cidrContains(net25, parseIp("192.168.1.128").?));
+    // /0 contains everything, including v6.
+    try testing.expect(cidrContains(parseCidr("all").?, parseIp("8.8.8.8").?));
+    try testing.expect(cidrContains(parseCidr("all").?, parseIp("::1").?));
+    // v6 prefix.
+    const v6net = parseCidr("2001:db8::/32").?;
+    try testing.expect(cidrContains(v6net, parseIp("2001:db8::1").?));
+    try testing.expect(!cidrContains(v6net, parseIp("2001:db9::1").?));
+    // Exact host routes.
+    try testing.expect(cidrContains(parseCidr("10.0.0.5").?, parseIp("10.0.0.5").?));
+    try testing.expect(!cidrContains(parseCidr("10.0.0.5").?, parseIp("10.0.0.6").?));
+    // Cross-family prefixes never match (except a /0).
+    try testing.expect(!cidrContains(parseCidr("10.0.0.0/8").?, parseIp("::1").?));
+    try testing.expect(!cidrContains(parseCidr("2001:db8::/32").?, parseIp("10.1.2.3").?));
+}

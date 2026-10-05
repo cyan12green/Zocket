@@ -65,6 +65,8 @@ top-level directives + `server {}` blocks holding `location {}` blocks. No
 | `access auth_request` | — | access | Subrequest auth |
 | `access limit_req` | — | access | Rate limiting |
 | `access limit_conn` | — | access | Concurrency limiting |
+| `access access` | — | access | CIDR allow/deny (auto-bound by `allow`/`deny`) |
+| `post_read realip` | — | post_read | Real client IP from trusted proxies (auto-bound by `set_real_ip_from` et al.) |
 | `content precompressed` | — | content | .gz sibling serving |
 | `rewrite proxy_cache` | — | rewrite | Response cache lookup |
 | `content try_files` | — | content | Probe files, fall back (auto-bound by `try_files`) |
@@ -120,6 +122,21 @@ spinning).
 |---|---|---|---|
 | `try_files` | `try_files $uri $uri/ /fallback;` or `try_files $uri =404;` | — | Probe each candidate against `root` in order; redirect to the first that exists. `$uri` is the request target, `$uri/` appends `index`. The last entry is the fallback: a URI redirects to it, `=code` answers that status in place. |
 | `error_page` | `error_page 404 500 /50x.html;` or `error_page 503 =200;` | — | After the walk, when the outgoing status matches, redirect to the URI (methods other than GET/HEAD become GET) or rewrite the status in place (`=code`). Matches the status the request is heading out with — including 404 when no module claimed it. |
+
+### Access control & real client IP
+
+`allow`/`deny` evaluate in declaration order against `client_ip`
+(first match wins; no match allows). Behind a CDN/LB, pair with
+`set_real_ip_from` so the decision sees the real client, not the proxy
+peer (the realip module runs in `post_read`, before every access check).
+
+| Directive | Syntax | Default | Description |
+|---|---|---|---|
+| `allow` | `allow 192.168.1.0/24;`, `allow 10.0.0.5;`, `allow all;` | — | Allow matching clients. Binds the `access` module. |
+| `deny` | `deny 192.168.1.0/24;`, `deny all;` | — | Deny matching clients (403). Binds the `access` module. |
+| `set_real_ip_from` | `set_real_ip_from 10.0.0.0/8;` | — | Trust this prefix: the peer may report the client IP. Binds `realip`. |
+| `real_ip_header` | `real_ip_header X-Forwarded-For;` | X-Forwarded-For | Header to read the client IP from. |
+| `real_ip_recursive` | `real_ip_recursive on\|off;` | off | Off: take the last header entry. On: walk right-to-left past trusted entries to the first untrusted one. |
 
 ### Listen directive
 
