@@ -176,6 +176,9 @@ pub const Server = struct {
     /// misconfiguration backstop (`try_files` converges on its own because
     /// the redirect target is the candidate that already exists).
     pub fn handleRequest(self: *const Server, ctx: *pipeline.Context) !pipeline.Outcome {
+        // Map table for this request (Frag.map renders through it; empty
+        // when the config declares no maps).
+        ctx.maps = self.cfg.maps;
         var outcome = try pipeline.runWithRouter(registry.default_registry, self.cfg.routes, &self.router, ctx);
         var hops: u8 = 0;
         while (ctx.internal_redirect_target) |target| {
@@ -1263,4 +1266,73 @@ test "internal redirect: self-referential error_page stops at the cap" {
 
     _ = try srv.handleRequest(&ctx);
     try testing.expectEqual(max_internal_redirects, ctx.redirect_hops);
+}
+
+test "map vars render per request through the server" {
+    const cfg = comptime Config.fromConfComptime(
+        \\map $http_user_agent $is_bot {
+        \\    default 0;
+        \\    curl 1;
+        \\    ~*bot 1;
+        \\}
+        \\server {
+        \\    location / {
+        \\        return 200 "bot=$is_bot\n";
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    const cases = [_]struct { ua: ?[]const u8, want: []const u8 }{
+        .{ .ua = "Googlebot/2.1", .want = "bot=1\n" },
+        // Literals are exact (nginx semantics): "curl" hits, "curl/8.0" falls
+        // to the default.
+        .{ .ua = "curl", .want = "bot=1\n" },
+        .{ .ua = "curl/8.0", .want = "bot=0\n" },
+        .{ .ua = "Mozilla/5.0", .want = "bot=0\n" },
+        .{ .ua = null, .want = "bot=0\n" },
+    };
+    for (cases) |c| {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.target = "/";
+        req.decoded_target = "/";
+        if (c.ua) |ua| _ = req.addHeaderParsed("User-Agent", ua) catch unreachable;
+        var resp = registry.Response.init(.ok);
+        var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+        try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+        try testing.expectEqualStrings(c.want, resp.body);
+    }
+}
+
+test "map dest feeds set vars and second-request caching is per-request" {
+    // $tier derives from the path arg; a set var consumes it; two sequential
+    // requests must not leak cached evaluations into each other.
+    const cfg = comptime Config.fromConfComptime(
+        \\map $arg_tier $quota {
+        \\    default 10;
+        \\    pro 100;
+        \\}
+        \\server {
+        \\    location / {
+        \\        set $msg "quota=$quota";
+        \\        return 200 "$msg\n";
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    const cases = [_]struct { target: []const u8, query: []const u8, want: []const u8 }{
+        .{ .target = "/?tier=pro", .query = "tier=pro", .want = "quota=100\n" },
+        .{ .target = "/", .query = "", .want = "quota=10\n" },
+    };
+    for (cases) |c| {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.target = c.target;
+        req.decoded_target = "/";
+        req.query_string = c.query;
+        var resp = registry.Response.init(.ok);
+        var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+        try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+        try testing.expectEqualStrings(c.want, resp.body);
+    }
 }

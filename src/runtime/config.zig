@@ -11,6 +11,7 @@ pub const ModuleBinding = router.ModuleBinding;
 pub const Phase = router.Phase;
 pub const Frag = vars.Frag;
 pub const LogFormat = vars.LogFormat;
+pub const MapDef = vars.MapDef;
 
 /// Server configuration: the route table declaring which modules attach to
 /// which phases per route. Backing strings are borrowed:
@@ -46,6 +47,9 @@ pub const Config = struct {
     /// Named log formats (`log_format` directives); index 0 is the default
     /// `combined` when none is declared.
     log_formats: []const LogFormat = &.{},
+    /// Compiled `map` blocks (`map` directives, top-level). Referenced by
+    /// `Frag.map` through `Context.maps` (set per request by the server).
+    maps: []const MapDef = &.{},
     /// Multi-server specs: each server {} block gets its own listen port,
     /// server_name, and route range. When empty (single-server), the top-
     /// level listen_port + routes are used directly.

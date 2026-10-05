@@ -136,6 +136,7 @@ const H_real_ip_recursive = keyHash("real_ip_recursive");
 const H_limit_req_status = keyHash("limit_req_status");
 const H_limit_conn_status = keyHash("limit_conn_status");
 const H_limit_rate = keyHash("limit_rate");
+const H_map = keyHash("map");
 const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
 const H_access_log = keyHash("access_log");
@@ -440,6 +441,21 @@ const ErrorPageSpec = struct {
     target: Str = .{ .src = "" },
 };
 
+/// One `map` entry as parsed (key/value unresolved until build).
+const MapEntrySpec = struct {
+    kind: vars.MapEntryKind = .literal,
+    key: Str = .{ .src = "" },
+    value: Str = .{ .src = "" },
+};
+
+/// One top-level `map` block as parsed.
+const MapSpec = struct {
+    source: Str = .{ .src = "" },
+    dest: Str = .{ .src = "" },
+    entries_start: usize = 0,
+    entries_len: usize = 0,
+};
+
 /// One `rewrite` rule as parsed (replacement unresolved until build, when
 /// the route's set scope is known; the pattern NFA compiles immediately).
 const RewriteSpec = struct {
@@ -457,6 +473,8 @@ const Builder = struct {
     error_pages: ct_pool.CtPool(ErrorPageSpec, 256) = .{},
     try_files: ct_pool.CtPool(Str, 1024) = .{},
     rewrites: ct_pool.CtPool(RewriteSpec, 256) = .{},
+    maps: ct_pool.CtPool(MapSpec, vars.max_maps) = .{},
+    map_entries: ct_pool.CtPool(MapEntrySpec, 256) = .{},
     access_rules: ct_pool.CtPool(AccessSpec, 256) = .{},
     realip_from: ct_pool.CtPool(Str, 64) = .{},
     strings: ct_pool.CtPool(u8, string_cap) = .{},
@@ -611,6 +629,29 @@ fn resolve(str: Str, strings: []const u8) []const u8 {
         .src => |s| s,
         .pool => |p| strings[p.start..][0..p.len],
     };
+}
+
+/// Validate a `map` variable operand (`$name`). Destinations must also be
+/// resolvable as user slots: builtins and the http_/arg_/cookie_ families
+/// resolve before user slots, so a destination shadowing them would be dead.
+fn mapVarBare(lx: *Lexer, s: []const u8, comptime role: []const u8) []const u8 {
+    if (s.len < 2 or s[0] != '$') lx.fail("map: " ++ role ++ " must look like $name");
+    const bare = s[1..];
+    if (bare.len == 0 or !(std.ascii.isAlphabetic(bare[0]) or bare[0] == '_')) {
+        lx.fail("map: name must start with a letter or underscore");
+    }
+    for (bare) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) {
+            lx.fail("map: name must be [A-Za-z0-9_]*");
+        }
+    }
+    if (comptime std.mem.eql(u8, role, "destination")) {
+        if (vars.isBuiltinName(bare)) lx.fail("map: destination shadows a built-in variable");
+        if (std.mem.startsWith(u8, bare, "http_") or std.mem.startsWith(u8, bare, "arg_") or std.mem.startsWith(u8, bare, "cookie_")) {
+            lx.fail("map: destination shadows a header/arg/cookie variable family");
+        }
+    }
+    return bare;
 }
 
 /// Line/column of a byte offset, for error messages (`conf:<line>:<col>: ...`).
@@ -935,6 +976,49 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
                     else => lx.fail("unknown tls directive '" ++ dn ++ "'"),
                 }
             }
+            b.cost += 16;
+        },
+        H_map => {
+            // map $source $dest { default v; literal v; ~regex v; ~*regex v; }
+            // Top-level only (http scope, like nginx). Dest becomes a
+            // variable usable in any complex value; it desugars into a
+            // synthetic per-route set at build.
+            const src_t = lx.token() orelse lx.fail("map: expected a source variable");
+            const dst_t = lx.token() orelse lx.fail("map: expected a destination variable");
+            const srcs = src_t.srcOf("map: source cannot contain escapes");
+            const dsts = dst_t.srcOf("map: destination cannot contain escapes");
+            _ = mapVarBare(lx, srcs, "source");
+            _ = mapVarBare(lx, dsts, "destination");
+            for (b.maps.items[0..b.maps.len]) |m| {
+                if (std.mem.eql(u8, resolve(m.dest, b.strings.items[0..]), dsts)) {
+                    lx.fail("map: duplicate destination variable");
+                }
+            }
+            lx.expectOpen("map");
+            const entries_start = b.map_entries.len;
+            var entries_len: usize = 0;
+            var seen_default = false;
+            while (lx.peek() != '}') {
+                const kt = lx.value(b, "map");
+                const key = resolve(kt, b.strings.items[0..]);
+                const v = lx.value(b, "map");
+                lx.expectTerminator("map");
+                if (std.mem.eql(u8, key, "default")) {
+                    if (seen_default) lx.fail("map: duplicate default");
+                    seen_default = true;
+                    _ = b.map_entries.create(.{ .kind = .literal, .key = .{ .src = "" }, .value = v });
+                } else if (std.mem.startsWith(u8, key, "~*")) {
+                    _ = b.map_entries.create(.{ .kind = .regex_ci, .key = kt, .value = v });
+                } else if (std.mem.startsWith(u8, key, "~")) {
+                    _ = b.map_entries.create(.{ .kind = .regex, .key = kt, .value = v });
+                } else {
+                    _ = b.map_entries.create(.{ .kind = .literal, .key = kt, .value = v });
+                }
+                entries_len += 1;
+                if (entries_len > 64) lx.fail("map: too many entries");
+            }
+            lx.pos += 1; // consume '}'
+            _ = b.maps.create(.{ .source = src_t, .dest = dst_t, .entries_start = entries_start, .entries_len = entries_len });
             b.cost += 16;
         },
         H_log_format => {
@@ -1851,25 +1935,108 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .len = len };
     };
 
+    // Compiled `map` blocks (M-C2): source/default/values parse with an
+    // EMPTY set scope (builtins + http/arg/cookie + captures only — set
+    // vars are per-route and map tables are global, so neither sees the
+    // other; documented). Regex keys compile their NFA here; bad patterns
+    // are compile errors.
+    const MapEntryTable = struct { items: [256]vars.MapEntry, ranges: [vars.max_maps]Range };
+    const map_entry_table: MapEntryTable = comptime blk: {
+        var items: [256]vars.MapEntry = undefined;
+        var ranges: [vars.max_maps]Range = undefined;
+        var pos: usize = 0;
+        const map_specs = b.maps.freeze();
+        for (map_specs, 0..) |ms, mi| {
+            const start = pos;
+            for (b.map_entries.items[ms.entries_start..][0..ms.entries_len]) |es| {
+                const key_text = resolve(es.key, strings);
+                const value_text = resolve(es.value, strings);
+                const value = vars.parseComplexValue(value_text, &.{});
+                switch (es.kind) {
+                    .literal => {
+                        if (key_text.len == 0) continue; // `default`: value stored on the def
+                        items[pos] = .{ .kind = .literal, .key = key_text, .value = value };
+                    },
+                    .regex, .regex_ci => {
+                        const pat = if (es.kind == .regex_ci) key_text[2..] else key_text[1..];
+                        items[pos] = .{ .kind = es.kind, .pattern = regex_mod.compileRegex(pat), .value = value };
+                    },
+                }
+                pos += 1;
+            }
+            ranges[mi] = .{ .start = start, .len = pos - start };
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
+    const MapDefTable = struct { items: [vars.max_maps]vars.MapDef, len: usize };
+    const map_table: MapDefTable = comptime blk: {
+        var items: [vars.max_maps]vars.MapDef = undefined;
+        const map_specs = b.maps.freeze();
+        for (map_specs, 0..) |ms, mi| {
+            // The default value rides on the literal entry with an empty
+            // key (stored by the parser arm); entries hold the rest.
+            var default_text: []const u8 = "";
+            const er = map_entry_table.ranges[mi];
+            for (b.map_entries.items[ms.entries_start..][0..ms.entries_len]) |es| {
+                if (es.kind == .literal and resolve(es.key, strings).len == 0) {
+                    default_text = resolve(es.value, strings);
+                }
+            }
+            items[mi] = .{
+                .name = resolve(ms.dest, strings)[1..],
+                .source = vars.parseComplexValue(resolve(ms.source, strings), &.{}),
+                .default = vars.parseComplexValue(default_text, &.{}),
+                .entries = map_entry_table.items[er.start..][0..er.len],
+            };
+        }
+        break :blk .{ .items = items, .len = map_specs.len };
+    };
+
     // Resolve an `access_log <name>` directive to its log_format index.
+    // Single-frag values for the synthetic map sets (one per map block,
+    // shared by every route): `[{.map = idx}]`.
+    const MapFragSingletons = struct { items: [vars.max_maps][1]vars.Frag };
+    const map_frags: MapFragSingletons = comptime blk: {
+        var items: [vars.max_maps][1]vars.Frag = undefined;
+        const map_specs = b.maps.freeze();
+        for (map_specs, 0..) |_, mi| {
+            items[mi] = .{.{ .map = @intCast(mi) }};
+        }
+        break :blk .{ .items = items };
+    };
+
     const SetTable = struct { items: [1024]SetVar, ranges: [route_cap]Range };
     const set_table: SetTable = comptime blk: {
         var items: [1024]SetVar = undefined;
         var ranges: [route_cap]Range = undefined;
         var pos: usize = 0;
+        const map_specs = b.maps.freeze();
         for (route_specs, 0..) |spec, ri| {
-            ranges[ri] = .{ .start = pos, .len = spec.set_len };
-            // Resolve set values in declaration order with a growing scope:
-            // a set may reference sets declared before it (forward references
-            // are compile errors, plan §5.3).
-            const scope_start = pos;
+            if (spec.set_len + map_specs.len > vars.max_user_vars) {
+                @compileError("too many user variables in one location (sets + maps exceed the slot budget)");
+            }
+            ranges[ri] = .{ .start = pos, .len = spec.set_len + map_specs.len };
+            // Synthetic map sets FIRST (slots 0..m-1): every route sees
+            // every map dest, so `$mapvar` resolves in any complex value.
+            // Real sets follow (slots m..); their scopes are
+            // synthetics + real prefix, preserving the no-forward-ref rule.
+            const scope_base = pos;
+            for (map_specs, 0..) |ms, mi| {
+                items[pos] = .{
+                    .name = resolve(ms.dest, strings)[1..],
+                    .slot = @intCast(mi),
+                    .value = map_frags.items[mi][0..1],
+                };
+                pos += 1;
+            }
             for (set_specs[spec.set_start..][0..spec.set_len], 0..) |ss, si| {
                 const name = resolve(ss.name, strings);
                 const value_text = resolve(ss.value, strings);
-                const scope = items[scope_start .. scope_start + si];
+                const scope = items[scope_base .. scope_base + map_specs.len + si];
                 items[pos] = .{
                     .name = name,
-                    .slot = @intCast(si),
+                    .slot = @intCast(map_specs.len + si),
                     .value = vars.parseComplexValue(value_text, scope),
                 };
                 pos += 1;
@@ -2200,6 +2367,7 @@ fn build(b: *const Builder) Config {
         .listen_port = b.listen_port,
         .listen_spec = b.listen_spec,
         .log_formats = log_table.items[0..log_table.len],
+        .maps = map_table.items[0..map_table.len],
         .servers = servers_built.items[0..servers_built.len],
         .select_fn = select_fn,
         .host_select = b.host_select,
@@ -3304,4 +3472,32 @@ test "conf: limit statuses and limit_rate parse" {
     try testing.expectEqual(@as(u64, 100 * 1024), cfg.routes[0].limit_rate_bps);
     try testing.expectEqual(@as(u16, 0), cfg.routes[1].limit_req_status);
     try testing.expectEqual(@as(u64, 0), cfg.routes[1].limit_rate_bps);
+}
+
+test "conf: map blocks compile sources, entries and defaults" {
+    const cfg = parse(
+        \\map $http_user_agent $is_bot {
+        \\    default 0;
+        \\    curl 1;
+        \\    ~*bot 1;
+        \\}
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        set $greet "hi";
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 1), cfg.maps.len);
+    try testing.expectEqualStrings("is_bot", cfg.maps[0].name);
+    try testing.expectEqual(@as(usize, 2), cfg.maps[0].entries.len);
+    try testing.expectEqual(vars.MapEntryKind.literal, cfg.maps[0].entries[0].kind);
+    try testing.expectEqualStrings("curl", cfg.maps[0].entries[0].key);
+    try testing.expectEqual(vars.MapEntryKind.regex_ci, cfg.maps[0].entries[1].kind);
+    // Synthetic map set is slot 0 on every route; the real set follows.
+    try testing.expectEqual(@as(usize, 2), cfg.routes[0].set_vars.len);
+    try testing.expectEqualStrings("is_bot", cfg.routes[0].set_vars[0].name);
+    try testing.expectEqual(@as(u8, 0), cfg.routes[0].set_vars[0].slot);
+    try testing.expectEqualStrings("greet", cfg.routes[0].set_vars[1].name);
+    try testing.expectEqual(@as(u8, 1), cfg.routes[0].set_vars[1].slot);
 }

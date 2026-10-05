@@ -182,6 +182,14 @@ pub const Context = struct {
     /// the route's `log_format` index into this table. Null in tests and
     /// module-level invocation (the module falls back to `combined`).
     formats: ?[]const LogFormat = null,
+    /// Compiled `map` blocks (config `map`); `Frag.map` renders through
+    /// this table with per-request caching in `map_slots`. Empty in tests
+    /// and module-level invocation (no map vars exist there).
+    maps: []const vars_mod.MapDef = &.{},
+    /// Cached map evaluations for this request (parallel to user_slots).
+    map_slots: [vars_mod.max_maps]?[]const u8 = @as([vars_mod.max_maps]?[]const u8, @splat(@as(?[]const u8, null))),
+    /// Map evaluation depth (cyclic-map backstop; see vars.evalMap).
+    map_depth: u8 = 0,
     /// Per-request start instant for `$request_time`.
     started: compat.Instant = undefined,
     /// Monotonic request timestamp in ns (reactor clock; 0 when unset, e.g.

@@ -51,7 +51,7 @@ pub const kind_class_ci: u8 = 8;
 
 const max_states = 8192;
 const max_classes = 256;
-const max_groups = 9;
+pub const max_groups = 9;
 
 const RegexErr = error{
     UnbalancedParen,

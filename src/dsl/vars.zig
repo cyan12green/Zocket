@@ -4,6 +4,7 @@ const registry = @import("registry.zig");
 const http_parser = @import("../http/parser.zig");
 const arena_mod = @import("../http/arena.zig");
 const ct_pool = @import("../ct_pool.zig");
+const regex_mod = @import("regex.zig"); // fn-body use only (Regex itself lives here)
 
 pub const Context = registry.Context;
 
@@ -55,6 +56,32 @@ pub const Frag = union(enum) {
     capture: u8,
     /// Slot index into ctx.user_slots (comptime-resolved).
     user: u8,
+    /// Map-table index into ctx.maps (comptime-resolved): `map` dest vars
+    /// desugar into synthetic per-route sets whose single frag is this.
+    map: u8,
+};
+
+/// One `map` entry: match the rendered source, serve the rendered value.
+pub const MapEntryKind = enum { literal, regex, regex_ci };
+
+pub const MapEntry = struct {
+    kind: MapEntryKind = .literal,
+    /// Literal key (literal kind).
+    key: []const u8 = "",
+    /// Compiled NFA (regex kinds).
+    pattern: Regex = .{},
+    /// Value rendered on match (a complex value: literals + $vars).
+    value: []const Frag = &.{},
+};
+
+/// One compiled `map` block: source rendered per request, first matching
+/// entry (declaration order) wins, else the default.
+pub const MapDef = struct {
+    /// Dest variable name (bare, without `$`).
+    name: []const u8 = "",
+    source: []const Frag = &.{},
+    default: []const Frag = &.{},
+    entries: []const MapEntry = &.{},
 };
 
 /// A user variable declared with `set` in a location (M-C).
@@ -123,7 +150,7 @@ pub const RegexState = struct {
 };
 
 /// Comptime cap on `set $name` user variables per location.
-pub const max_user_vars = 8;
+pub const max_user_vars = 16;
 
 // ---- name → VarId resolution (comptime) ----
 
@@ -179,6 +206,23 @@ pub fn resolveBuiltin(comptime name: []const u8) ?VarId {
         H_time_iso8601 => .time_iso8601,
         else => null,
     };
+}
+
+/// Runtime twin of resolveBuiltin for conf validation (map destinations
+/// must not shadow builtins; resolveBuiltin itself needs comptime names).
+pub fn isBuiltinName(name: []const u8) bool {
+    // Mirrors the VarId table above.
+    const known = [_][]const u8{
+        "method", "request_uri", "uri", "args", "query_string", "host",
+        "status", "body_bytes_sent", "remote_addr", "remote_port",
+        "server_protocol", "scheme", "request_time", "content_length",
+        "content_type", "ip", "date", "request", "bytes", "referer",
+        "user_agent", "time_local", "time_iso8601",
+    };
+    for (known) |k| {
+        if (std.mem.eql(u8, k, name)) return true;
+    }
+    return false;
 }
 
 fn keyHash(key: []const u8) u64 {
@@ -497,6 +541,41 @@ fn getCapture(ctx: *Context, index: u8) []const u8 {
     return s[r.start..r.end];
 }
 
+/// Max map blocks per config (bounds Frag.map + ctx.map_slots).
+pub const max_maps = 16;
+
+/// Evaluate map `idx` for this request: render the source, first matching
+/// entry (declaration order) wins, else the default. Results cache in
+/// ctx.map_slots (request-scoped, arena-backed like user_slots).
+/// Cyclic maps (a value using its own dest, directly or transitively)
+/// bottom out at depth 4 with the empty string.
+pub fn evalMap(ctx: *Context, idx: u8) ?[]const u8 {
+    if (idx >= max_maps) return null;
+    if (ctx.map_slots[idx]) |cached| return cached;
+    if (idx >= ctx.maps.len) return null;
+    if (ctx.map_depth >= 4) return "";
+    const def = ctx.maps[idx];
+    ctx.map_depth += 1;
+    defer ctx.map_depth -= 1;
+    const src = renderComplexArena(ctx, def.source, &ctx.req.arena) orelse return null;
+    for (def.entries) |e| {
+        const hit = switch (e.kind) {
+            .literal => std.mem.eql(u8, e.key, src),
+            .regex, .regex_ci => blk: {
+                var caps: [regex_mod.max_groups + 1]CaptureRange = undefined;
+                break :blk regex_mod.match(&e.pattern, src, &caps, 0, e.kind == .regex_ci);
+            },
+        };
+        if (!hit) continue;
+        const out = renderComplexArena(ctx, e.value, &ctx.req.arena) orelse return null;
+        ctx.map_slots[idx] = out;
+        return out;
+    }
+    const out = renderComplexArena(ctx, def.default, &ctx.req.arena) orelse return null;
+    ctx.map_slots[idx] = out;
+    return out;
+}
+
 // ---- sinks ----
 
 /// A sink is anything exposing `appendAll([]const u8) !void`.
@@ -532,6 +611,7 @@ pub fn renderComplex(ctx: *Context, value: []const Frag, sink: anytype) !void {
             .arg => |h| try sink.appendAll(getArg(ctx, h)),
             .cookie => |h| try sink.appendAll(getCookie(ctx, h)),
             .capture => |idx| try sink.appendAll(getCapture(ctx, idx)),
+            .map => |idx| try sink.appendAll(evalMap(ctx, idx) orelse return error.OutOfMemory),
             .user => |slot| {
                 // Lazy render-on-first-use into the request arena, cached in
                 // ctx.user_slots[slot] (M-C). The route's SetVar table is
@@ -583,6 +663,7 @@ fn fragLen(ctx: *Context, frag: Frag, scratch: *GetterScratch) ?usize {
         .arg => |h| getArg(ctx, h).len,
         .cookie => |h| getCookie(ctx, h).len,
         .capture => |idx| getCapture(ctx, idx).len,
+        .map => |idx| (evalMap(ctx, idx) orelse return null).len,
         .user => |slot| blk: {
             if (ctx.user_slots[slot]) |cached| break :blk cached.len;
             const route = ctx.route orelse break :blk 0;
@@ -604,6 +685,7 @@ fn fragSlice(ctx: *Context, frag: Frag, scratch: *GetterScratch) ?[]const u8 {
         .arg => |h| getArg(ctx, h),
         .cookie => |h| getCookie(ctx, h),
         .capture => |idx| getCapture(ctx, idx),
+        .map => |idx| evalMap(ctx, idx) orelse "",
         .user => |slot| ctx.user_slots[slot] orelse "",
     };
 }
@@ -1042,4 +1124,40 @@ test "hashFn and hashLower are deterministic and case-distinct" {
     try testing.expectEqual(hashLower("ABC"), hashLower("abc"));
     try testing.expectEqual(hashLower("AbC"), hashLower("aBc"));
     try testing.expect(hashLower("a") != hashLower("b"));
+}
+
+test "evalMap matches literals, regexes and defaults with caching" {
+    const src = comptime parseComplexValue("$http_x_role", &.{});
+    const v_admin = comptime parseComplexValue("wheel", &.{});
+    const v_dev = comptime parseComplexValue("staff", &.{});
+    const v_default = comptime parseComplexValue("guest", &.{});
+    const entries = [_]MapEntry{
+        .{ .kind = .literal, .key = "admin", .value = v_admin },
+        .{ .kind = .regex, .pattern = regex_mod.compileRegex("^dev-"), .value = v_dev },
+    };
+    const defs = [_]MapDef{.{ .name = "role_name", .source = src, .default = v_default, .entries = &entries }};
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.addHeaderParsed("x-role", "dev-ops") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp, .maps = &defs };
+    try testing.expectEqualStrings("staff", evalMap(&ctx, 0).?);
+    // Cached in the request slot (second eval doesn't re-render).
+    try testing.expect(ctx.map_slots[0] != null);
+    try testing.expectEqualStrings("staff", evalMap(&ctx, 0).?);
+}
+
+test "evalMap out-of-range index and cyclic maps bottom out" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expect(evalMap(&ctx, 0) == null); // no maps at all
+    try testing.expect(evalMap(&ctx, 15) == null);
+    // Self-referential value: depth guard returns "" instead of recursing.
+    const src = comptime parseComplexValue("x", &.{});
+    const self_ref = [_]Frag{.{ .map = 0 }};
+    const defs = [_]MapDef{.{ .name = "loop", .source = src, .default = &self_ref, .entries = &.{} }};
+    var ctx2 = Context{ .req = &req, .resp = &resp, .maps = &defs };
+    try testing.expectEqualStrings("", evalMap(&ctx2, 0).?);
 }

@@ -146,6 +146,29 @@ peer (the realip module runs in `post_read`, before every access check).
 | `limit_conn_status` | `limit_conn_status 429\|503;` | 503 | Refusal status for over-limit connections. |
 | `limit_rate` | `limit_rate 100k;` | 0 (unlimited) | Per-connection response bandwidth cap (k/m/g suffixes). Token bucket paced in the reactor: memory and sendfile body bytes; headers/framing bypass. Plain HTTP/1.1 only (TLS/h2 framing paths bypass it). |
 
+### Variable maps
+
+Top-level `map` blocks (http scope) compile a key→value table into a
+variable usable in any complex value (`return` bodies/headers,
+`proxy_set_header`, `set` values, log formats):
+
+```
+map $http_user_agent $is_bot {
+    default 0;
+    curl    1;
+    ~*bot   1;
+}
+```
+
+First matching entry in declaration order wins (`default` when nothing
+matches); literals are exact, `~`/`~*` are regex (NFA, `$1..$9`
+unsupported in values). Results cache per request. Scoping rules: map
+sources and values see builtins plus `$http_*`/`$arg_*`/`$cookie_*` and
+captures only — route `set` vars and other maps are out of scope there
+(both tables are global while sets are per-route). Destinations must not
+shadow builtins or the header/arg/cookie families (compile error); each
+map consumes one user-variable slot on every route (budget: 16 total).
+
 ### Listen directive
 
 | Syntax | Description |
