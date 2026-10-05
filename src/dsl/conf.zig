@@ -133,6 +133,9 @@ const H_deny = keyHash("deny");
 const H_set_real_ip_from = keyHash("set_real_ip_from");
 const H_real_ip_header = keyHash("real_ip_header");
 const H_real_ip_recursive = keyHash("real_ip_recursive");
+const H_limit_req_status = keyHash("limit_req_status");
+const H_limit_conn_status = keyHash("limit_conn_status");
+const H_limit_rate = keyHash("limit_rate");
 const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
 const H_access_log = keyHash("access_log");
@@ -354,6 +357,14 @@ const LocationSpec = struct {
     /// `proxy_keepalive N;` / `proxy_keepalive_timeout S;` (0 = default).
     proxy_keepalive_max: u32 = 0,
     proxy_keepalive_timeout: u32 = 0,
+    /// `limit_req_status` / `limit_conn_status` (429 or 503, 0 = default).
+    limit_req_status: u16 = 0,
+    limit_conn_status: u16 = 0,
+    /// `limit_rate` bytes per second (0 = unlimited). Latched per response
+    /// by the reactor, which paces body bytes (memory + sendfile) against
+    /// a token bucket. Plain HTTP/1.1 only in v1 (TLS/h2 framing paths
+    /// bypass it).
+    limit_rate_bps: u64 = 0,
     /// `allow` / `deny` rules in declaration order: range into the
     /// builder's access-rule pool (allow flag + raw value, CIDR-parsed at
     /// build).
@@ -1370,6 +1381,28 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             ensureModuleBound(b, spec, .access, "limit_req");
             b.cost += 8;
         },
+        H_limit_req_status => {
+            // `limit_req_status 429|503;` (default 503).
+            const s = lx.number("limit_req_status", u16);
+            if (s != 429 and s != 503) lx.fail("limit_req_status: must be 429 or 503");
+            lx.expectTerminator("limit_req_status");
+            spec.limit_req_status = s;
+            b.cost += 8;
+        },
+        H_limit_conn_status => {
+            // `limit_conn_status 429|503;` (default 503).
+            const s = lx.number("limit_conn_status", u16);
+            if (s != 429 and s != 503) lx.fail("limit_conn_status: must be 429 or 503");
+            lx.expectTerminator("limit_conn_status");
+            spec.limit_conn_status = s;
+            b.cost += 8;
+        },
+        H_limit_rate => {
+            // `limit_rate 100k;` — sizes accept k/m/g suffixes.
+            spec.limit_rate_bps = lx.size("limit_rate");
+            lx.expectTerminator("limit_rate");
+            b.cost += 8;
+        },
         H_limit_conn => {
             // `limit_conn N;`
             const t = lx.token() orelse lx.fail("limit_conn: expected a count");
@@ -2027,6 +2060,9 @@ fn build(b: *const Builder) Config {
                 .limit_req_rate = spec.limit_rate,
                 .limit_req_burst = spec.limit_burst,
                 .limit_conn_max = spec.limit_conn_max,
+                .limit_req_status = spec.limit_req_status,
+                .limit_conn_status = spec.limit_conn_status,
+                .limit_rate_bps = spec.limit_rate_bps,
                 .upstreams = up_table.items[ur.start..][0..ur.len],
                 .error_pages = err_table.items[err_table.ranges[ri].start..][0..err_table.ranges[ri].len],
                 .try_files = try_table.items[try_table.ranges[ri].start..][0..try_table.ranges[ri].len],
@@ -3244,4 +3280,28 @@ test "conf: listen accepts the proxy_protocol flag in all forms" {
         \\}
     );
     try testing.expect(c4.servers[0].listen_spec == null or !c4.servers[0].listen_spec.?.proxy_protocol);
+}
+
+test "conf: limit statuses and limit_rate parse" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        limit_req rate=10;
+        \\        limit_req_status 429;
+        \\        limit_conn 2;
+        \\        limit_conn_status 429;
+        \\        limit_rate 100k;
+        \\    }
+        \\    location /plain {
+        \\        content echo;
+        \\        limit_req rate=10;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(u16, 429), cfg.routes[0].limit_req_status);
+    try testing.expectEqual(@as(u16, 429), cfg.routes[0].limit_conn_status);
+    try testing.expectEqual(@as(u64, 100 * 1024), cfg.routes[0].limit_rate_bps);
+    try testing.expectEqual(@as(u16, 0), cfg.routes[1].limit_req_status);
+    try testing.expectEqual(@as(u64, 0), cfg.routes[1].limit_rate_bps);
 }

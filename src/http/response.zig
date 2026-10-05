@@ -23,6 +23,7 @@ pub const Status = enum(u16) {
     bad_gateway = 502,
     service_unavailable = 503,
     switching_protocols = 101,
+    too_many_requests = 429,
 
     pub fn reasonPhrase(self: Status) []const u8 {
         return switch (self) {
@@ -42,6 +43,7 @@ pub const Status = enum(u16) {
             .not_implemented => "Not Implemented",
             .bad_gateway => "Bad Gateway",
             .service_unavailable => "Service Unavailable",
+            .too_many_requests => "Too Many Requests",
             .switching_protocols => "Switching Protocols",
         };
     }
@@ -163,6 +165,7 @@ pub fn reasonPhraseForCode(comptime code: u16) []const u8 {
         413 => "Payload Too Large",
         416 => "Range Not Satisfiable",
         431 => "Request Header Fields Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         else => "Unknown",
@@ -599,6 +602,7 @@ test "all statuses produce correct code and reason phrase" {
         .{ .status = .header_too_large, .want = "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\n\r\n" },
         .{ .status = .internal_error, .want = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n" },
         .{ .status = .not_implemented, .want = "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n" },
+        .{ .status = .too_many_requests, .want = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n" },
     };
     for (cases) |c| {
         var resp = Response.init(c.status);

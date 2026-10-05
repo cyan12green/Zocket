@@ -138,6 +138,14 @@ peer (the realip module runs in `post_read`, before every access check).
 | `real_ip_header` | `real_ip_header X-Forwarded-For;` | X-Forwarded-For | Header to read the client IP from. |
 | `real_ip_recursive` | `real_ip_recursive on\|off;` | off | Off: take the last header entry. On: walk right-to-left past trusted entries to the first untrusted one. |
 
+### Rate and bandwidth limits
+
+| Directive | Syntax | Default | Description |
+|---|---|---|---|
+| `limit_req_status` | `limit_req_status 429\|503;` | 503 | Refusal status for rate-limited requests. |
+| `limit_conn_status` | `limit_conn_status 429\|503;` | 503 | Refusal status for over-limit connections. |
+| `limit_rate` | `limit_rate 100k;` | 0 (unlimited) | Per-connection response bandwidth cap (k/m/g suffixes). Token bucket paced in the reactor: memory and sendfile body bytes; headers/framing bypass. Plain HTTP/1.1 only (TLS/h2 framing paths bypass it). |
+
 ### Listen directive
 
 | Syntax | Description |

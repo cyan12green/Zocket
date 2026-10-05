@@ -171,6 +171,15 @@ pub const Route = struct {
     /// Concurrency cap (limit_conn module): max simultaneous in-flight
     /// requests per client key. 0 disables.
     limit_conn_max: u32 = 0,
+    /// Refusal statuses (`limit_req_status` / `limit_conn_status`): 429 or
+    /// 503. 0 selects the 503 default.
+    limit_req_status: u16 = 0,
+    limit_conn_status: u16 = 0,
+    /// `limit_rate` bytes per second (0 = unlimited). Latched per response
+    /// by the reactor, which paces body bytes (memory + sendfile) against
+    /// a token bucket. Plain HTTP/1.1 only in v1 (TLS/h2 framing paths
+    /// bypass it).
+    limit_rate_bps: u64 = 0,
     /// Precompressed serving (precompressed module): look for a `.gz`
     /// sibling of the requested file and serve it with Content-Encoding.
     precompressed: bool = false,

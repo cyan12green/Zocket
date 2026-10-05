@@ -138,10 +138,31 @@ pub const limit_conn_release = registry.Module{
     .run = runConnRelease,
 };
 
-fn reject(ctx: *Context) Action {
-    ctx.resp.status = .service_unavailable;
-    ctx.resp.setBody(registry.Status.service_unavailable.reasonPhrase());
+/// Refuse with the route's configured status (`limit_req_status` /
+/// `limit_conn_status`, 0 = 503 Service Unavailable).
+fn reject(ctx: *Context, status: Status) Action {
+    ctx.resp.status = status;
+    ctx.resp.setBody(status.reasonPhrase());
     return .handled;
+}
+
+/// Effective refusal status for a route (0 selects the 503 default).
+fn reqStatus(route: *const Route) Status {
+    return switch (route.limit_req_status) {
+        0 => .service_unavailable,
+        429 => .too_many_requests,
+        503 => .service_unavailable,
+        else => .service_unavailable,
+    };
+}
+
+fn connStatus(route: *const Route) Status {
+    return switch (route.limit_conn_status) {
+        0 => .service_unavailable,
+        429 => .too_many_requests,
+        503 => .service_unavailable,
+        else => .service_unavailable,
+    };
 }
 
 fn runReq(ctx: *Context) anyerror!Action {
@@ -165,7 +186,7 @@ fn runReq(ctx: *Context) anyerror!Action {
     const zone = &req_zones[shard];
     zone.mutex.lock();
     defer zone.mutex.unlock();
-    const r = zone.upsertLocked(key) orelse return reject(ctx);
+    const r = zone.upsertLocked(key) orelse return reject(ctx, reqStatus(route));
     if (!r.existed) {
         r.slot.* = .{ .credit_ns = max_credit_ns, .last_ns = now };
     } else if (now > r.slot.last_ns) {
@@ -178,7 +199,7 @@ fn runReq(ctx: *Context) anyerror!Action {
         return .pass;
     }
     // Bucket empty: reject without consuming anything.
-    return reject(ctx);
+    return reject(ctx, reqStatus(route));
 }
 
 fn runConn(ctx: *Context) anyerror!Action {
@@ -190,13 +211,13 @@ fn runConn(ctx: *Context) anyerror!Action {
     {
         conn_zone.mutex.lock();
         defer conn_zone.mutex.unlock();
-        const r = conn_zone.upsertLocked(key) orelse return reject(ctx);
+        const r = conn_zone.upsertLocked(key) orelse return reject(ctx, connStatus(route));
         if (r.slot.active < route.limit_conn_max) {
             r.slot.active += 1;
             admitted = true;
         }
     }
-    if (!admitted) return reject(ctx);
+    if (!admitted) return reject(ctx, connStatus(route));
 
     // Mark this request as holding a slot so the release module (log phase,
     // always-run) decrements exactly once.
@@ -401,4 +422,25 @@ test "limit_conn double release is safe and rejections carry 503" {
     try testing.expectEqual(Action.pass, try runConnRelease(&a.ctx));
     try testing.expectEqual(Action.pass, try runConn(&b.ctx));
     try testing.expectEqual(Action.pass, try runConnRelease(&b.ctx));
+}
+
+test "limit_req_status and limit_conn_status select 429 when configured" {
+    try lifecycleInit(null);
+    try testing.expectEqual(Status.service_unavailable, reqStatus(&Route{ .path = "/" }));
+    try testing.expectEqual(Status.too_many_requests, reqStatus(&Route{ .path = "/", .limit_req_status = 429 }));
+    try testing.expectEqual(Status.service_unavailable, connStatus(&Route{ .path = "/" }));
+    try testing.expectEqual(Status.too_many_requests, connStatus(&Route{ .path = "/", .limit_conn_status = 429 }));
+
+    // Exhaust a 1/s bucket with 429 configured: the refusal carries 429.
+    const route = Route{ .path = "/", .limit_req_rate = 8, .limit_req_burst = 8, .limit_req_status = 429 };
+    var c1: Case = undefined;
+    // per_shard_rate = 8/8 = 1, burst = 8/8 = 1: one admit, then shed.
+    makeCtx(&c1, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 9, 9, 9, 9 }, T0);
+    defer c1.req.deinit();
+    const ctx = &c1.ctx;
+    ctx.route = &route;
+    try testing.expectEqual(Action.pass, try runReq(ctx));
+    try testing.expectEqual(Action.handled, try runReq(ctx));
+    try testing.expectEqual(Status.too_many_requests, c1.resp.status);
+    try testing.expectEqualStrings("Too Many Requests", c1.resp.body);
 }
