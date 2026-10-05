@@ -78,6 +78,7 @@ Filters (run after every outcome, reverse declaration order):
 |---|---|---|
 | `filter headers` | — | Header manipulation (auto-bound by add/set/remove_header) |
 | `filter gzip` | — | gzip compression (auto-bound by `gzip on;`) |
+| `filter gunzip` | — | gzip inflation for non-gzip clients (auto-bound by `gunzip on;`) |
 | `filter cache_headers` | — | Cache-Control (auto-bound by `max_age`) |
 | `filter proxy_cache_store` | — | Cache store (auto-bound by `proxy_cache on;`) |
 
@@ -110,6 +111,14 @@ Filters (run after every outcome, reverse declaration order):
 
 Zone sizing (in `limits` section): `proxy_cache_max_bytes` (32 MiB),
 `proxy_cache_max_entries` (256).
+
+### Freshness: expires, etag, gunzip
+
+| Directive | Syntax | Default | Description |
+|---|---|---|---|
+| `expires` | `expires off\|epoch\|max\|30s\|10m\|2h\|1d\|90;` | off | `epoch`/`max` stamp fixed dates; a duration stamps now+delta and overrides `Cache-Control: max-age` (epoch forces `no-cache`). Off leaves `Cache-Control` to `max_age`. |
+| `etag` | `etag on\|off;` | on | Off suppresses `ETag` emission (conditional `Last-Modified` matching still applies). |
+| `gunzip` | `gunzip on\|off;` | off | Inflate `Content-Encoding: gzip` bodies for clients that don't accept gzip (memory bodies only; corrupt payloads pass through visibly). |
 
 ### Internal redirects: try_files & error_page
 

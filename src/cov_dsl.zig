@@ -36,4 +36,5 @@ comptime {
     _ = @import("dsl/modules/rewrite.zig");
     _ = @import("dsl/modules/access.zig");
     _ = @import("dsl/modules/realip.zig");
+    _ = @import("dsl/modules/gunzip.zig");
 }

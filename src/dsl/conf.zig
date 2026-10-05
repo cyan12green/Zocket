@@ -136,6 +136,9 @@ const H_real_ip_recursive = keyHash("real_ip_recursive");
 const H_limit_req_status = keyHash("limit_req_status");
 const H_limit_conn_status = keyHash("limit_conn_status");
 const H_limit_rate = keyHash("limit_rate");
+const H_expires = keyHash("expires");
+const H_etag = keyHash("etag");
+const H_gunzip = keyHash("gunzip");
 const H_map = keyHash("map");
 const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
@@ -366,6 +369,10 @@ const LocationSpec = struct {
     /// a token bucket. Plain HTTP/1.1 only in v1 (TLS/h2 framing paths
     /// bypass it).
     limit_rate_bps: u64 = 0,
+    /// `expires off|epoch|max|<n>[s|m|h|d];` (default off).
+    expires: router.Expires = .off,
+    /// `etag on|off;` (default on): emit ETag when metadata is known.
+    etag_enabled: bool = true,
     /// `allow` / `deny` rules in declaration order: range into the
     /// builder's access-rule pool (allow flag + raw value, CIDR-parsed at
     /// build).
@@ -652,6 +659,33 @@ fn mapVarBare(lx: *Lexer, s: []const u8, comptime role: []const u8) []const u8 {
         }
     }
     return bare;
+}
+
+/// Parse an `expires` duration: bare seconds or a trailing s|m|h|d unit.
+/// Fails the build on garbage (negative durations are not expressible —
+/// the token grammar has no minus).
+fn parseDurationSecs(lx: *Lexer, s: []const u8) u32 {
+    if (s.len == 0) lx.fail("expires: empty duration");
+    var mult: u32 = 1;
+    var digits = s;
+    switch (s[s.len - 1]) {
+        's' => digits = s[0 .. s.len - 1],
+        'm' => {
+            mult = 60;
+            digits = s[0 .. s.len - 1];
+        },
+        'h' => {
+            mult = 3600;
+            digits = s[0 .. s.len - 1];
+        },
+        'd' => {
+            mult = 86400;
+            digits = s[0 .. s.len - 1];
+        },
+        else => {},
+    }
+    const n = std.fmt.parseInt(u32, digits, 10) catch lx.fail("expires: bad duration");
+    return n * mult;
 }
 
 /// Line/column of a byte offset, for error messages (`conf:<line>:<col>: ...`).
@@ -1487,6 +1521,35 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             lx.expectTerminator("limit_rate");
             b.cost += 8;
         },
+        H_expires => {
+            // `expires off|epoch|max|30s|10m|2h|1d|<seconds>;`
+            const tok = lx.token() orelse lx.fail("expires: expected a value");
+            const s = tok.srcOf("expires: value cannot contain escapes");
+            if (std.mem.eql(u8, s, "off")) {
+                spec.expires = .off;
+            } else if (std.mem.eql(u8, s, "epoch")) {
+                spec.expires = .epoch;
+            } else if (std.mem.eql(u8, s, "max")) {
+                spec.expires = .max;
+            } else {
+                spec.expires = .{ .after = parseDurationSecs(lx, s) };
+            }
+            lx.expectTerminator("expires");
+            b.cost += 8;
+        },
+        H_etag => {
+            spec.etag_enabled = lx.boolOnOff("etag");
+            lx.expectTerminator("etag");
+            b.cost += 8;
+        },
+        H_gunzip => {
+            const tok = lx.token() orelse lx.fail("gunzip: expected on|off");
+            const vs = tok.srcOf("gunzip: value cannot contain escapes");
+            const on = if (std.mem.eql(u8, vs, "on")) true else if (std.mem.eql(u8, vs, "off")) false else lx.fail("gunzip: expected on|off");
+            lx.expectTerminator("gunzip");
+            if (on) ensureFilterBound(b, spec, "gunzip");
+            b.cost += 8;
+        },
         H_limit_conn => {
             // `limit_conn N;`
             const t = lx.token() orelse lx.fail("limit_conn: expected a count");
@@ -2230,6 +2293,8 @@ fn build(b: *const Builder) Config {
                 .limit_req_status = spec.limit_req_status,
                 .limit_conn_status = spec.limit_conn_status,
                 .limit_rate_bps = spec.limit_rate_bps,
+                .expires = spec.expires,
+                .etag_enabled = spec.etag_enabled,
                 .upstreams = up_table.items[ur.start..][0..ur.len],
                 .error_pages = err_table.items[err_table.ranges[ri].start..][0..err_table.ranges[ri].len],
                 .try_files = try_table.items[try_table.ranges[ri].start..][0..try_table.ranges[ri].len],
@@ -3500,4 +3565,40 @@ test "conf: map blocks compile sources, entries and defaults" {
     try testing.expectEqual(@as(u8, 0), cfg.routes[0].set_vars[0].slot);
     try testing.expectEqualStrings("greet", cfg.routes[0].set_vars[1].name);
     try testing.expectEqual(@as(u8, 1), cfg.routes[0].set_vars[1].slot);
+}
+
+test "conf: expires, etag and gunzip parse" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        expires 1h;
+        \\        etag off;
+        \\        gunzip on;
+        \\    }
+        \\    location /plain {
+        \\        content echo;
+        \\        expires epoch;
+        \\    }
+        \\    location /far {
+        \\        content echo;
+        \\        expires max;
+        \\    }
+        \\    location /bare {
+        \\        content echo;
+        \\        expires 90;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(router.Expires{ .after = 3600 }, cfg.routes[0].expires);
+    try testing.expect(!cfg.routes[0].etag_enabled);
+    try testing.expectEqual(router.Expires.epoch, cfg.routes[1].expires);
+    try testing.expectEqual(router.Expires.max, cfg.routes[2].expires);
+    try testing.expectEqual(router.Expires{ .after = 90 }, cfg.routes[3].expires);
+    // gunzip bound as a filter by directive presence.
+    var found = false;
+    for (cfg.routes[0].filters) |fb| {
+        if (std.mem.eql(u8, fb.module, "gunzip")) found = true;
+    }
+    try testing.expect(found);
 }

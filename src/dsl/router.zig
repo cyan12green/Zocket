@@ -111,6 +111,14 @@ pub const Route = struct {
     /// Access control (`allow`/`deny`, first match wins; no match allows):
     /// ordered CIDR rules evaluated in the access phase.
     access_rules: []const AccessRule = &.{},
+    /// `expires` response header control (cache_headers filter): off by
+    /// default (Cache-Control follows max_age); epoch/max stamp fixed
+    /// dates; after(N) stamps now+N and overrides Cache-Control max-age.
+    expires: Expires = .off,
+    /// `etag on|off` (default on): emit the ETag header when content
+    /// metadata is known. Off suppresses emission only; conditional
+    /// matching on Last-Modified still applies.
+    etag_enabled: bool = true,
     /// Trusted-proxy prefixes (`set_real_ip_from`): when the peer matches,
     /// `client_ip` is replaced from `real_ip_header` (default
     /// X-Forwarded-For) in the post_read phase, so downstream access
@@ -303,6 +311,15 @@ pub const Balance = enum {
         if (std.mem.eql(u8, s, "least_time")) return .least_time;
         return null;
     }
+};
+
+/// `expires` value: off (no Expires header), epoch/max fixed stamps, or a
+/// relative offset in seconds from now.
+pub const Expires = union(enum) {
+    off,
+    epoch,
+    max,
+    after: u32,
 };
 
 /// One `error_page` entry: which status it serves, and what to serve.

@@ -106,6 +106,7 @@ comptime {
     _ = @import("dsl/modules/rewrite.zig");
     _ = @import("dsl/modules/access.zig");
     _ = @import("dsl/modules/realip.zig");
+    _ = @import("dsl/modules/gunzip.zig");
     _ = @import("dsl/htpasswd.zig");
     _ = @import("http/arena.zig");
     _ = @import("http2/hpack.zig");

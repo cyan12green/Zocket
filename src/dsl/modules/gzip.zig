@@ -57,7 +57,7 @@ fn hasHeader(resp: *registry.Response, comptime name: []const u8) bool {
 
 /// True if a comma-separated header value (with optional `;` parameters)
 /// contains the given token. Token matching is a hash compare.
-fn acceptsToken(value: []const u8, comptime token: []const u8) bool {
+pub fn acceptsToken(value: []const u8, comptime token: []const u8) bool {
     var tokens = std.mem.tokenizeAny(u8, value, ",");
     while (tokens.next()) |t| {
         var tok = std.mem.trim(u8, t, " \t");

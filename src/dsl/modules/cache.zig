@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("../../compat.zig");
 const registry = @import("../registry.zig");
 
 pub const Context = registry.Context;
@@ -66,14 +67,51 @@ pub fn etagMatches(value: []const u8, etag: []const u8) bool {
     return false;
 }
 
+/// nginx's fixed stamps for `expires epoch|max`.
+pub const expires_epoch_stamp = "Thu, 01 Jan 1970 00:00:01 GMT";
+pub const expires_max_stamp = "Thu, 31 Dec 2037 23:55:55 GMT";
+/// nginx's `expires max` Cache-Control (10 years).
+pub const expires_max_age: u32 = 315360000;
+
+/// Wall-clock seconds (REALTIME). Falls back to 0 under a hostile clock.
+fn wallNowSecs() u64 {
+    const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return 0;
+    return @intCast(@max(0, ts.sec));
+}
+
 fn cacheRun(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
-    if (route.max_age_seconds > 0) {
-        ctx.resp.setHeaderFmt("Cache-Control", "max-age={d}", .{route.max_age_seconds});
-    } else {
-        ctx.resp.setHeader("Cache-Control", "no-cache");
+    switch (route.expires) {
+        .off => {
+            if (route.max_age_seconds > 0) {
+                ctx.resp.setHeaderFmt("Cache-Control", "max-age={d}", .{route.max_age_seconds});
+            } else {
+                ctx.resp.setHeader("Cache-Control", "no-cache");
+            }
+        },
+        .epoch => {
+            ctx.resp.setHeader("Expires", expires_epoch_stamp);
+            ctx.resp.setHeader("Cache-Control", "no-cache");
+        },
+        .max => {
+            ctx.resp.setHeader("Expires", expires_max_stamp);
+            ctx.resp.setHeaderFmt("Cache-Control", "max-age={d}", .{expires_max_age});
+        },
+        .after => |s| {
+            var buf: [48]u8 = undefined;
+            const stamp = formatHttpDate(wallNowSecs() + s, &buf) orelse return .pass;
+            // Borrowed stack memory: dupe into the shared request memory
+            // (setHeader borrows; literals are the only other callers).
+            const kept = ctx.sharedDupe(stamp) orelse return error.OutOfMemory;
+            ctx.resp.setHeader("Expires", kept);
+            ctx.resp.setHeaderFmt("Cache-Control", "max-age={d}", .{s});
+        },
     }
-    if (ctx.etag) |etag| ctx.resp.setHeader("ETag", etag);
+    // `etag off` suppresses emission only; conditional matching above still
+    // applies (Last-Modified keeps working).
+    if (route.etag_enabled) {
+        if (ctx.etag) |etag| ctx.resp.setHeader("ETag", etag);
+    }
     if (ctx.last_modified) |lm| ctx.resp.setHeader("Last-Modified", lm);
     return .pass;
 }
@@ -382,4 +420,66 @@ test "cache_headers passes with no route and emits etag-only" {
     try testing.expectEqual(Action.pass, try cache_headers.run(&ctx2));
     try testing.expectEqual(@as(usize, 2), resp2.header_count);
     try testing.expectEqualStrings("ETag", resp2.headers[1].name);
+}
+
+test "cache_headers emits expires variants and honors etag off" {
+    // epoch: exact stamp + no-cache.
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        var resp = registry.Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp, .etag = "\"abc\"" };
+        const route = registry.Route{ .path = "/", .expires = .epoch };
+        ctx.route = &route;
+        try testing.expectEqual(Action.pass, try cacheRun(&ctx));
+        try testing.expectEqualStrings(expires_epoch_stamp, headerValue(&resp, "Expires").?);
+        try testing.expectEqualStrings("no-cache", headerValue(&resp, "Cache-Control").?);
+        try testing.expectEqualStrings("\"abc\"", headerValue(&resp, "ETag").?);
+    }
+    // max: exact stamp + 10y max-age.
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        var resp = registry.Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        const route = registry.Route{ .path = "/", .expires = .max };
+        ctx.route = &route;
+        try testing.expectEqual(Action.pass, try cacheRun(&ctx));
+        try testing.expectEqualStrings(expires_max_stamp, headerValue(&resp, "Expires").?);
+        try testing.expectEqualStrings("max-age=315360000", headerValue(&resp, "Cache-Control").?);
+    }
+    // after: stamp parses back to ~now+delta, max-age overridden.
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        var resp = registry.Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        const route = registry.Route{ .path = "/", .max_age_seconds = 60, .expires = .{ .after = 3600 } };
+        ctx.route = &route;
+        try testing.expectEqual(Action.pass, try cacheRun(&ctx));
+        const stamp = headerValue(&resp, "Expires").?;
+        const then = parseHttpDate(stamp) orelse return error.BadStamp;
+        const now = wallNowSecs();
+        try testing.expect(then >= now + 3595 and then <= now + 3605);
+        try testing.expectEqualStrings("max-age=3600", headerValue(&resp, "Cache-Control").?);
+    }
+    // etag off: ETag suppressed, Last-Modified kept.
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        var resp = registry.Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp, .etag = "\"abc\"", .last_modified = "Thu, 01 Jan 1970 00:00:01 GMT" };
+        const route = registry.Route{ .path = "/", .etag_enabled = false };
+        ctx.route = &route;
+        try testing.expectEqual(Action.pass, try cacheRun(&ctx));
+        try testing.expect(headerValue(&resp, "ETag") == null);
+        try testing.expect(headerValue(&resp, "Last-Modified") != null);
+    }
+}
+
+fn headerValue(resp: *const registry.Response, name: []const u8) ?[]const u8 {
+    for (resp.headers[0..resp.header_count]) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
 }
