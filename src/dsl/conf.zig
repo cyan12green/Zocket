@@ -112,6 +112,8 @@ const H_filter = keyHash("filter");
 const H_http = keyHash("http");
 const H_gzip = keyHash("gzip");
 const H_precompressed = keyHash("precompressed");
+const H_sub_filter = keyHash("sub_filter");
+const H_sub_filter_once = keyHash("sub_filter_once");
 const H_auth_request = keyHash("auth_request");
 const H_cors = keyHash("cors");
 const H_cors_origin = keyHash("cors_origin");
@@ -374,6 +376,10 @@ const LocationSpec = struct {
     /// `precompressed br;` / `precompressed zstd;` — same for .br / .zst.
     precompressed_br: bool = false,
     precompressed_zstd: bool = false,
+    /// `sub_filter <match> <replacement>;` + `sub_filter_once on|off;`.
+    sub_filter_match: ?Str = null,
+    sub_filter_replacement: ?Str = null,
+    sub_filter_once: bool = true,
     /// `auth_request <uri>;`
     auth_request: ?Str = null,
     /// `proxy_cache on;` / valid / stale-while-revalidate
@@ -1603,6 +1609,22 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             lx.expectTerminator("proxy_ws");
             b.cost += 8;
         },
+        H_sub_filter => {
+            // `sub_filter <match> <replacement>;` — two values, then `;`.
+            const m = lx.value(b, "sub_filter");
+            const r = lx.value(b, "sub_filter");
+            lx.expectTerminator("sub_filter");
+            spec.sub_filter_match = m;
+            spec.sub_filter_replacement = r;
+            ensureFilterBound(b, spec, "sub_filter");
+            b.cost += 8;
+        },
+        H_sub_filter_once => {
+            spec.sub_filter_once = lx.boolOnOff("sub_filter_once");
+            lx.expectTerminator("sub_filter_once");
+            ensureFilterBound(b, spec, "sub_filter");
+            b.cost += 8;
+        },
         H_precompressed => {
             // `precompressed gz|br|zstd;` (repeatable, one codec each).
             const t = lx.token() orelse lx.fail("precompressed: expected a codec");
@@ -2613,6 +2635,9 @@ fn build(b: *const Builder) Config {
                 .precompressed = spec.precompressed_gz,
                 .precompressed_br = spec.precompressed_br,
                 .precompressed_zstd = spec.precompressed_zstd,
+                .sub_filter_match = if (spec.sub_filter_match) |s| resolve(s, strings) else null,
+                .sub_filter_replacement = if (spec.sub_filter_replacement) |s| resolve(s, strings) else null,
+                .sub_filter_once = spec.sub_filter_once,
                 .auth_request_uri = if (spec.auth_request) |u| resolve(u, strings) else null,
                 .cors_enabled = spec.cors_enabled,
                 .cors_origin = if (spec.cors_origin) |s| resolve(s, strings) else null,
@@ -4247,4 +4272,18 @@ test "conf: precompressed accepts gz br zstd repeatably" {
     try testing.expect(cfg.routes[0].precompressed);
     try testing.expect(cfg.routes[0].precompressed_br);
     try testing.expect(!cfg.routes[0].precompressed_zstd);
+}
+
+test "conf: sub_filter binds the filter with once default" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite echo;
+        \\        sub_filter "foo" "bar";
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("foo", cfg.routes[0].sub_filter_match.?);
+    try testing.expectEqualStrings("bar", cfg.routes[0].sub_filter_replacement.?);
+    try testing.expect(cfg.routes[0].sub_filter_once);
 }

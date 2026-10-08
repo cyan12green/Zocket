@@ -209,6 +209,11 @@ pub const Route = struct {
     /// as gzip_static/brotli_static — serve disk twins, never encode.
     precompressed_br: bool = false,
     precompressed_zstd: bool = false,
+    /// Response body substitution (`sub_filter` filter): match/replace
+    /// pair plus once flag (default true — first occurrence only).
+    sub_filter_match: ?[]const u8 = null,
+    sub_filter_replacement: ?[]const u8 = null,
+    sub_filter_once: bool = true,
     /// Response caching (proxy_cache modules): enable + fresh window and
     /// stale-while-revalidate grace, both in seconds.
     proxy_cache_enabled: bool = false,

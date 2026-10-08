@@ -481,6 +481,7 @@ pub const default_registry = Registry(.{
     @import("modules/auth_bundle.zig").secure_link,
     @import("modules/auth_bundle.zig").auth_jwt,
     @import("modules/acme_challenge.zig").acme_challenge,
+    @import("modules/sub_filter.zig").sub_filter,
 });
 
 const testing = std.testing;
