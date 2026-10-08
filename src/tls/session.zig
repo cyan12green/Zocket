@@ -1264,9 +1264,10 @@ test "mTLS verify flight carries CertificateRequest, plain flight does not" {
     const vn = verify.takeOut(&verify_out);
     try testing.expect(pn > 0 and vn > pn);
     // One extra encrypted record: header(5) + CR message(17) + inner
-    // content-type byte(1) + AEAD tag(16) = 39, ±1 because the ECDSA
-    // CertificateVerify DER length varies per signature.
-    try testing.expect(vn - pn >= 38 and vn - pn <= 40);
+    // content-type byte(1) + AEAD tag(16) = 39, plus the difference of
+    // the two sessions' CertificateVerify DER lengths (ECDSA signatures
+    // encode 68..72 bytes depending on leading-zero trims, so ±4).
+    try testing.expect(vn > pn and vn - pn >= 35 and vn - pn <= 43);
 }
 
 test "mTLS Finished without a client cert fails closed" {
