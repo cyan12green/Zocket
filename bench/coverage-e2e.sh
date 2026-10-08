@@ -78,7 +78,7 @@ import time
 time.sleep(3600)
 PYEOF
     local orig=$!
-    rm -f "$ROOT"/coverage-*.zcov
+    ls "$ROOT"/coverage-*.zcov 2>/dev/null | sort >"$dir"/.before
     cd "$ROOT"
     "$bin" --threads 2 >"$dir"/server.log 2>&1 &
     local srv=$!
@@ -105,7 +105,8 @@ PYEOF
     kill -TERM "$srv" 2>/dev/null || true
     wait "$srv" 2>/dev/null || true
     kill "$orig" 2>/dev/null || true
-    mv "$ROOT"/coverage-*.zcov "$dir"/ 2>/dev/null || true
+    comm -13 "$dir"/.before <(ls "$ROOT"/coverage-*.zcov 2>/dev/null | sort) | while read -r f; do mv "$f" "$dir"/; done
+    rm -f "$dir"/.before
     cd "$ROOT"
 }
 
