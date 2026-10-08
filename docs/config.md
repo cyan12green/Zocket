@@ -88,7 +88,7 @@ Filters (run after every outcome, reverse declaration order):
 
 | Directive | Syntax | Default | Description |
 |---|---|---|---|
-| `proxy_pass` | `proxy_pass [http://\|https://]host[:port];` | — | Single upstream (IPv4 literal or DNS hostname; `https://` enables upstream TLS, default port 443; `http://` default 80; bare `host:port` stays plaintext). |
+| `proxy_pass` | `proxy_pass [http://\|https://]host[:port][/uri/];` | — | Single upstream (IPv4 literal or DNS hostname; `https://` enables upstream TLS, default port 443; `http://` default 80; bare `host:port` stays plaintext). An optional URI tail replaces the matched location prefix in the upstream request target (`location /api/` + `proxy_pass http://h/v1/;` → upstream sees `/v1/...`; query preserved). |
 | `upstream` | `upstream [http://\|https://]host[:port];` | — | Append backend (max 8 per route; same scheme rules as `proxy_pass`). |
 | `balance` | `balance round_robin\|least_connections\|ip_hash\|random\|consistent_hash\|least_time` | round_robin | LB strategy. |
 | `proxy_set_header` | `proxy_set_header name value;` | — | Override upstream request header. |

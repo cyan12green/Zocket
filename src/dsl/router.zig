@@ -218,6 +218,10 @@ pub const Route = struct {
     sub_filter_match: ?[]const u8 = null,
     sub_filter_replacement: ?[]const u8 = null,
     sub_filter_once: bool = true,
+    /// `proxy_pass http://host/prefix/;` URI tail: when set and the
+    /// request target starts with this route's location path, the matched
+    /// prefix is replaced by this URI (query preserved) — nginx rule.
+    proxy_pass_uri: ?[]const u8 = null,
     /// Location rewriting (`proxy_redirect <from> <to>;`): prefix-substitute
     /// upstream Location/Refresh values starting with `from`. Null = off.
     proxy_redirect_from: ?[]const u8 = null,

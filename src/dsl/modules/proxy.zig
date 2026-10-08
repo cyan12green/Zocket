@@ -1208,6 +1208,26 @@ fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream, 
     }
 }
 
+/// Effective upstream request target: `proxy_pass http://host/uri/;`
+/// replaces the matched location prefix with `uri` (query preserved). Pure
+/// given the route + target (unit-tested); falls back to the original
+/// target when the prefix does not match (defensive; the route matched).
+fn upstreamTarget(ctx: *Context, route: *const registry.Route) []const u8 {
+    const uri = route.proxy_pass_uri orelse return ctx.req.target;
+    const t = ctx.req.target;
+    const qpos = std.mem.indexOfScalar(u8, t, '?');
+    const tpath = if (qpos) |q| t[0..q] else t;
+    const query = if (qpos) |q| t[q..] else "";
+    if (!std.mem.startsWith(u8, tpath, route.path)) return t;
+    const a = ctx.req.arena.asAllocator();
+    const tail = tpath[route.path.len..];
+    const out = a.alloc(u8, uri.len + tail.len + query.len) catch return t;
+    @memcpy(out[0..uri.len], uri);
+    @memcpy(out[uri.len..][0..tail.len], tail);
+    @memcpy(out[uri.len + tail.len ..][0..query.len], query);
+    return out;
+}
+
 fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
     // Two-pass: compute exact wire size, then serialize into a single
     // contiguous arena buffer (no ArrayList reallocations, no wasted memory).
@@ -1224,8 +1244,10 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
 
     // --- pass 1: compute exact size ---
     var total: usize = 0;
-    // request line: "METHOD /target HTTP/1.1\r\n"
-    total += method.len + 1 + ctx.req.target.len + 11;
+    // request line: "METHOD /target HTTP/1.1\r\n" (proxy_pass URI
+    // rewriting: the matched location prefix may be replaced).
+    const target = if (ctx.route) |r| upstreamTarget(ctx, r) else ctx.req.target;
+    total += method.len + 1 + target.len + 11;
     // "Host: upstream:port\r\n"
     total += 6 + up.host.len + 1 + digitCount(up.port) + 2;
     // "X-Forwarded-For: a.b.c.d\r\nX-Real-IP: a.b.c.d\r\n"
@@ -1308,7 +1330,7 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
 
     write(buf, &pos, method);
     write(buf, &pos, " ");
-    write(buf, &pos, ctx.req.target);
+    write(buf, &pos, target);
     write(buf, &pos, " HTTP/1.1\r\n");
 
     write(buf, &pos, "Host: ");
@@ -2363,6 +2385,9 @@ const FakeUpstream = struct {
     response: []const u8,
     stop_flag: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
+    /// Last request head the origin saw (for request-rewrite assertions).
+    last_req: [1024]u8 = undefined,
+    last_req_len: usize = 0,
 
     fn start(response: []const u8, max_conns: usize) !*FakeUpstream {
         const self = try testing.allocator.create(FakeUpstream);
@@ -2418,6 +2443,8 @@ const FakeUpstream = struct {
                     }
                 }
                 if (!complete) break;
+                self.last_req_len = @min(used, self.last_req.len);
+                @memcpy(self.last_req[0..self.last_req_len], req_buf[0..self.last_req_len]);
                 _ = compat.write(fd, self.response) catch break;
             }
             compat.close(fd);
@@ -3518,4 +3545,57 @@ test "proxy TLS handles large and chunked upstream bodies" {
         try testing.expectEqual(Action.handled, try run(&ctx));
         try testing.expectEqualStrings("hello", resp.body);
     }
+}
+
+test "proxy_pass URI tail replaces the matched location prefix" {
+    const fake = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = fake.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", fake.port).?,
+    }};
+    const route = registry.Route{
+        .path = "/api/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_pass_uri = "/v1/",
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/api/users?q=1";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    // The origin saw the rewritten target, query preserved.
+    try testing.expect(std.mem.startsWith(u8, fake.last_req[0..fake.last_req_len], "GET /v1/users?q=1 HTTP/1.1\r\n"));
+}
+
+test "upstreamTarget rewriting rules are pure and defensive" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    const route = registry.Route{ .path = "/api/", .proxy_pass_uri = "/v1/" };
+    ctx.route = &route;
+    // Prefix match: replaced with the URI tail, query kept.
+    req.target = "/api/users?q=1";
+    try testing.expectEqualStrings("/v1/users?q=1", upstreamTarget(&ctx, &route));
+    // Exact tail (location itself): fully replaced.
+    req.target = "/api/";
+    try testing.expectEqualStrings("/v1/", upstreamTarget(&ctx, &route));
+    // No query.
+    req.target = "/api/users";
+    try testing.expectEqualStrings("/v1/users", upstreamTarget(&ctx, &route));
+    // Non-matching prefix falls back to the original.
+    req.target = "/other";
+    try testing.expectEqualStrings("/other", upstreamTarget(&ctx, &route));
+    // No URI configured: identity.
+    const plain = registry.Route{ .path = "/api/" };
+    try testing.expectEqualStrings("/other", upstreamTarget(&ctx, &plain));
 }

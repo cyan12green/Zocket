@@ -418,6 +418,9 @@ const LocationSpec = struct {
     proxy_ssl_trusted_certificate: ?Str = null,
     /// `proxy_ssl_name <name>;` (SNI/verify override).
     proxy_ssl_name: ?Str = null,
+    /// `proxy_pass http://host/prefix/;` URI tail: replaces the matched
+    /// location prefix in the upstream request target.
+    proxy_pass_uri: ?Str = null,
     /// `limit_req_status` / `limit_conn_status` (429 or 503, 0 = default).
     limit_req_status: u16 = 0,
     limit_conn_status: u16 = 0,
@@ -783,7 +786,7 @@ fn resolve(str: Str, strings: []const u8) []const u8 {
 /// `https://` enables upstream TLS (default port 443); `http://` is
 /// explicit plaintext (default 80); bare values keep the historical
 /// host:port shape (port required).
-fn splitEndpoint(lx: *Lexer, comptime dir: []const u8, s: []const u8) struct { host: []const u8, port: u16, tls: bool } {
+fn splitEndpoint(lx: *Lexer, comptime dir: []const u8, s: []const u8) struct { host: []const u8, port: u16, tls: bool, uri: ?[]const u8 } {
     var rest = s;
     var tls = false;
     if (std.mem.startsWith(u8, rest, "https://")) {
@@ -792,14 +795,21 @@ fn splitEndpoint(lx: *Lexer, comptime dir: []const u8, s: []const u8) struct { h
     } else if (std.mem.startsWith(u8, rest, "http://")) {
         rest = rest["http://".len..];
     }
+    // Optional URI tail (nginx `proxy_pass http://host/v1/;` replaces the
+    // matched location prefix with it): everything from the first '/'.
+    var uri: ?[]const u8 = null;
+    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
+        uri = rest[slash..];
+        rest = rest[0..slash];
+    }
     if (std.mem.indexOfScalar(u8, rest, ':')) |colon| {
         const host = rest[0..colon];
         const port = std.fmt.parseInt(u16, rest[colon + 1 ..], 10) catch
             lx.fail(dir ++ ": expected host:port");
-        return .{ .host = host, .port = port, .tls = tls };
+        return .{ .host = host, .port = port, .tls = tls, .uri = uri };
     }
     if (std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://")) {
-        return .{ .host = rest, .port = if (tls) 443 else 80, .tls = tls };
+        return .{ .host = rest, .port = if (tls) 443 else 80, .tls = tls, .uri = uri };
     }
     lx.fail(dir ++ ": expected host:port");
 }
@@ -1409,6 +1419,11 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             lx.expectTerminator("proxy_pass");
             const ep = splitEndpoint(lx, "proxy_pass", s);
             if (spec.upstreams_len == 0) spec.upstreams_start = b.upstreams.len;
+            if (ep.uri) |u| {
+                const pool_start = b.strings.len;
+                for (u) |ch| _ = b.strings.create(ch);
+                spec.proxy_pass_uri = .{ .pool = .{ .start = pool_start, .len = b.strings.len - pool_start } };
+            }
             _ = b.upstreams.create(parseUpstream(lx, "proxy_pass", ep.host, ep.port, ep.tls));
             spec.upstreams_len += 1;
             b.cost += 8;
@@ -2767,6 +2782,7 @@ fn build(b: *const Builder) Config {
                 .proxy_ssl_verify = spec.proxy_ssl_verify,
                 .proxy_ssl_trusted_certificate = if (spec.proxy_ssl_trusted_certificate) |s| resolve(s, strings) else null,
                 .proxy_ssl_name = if (spec.proxy_ssl_name) |s| resolve(s, strings) else null,
+                .proxy_pass_uri = if (spec.proxy_pass_uri) |s| resolve(s, strings) else null,
                 .access_rules = access_table.items[access_table.ranges[ri].start..][0..access_table.ranges[ri].len],
                 .realip_from = realip_table.items[realip_table.ranges[ri].start..][0..realip_table.ranges[ri].len],
                 .real_ip_header = if (spec.real_ip_header) |h| resolve(h, strings) else null,
@@ -4471,4 +4487,22 @@ test "conf: server-scope tls block overrides the global section" {
     try testing.expectEqualStrings("a.key", cfg.servers[0].tls.key);
     // b.test has no per-server block: empty override (inherits at init).
     try testing.expectEqualStrings("", cfg.servers[1].tls.cert);
+}
+
+test "conf: proxy_pass URI tail lands on the route" {
+    const cfg = parse(
+        \\server {
+        \\    location /api/ {
+        \\        rewrite proxy;
+        \\        proxy_pass http://127.0.0.1:9000/v1/;
+        \\    }
+        \\    location / {
+        \\        rewrite proxy;
+        \\        proxy_pass 127.0.0.1:9001;
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("/v1/", cfg.routes[0].proxy_pass_uri.?);
+    try testing.expect(cfg.routes[1].proxy_pass_uri == null);
+    try testing.expectEqual(@as(u16, 9000), cfg.routes[0].upstreams[0].port);
 }

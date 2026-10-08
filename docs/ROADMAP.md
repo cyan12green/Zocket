@@ -399,6 +399,8 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   response-body substitution (single + `once` semantics), `proxy_redirect`
   Location rewriting, X-Accel-Redirect internal file redirect. All shipped
   2026-10.
+- D1.7 proxy parity ✅ SHIPPED 2026-10: `proxy_pass http://host/uri/;`
+  URI-tail rewriting (nginx location-prefix replacement, query preserved).
 - D1.6 protocol extras ✅ SHIPPED 2026-10: `Expect: 100-continue` answered
   immediately on HTTP/1.1 (plaintext + TLS) and HTTP/2 (interim :status 100
   HEADERS), so waiting clients upload without the ~1 s continue timer;
