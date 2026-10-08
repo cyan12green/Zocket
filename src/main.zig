@@ -86,7 +86,42 @@ pub const ValidateError = error{
     PortBindFailed,
 };
 
+fn validateTlsBlock(tls: zocket.runtime.config.TlsConfig, allocator: std.mem.Allocator) ValidateError!void {
+    const cert_pem = compat.readFileAlloc(allocator, tls.cert, 1 << 20) catch return error.TlsFilesUnreadable;
+    defer allocator.free(cert_pem);
+    const key_pem = compat.readFileAlloc(allocator, tls.key, 1 << 20) catch return error.TlsFilesUnreadable;
+    defer allocator.free(key_pem);
+    const creds = zocket.tls.cert.loadCredentials(allocator, cert_pem, key_pem) catch return error.TlsCredentialsInvalid;
+    defer allocator.free(creds.cert_der);
+    if (tls.ocsp_file.len > 0) {
+        const der = compat.readFileAlloc(allocator, tls.ocsp_file, 1 << 20) catch return error.TlsFilesUnreadable;
+        defer allocator.free(der);
+        const parsed = zocket.tls.ocsp.parseResponse(der) catch return error.TlsCredentialsInvalid;
+        if (parsed.cert != .good) return error.TlsCredentialsInvalid;
+    }
+    if (tls.verify_client and tls.client_ca.len == 0) return error.TlsCredentialsInvalid;
+    if (tls.client_ca.len > 0) {
+        var bundle = std.crypto.Certificate.Bundle.empty;
+        defer bundle.deinit(allocator);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return error.TlsCredentialsInvalid;
+        const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
+        if (std.fs.path.isAbsolute(tls.client_ca)) {
+            bundle.addCertsFromFilePathAbsolute(allocator, io, now, tls.client_ca) catch
+                return error.TlsCredentialsInvalid;
+        } else {
+            bundle.addCertsFromFilePath(allocator, io, now, .cwd(), tls.client_ca) catch
+                return error.TlsCredentialsInvalid;
+        }
+    }
+}
+
 fn validateConfig(cfg: zocket.runtime.config.Config, opts: ServerOpts, allocator: std.mem.Allocator) ValidateError!void {
+    // Per-server TLS overrides (`server { tls { … } }`) validate the same
+    // way as the global section — a bad vhost cert must fail --validate.
+    for (cfg.servers) |spec| {
+        if (spec.tls.cert.len > 0) try validateTlsBlock(spec.tls, allocator);
+    }
     if (cfg.tls.enabled()) {
         const cert_pem = compat.readFileAlloc(allocator, cfg.tls.cert, 1 << 20) catch return error.TlsFilesUnreadable;
         defer allocator.free(cert_pem);

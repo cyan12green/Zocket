@@ -545,6 +545,65 @@ const StreamSniSpec = struct {
     port: u16 = 0,
 };
 
+/// One `tls { ... }` block (top level or server scope): the file-backed
+/// TLS knobs. Server-scope blocks override the global one for that vhost.
+const TlsSpec = struct {
+    cert: Str = .{ .src = "" },
+    key: Str = .{ .src = "" },
+    ocsp: Str = .{ .src = "" },
+    client_ca: Str = .{ .src = "" },
+    verify_client: bool = false,
+    ktls: bool = false,
+};
+
+/// Parse the body of a `tls { ... }` block into `spec` (shared by the
+/// global and per-server arms).
+fn parseTlsBody(lx: *Lexer, b: *Builder, spec: *TlsSpec) void {
+    lx.expectOpen("tls");
+    var seen_cert = false;
+    var seen_key = false;
+    while (true) {
+        if (lx.peek() == '}') {
+            lx.pos += 1;
+            break;
+        }
+        const t = lx.token() orelse lx.fail("tls: expected a directive");
+        const dn = t.srcOf("tls: directive cannot contain escapes");
+        switch (keyHash(dn)) {
+            H_cert => {
+                if (seen_cert) lx.fail("duplicate tls cert");
+                seen_cert = true;
+                spec.cert = lx.value(b, "tls cert");
+                lx.expectTerminator("tls cert");
+            },
+            H_key => {
+                if (seen_key) lx.fail("duplicate tls key");
+                seen_key = true;
+                spec.key = lx.value(b, "tls key");
+                lx.expectTerminator("tls key");
+            },
+            H_ocsp_file => {
+                spec.ocsp = lx.value(b, "tls ocsp_file");
+                lx.expectTerminator("tls ocsp_file");
+            },
+            H_client_ca => {
+                spec.client_ca = lx.value(b, "tls client_ca");
+                lx.expectTerminator("tls client_ca");
+            },
+            H_verify_client => {
+                spec.verify_client = lx.boolOnOff("tls verify_client");
+                lx.expectTerminator("tls verify_client");
+            },
+            H_ktls => {
+                spec.ktls = lx.boolOnOff("tls ktls");
+                lx.expectTerminator("tls ktls");
+            },
+            else => lx.fail("unknown tls directive '" ++ dn ++ "'"),
+        }
+    }
+    b.cost += 16;
+}
+
 /// Comptime builder: append-only pools for every piece of the config.
 const Builder = struct {
     routes: ct_pool.CtPool(LocationSpec, route_cap) = .{},
@@ -580,12 +639,10 @@ const Builder = struct {
     acme_dir: Str = .{ .src = "" },
     acme_contact: Str = .{ .src = "" },
     acme_domains: ct_pool.CtPool(Str, 8) = .{},
-    tls_cert: Str = .{ .src = "" },
-    tls_key: Str = .{ .src = "" },
-    tls_ocsp: Str = .{ .src = "" },
-    tls_client_ca: Str = .{ .src = "" },
-    tls_verify_client: bool = false,
-    tls_ktls: bool = false,
+    tls_spec: TlsSpec = .{},
+    /// Per-server TLS overrides (`tls {}` inside a server block).
+    server_tls: [max_servers]TlsSpec = @as([max_servers]TlsSpec, @splat(TlsSpec{})),
+    server_tls_seen: [max_servers]bool = @as([max_servers]bool, @splat(false)),
     resolver_addrs: ct_pool.CtPool(Str, 3) = .{},
     tls_seen: bool = false,
     listen_port: ?u16 = null,
@@ -1107,49 +1164,7 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
         H_tls => {
             if (b.tls_seen) lx.fail("duplicate tls block");
             b.tls_seen = true;
-            lx.expectOpen(name);
-            var seen_cert = false;
-            var seen_key = false;
-            while (true) {
-                if (lx.peek() == '}') {
-                    lx.pos += 1;
-                    break;
-                }
-                const t = lx.token() orelse lx.fail("tls: expected a directive");
-                const dn = t.srcOf("tls: directive cannot contain escapes");
-                switch (keyHash(dn)) {
-                    H_cert => {
-                        if (seen_cert) lx.fail("duplicate tls cert");
-                        seen_cert = true;
-                        b.tls_cert = lx.value(b, "tls cert");
-                        lx.expectTerminator("tls cert");
-                    },
-                    H_key => {
-                        if (seen_key) lx.fail("duplicate tls key");
-                        seen_key = true;
-                        b.tls_key = lx.value(b, "tls key");
-                        lx.expectTerminator("tls key");
-                    },
-                    H_ocsp_file => {
-                        b.tls_ocsp = lx.value(b, "tls ocsp_file");
-                        lx.expectTerminator("tls ocsp_file");
-                    },
-                    H_client_ca => {
-                        b.tls_client_ca = lx.value(b, "tls client_ca");
-                        lx.expectTerminator("tls client_ca");
-                    },
-                    H_verify_client => {
-                        b.tls_verify_client = lx.boolOnOff("tls verify_client");
-                        lx.expectTerminator("tls verify_client");
-                    },
-                    H_ktls => {
-                        b.tls_ktls = lx.boolOnOff("tls ktls");
-                        lx.expectTerminator("tls ktls");
-                    },
-                    else => lx.fail("unknown tls directive '" ++ dn ++ "'"),
-                }
-            }
-            b.cost += 16;
+            parseTlsBody(lx, b, &b.tls_spec);
         },
         H_map => {
             // map $source $dest { default v; literal v; ~regex v; ~*regex v; }
@@ -2167,6 +2182,13 @@ fn parseServer(lx: *Lexer, b: *Builder) void {
             lx.expectTerminator("listen");
             continue;
         }
+        if (keyHash(dn) == H_tls) {
+            const si = b.current_server;
+            if (b.server_tls_seen[si]) lx.fail("duplicate tls block in server");
+            b.server_tls_seen[si] = true;
+            parseTlsBody(lx, b, &b.server_tls[si]);
+            continue;
+        }
         if (keyHash(dn) == H_filter) {
             appendServerFilter(b, parseScopedFilter(lx, b));
             continue;
@@ -2800,12 +2822,27 @@ fn build(b: *const Builder) Config {
             const end = if (i + 1 < b.server_count) b.server_routes_start[i + 1] else routes_built.len;
             const ns = b.server_name_starts[i];
             const nl = b.server_name_lens[i];
+            const stls = b.server_tls[i];
+            // A server-scope `tls {}` must be complete (cert AND key):
+            // a half-configured vhost would fail at startup anyway.
+            if (b.server_tls_seen[i] and (stls.cert.src.len == 0 or stls.key.src.len == 0)) {
+                @compileError("server tls block needs both cert and key");
+            }
+            const stls_cfg = if (b.server_tls_seen[i]) config_mod.TlsConfig{
+                .cert = resolve(stls.cert, strings),
+                .key = resolve(stls.key, strings),
+                .ocsp_file = resolve(stls.ocsp, strings),
+                .client_ca = resolve(stls.client_ca, strings),
+                .verify_client = stls.verify_client,
+                .ktls = stls.ktls,
+            } else config_mod.TlsConfig{};
             items[len] = .{
                 .listen_port = b.server_listen_ports[i] orelse b.listen_port,
                 .listen_spec = b.server_listen_specs[i] orelse b.listen_spec,
                 .server_names = name_table.items[ns..][0..nl],
                 .routes_start = start,
                 .routes_len = end - start,
+                .tls = stls_cfg,
             };
             len += 1;
         }
@@ -2937,12 +2974,12 @@ fn build(b: *const Builder) Config {
         },
         .limits = b.limits,
         .tls = .{
-            .cert = resolve(b.tls_cert, strings),
-            .key = resolve(b.tls_key, strings),
-            .ocsp_file = resolve(b.tls_ocsp, strings),
-            .client_ca = resolve(b.tls_client_ca, strings),
-            .verify_client = b.tls_verify_client,
-            .ktls = b.tls_ktls,
+            .cert = resolve(b.tls_spec.cert, strings),
+            .key = resolve(b.tls_spec.key, strings),
+            .ocsp_file = resolve(b.tls_spec.ocsp, strings),
+            .client_ca = resolve(b.tls_spec.client_ca, strings),
+            .verify_client = b.tls_spec.verify_client,
+            .ktls = b.tls_spec.ktls,
         },
         .listen_port = b.listen_port,
         .listen_spec = b.listen_spec,
@@ -4403,4 +4440,35 @@ test "conf: proxy_next_upstream accepts condition lists" {
     );
     try testing.expect(cfg.routes[0].proxy_next_upstream);
     try testing.expectEqual(@as(u8, 0x01 | 0x02 | 0x04), cfg.routes[0].proxy_next_upstream_mask);
+}
+
+test "conf: server-scope tls block overrides the global section" {
+    const cfg = parse(
+        \\tls {
+        \\    cert "global.pem";
+        \\    key "global.key";
+        \\}
+        \\server {
+        \\    server_name a.test;
+        \\    tls {
+        \\        cert "a.pem";
+        \\        key "a.key";
+        \\    }
+        \\    location / {
+        \\        rewrite echo;
+        \\    }
+        \\}
+        \\server {
+        \\    server_name b.test;
+        \\    location / {
+        \\        rewrite echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("global.pem", cfg.tls.cert);
+    try testing.expectEqual(@as(usize, 2), cfg.servers.len);
+    try testing.expectEqualStrings("a.pem", cfg.servers[0].tls.cert);
+    try testing.expectEqualStrings("a.key", cfg.servers[0].tls.key);
+    // b.test has no per-server block: empty override (inherits at init).
+    try testing.expectEqualStrings("", cfg.servers[1].tls.cert);
 }

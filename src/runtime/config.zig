@@ -100,6 +100,10 @@ pub const Config = struct {
     /// Per-server virtual host spec.
     pub const ServerSpec = struct {
         listen_port: ?u16 = null,
+        /// Per-server TLS override (server-scope `tls {}`); empty cert/key
+        /// inherits the global `tls` section. Drives SNI-based cert
+        /// selection at handshake time.
+        tls: TlsConfig = .{},
         listen_spec: ?sockets.ListenSpec = null,
         server_names: []const []const u8 = &.{},
         routes_start: usize = 0,

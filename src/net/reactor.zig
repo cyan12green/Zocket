@@ -23,6 +23,7 @@ const http2_frames = @import("../http2/frames.zig");
 const websocket_mod = @import("../http/websocket.zig");
 const proxy_mod = @import("../dsl/modules/proxy.zig");
 const proxy_proto = @import("proxy_proto.zig");
+const sni_mod = @import("sni.zig");
 const dsl_registry = @import("../dsl/registry.zig");
 const default_registry = dsl_registry.default_registry;
 
@@ -1006,12 +1007,19 @@ pub const Reactor = struct {
             if (session.tls == null and session.h2 == null) {
                 const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
                 if (recv_slice.len >= 6 and recv_slice[0] == 0x16 and recv_slice[1] == 0x03 and recv_slice[5] == 0x01) {
-                    if (self.http_handler) |handler| {
-                        if (handler.tls_creds) |*creds| {
-                            session.tls = tls_conn.TlsConn.init(creds);
-                            session.tls_plain = buffer_mod.Buffer.fromSlice(&session.tls_plain_data);
-                            session.tls_stage = buffer_mod.Buffer.fromSlice(&session.tls_stage_data);
-                        }
+                    // SNI-based vhost certificate selection: route the
+                    // handshake to the server whose server_name matches
+                    // the ClientHello's SNI (falls back to the default /
+                    // first server with credentials when unmatched).
+                    const creds_server = blk: {
+                        const group = self.server_group orelse break :blk self.handler;
+                        const sni_name = sni_mod.peekServerName(recv_slice) orelse break :blk self.handler;
+                        break :blk group.selectServerTls(sni_name);
+                    };
+                    if (creds_server.tls_creds) |*creds| {
+                        session.tls = tls_conn.TlsConn.init(creds);
+                        session.tls_plain = buffer_mod.Buffer.fromSlice(&session.tls_plain_data);
+                        session.tls_stage = buffer_mod.Buffer.fromSlice(&session.tls_stage_data);
                     }
                 }
             }

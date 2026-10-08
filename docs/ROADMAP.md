@@ -394,11 +394,18 @@ Sized the same way as C1–C3. Goal: every feature below exists in
 nginx/Caddy today; each ships with tests + docs + its own commit, then
 the comparison benchmarks must show Zocket ahead (iterate until green).
 
-- D1 content parity: precompressed `.br`/`.zstd` twins (no encoders —
+- D1 content parity ✅: precompressed `.br`/`.zstd` twins (no encoders —
   serve sibling twins like gzip_static/brotli_static), `sub_filter`
   response-body substitution (single + `once` semantics), `proxy_redirect`
-  Location rewriting, X-Accel-Redirect internal file redirect.
-- D2 auth/resilience: JWT ES256 + `jwks_file` (TLS ECDSA verify reuse),
+  Location rewriting, X-Accel-Redirect internal file redirect. All shipped
+  2026-10.
+- D1.5 TLS parity ✅ SHIPPED 2026-10: server-scope `tls {}` blocks with
+  SNI-based certificate selection at handshake time (exact > wildcard >
+  default; cert-less vhost falls back to a server with creds;
+  `--validate` checks every override). Upstream TLS keepalive pooling
+  (per-backend, idle-reaped, reconnect-on-stale) also shipped 2026-10.
+- D2 auth/resilience: JWT ES256 ✅ + `jwks_file` deferred (TLS ECDSA
+  verify reuse done; JWKS rotation still deferred),
   `proxy_next_upstream` status retry (`http_502|http_503|...`), upstream
   TLS keepalive pooling (pool keyed by host/port/tls) + parked-path TLS.
 - D3 ACME issuance loop: account→order→poll→finalize→download→install

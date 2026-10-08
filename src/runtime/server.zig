@@ -1228,10 +1228,13 @@ pub const ServerGroup = struct {
         errdefer allocator.free(srvs);
         inline for (cfg.servers, 0..) |spec, i| {
             const sub_routes = cfg.routes[spec.routes_start..][0..spec.routes_len];
+            // Server-scope tls block overrides the global section (SNI
+            // cert selection); an unset one inherits.
+            const sub_tls = if (spec.tls.cert.len > 0) spec.tls else cfg.tls;
             const sub_cfg = config_mod.Config{
                 .routes = sub_routes,
                 .limits = cfg.limits,
-                .tls = cfg.tls,
+                .tls = sub_tls,
                 .listen_port = spec.listen_port,
                 .log_formats = cfg.log_formats,
                 .maps = cfg.maps,
@@ -1247,6 +1250,19 @@ pub const ServerGroup = struct {
     /// select_fn when available (O(1) exact match + wildcard scan), falls
     /// back to runtime matching for dynamically-constructed configs.
     /// When host_select is false, always returns the first server.
+    /// Like `selectServer`, but for the TLS handshake: the chosen vhost
+    /// must carry credentials, else the first server with any is used
+    /// (nginx picks the matching `ssl_certificate` per SNI; a vhost with
+    /// no cert must not kill the handshake when another has one).
+    pub fn selectServerTls(self: *const ServerGroup, sni: []const u8) *const Server {
+        const srv = self.selectServer(sni, null);
+        if (srv.tls_creds != null) return srv;
+        for (self.servers) |*s| {
+            if (s.tls_creds != null) return s;
+        }
+        return srv;
+    }
+
     pub fn selectServer(self: *const ServerGroup, host: []const u8, cfg: ?config_mod.Config) *const Server {
         if (!self.host_select) return &self.servers[0];
         // Fast path: comptime-generated select function.
@@ -1532,4 +1548,33 @@ test "loadTls refuses verify_client without a bundle, loads a good one" {
     if (srv.client_ca_bundle) |*b| b.deinit(std.heap.page_allocator);
     srv.tls_creds = null;
     srv.client_ca_bundle = null;
+}
+
+test "selectServerTls picks the SNI vhost, falls back to a server with creds" {
+    // s1: default, creds A. s2 (api.test): no creds. s3 (secure.test): creds B.
+    const testdata = @import("../tls/testdata.zig");
+    const creds_a = try tls_cert.loadCredentials(testing.allocator, testdata.cert_pem, testdata.key_pem);
+    defer testing.allocator.free(creds_a.cert_der);
+    const creds_b = try tls_cert.loadCredentials(testing.allocator, testdata.cert384_pem, testdata.key384_pem);
+    defer testing.allocator.free(creds_b.cert_der);
+    var s1 = Server.init(.{ .server_names = &.{"default.test"} });
+    s1.tls_creds = creds_a;
+    const s2 = Server.init(.{ .server_names = &.{"api.test"} });
+    var s3 = Server.init(.{ .server_names = &.{"secure.test"} });
+    s3.tls_creds = creds_b;
+    const servers = [_]Server{ s1, s2, s3 };
+    const group = ServerGroup{ .servers = &servers, .default_idx = 0 };
+    // Exact SNI with creds: that vhost's cert.
+    try testing.expectEqual(&servers[2], group.selectServerTls("secure.test"));
+    // Matched vhost without creds falls back to one that has them (the
+    // first in order), never breaking the handshake.
+    try testing.expectEqual(&servers[0], group.selectServerTls("api.test"));
+    // Unmatched SNI: default server has creds -> default.
+    try testing.expectEqual(&servers[0], group.selectServerTls("other.test"));
+    // Wildcard.
+    var s4 = Server.init(.{ .server_names = &.{"*.wild.test"} });
+    s4.tls_creds = creds_b;
+    const servers2 = [_]Server{ s1, s2, s4 };
+    const group2 = ServerGroup{ .servers = &servers2, .default_idx = 0 };
+    try testing.expectEqual(&servers2[2], group2.selectServerTls("v1.wild.test"));
 }
