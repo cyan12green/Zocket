@@ -1,0 +1,4 @@
+Bombarding http://127.0.0.1:18305/static for 6s using 1000 connection(s)
+ 00m05s 00m04s 00m04s 00m04s 00m04s 00m04s 00m03s 00m03s 00m03s 00m03s 00m03s 00m02s 00m02s 00m02s 00m02s 00m02s 00m01s 00m01s 00m01s 00m01s 00m01s 6s
+Done!
+{"spec":{"numberOfConnections":1000,"testType":"timed","testDurationSeconds":6,"method":"GET","url":"http://127.0.0.1:18305/static","body":"","stream":false,"timeoutSeconds":2,"client":"fasthttp"},"result":{"bytesRead":80070732360,"bytesWritten":5270151,"timeTakenSeconds":6.088494813,"req1xx":0,"req2xx":76344,"req3xx":0,"req4xx":0,"req5xx":0,"others":0,"latency":{"mean":78834.65798229068,"stddev":80202.12569918773,"max":3.234602e+06,"percentiles":{"50":81650,"75":108836,"90":128070,"95":131735,"99":150976}},"rps":{"mean":12641.121660740098,"stddev":927.0377620038109,"max":15028.254621513908,"percentiles":{"50":12828.686674,"75":12999.433875,"90":13143.431813,"95":13251.566998,"99":13793.144807}}}}

@@ -121,13 +121,24 @@ or set `ENVOY_BIN=` to include them). 8 workload cells.
 | cache_hit | 402,292 | 203,728 | 1.97x |
 | lb_rr | 403,032 | 147,109 | 2.74x |
 
-## HTTP/2 (h2c, h2load)
+## HTTP/2 over TLS (h2load) — 2026-10
 
-![H2 compare](graphs/h2_compare.png)
+`bash bench/h2-bench.sh --reps 3 --duration 6 --conns "100 500"` — h2load
+(from the pinned `third_party/nghttp2`, cmake build), 4 threads / 4 nginx
+workers, 10 concurrent streams per connection, alternating port layouts.
+Medians of 6 samples per server and cell.
 
-## HTTP/2 over TLS
+| Cell | Zocket | nginx | Ratio | mean RTT Zocket | mean RTT nginx |
+|---|---:|---:|---:|---:|---:|
+| h2 100 conns x 10 streams | 425,842 | 412,053 | 1.03x | 2.12 ms | 2.13 ms |
+| h2 500 conns x 10 streams | 402,158 | 375,125 | 1.07x | 11.2 ms | 11.0 ms |
 
-![TLS compare](graphs/tls_compare.png)
+HTTP/1.1 over the same TLS listener (bombardier `-k`, GET /, c=100,
+medians of 3): Zocket 310,419 vs nginx 268,957 req/s (1.15x).
+
+The historical h2/h2c graphs above stay from the earlier suite; the TLS
+nginx build (`bench/build-nginx-tls.sh`) and h2load are the current
+oracles for this section.
 
 ## Chunked transfer
 
@@ -145,6 +156,16 @@ bash bench/compare-servers.sh --matrix --bodies "1024 8192 65536" --conns-list "
 bash bench/compare-servers.sh --static "1024 1048576" --conns-list "100 1000"
 bash bench/modules-bench.sh
 bash bench/unified.sh
+
+# HTTP/2 over TLS (needs h2load + a TLS nginx + a P-256 cert pair):
+cmake -B third_party/nghttp2/build -DENABLE_APP=ON -DENABLE_EXAMPLES=OFF \
+      -DENABLE_HPACK_TOOLS=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build third_party/nghttp2/build --target h2load -j
+bash bench/build-nginx-tls.sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -keyout /tmp/opencode/bench-tls.key -out /tmp/opencode/bench-tls.crt \
+      -days 30 -nodes -subj "/CN=localhost"
+bash bench/h2-bench.sh --reps 3 --duration 6 --conns "100 500"
 
 # Generate every graph from stored results (what --run does after the suite):
 python3 bench/graphs.py

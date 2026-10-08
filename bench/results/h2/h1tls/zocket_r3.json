@@ -1,0 +1,4 @@
+Bombarding https://127.0.0.1:18443/ for 4s using 100 connection(s)
+ 00m03s 00m02s 00m02s 00m02s 00m02s 00m02s 00m01s 00m01s 00m01s 00m01s 00m01s 4s
+Done!
+{"spec":{"numberOfConnections":100,"testType":"timed","testDurationSeconds":4,"method":"GET","url":"https://127.0.0.1:18443/","body":"","stream":false,"timeoutSeconds":2,"client":"fasthttp"},"result":{"bytesRead":0,"bytesWritten":0,"timeTakenSeconds":4.000030041,"req1xx":0,"req2xx":0,"req3xx":0,"req4xx":0,"req5xx":0,"others":1064257,"errors":[{"description":"dial tcp 127.0.0.1:18443: connect: connection refused","count":1064257}],"latency":{"mean":329.86905794371097,"stddev":353.53353886736113,"max":14089,"percentiles":{"50":182,"75":377,"90":682,"95":990,"99":2583}},"rps":{"mean":266177.0159774101,"stddev":17523.18642701248,"max":359668.5892296896,"percentiles":{"50":263510.017324,"75":270291.327544,"90":281328.964436,"95":300255.765642,"99":330894.617628}}}}

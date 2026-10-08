@@ -1,0 +1,31 @@
+# nginx benchmark config for HTTP/2 over TLS (template).
+# Placeholders: @@PORT@@ (listen port), @@ERRLOG@@ (error log path),
+# @@PREFIX@@ (runtime prefix: pid file location), @@CERT@@/@@KEY@@ (PEM
+# files). h2load measures h2 via ALPN; the location is nginx's echo twin.
+worker_processes 4;
+daemon off;
+error_log @@ERRLOG@@ crit;
+pid @@PREFIX@@/nginx.pid;
+
+events {
+    worker_connections 16384;
+}
+
+http {
+    access_log off;
+    server_tokens off;
+    keepalive_timeout 65;
+    keepalive_requests 100000;
+
+    server {
+        listen 127.0.0.1:@@PORT@@ ssl;
+        http2 on;
+        ssl_certificate @@CERT@@;
+        ssl_certificate_key @@KEY@@;
+        ssl_session_cache off;
+
+        location / {
+            echo -n "";
+        }
+    }
+}
