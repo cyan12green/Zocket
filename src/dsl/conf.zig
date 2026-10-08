@@ -114,6 +114,7 @@ const H_gzip = keyHash("gzip");
 const H_precompressed = keyHash("precompressed");
 const H_sub_filter = keyHash("sub_filter");
 const H_sub_filter_once = keyHash("sub_filter_once");
+const H_proxy_redirect = keyHash("proxy_redirect");
 const H_auth_request = keyHash("auth_request");
 const H_cors = keyHash("cors");
 const H_cors_origin = keyHash("cors_origin");
@@ -380,6 +381,9 @@ const LocationSpec = struct {
     sub_filter_match: ?Str = null,
     sub_filter_replacement: ?Str = null,
     sub_filter_once: bool = true,
+    /// `proxy_redirect <from> <to>;` (single pair, v1).
+    proxy_redirect_from: ?Str = null,
+    proxy_redirect_to: ?Str = null,
     /// `auth_request <uri>;`
     auth_request: ?Str = null,
     /// `proxy_cache on;` / valid / stale-while-revalidate
@@ -1619,6 +1623,15 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             ensureFilterBound(b, spec, "sub_filter");
             b.cost += 8;
         },
+        H_proxy_redirect => {
+            // `proxy_redirect <from> <to>;` — two values, then `;`.
+            const f = lx.value(b, "proxy_redirect");
+            const to = lx.value(b, "proxy_redirect");
+            lx.expectTerminator("proxy_redirect");
+            spec.proxy_redirect_from = f;
+            spec.proxy_redirect_to = to;
+            b.cost += 8;
+        },
         H_sub_filter_once => {
             spec.sub_filter_once = lx.boolOnOff("sub_filter_once");
             lx.expectTerminator("sub_filter_once");
@@ -2638,6 +2651,8 @@ fn build(b: *const Builder) Config {
                 .sub_filter_match = if (spec.sub_filter_match) |s| resolve(s, strings) else null,
                 .sub_filter_replacement = if (spec.sub_filter_replacement) |s| resolve(s, strings) else null,
                 .sub_filter_once = spec.sub_filter_once,
+                .proxy_redirect_from = if (spec.proxy_redirect_from) |s| resolve(s, strings) else null,
+                .proxy_redirect_to = if (spec.proxy_redirect_to) |s| resolve(s, strings) else null,
                 .auth_request_uri = if (spec.auth_request) |u| resolve(u, strings) else null,
                 .cors_enabled = spec.cors_enabled,
                 .cors_origin = if (spec.cors_origin) |s| resolve(s, strings) else null,
@@ -4286,4 +4301,18 @@ test "conf: sub_filter binds the filter with once default" {
     try testing.expectEqualStrings("foo", cfg.routes[0].sub_filter_match.?);
     try testing.expectEqualStrings("bar", cfg.routes[0].sub_filter_replacement.?);
     try testing.expect(cfg.routes[0].sub_filter_once);
+}
+
+test "conf: proxy_redirect stores the from-to pair" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite proxy;
+        \\        proxy_pass 127.0.0.1:9000;
+        \\        proxy_redirect http://127.0.0.1:9000 https://example.com;
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("http://127.0.0.1:9000", cfg.routes[0].proxy_redirect_from.?);
+    try testing.expectEqualStrings("https://example.com", cfg.routes[0].proxy_redirect_to.?);
 }

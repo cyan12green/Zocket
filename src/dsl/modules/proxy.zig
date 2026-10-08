@@ -87,6 +87,7 @@ pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_nam
     ctx.resp.status = @enumFromInt(res.status);
     const ws101 = isWs101(ctx, res.status);
     const arena_a = ctx.req.arena.asAllocator();
+    const route = ctx.route;
     for (res.headers) |h| {
         const skip = switch (http_parser.header_hasher.hash(h.name)) {
             http_parser.header_hasher.hash("connection") => !ws101,
@@ -97,7 +98,8 @@ pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_nam
         };
         if (skip) continue;
         const name_c = arena_a.dupe(u8, h.name) catch return error.OutOfMemory;
-        const value_c = arena_a.dupe(u8, h.value) catch return error.OutOfMemory;
+        const value_src = if (route) |r| redirectRewrite(r, h.name, h.value, arena_a) orelse h.value else h.value;
+        const value_c = arena_a.dupe(u8, value_src) catch return error.OutOfMemory;
         ctx.resp.setHeader(name_c, value_c);
     }
     const body = arena_a.dupe(u8, res.body) catch return error.OutOfMemory;
@@ -450,6 +452,24 @@ fn forward(
     }
 }
 
+/// Rewrite an upstream redirect target per `proxy_redirect <from> <to>;`:
+/// when both are set and `name` is Location/Refresh (any case) and `value`
+/// starts with `from`, returns the substituted value (caller-owned copy
+/// into `alloc`); otherwise null (keep the original). Pure (unit-tested).
+fn redirectRewrite(route: *const registry.Route, name: []const u8, value: []const u8, alloc: std.mem.Allocator) ?[]const u8 {
+    const from = route.proxy_redirect_from orelse return null;
+    const to = route.proxy_redirect_to orelse return null;
+    if (from.len == 0) return null;
+    const is_loc = std.ascii.eqlIgnoreCase(name, "location");
+    const is_ref = std.ascii.eqlIgnoreCase(name, "refresh");
+    if (!is_loc and !is_ref) return null;
+    if (!std.mem.startsWith(u8, value, from)) return null;
+    const out = alloc.alloc(u8, to.len + value.len - from.len) catch return null;
+    @memcpy(out[0..to.len], to);
+    @memcpy(out[to.len..], value[from.len..]);
+    return out;
+}
+
 /// True when this response is a proxied WebSocket handshake: route opted
 /// into `proxy_ws` and the backend answered 101. The `Connection` header
 /// is end-to-end here (not hop-by-hop), so adopt sites preserve it.
@@ -539,7 +559,13 @@ fn attemptForward(
             http_parser.header_hasher.hash("transfer-encoding") => true,
             else => false,
         };
-        if (!skip) ctx.resp.setHeader(h.name, h.value);
+        if (skip) continue;
+        // proxy_redirect rewrites Location/Refresh (arena-owned copy).
+        if (redirectRewrite(route, h.name, h.value, ctx.req.arena.asAllocator())) |v| {
+            ctx.resp.setHeader(h.name, v);
+        } else {
+            ctx.resp.setHeader(h.name, h.value);
+        }
     }
 
     // The body slice lives in the reader's stack buffer: copy into the
@@ -648,12 +674,13 @@ fn attemptForwardTls(
         };
         if (skip) continue;
         const arena_a = ctx.req.arena.asAllocator();
+        const rewrote = redirectRewrite(route, h.name, h.value, arena_a);
         const name_c = arena_a.dupe(u8, h.name) catch {
             sock.client.end() catch {};
             sock.writer_iface.flush() catch {};
             return fail(pick, route, started_ns, fd);
         };
-        const value_c = arena_a.dupe(u8, h.value) catch {
+        const value_c = arena_a.dupe(u8, rewrote orelse h.value) catch {
             sock.client.end() catch {};
             sock.writer_iface.flush() catch {};
             return fail(pick, route, started_ns, fd);
@@ -2797,4 +2824,58 @@ test "health unregister drops routes so the prober never touches them" {
     }
     hc_mutex.unlock();
     try testing.expect(!found);
+}
+
+test "proxy_redirect rewrites Location prefixes only" {
+    const route = registry.Route{
+        .path = "/",
+        .proxy_redirect_from = "http://127.0.0.1:9000",
+        .proxy_redirect_to = "https://example.com",
+    };
+    const a = testing.allocator;
+    const hit = redirectRewrite(&route, "Location", "http://127.0.0.1:9000/login?x=1", a).?;
+    defer a.free(hit);
+    try testing.expectEqualStrings("https://example.com/login?x=1", hit);
+    // Case-insensitive header name.
+    const hit2 = redirectRewrite(&route, "LOCATION", "http://127.0.0.1:9000/", a).?;
+    defer a.free(hit2);
+    try testing.expectEqualStrings("https://example.com/", hit2);
+    // Non-matching value, other headers, and off-routes pass through.
+    try testing.expect(redirectRewrite(&route, "Location", "http://other/x", a) == null);
+    try testing.expect(redirectRewrite(&route, "Content-Type", "http://127.0.0.1:9000/", a) == null);
+    const plain = registry.Route{ .path = "/" };
+    try testing.expect(redirectRewrite(&plain, "Location", "http://127.0.0.1:9000/", a) == null);
+}
+
+test "proxy_redirect 302 round-trips rewritten through a fake origin" {
+    const fake = try FakeUpstream.start("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9000/login\r\nContent-Length: 0\r\n\r\n", 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = fake.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", fake.port).?,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_redirect_from = "http://127.0.0.1:9000",
+        .proxy_redirect_to = "https://example.com",
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/old";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.found, resp.status);
+    var loc: ?[]const u8 = null;
+    for (resp.headers[0..resp.header_count]) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "location")) loc = h.value;
+    }
+    try testing.expectEqualStrings("https://example.com/login", loc.?);
 }

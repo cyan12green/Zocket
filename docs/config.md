@@ -101,6 +101,7 @@ Filters (run after every outcome, reverse declaration order):
 | `proxy_ssl_trusted_certificate` | `proxy_ssl_trusted_certificate path;` | — | PEM CA bundle file for upstream verification (absolute or cwd-relative). Loaded once per path, cached process-wide. |
 | `proxy_ssl_name` | `proxy_ssl_name name;` | upstream hostname | SNI + verify hostname override (required to verify IP-literal backends). |
 | `proxy_ws` | `proxy_ws on\|off;` | off | Forward `Connection: Upgrade` + `Upgrade` to the backend and relay a 101 back (`Connection` preserved end-to-end). v1 covers the handshake; post-101 duplex byte-pipe rides the Stage-2 upstream seam. |
+| `proxy_redirect` | `proxy_redirect from to;` | off | Prefix-rewrite upstream `Location`/`Refresh` values starting with `from` (single pair, v1; nginx `default` form deferred). |
 | `proxy_keepalive` | `proxy_keepalive number;` | 8 | Pooled keepalive connections per backend per thread (clamped to 32). |
 | `proxy_keepalive_timeout` | `proxy_keepalive_timeout seconds;` | 60 | Idle expiry for pooled connections (reaped on next use). |
 | `health_check` | `health_check path=... interval=... rise=... fall=... timeout=...` | — | Active backend probing. |

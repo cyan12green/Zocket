@@ -214,6 +214,10 @@ pub const Route = struct {
     sub_filter_match: ?[]const u8 = null,
     sub_filter_replacement: ?[]const u8 = null,
     sub_filter_once: bool = true,
+    /// Location rewriting (`proxy_redirect <from> <to>;`): prefix-substitute
+    /// upstream Location/Refresh values starting with `from`. Null = off.
+    proxy_redirect_from: ?[]const u8 = null,
+    proxy_redirect_to: ?[]const u8 = null,
     /// Response caching (proxy_cache modules): enable + fresh window and
     /// stale-while-revalidate grace, both in seconds.
     proxy_cache_enabled: bool = false,
