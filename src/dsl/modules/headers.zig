@@ -157,16 +157,16 @@ test "headers set appends when missing and add stops at capacity" {
     try testing.expectEqual(Action.pass, try run(&ctx));
     try testing.expectEqualStrings("v", headerOf(&resp, "X-Fresh").?);
 
-    // A full header table (8/8): `add` is dropped, never panics.
+    // A full header table (cap/cap): `add` is dropped, never panics.
     var full = Response.init(.ok);
-    full.setHeader("H0", "0");
-    full.setHeader("H1", "1");
-    full.setHeader("H2", "2");
-    full.setHeader("H3", "3");
-    full.setHeader("H4", "4");
-    full.setHeader("H5", "5");
-    full.setHeader("H6", "6");
-    full.setHeader("H7", "7");
+    var hi: usize = 0;
+    while (hi < @import("../../http/response.zig").max_resp_headers) : (hi += 1) {
+        var nbuf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&nbuf, "H{d}", .{hi}) catch unreachable;
+        // Names must outlive the response: dup into the request arena.
+        const owned = req.arena.asAllocator().dupe(u8, name) catch unreachable;
+        full.setHeader(owned, "0");
+    }
     var ctx2 = Context{ .req = &req, .resp = &full };
     const route2 = registry.Route{
         .path = "/",
@@ -176,7 +176,7 @@ test "headers set appends when missing and add stops at capacity" {
     };
     ctx2.route = &route2;
     try testing.expectEqual(Action.pass, try run(&ctx2));
-    try testing.expectEqual(@as(usize, 8), full.header_count);
+    try testing.expectEqual(@import("../../http/response.zig").max_resp_headers, full.header_count);
     try testing.expect(headerOf(&full, "X-Overflow") == null);
 }
 
