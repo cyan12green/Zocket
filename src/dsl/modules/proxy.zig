@@ -621,113 +621,148 @@ fn attemptForwardTls(
 ) anyerror!Action {
     ensureHealthChecker(route);
     const up = &upstreams[pick];
-    const fail = struct {
-        fn call(p: usize, r: *const registry.Route, start: u64, fd: posix_fd) anyerror!Action {
-            if (fd >= 0) posix_close(fd);
-            active[p] -|= 1;
-            markFailure(p, r, start);
-            return error.UpstreamTransport;
+    // Pooled live session first (same backend index, idle-checked).
+    // A stale pooled session (origin closed idly) gets one transparent
+    // reconnect: its bytes never reached a live backend, so resending is
+    // safe. Fresh-session failures propagate as UpstreamTransport.
+    var ps: ?*TlsPooled = acquireTlsPooled(pick, nowNs(), keepaliveIdleNs(route));
+    {
+        var depth: usize = 0;
+        for (tls_pool[pick]) |slot| depth += @intFromBool(slot != null);
+        var link: [64]u8 = undefined;
+        var lbuf: [64]u8 = undefined;
+        var link_slice: []const u8 = "-";
+        if (ps) |s| {
+            const lp = std.fmt.bufPrint(&lbuf, "/proc/self/fd/{d}", .{s.sock.fd}) catch "?";
+            link_slice = compat.readlink(lp, &link) catch "?";
         }
-    }.call;
+    }
+    var reused = ps != null;
+    while (true) {
+        if (ps == null) {
+            const fd = connectUpstream(up, connectTimeoutMs(route)) catch {
+                markFailure(pick, route, started_ns);
+                return error.UpstreamTransport;
+            };
+            const fresh = std.heap.page_allocator.create(TlsPooled) catch {
+                posix_close(fd);
+                markFailure(pick, route, started_ns);
+                return error.UpstreamTransport;
+            };
+            fresh.* = .{ .sock = undefined, .handshaked = false, .last_used_ns = 0 };
+            fresh.sock.fd = fd;
+            tlsHandshake(fresh, route, up) catch {
+                destroyTls(fresh);
+                markFailure(pick, route, started_ns);
+                return error.UpstreamTransport;
+            };
+            fresh.handshaked = true;
+            ps = fresh;
+        } else {
+            // Refresh timeouts from the current route (pool spans configs).
+            ps.?.sock.read_ms = @intCast(readTimeoutS(route) * 1000);
+            ps.?.sock.write_ms = sendTimeoutMs(route);
+        }
+        const sock = &ps.?.sock;
 
-    const fd = connectUpstream(up, connectTimeoutMs(route)) catch {
-        return fail(pick, route, started_ns, -1);
-    };
-    var bufs = tlsBuffers(ctx) orelse {
-        return fail(pick, route, started_ns, fd);
-    };
-    var sock: TlsUpstream = undefined;
-    tlsHandshake(fd, route, up, &bufs, &sock) catch {
-        return fail(pick, route, started_ns, fd);
-    };
+        // Record-layer round trip; any transport failure lands below.
+        // The reader lives here so the parsed body can borrow it.
+        var reader = UpstreamReader.init();
+        const res = tlsRoundTrip(ctx, up, sock, &reader) catch {
+            const retry = reused;
+            destroyTls(ps.?);
+            ps = null;
+            reused = false;
+            if (retry) continue;
+            active[pick] -|= 1;
+            markFailure(pick, route, started_ns);
+            return error.UpstreamTransport;
+        };
 
-    // Record-layer send (poll-bounded writer iface; flush pushes the
-    // client buffer into the socket buffer, then onto the wire).
-    const req = buildUpstreamRequest(ctx, up) catch {
-        return fail(pick, route, started_ns, fd);
-    };
-    sock.client.writer.writeAll(req) catch {
-        return fail(pick, route, started_ns, fd);
-    };
-    sock.client.writer.flush() catch {
-        return fail(pick, route, started_ns, fd);
-    };
-    sock.writer_iface.flush() catch {
-        return fail(pick, route, started_ns, fd);
-    };
 
-    // Record-layer read through the same parse state machine.
-    var reader = UpstreamReader.init();
-    const read_result: ?UpstreamReader.Parsed = while (true) {
+        // Success: same bookkeeping as the plaintext path, then park the
+        // live session (keyed by backend, idle-reaped like pooled fds).
+        if (healthSlot(route, pick)) |slot| {
+            slot.fails.store(0, .monotonic);
+            slot.last_fail_ns.store(0, .monotonic);
+        }
+        active[pick] -|= 1;
+        const elapsed = nowNs() -% started_ns;
+        ewma_ns[pick] = if (ewma_ns[pick] == 0)
+            elapsed
+        else
+            ewma_ns[pick] - (ewma_ns[pick] >> 3) + (elapsed >> 3);
+
+        const r = res;
+        ctx.resp.status = @enumFromInt(r.status);
+        const ws101 = isWs101(ctx, r.status);
+        const arena_a = ctx.req.arena.asAllocator();
+        for (r.headers) |h| {
+            const skip = switch (http_parser.header_hasher.hash(h.name)) {
+                http_parser.header_hasher.hash("connection") => !ws101,
+                http_parser.header_hasher.hash("content-length") => true,
+                http_parser.header_hasher.hash("transfer-encoding") => true,
+                else => false,
+            };
+            if (skip) continue;
+            const rewrote = redirectRewrite(route, h.name, h.value, arena_a);
+            const name_c = arena_a.dupe(u8, h.name) catch return error.OutOfMemory;
+            const value_c = arena_a.dupe(u8, rewrote orelse h.value) catch return error.OutOfMemory;
+            ctx.resp.setHeader(name_c, value_c);
+        }
+        const body = ctx.sharedDupe(r.body) orelse return error.OutOfMemory;
+        ctx.resp.body = body;
+        if (offer_sticky) {
+            if (ctx.route.?.sticky_cookie) |name| {
+                var tag_buf: [32]u8 = undefined;
+                const tag = std.fmt.bufPrint(&tag_buf, "{s}=s{d}; Path=/", .{ name, pick }) catch "";
+                if (tag.len > 0) ctx.resp.setHeader("Set-Cookie", tag);
+            }
+        }
+        releaseTlsPooled(pick, ps.?, nowNs(), keepaliveMax(route));
+        return .handled;
+    }
+}
+
+/// One record-layer round trip over a live session: send the upstream
+/// request, then fill `reader` until its head parses (or EOF/transport
+/// failure). The caller owns `reader`, so the parsed body may borrow it.
+fn tlsRoundTrip(ctx: *Context, up: *const router.Upstream, sock: *TlsUpstream, reader: *UpstreamReader) !UpstreamReader.Parsed {
+    const req = try buildUpstreamRequest(ctx, up);
+    sock.client.writer.writeAll(req) catch |e| {
+        return e;
+    };
+    sock.client.writer.flush() catch |e| {
+        return e;
+    };
+    sock.writer_iface.flush() catch |e| {
+        return e;
+    };
+    {
+        var la: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+        var llen: std.posix.socklen_t = 16;
+        _ = std.os.linux.getsockname(sock.fd, @ptrCast(&la), &llen);
+        var pa: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+        var plen: std.posix.socklen_t = 16;
+        _ = std.os.linux.getpeername(sock.fd, @ptrCast(&pa), &plen);
+    }
+    while (true) {
         const res = reader.tryParse() catch |e| switch (e) {
             error.Incomplete => {
-                const n = tlsFill(&reader, &sock) catch break null;
-                if (n == 0) break null; // clean close_notify EOF
+                const n = tlsFill(reader, sock) catch {
+                    return error.UpstreamTransport;
+                };
+                if (n == 0) {
+                    return error.UpstreamTransport; // clean close_notify EOF
+                }
                 continue;
             },
-            else => break null,
+            else => {
+                return error.UpstreamTransport;
+            },
         };
-        break res;
-    };
-    if (read_result == null) {
-        return fail(pick, route, started_ns, fd);
+        return res;
     }
-
-    // Success: same bookkeeping as the plaintext path, minus pooling.
-    if (healthSlot(route, pick)) |slot| {
-        slot.fails.store(0, .monotonic);
-        slot.last_fail_ns.store(0, .monotonic);
-    }
-    active[pick] -|= 1;
-    const elapsed = nowNs() -% started_ns;
-    ewma_ns[pick] = if (ewma_ns[pick] == 0)
-        elapsed
-    else
-        ewma_ns[pick] - (ewma_ns[pick] >> 3) + (elapsed >> 3);
-
-    const r = read_result.?;
-    ctx.resp.status = @enumFromInt(r.status);
-    const ws101 = isWs101(ctx, r.status);
-    for (r.headers) |h| {
-        const skip = switch (http_parser.header_hasher.hash(h.name)) {
-            http_parser.header_hasher.hash("connection") => !ws101,
-            http_parser.header_hasher.hash("content-length") => true,
-            http_parser.header_hasher.hash("transfer-encoding") => true,
-            else => false,
-        };
-        if (skip) continue;
-        const arena_a = ctx.req.arena.asAllocator();
-        const rewrote = redirectRewrite(route, h.name, h.value, arena_a);
-        const name_c = arena_a.dupe(u8, h.name) catch {
-            sock.client.end() catch {};
-            sock.writer_iface.flush() catch {};
-            return fail(pick, route, started_ns, fd);
-        };
-        const value_c = arena_a.dupe(u8, rewrote orelse h.value) catch {
-            sock.client.end() catch {};
-            sock.writer_iface.flush() catch {};
-            return fail(pick, route, started_ns, fd);
-        };
-        ctx.resp.setHeader(name_c, value_c);
-    }
-    const body = ctx.sharedDupe(r.body) orelse {
-        sock.client.end() catch {};
-        sock.writer_iface.flush() catch {};
-        return fail(pick, route, started_ns, fd);
-    };
-    ctx.resp.body = body;
-    if (offer_sticky) {
-        if (ctx.route.?.sticky_cookie) |name| {
-            var tag_buf: [32]u8 = undefined;
-            const tag = std.fmt.bufPrint(&tag_buf, "{s}=s{d}; Path=/", .{ name, pick }) catch "";
-            if (tag.len > 0) ctx.resp.setHeader("Set-Cookie", tag);
-        }
-    }
-    // Single-use: close_notify (best-effort) then close, never pooled.
-    sock.client.end() catch {};
-    sock.writer_iface.flush() catch {};
-    posix_close(fd);
-    return .handled;
 }
 
 /// Fill an UpstreamReader buffer from a TLS session. Clean EOF
@@ -735,13 +770,27 @@ fn attemptForwardTls(
 /// mirroring the plaintext path.
 fn tlsFill(reader: *UpstreamReader, sock: *TlsUpstream) !usize {
     if (reader.used == reader.buf.len) return error.UpstreamBufferFull;
-    // readSliceShort returns 0 on clean EOF (close_notify) — the caller
-    // maps it to UpstreamClosed, mirroring the plaintext path.
-    const n = sock.client.reader.readSliceShort(reader.buf[reader.used..]) catch {
-        return error.UpstreamTransport;
-    };
-    reader.used += n;
-    return n;
+    // NOTE: NOT readSliceShort — that API loops until the destination
+    // buffer fills, so it would wait for MORE records (until EOF or the
+    // read timeout) before yielding plaintext that is already decrypted.
+    // Instead: drain buffered plaintext, else advance the record layer by
+    // exactly one record (a NewSessionTicket yields zero app bytes and
+    // simply loops), returning as soon as bytes are available.
+    while (true) {
+        const buffered = sock.client.reader.buffered();
+        if (buffered.len > 0) {
+            const n = @min(buffered.len, reader.buf.len - reader.used);
+            @memcpy(reader.buf[reader.used..][0..n], buffered[0..n]);
+            sock.client.reader.toss(n);
+            reader.used += n;
+            return n;
+        }
+        var data: [1][]u8 = .{reader.buf[reader.used..]};
+        _ = sock.client.reader.readVec(&data) catch |e| switch (e) {
+            error.EndOfStream => return 0, // clean EOF (close_notify / FIN)
+            else => return error.UpstreamTransport,
+        };
+    }
 }
 
 fn badGateway(ctx: *Context) Action {
@@ -1587,6 +1636,80 @@ const TlsUpstream = struct {
     client: tls_client,
 };
 
+/// Heap-pooled TLS session: the live Client plus its four record buffers
+/// (embedded arrays — the ifaces borrow them, so the struct must never
+/// move; heap-boxed once). Reused across requests to the same backend
+/// (pool key = backend index, like the plaintext fd pool).
+const tls_pool_cap: usize = 4;
+const TlsPooled = struct {
+    sock: TlsUpstream,
+    /// True once the handshake completed (only then is `client` valid
+    /// for end()/reuse; a failed handshake destroys raw).
+    handshaked: bool = false,
+    io_read: [tls_client.min_buffer_len]u8 = undefined,
+    io_write: [tls_client.min_buffer_len]u8 = undefined,
+    tls_read: [tls_client.min_buffer_len]u8 = undefined,
+    tls_write: [tls_client.min_buffer_len]u8 = undefined,
+    last_used_ns: u64 = 0,
+};
+
+threadlocal var tls_pool: [max_backends][tls_pool_cap]?*TlsPooled = @as([max_backends][tls_pool_cap]?*TlsPooled, @splat(@as([tls_pool_cap]?*TlsPooled, @splat(@as(?*TlsPooled, null)))));
+/// Handshakes performed (test hook: reuse shows as flat).
+threadlocal var tls_handshake_count: u64 = 0;
+
+fn destroyTls(ps: *TlsPooled) void {
+    if (ps.handshaked) {
+        ps.sock.client.end() catch {};
+        ps.sock.writer_iface.flush() catch {};
+    }
+    if (ps.sock.fd >= 0) posix_close(ps.sock.fd);
+    std.heap.page_allocator.destroy(ps);
+}
+
+/// Pop a fresh idle session for backend `idx` (null when empty/stale).
+/// Stale entries are destroyed inline (idle reap, same rule as the fd pool).
+fn acquireTlsPooled(idx: usize, now_ns: u64, idle_ns: u64) ?*TlsPooled {
+    for (&tls_pool[idx]) |*slot| {
+        const ps = slot.* orelse continue;
+        slot.* = null;
+        if (now_ns -| ps.last_used_ns > idle_ns) {
+            destroyTls(ps);
+            continue;
+        }
+        return ps;
+    }
+    return null;
+}
+
+/// Park a live session (or destroy when the pool is full / oversized).
+fn releaseTlsPooled(idx: usize, ps: *TlsPooled, now_ns: u64, max_conns: usize) void {
+    ps.last_used_ns = now_ns;
+    const cap: usize = @min(max_conns, tls_pool_cap);
+    var used: usize = 0;
+    for (tls_pool[idx]) |slot| used += @intFromBool(slot != null);
+    if (used >= cap) {
+        destroyTls(ps);
+        return;
+    }
+    for (&tls_pool[idx]) |*slot| {
+        if (slot.* == null) {
+            slot.* = ps;
+            return;
+        }
+    }
+    destroyTls(ps); // unreachable (counted above), stay safe
+}
+
+/// Empty a backend's TLS pool (test isolation).
+fn drainTlsPool(idx: usize) void {
+    for (&tls_pool[idx]) |*slot| {
+        if (slot.*) |ps| {
+            slot.* = null;
+            destroyTls(ps);
+        }
+    }
+}
+
 /// Poll-bounded socket Reader/Writer for the TLS record layer. The std
 /// client needs blocking-ish semantics, but SO_RCVTIMEO expiry surfaces as
 /// EAGAIN — which std treats as a programmer-bug panic, not a catchable
@@ -1619,6 +1742,7 @@ fn tlsStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.R
     return n;
 }
 
+
 fn tlsRawRead(s: *TlsUpstream, data: [][]u8) !usize {
     var total: usize = 0;
     for (data) |buf| {
@@ -1635,7 +1759,9 @@ fn tlsRawRead(s: *TlsUpstream, data: [][]u8) !usize {
                 if (n < buf.len) return total; // short read: more later
             },
             .INTR => continue, // signal: retry the slice once via loop
-            else => return error.ReadFailed,
+            else => {
+                return error.ReadFailed;
+            },
         }
     }
     return total;
@@ -1697,25 +1823,24 @@ fn tlsRawWrite(s: *TlsUpstream, bytes: []const u8) !usize {
 /// Handshake a connected fd as a TLS client. Errors (alert, bad cert,
 /// timeout) surface for the caller to map to UpstreamTransport.
 fn tlsHandshake(
-    fd: posix_fd,
+    ps: *TlsPooled,
     route: *const registry.Route,
     up: *const router.Upstream,
-    bufs: *TlsBuffers,
-    sock: *TlsUpstream,
 ) anyerror!void {
+    const sock = &ps.sock;
     sock.* = .{
-        .fd = fd,
+        .fd = ps.sock.fd,
         .read_ms = @intCast(readTimeoutS(route) * 1000),
         .write_ms = sendTimeoutMs(route),
         .reader_iface = .{
             .vtable = &tls_reader_vtable,
-            .buffer = bufs.io_read[0..],
+            .buffer = &ps.io_read,
             .seek = 0,
             .end = 0,
         },
         .writer_iface = .{
             .vtable = &tls_writer_vtable,
-            .buffer = bufs.io_write[0..],
+            .buffer = &ps.io_write,
             .end = 0,
         },
         .client = undefined,
@@ -1746,8 +1871,8 @@ fn tlsHandshake(
     sock.client = tls_client.init(&sock.reader_iface, &sock.writer_iface, .{
         .host = host_opt,
         .ca = ca_opt,
-        .write_buffer = bufs.tls_write[0..],
-        .read_buffer = bufs.tls_read[0..],
+        .write_buffer = &ps.tls_write,
+        .read_buffer = &ps.tls_read,
         .entropy = &entropy,
         .realtime_now = now,
         // Origins that close without close_notify (python http.server, our
@@ -1761,28 +1886,8 @@ fn tlsHandshake(
         std.log.info("upstream TLS handshake failed", .{});
         return error.UpstreamTransport;
     };
+    tls_handshake_count += 1;
 }
-
-/// Allocate handshake scratch from the request arena (single-use session:
-/// freed with the request — no pooling, no free path).
-fn tlsBuffers(ctx: *Context) ?TlsBuffers {
-    const a = ctx.req.arena.asAllocator();
-    const n = tls_client.min_buffer_len;
-    return .{
-        .io_read = a.alloc(u8, n) catch return null,
-        .io_write = a.alloc(u8, n) catch return null,
-        .tls_read = a.alloc(u8, n) catch return null,
-        .tls_write = a.alloc(u8, n) catch return null,
-    };
-}
-
-/// 4 × min_buffer_len scratch for one TLS session (request-arena owned).
-const TlsBuffers = struct {
-    io_read: []u8,
-    io_write: []u8,
-    tls_read: []u8,
-    tls_write: []u8,
-};
 
 const testing = std.testing;
 
@@ -2158,6 +2263,8 @@ fn drainPool(idx: usize) void {
 /// across tests — call this at the start of any test that forwards.
 pub fn testResetRoute(route: *const registry.Route) void {
     unregisterHealthRoute(route);
+    for (0..max_backends) |i| drainTlsPool(i);
+    tls_handshake_count = 0;
     health_zone.mutex.lock();
     defer health_zone.mutex.unlock();
     for (0..max_backends) |i| {
@@ -2556,8 +2663,12 @@ const TlsOrigin = struct {
         var plain_used: usize = 0;
         while (true) {
             var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&pfds, 5000) catch return;
-            if (ready == 0) return;
+            const ready = std.posix.poll(&pfds, 5000) catch {
+                return;
+            };
+            if (ready == 0) {
+                return;
+            }
             const n = posix.read(fd, &in_buf) catch {
                 return;
             };
@@ -2569,8 +2680,10 @@ const TlsOrigin = struct {
             };
             flushOut(fd, &conn, &out_buf);
             if (conn.stage() != .application) continue;
+            // Append into the unconsumed tail (a split record must not
+            // overwrite bytes an earlier take already banked).
             const p = switch (conn.inner) {
-                inline else => |*s| s.takePlaintext(&plain),
+                inline else => |*s| s.takePlaintext(plain[plain_used..]),
             };
             if (p == 0) continue;
             plain_used += p;
@@ -2581,7 +2694,9 @@ const TlsOrigin = struct {
                 },
             }
             flushOut(fd, &conn, &out_buf);
-            return;
+            // Keep-alive: serve further requests on this connection until
+            // the peer closes (lets pooled client sessions actually reuse).
+            plain_used = 0;
         }
     }
 
@@ -2969,4 +3084,77 @@ test "statusRetryable matches only masked codes" {
     try testing.expect(!statusRetryable(&r, .ok));
     const off = registry.Route{ .path = "/" };
     try testing.expect(!statusRetryable(&off, .bad_gateway));
+}
+
+
+test "tryParse handles the exact 47-byte response" {
+    var r = UpstreamReader.init();
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntls-hello";
+    @memcpy(r.buf[0..resp.len], resp);
+    r.used = resp.len;
+    const p = try r.tryParse();
+    try testing.expectEqual(@as(u16, 200), p.status);
+    try testing.expectEqualStrings("tls-hello", p.body);
+}
+
+test "proxy TLS pools live sessions across requests" {
+    const origin = try TlsOrigin.start("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntls-hello");
+    defer origin.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = origin.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", origin.port).?,
+        .tls = true,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_ssl_verify = false,
+        .proxy_keepalive_max = 4,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    const once = struct {
+        fn go(rt: *const registry.Route) !void {
+            var req = registry.Request.init(testing.allocator);
+            defer req.deinit();
+            req.method = .get;
+            req.target = "/secure";
+            var resp = registry.Response.init(.ok);
+            var ctx = Context{ .req = &req, .resp = &resp };
+            ctx.route = rt;
+            try testing.expectEqual(Action.handled, try run(&ctx));
+            try testing.expectEqualStrings("tls-hello", resp.body);
+        }
+    }.go;
+    try once(&route);
+    try once(&route);
+    try once(&route);
+    // Three requests, one handshake: sessions 2 and 3 reused the pool.
+    try testing.expectEqual(@as(u64, 1), tls_handshake_count);
+}
+
+test "tls sock iface poll reads available bytes" {
+    // Isolation: does tlsStream see waiting data? (Rules out poll blindness.)
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    defer compat.close(pair[0]);
+    defer compat.close(pair[1]);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sock = TlsUpstream{
+        .fd = pair[0],
+        .read_ms = 2000,
+        .write_ms = 2000,
+        .reader_iface = .{ .vtable = &tls_reader_vtable, .buffer = rbuf[0..], .seek = 0, .end = 0 },
+        .writer_iface = .{ .vtable = &tls_writer_vtable, .buffer = wbuf[0..], .end = 0 },
+        .client = undefined,
+    };
+    _ = try compat.write(pair[1], "hello-poll");
+    var out: [64]u8 = undefined;
+    // Drive stream() directly through a temp writer over `out`.
+    var w: std.Io.Writer = .{ .vtable = &.{ .drain = std.Io.Writer.fixedDrain }, .buffer = out[0..], .end = 0 };
+    const n = try sock.reader_iface.vtable.stream(&sock.reader_iface, &w, .limited(out.len));
+    try testing.expect(n > 0);
+    try testing.expectEqualStrings("hello-poll", out[0..n]);
 }
