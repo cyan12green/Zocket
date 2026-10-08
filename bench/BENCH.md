@@ -170,3 +170,7 @@ bash bench/h2-bench.sh --reps 3 --duration 6 --conns "100 500"
 # Generate every graph from stored results (what --run does after the suite):
 python3 bench/graphs.py
 ```
+
+Graph rendering needs `python3-matplotlib`; on machines without it the
+tables above (and the raw JSON under `bench/results/`) are the source of
+truth — `bench/graphs.py --run` still runs fine up to the render step.
