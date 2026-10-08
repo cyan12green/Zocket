@@ -66,3 +66,26 @@ pub const client_key_pem =
     \\QtkCpYjrsUQ6PzeA3+IExSETk23PHz/gZA==
     \\-----END EC PRIVATE KEY-----
 ;
+pub const cert384_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBxDCCAUqgAwIBAgIUWogdlYUH4+lPG7eP8XpJXYj2KwQwCgYIKoZIzj0EAwMw
+    \\GTEXMBUGA1UEAwwOem9ja2V0LXRlc3QzODQwHhcNMjYxMDA4MTIyMzIwWhcNMzYx
+    \\MDA1MTIyMzIwWjAZMRcwFQYDVQQDDA56b2NrZXQtdGVzdDM4NDB2MBAGByqGSM49
+    \\AgEGBSuBBAAiA2IABFO2y3o2g0QfX9E+01ySHM95jNS+ZmkH4DRyjznPxvWClrHw
+    \\pHErajRiJ14+90W3kFMq4T+Kedf4t3zbtayeOJx4tUMZu229HeKN07NewW71lrCf
+    \\G4C39VSw96SvQ3wLBKNTMFEwHQYDVR0OBBYEFBU9HFW9hL1R/46oUzQG/4waOp7t
+    \\MB8GA1UdIwQYMBaAFBU9HFW9hL1R/46oUzQG/4waOp7tMA8GA1UdEwEB/wQFMAMB
+    \\Af8wCgYIKoZIzj0EAwMDaAAwZQIwYqrR1Do8yXz+mB/DSldoERO2x/53h7tHvT7D
+    \\N3QuW3CBKbHpxJdLz6zYAbRmH+2zAjEA8iZvwgAQa8Uw3dYA4cQ5DkTfQsDCZRgd
+    \\wubFgM+0UeXR1fIgt9pVAjOxacgQPdMO
+    \\-----END CERTIFICATE-----
+;
+
+pub const key384_pem =
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\MIGkAgEBBDD+sZe8c5obuz949CjpB4x5NLcCTOUsA7rQo++MtF/e4wlsID0k7Uqd
+    \\OIJUzrXmTcOgBwYFK4EEACKhZANiAARTtst6NoNEH1/RPtNckhzPeYzUvmZpB+A0
+    \\co85z8b1gpax8KRxK2o0YidePvdFt5BTKuE/innX+Ld827WsnjiceLVDGbttvR3i
+    \\jdOzXsFu9ZawnxuAt/VUsPekr0N8CwQ=
+    \\-----END EC PRIVATE KEY-----
+;

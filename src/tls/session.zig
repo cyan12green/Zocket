@@ -1310,3 +1310,39 @@ test "session exportTxKeys hands out TX material in application stage" {
     var tiny: [4]u8 = undefined;
     try testing.expect(sess.exportTxKeys(&tiny, &iv) == null);
 }
+
+test "all six cipher suites complete the server flight" {
+    // Variant coverage: each Session monomorphization carries its own
+    // blocks; feeding the same captured ClientHello through every suite
+    // exercises each variant's hello/keyshake/flight path (P-384 suites
+    // use the secp384r1 fixtures).
+    const allocator = testing.allocator;
+    var creds256 = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds256.cert_der);
+    var creds384 = try cert_mod.loadCredentials(allocator, testdata.cert384_pem, testdata.key384_pem);
+    defer allocator.free(creds384.cert_der);
+    const S256a = Session(std.crypto.aead.aes_gcm.Aes128Gcm, Sha256, Sha256, EcdsaP256, 0x0403);
+    const S256b = Session(std.crypto.aead.chacha_poly.ChaCha20Poly1305, Sha256, Sha256, EcdsaP256, 0x0403);
+    const S256c = Session(std.crypto.aead.aes_gcm.Aes256Gcm, std.crypto.hash.sha2.Sha384, Sha256, EcdsaP256, 0x0403);
+    const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+    const S384a = Session(std.crypto.aead.aes_gcm.Aes128Gcm, Sha256, std.crypto.hash.sha2.Sha384, EcdsaP384, 0x0503);
+    const S384b = Session(std.crypto.aead.aes_gcm.Aes256Gcm, std.crypto.hash.sha2.Sha384, std.crypto.hash.sha2.Sha384, EcdsaP384, 0x0503);
+    const S384c = Session(std.crypto.aead.chacha_poly.ChaCha20Poly1305, Sha256, std.crypto.hash.sha2.Sha384, EcdsaP384, 0x0503);
+    inline for (.{
+        .{ S256a, &creds256 },
+        .{ S256b, &creds256 },
+        .{ S256c, &creds256 },
+        .{ S384a, &creds384 },
+        .{ S384b, &creds384 },
+        .{ S384c, &creds384 },
+    }) |pair| {
+        var hello_buf: [1024]u8 = undefined;
+        const rec = mtlsHelloRecord(&hello_buf);
+        var sess = pair[0].init(allocator, pair[1]);
+        defer sess.deinit();
+        try sess.feed(rec);
+        try testing.expectEqual(Stage.waiting_finished, sess.currentStage());
+        var out: [32 * 1024]u8 = undefined;
+        try testing.expect(sess.takeOut(&out) > 0);
+    }
+}
