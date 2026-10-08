@@ -10,6 +10,8 @@ comptime {
     _ = @import("net/eventfd.zig");
     _ = @import("net/epoll.zig");
     _ = @import("net/sockets.zig");
+    _ = @import("net/sni.zig");
+    _ = @import("net/stream_proxy.zig");
     _ = @import("net/dispatcher.zig");
     _ = @import("net/iouring.zig");
     _ = @import("net/body_storage.zig");

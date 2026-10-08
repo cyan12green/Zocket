@@ -505,6 +505,23 @@ const RewriteSpec = struct {
     flag: router.RewriteFlag = .last,
 };
 
+/// One `stream { server { ... } }` block as parsed (L4 TCP proxy).
+const StreamSpec = struct {
+    listen_port: u16 = 0,
+    default_host: []const u8 = "",
+    default_port: u16 = 0,
+    has_default: bool = false,
+    sni_start: usize = 0,
+    sni_len: usize = 0,
+};
+
+/// One `sni <pattern> <host:port>;` entry inside a stream server.
+const StreamSniSpec = struct {
+    pattern: []const u8 = "",
+    host: []const u8 = "",
+    port: u16 = 0,
+};
+
 /// Comptime builder: append-only pools for every piece of the config.
 const Builder = struct {
     routes: ct_pool.CtPool(LocationSpec, route_cap) = .{},
@@ -535,6 +552,8 @@ const Builder = struct {
     server_filters_len: usize = 0,
     filters: ct_pool.CtPool(ModuleBinding, 64) = .{},
     limits: Limits = .{},
+    streams: ct_pool.CtPool(StreamSpec, 8) = .{},
+    stream_sni: ct_pool.CtPool(StreamSniSpec, 64) = .{},
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
     resolver_addrs: ct_pool.CtPool(Str, 3) = .{},
@@ -1883,6 +1902,80 @@ fn appendServerFilter(b: *Builder, fname: []const u8) void {
     b.server_filters_len += 1;
 }
 
+/// Parse a top-level `stream { ... }` block (L4 TCP proxy): one or more
+/// `server { listen; proxy_pass; sni ...; }` entries. Literals only in v1
+/// (a hostname fails the build — DNS-backed stream upstreams follow the
+/// proxy resolver path next).
+fn parseStream(lx: *Lexer, b: *Builder) void {
+    lx.expectOpen("stream");
+    var servers: usize = 0;
+    while (true) {
+        if (lx.peek() == '}') {
+            lx.pos += 1;
+            break;
+        }
+        const t = lx.token() orelse lx.fail("stream: expected a directive");
+        const dn = t.srcOf("stream: directive cannot contain escapes");
+        if (!std.mem.eql(u8, dn, "server")) lx.fail("stream: only 'server' blocks allowed");
+        parseStreamServer(lx, b);
+        servers += 1;
+    }
+    if (servers == 0) lx.fail("stream: no server blocks");
+    b.cost += 16;
+}
+
+fn parseStreamServer(lx: *Lexer, b: *Builder) void {
+    if (b.streams.len >= 8) lx.fail("too many stream servers (max 8)");
+    var spec = StreamSpec{};
+    spec.sni_start = b.stream_sni.len;
+    lx.expectOpen("server");
+    while (true) {
+        if (lx.peek() == '}') {
+            lx.pos += 1;
+            break;
+        }
+        const t = lx.token() orelse lx.fail("stream server: expected a directive");
+        const dn = t.srcOf("stream server: directive cannot contain escapes");
+        if (std.mem.eql(u8, dn, "listen")) {
+            const pt = lx.token() orelse lx.fail("stream listen: expected a port");
+            const ps = pt.srcOf("stream listen: port cannot contain escapes");
+            spec.listen_port = std.fmt.parseInt(u16, ps, 10) catch
+                lx.fail("stream listen: invalid port (bare port only in v1)");
+            lx.expectTerminator("listen");
+            b.cost += 8;
+            continue;
+        }
+        if (std.mem.eql(u8, dn, "proxy_pass")) {
+            const vt = lx.value(b, "proxy_pass");
+            const s = resolve(vt, b.strings.items[0..]);
+            lx.expectTerminator("proxy_pass");
+            const ep = splitEndpoint(lx, "proxy_pass", s);
+            if (ep.tls) lx.fail("proxy_pass: stream is plaintext TCP (no https://)");
+            spec.default_host = ep.host;
+            spec.default_port = ep.port;
+            spec.has_default = true;
+            b.cost += 8;
+            continue;
+        }
+        if (std.mem.eql(u8, dn, "sni")) {
+            const pat = lx.value(b, "sni");
+            const vt = lx.value(b, "sni");
+            const s = resolve(vt, b.strings.items[0..]);
+            lx.expectTerminator("sni");
+            const ep = splitEndpoint(lx, "sni", s);
+            if (ep.tls) lx.fail("sni: stream is plaintext TCP (no https://)");
+            _ = b.stream_sni.create(.{ .pattern = resolve(pat, b.strings.items[0..]), .host = ep.host, .port = ep.port });
+            spec.sni_len += 1;
+            b.cost += 8;
+            continue;
+        }
+        lx.fail("unknown stream server directive");
+    }
+    if (spec.listen_port == 0) lx.fail("stream server: missing listen");
+    if (!spec.has_default) lx.fail("stream server: missing proxy_pass");
+    _ = b.streams.create(spec);
+}
+
 fn parseServer(lx: *Lexer, b: *Builder) void {
     if (b.server_count >= max_servers) lx.fail("too many server blocks (max 16)");
     b.server_seen = true;
@@ -1975,6 +2068,10 @@ fn parseTop(lx: *Lexer, b: *Builder) void {
         }
         if (std.mem.eql(u8, dn, "server")) {
             parseServer(lx, b);
+            continue;
+        }
+        if (std.mem.eql(u8, dn, "stream")) {
+            parseStream(lx, b);
             continue;
         }
         if (keyHash(dn) == H_filter) {
@@ -2594,8 +2691,50 @@ fn build(b: *const Builder) Config {
         break :blk Impl.select;
     } else null;
 
+    // Build stream servers: literals pre-compute sockaddrs (zero runtime
+    // cost); hostnames are a build error in v1 (DNS-backed stream
+    // upstreams follow the proxy resolver path next).
+    // Flat SNI table by value (servers slice ranges of it; same shape
+    // as the server name_table above).
+    const Snis = struct { items: [64]router.StreamSniRoute, len: usize };
+    const snis_built: Snis = comptime blk: {
+        var items: [64]router.StreamSniRoute = undefined;
+        var len: usize = 0;
+        for (b.stream_sni.freeze()) |entry| {
+            if (entry.pattern.len == 0) @compileError("stream sni: empty pattern");
+            const sa = router.Upstream.makeSockaddr(entry.host, entry.port) orelse
+                @compileError("stream sni: host is not an IPv4 literal (DNS names deferred to v2)");
+            items[len] = .{ .pattern = entry.pattern, .host = entry.host, .port = entry.port, .sockaddr = sa };
+            len += 1;
+        }
+        break :blk .{ .items = items, .len = len };
+    };
+    const Streams = struct { items: [8]router.StreamServer, len: usize };
+    const streams_built: Streams = comptime blk: {
+        var items: [8]router.StreamServer = undefined;
+        var len: usize = 0;
+        var sni_pos: usize = 0;
+        for (b.streams.freeze()) |spec| {
+            const dsa = router.Upstream.makeSockaddr(spec.default_host, spec.default_port) orelse
+                @compileError("stream proxy_pass: host is not an IPv4 literal (DNS names deferred to v2)");
+            const start = sni_pos;
+            sni_pos += spec.sni_len;
+            items[len] = .{
+                .listen_port = spec.listen_port,
+                .default_host = spec.default_host,
+                .default_port = spec.default_port,
+                .default_sockaddr = dsa,
+                .sni_routes = snis_built.items[start..sni_pos],
+            };
+            len += 1;
+        }
+        break :blk .{ .items = items, .len = len };
+    };
+    const streams: []const router.StreamServer = streams_built.items[0..streams_built.len];
+
     return .{
         .routes = routes,
+        .streams = streams,
         .limits = b.limits,
         .tls = .{
             .cert = resolve(b.tls_cert, strings),
@@ -3880,4 +4019,30 @@ test "conf: proxy_ws toggles upgrade forwarding" {
         \\}
     );
     try testing.expect(cfg.routes[0].proxy_ws);
+}
+
+test "conf: stream block parses listen plus default plus sni routes" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite echo;
+        \\    }
+        \\}
+        \\stream {
+        \\    server {
+        \\        listen 9000;
+        \\        proxy_pass 127.0.0.1:8000;
+        \\        sni api.example.com 127.0.0.1:8001;
+        \\        sni *.example.com 127.0.0.1:8002;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 1), cfg.streams.len);
+    const s = cfg.streams[0];
+    try testing.expectEqual(@as(u16, 9000), s.listen_port);
+    try testing.expectEqual(@as(u16, 8000), s.default_port);
+    try testing.expectEqual(@as(usize, 2), s.sni_routes.len);
+    try testing.expectEqualStrings("api.example.com", s.sni_routes[0].pattern);
+    try testing.expectEqual(@as(u16, 8001), s.sni_routes[0].port);
+    try testing.expectEqualStrings("*.example.com", s.sni_routes[1].pattern);
 }

@@ -298,6 +298,31 @@ fn runServer(
     }
     defer for (reactors_buf[0..reactors_len]) |*r| r.deinit();
 
+    // TCP stream servers (`stream { server { ... } }`, C3): one accept
+    // thread each, started alongside the HTTP reactors and stopped with
+    // them. Route entries are heap copies of the comptime config slices.
+    var stream_buf: [8]*zocket.stream_proxy.Server = undefined;
+    var stream_len: usize = 0;
+    if (embedded) |cfg| {
+        for (cfg.streams) |*ss| {
+            if (stream_len >= stream_buf.len) break;
+            var entries_buf: [64]zocket.stream_proxy.Server.RouteEntry = undefined;
+            const m = @min(ss.sni_routes.len, entries_buf.len);
+            for (ss.sni_routes[0..m], 0..) |*r, i| {
+                entries_buf[i] = .{ .pattern = r.pattern, .addr = r.sockaddr };
+            }
+            const owned = allocator.dupe(zocket.stream_proxy.Server.RouteEntry, entries_buf[0..m]) catch break;
+            const srv = zocket.stream_proxy.Server.start(ss.listen_port, ss.default_sockaddr, owned) catch |e| {
+                std.debug.print("zocket: stream listen {d} failed: {s}\n", .{ ss.listen_port, @errorName(e) });
+                allocator.free(owned);
+                continue;
+            };
+            stream_buf[stream_len] = srv;
+            stream_len += 1;
+        }
+    }
+    defer for (stream_buf[0..stream_len]) |s| s.stop();
+
     // Signal handlers: SIGTERM/SIGINT graceful stop.
     zocket.multireactor.installSignalHandlers();
 
@@ -313,6 +338,9 @@ fn runServer(
                 }
             },
         }
+    }
+    for (stream_buf[0..stream_len]) |s| {
+        std.debug.print("Starting TCP stream proxy on port {d}\n", .{s.listen_port});
     }
     if (opts.idle_timeout > 0) {
         std.debug.print("Idle timeout: {}s\n", .{opts.idle_timeout});

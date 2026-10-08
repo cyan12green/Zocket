@@ -255,6 +255,27 @@ The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
 | `auth_jwt_secret` | — | HS256 shared secret for `Authorization: Bearer` JWTs (signature + `exp` enforced); failures 401 + `WWW-Authenticate: Bearer`. Binds `auth_jwt`. ES256/JWKS deferred. |
 | `auth_jwt_leeway` | 0 | Expiry leeway seconds for clock skew. |
 
+### TCP stream proxy with SNI routing
+
+```conf
+stream {
+    server {
+        listen 9000;
+        proxy_pass 127.0.0.1:8000;          # default backend
+        sni api.example.com 127.0.0.1:8001; # exact override
+        sni *.example.com 127.0.0.1:8002;   # wildcard override
+    }
+}
+```
+
+L4 passthrough: accept → MSG_PEEK the ClientHello → route on SNI
+(exact, then longest `*.suffix`, then the default; non-TLS and SNI-less
+clients take the default) → bidirectional relay until EOF or 60 s idle.
+v1 is one thread per connection (modest counts; reactor-integrated L4
+rides the Stage-2 upstream seam) and IPv4 literals only (stream
+`proxy_pass`/`sni` hostnames are a build error; DNS-backed stream
+upstreams follow the proxy resolver path next).
+
 ### Observability: Prometheus & status API
 
 | Directive | Phase | Description |

@@ -435,6 +435,26 @@ pub const Upstream = struct {
     }
 };
 
+/// TCP stream proxy (C3): one `stream { server { ... } }` block. The
+/// default backend handles plain TCP and SNI-less TLS; `sni_routes`
+/// override by ClientHello name (exact, then `*.suffix` wildcard).
+pub const StreamSniRoute = struct {
+    pattern: []const u8 = "",
+    host: []const u8 = "",
+    port: u16 = 0,
+    sockaddr: std.posix.sockaddr = .{ .family = 0, .data = @as([14]u8, @splat(@as(u8, 0))) },
+    hostname: ?[]const u8 = null,
+};
+
+pub const StreamServer = struct {
+    listen_port: u16 = 0,
+    default_host: []const u8 = "",
+    default_port: u16 = 0,
+    default_sockaddr: std.posix.sockaddr = .{ .family = 0, .data = @as([14]u8, @splat(@as(u8, 0))) },
+    default_hostname: ?[]const u8 = null,
+    sni_routes: []const StreamSniRoute = &.{},
+};
+
 /// A fixed response served from pre-serialised bytes:
 /// redirects, healthchecks, error pages.
 pub const ResponseTemplate = struct {

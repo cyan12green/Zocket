@@ -70,6 +70,9 @@ pub const Config = struct {
     /// reactor always uses the first server block (no Host header extraction).
     /// Enabled by default; `host_select off;` disables it.
     host_select: bool = true,
+    /// TCP stream servers (`stream { server { ... } }` blocks, C3): L4
+    /// passthrough with SNI preread routing. Empty when no stream block.
+    streams: []const router.StreamServer = &.{},
 
     /// Per-server virtual host spec.
     pub const ServerSpec = struct {

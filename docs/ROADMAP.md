@@ -344,8 +344,12 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
   adopt paths); non-101s still strip hop-by-hop headers. Full duplex
   byte-pipe handoff needs the streaming escape hatch (Stage 2 upstream
   seam) — documented, not silent.
-- TCP stream proxy + SNI preread routing: L4 `stream {}` reusing
-  multireactor + LB + shmem health; ClientHello peek parser.
+- TCP stream proxy + SNI preread routing ✅ SHIPPED 2026-10 (v1): L4
+  `stream { server { listen; proxy_pass; sni ...; } }` with a ClientHello
+  peek parser (`net/sni.zig`, zero-copy), exact→wildcard→default selection
+  (`selectSni`), poll-driven `relayPair` splice and a per-connection-thread
+  accept loop started from main alongside the HTTP reactors. Literals only;
+  no LB/shmem-health reuse yet (single backend + SNI overrides).
 - Prometheus `/metrics` + JSON access logs + status API ✅ SHIPPED 2026-10
   (v1): `prometheus` content module (exposition gauges from the six
   `ServerStats` counters) + `status_json` (same counters as JSON) +

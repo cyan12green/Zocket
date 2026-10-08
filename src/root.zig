@@ -5,6 +5,8 @@ pub const reactor = @import("net/reactor.zig");
 pub const dispatcher = @import("net/dispatcher.zig");
 pub const eventfd = @import("net/eventfd.zig");
 pub const sockets = @import("net/sockets.zig");
+pub const stream_proxy = @import("net/stream_proxy.zig");
+pub const sni = @import("net/sni.zig");
 pub const buffer = @import("net/buffer.zig");
 pub const connection = @import("net/connection.zig");
 pub const timer_wheel = @import("net/timer_wheel.zig");
@@ -83,6 +85,8 @@ comptime {
     _ = @import("net/epoll.zig");
     _ = @import("net/eventfd.zig");
     _ = @import("net/sockets.zig");
+    _ = @import("net/sni.zig");
+    _ = @import("net/stream_proxy.zig");
     _ = @import("net/server.zig");
     _ = @import("net/dispatcher.zig");
     _ = @import("net/reactor.zig");
