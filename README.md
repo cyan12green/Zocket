@@ -8,13 +8,14 @@ on every measured workload.
 ## Features
 
 - **Multi-reactor transport** — one SO_REUSEPORT listener + epoll loop per core, lock-free dispatch, connection pooling, optional io_uring
-- **HTTP/2 + TLS 1.3** — h2c prior-knowledge, HPACK, flow control; native Zig TLS (no OpenSSL), ECDSA, ALPN, session tickets
+- **HTTP/2 + TLS 1.3** — h2c prior-knowledge, HPACK, flow control; native Zig TLS (no OpenSSL), ECDSA, ALPN, session tickets, per-vhost certificates selected by SNI, OCSP stapling, mTLS client verification
 - **Comptime config** — nginx-flavored `.conf` compiled entirely at build time; invalid configs are compile errors, not runtime failures
 - **10-phase module pipeline** — handlers, filters, upstreams; comptime dispatch specialisation; prefix/exact/regex routing
-- **Modules** — static files + sendfile, reverse proxy (round-robin / least-conn / ip_hash / consistent_hash / least_time), sticky sessions, response cache, gzip, conditional GET, auth_basic, auth_request, rate limiting, header manipulation, precompressed serving, access/error logs, stub_status
+- **Modules** — static files + sendfile + ranges, reverse proxy (round-robin / least-conn / ip_hash / consistent_hash / least_time, TLS upstreams with keepalive pooling, chunked + arbitrarily large upstream bodies, URI rewriting), sticky sessions, response cache, gzip + precompressed `.gz`/`.br`/`.zstd` serving, `sub_filter` body rewriting, X-Accel-Redirect, conditional GET, auth_basic, auth_request, Basic/CORS/JWT (HS256 + ES256) auth, rate limiting, header manipulation, access/error logs, stub_status, Prometheus metrics
 - **Virtual hosts** — multiple `server {}` blocks with `server_name` (exact + wildcard), per-port multireactor threads, comptime Host matching
 - **IPv6** — dual-stack listeners (`listen [::]:8080;`), IPv4-mapped IPv6 for v4 clients, `IPV6_V6ONLY` control
 - **Connection limits** — `max_connections` global ceiling, `server_limit_conn` per-IP cap
+- **ACME auto-HTTPS** — built-in ACME v2 issuance + renewal daemon (http-01, ES256 JWS, CSR via native DER writer), no external certbot required
 - **Operations** — daemon mode (`--start/--stop/--status`), zero-downtime config reload (`--reload-hard`), graceful shutdown
 
 ## Quick start
@@ -31,8 +32,9 @@ See [`docs/config.md`](docs/config.md) for the full config reference.
 
 ## Benchmarks
 
-Zocket leads every measured workload — HTTP echo up to 3.2x, static 1.6x,
-precompressed 1.5x over nginx. Full methodology: [`bench/BENCH.md`](bench/BENCH.md).
+Zocket leads every measured workload — HTTP echo up to 3.8x nginx, static
+up to 2.1x, module features up to 2.0x, HTTP/2 over TLS 1.03–1.07x. Full
+methodology and tables: [`bench/BENCH.md`](bench/BENCH.md).
 
 ![Zocket vs nginx — HTTP/1.1](bench/graphs/readme_http.png)
 
