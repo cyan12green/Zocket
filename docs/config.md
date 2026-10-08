@@ -289,6 +289,7 @@ upstreams follow the proxy resolver path next).
 |---|---|---|
 | `tls { cert file; key file; }` | — | Enable TLS 1.3 (ECDSA only, no RSA). One block max. |
 | `tls { ocsp_file der; }` | — | Staple a DER OCSP response when clients send `status_request` (RFC 8446 §4.4.2.1). Loaded + parsed at startup; revoked/garbage responses fail startup closed (`--validate` covers it). |
+| `tls { client_ca file; verify_client on\|off; }` | off | mTLS: send CertificateRequest and verify the client chain against the PEM bundle (leaf directly or via presented intermediates) + CertificateVerify signature under the session scheme. `verify_client on` without `client_ca` fails startup closed. |
 
 ### Response headers
 

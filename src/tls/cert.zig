@@ -54,6 +54,11 @@ pub const Credentials = struct {
     /// The DER certificate bytes (first certificate of the chain).
     cert_der: []const u8,
     key: KeyPair,
+    /// mTLS: request + verify client certificates (`tls verify_client`
+    /// with `tls client_ca`). The bundle is process-lifetime (loaded at
+    /// startup); sessions only borrow it.
+    verify_client: bool = false,
+    client_ca: ?*const std.crypto.Certificate.Bundle = null,
     /// Validated DER OCSP response for stapling (empty = no staple).
     /// Loaded from `tls ocsp_file` at startup; the session staples it
     /// only when the client sent status_request.

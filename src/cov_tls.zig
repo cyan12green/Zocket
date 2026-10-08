@@ -13,4 +13,5 @@ comptime {
     _ = @import("tls/testdata.zig");
     _ = @import("tls/tickets.zig");
     _ = @import("tls/ocsp.zig");
+    _ = @import("tls/mtls.zig");
 }

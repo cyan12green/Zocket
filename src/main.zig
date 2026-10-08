@@ -100,6 +100,21 @@ fn validateConfig(cfg: zocket.runtime.config.Config, opts: ServerOpts, allocator
             const parsed = zocket.tls.ocsp.parseResponse(der) catch return error.TlsCredentialsInvalid;
             if (parsed.cert != .good) return error.TlsCredentialsInvalid;
         }
+        if (cfg.tls.verify_client and cfg.tls.client_ca.len == 0) return error.TlsCredentialsInvalid;
+        if (cfg.tls.client_ca.len > 0) {
+            var bundle = std.crypto.Certificate.Bundle.empty;
+            defer bundle.deinit(allocator);
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return error.TlsCredentialsInvalid;
+            const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
+            if (std.fs.path.isAbsolute(cfg.tls.client_ca)) {
+                bundle.addCertsFromFilePathAbsolute(allocator, io, now, cfg.tls.client_ca) catch
+                    return error.TlsCredentialsInvalid;
+            } else {
+                bundle.addCertsFromFilePath(allocator, io, now, .cwd(), cfg.tls.client_ca) catch
+                    return error.TlsCredentialsInvalid;
+            }
+        }
     }
     // Effective listen port (CLI wins, else conf, else default), resolved
     // the same way runServer resolves it.

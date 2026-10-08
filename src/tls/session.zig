@@ -18,6 +18,7 @@ const handshake_mod = @import("handshake.zig");
 const record_mod = @import("record.zig");
 const keyschedule_mod = @import("keyschedule.zig");
 const tickets_mod = @import("tickets.zig");
+const mtls_mod = @import("mtls.zig");
 const X25519 = std.crypto.dh.X25519;
 
 pub const Error = error{
@@ -88,6 +89,14 @@ pub fn Session(
         /// Client sent status_request (carried from the final ClientHello;
         /// second hello after HRR wins, like the rest of negotiation).
         status_requested: bool = false,
+        /// mTLS progress: Certificate seen (chain verified) and
+        /// CertificateVerify seen (signature verified). Both required
+        /// before Finished when the credentials ask for client certs.
+        client_cert_seen: bool = false,
+        client_cert_ok: bool = false,
+        /// Verified client leaf DER (allocator-owned copy for the
+        /// connection lifetime; empty until the chain verifies).
+        client_leaf: []const u8 = &.{},
         in_buf: std.ArrayList(u8) = .empty,
         handshake_buf: std.ArrayList(u8) = .empty,
         out_buf: std.ArrayList(u8) = .empty,
@@ -109,6 +118,7 @@ pub fn Session(
         }
 
         pub fn deinit(self: *Self) void {
+            if (self.client_leaf.len > 0) self.allocator.free(self.client_leaf);
             self.in_buf.deinit(self.allocator);
             self.handshake_buf.deinit(self.allocator);
             self.out_buf.deinit(self.allocator);
@@ -363,6 +373,8 @@ pub fn Session(
                 const message = self.handshake_buf.items[0 .. 4 + msg_len];
                 switch (self.handshake_buf.items[0]) {
                     0x01 => try self.onClientHello(message),
+                    0x0b => try self.onClientCertificate(message),
+                    0x0f => try self.onClientCertificateVerify(message),
                     0x14 => try self.onClientFinished(message),
                     else => return self.fail(error.TlsUnexpectedMessage, .unexpected_message),
                 }
@@ -502,6 +514,15 @@ pub fn Session(
             self.hashMessage(msg[0..n_ee]);
             try self.emitEncryptedHandshake(msg[0..n_ee]);
 
+            // mTLS: ask for a client certificate (fresh handshakes only;
+            // resumption authenticates via the ticket-bound PSK instead).
+            if (!resumed and self.creds.verify_client) {
+                const n_cr = handshake_mod.buildCertificateRequest(&msg) catch
+                    return error.OutOfMemory;
+                self.hashMessage(msg[0..n_cr]);
+                try self.emitEncryptedHandshake(msg[0..n_cr]);
+            }
+
             if (!resumed) {
                 // OCSP stapling (C3): the client asked via status_request
                 // and startup loaded a validated response — staple it in
@@ -591,9 +612,54 @@ pub fn Session(
             self.out_buf.appendSlice(self.allocator, rec[0..m]) catch return error.OutOfMemory;
         }
 
+        /// Client Certificate (mTLS): chain-verify the leaf against the
+        /// startup client-CA bundle and retain it for the CertificateVerify
+        /// step. Only valid in waiting_finished when we asked (verify_client
+        /// and not resumed); anything else is fail-closed.
+        fn onClientCertificate(self: *Self, message: []const u8) Error!void {
+            if (self.stage != .waiting_finished or !self.creds.verify_client)
+                return self.fail(error.TlsUnexpectedMessage, .unexpected_message);
+            if (self.client_cert_seen)
+                return self.fail(error.TlsUnexpectedMessage, .unexpected_message);
+            self.hashMessage(message);
+            const bundle = self.creds.client_ca orelse
+                return self.fail(error.TlsIllegalParameter, .internal_error);
+            var certs: [8][]const u8 = undefined;
+            const n = mtls_mod.parseClientCertificate(message[4..], &certs) catch
+                return self.fail(error.TlsDecodeError, .decode_error);
+            const now = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch
+                return self.fail(error.TlsIllegalParameter, .internal_error);
+            mtls_mod.verifyChain(bundle, certs[0], certs[1..n], now.sec) catch
+                return self.fail(error.TlsDecodeError, .unknown_ca);
+            self.client_leaf = self.allocator.dupe(u8, certs[0]) catch return error.OutOfMemory;
+            self.client_cert_seen = true;
+        }
+
+        /// Client CertificateVerify (mTLS): the signature must cover the
+        /// transcript through the client Certificate under our scheme.
+        fn onClientCertificateVerify(self: *Self, message: []const u8) Error!void {
+            if (self.stage != .waiting_finished or !self.creds.verify_client or !self.client_cert_seen)
+                return self.fail(error.TlsUnexpectedMessage, .unexpected_message);
+            if (self.client_cert_ok)
+                return self.fail(error.TlsUnexpectedMessage, .unexpected_message);
+            const cv = mtls_mod.parseCertificateVerify(message[4..]) catch
+                return self.fail(error.TlsDecodeError, .decode_error);
+            if (cv.scheme != signature_scheme)
+                return self.fail(error.TlsIllegalParameter, .illegal_parameter);
+            const digest = self.sig_transcript.peek();
+            mtls_mod.verifySignature(Ecdsa, self.client_leaf, &digest, cv.sig) catch
+                return self.fail(error.TlsDecodeError, .bad_certificate);
+            self.hashMessage(message);
+            self.client_cert_ok = true;
+        }
+
         fn onClientFinished(self: *Self, message: []const u8) Error!void {
             if (self.stage != .waiting_finished)
                 return self.fail(error.TlsUnexpectedMessage, .unexpected_message);
+            // mTLS: no verified client signature, no application data.
+            // Resumed (PSK) sessions skip client auth by design.
+            if (self.creds.verify_client and self.psk_len == 0 and !self.client_cert_ok)
+                return self.fail(error.TlsUnexpectedMessage, .certificate_required);
             // The client's Finished verify_data covers the transcript up to
             // (and including) the server's Finished — NOT the client's own
             // Finished (RFC 8446 §4.4.4). Compute the expected value first,
@@ -977,4 +1043,231 @@ test "session: write/shutdown/take APIs before the handshake completes" {
     try testing.expectEqual(@as(u8, @intFromEnum(tls.ContentType.alert)), tmp[0]);
     try sess.shutdown();
     try testing.expectEqual(@as(usize, 0), sess.takeOut(&tmp));
+}
+
+/// mTLS message-level tests: drive the client-auth handlers directly with
+/// the real fixture chain (no network). The session is placed in
+/// waiting_finished — the handlers only need the transcript hashes and the
+/// startup bundle, never traffic keys.
+fn mtlsTestCreds(allocator: std.mem.Allocator) !struct {
+    creds: cert_mod.Credentials,
+    bundle: std.crypto.Certificate.Bundle,
+    leaf_der: []const u8,
+} {
+    const pem_mod = @import("pem.zig");
+    const creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    errdefer allocator.free(creds.cert_der);
+    var ca_buf: [4096]u8 = undefined;
+    const ca_len = (try pem_mod.decodeFirst(testdata.client_ca_pem, "CERTIFICATE", &ca_buf)) orelse
+        return error.TestUnexpected;
+    var bundle = std.crypto.Certificate.Bundle.empty;
+    errdefer bundle.deinit(allocator);
+    const now_sec: i64 = 1_800_000_000;
+    const start: u32 = @intCast(bundle.bytes.items.len);
+    try bundle.bytes.appendSlice(allocator, ca_buf[0..ca_len]);
+    try bundle.parseCert(allocator, start, now_sec);
+    var leaf_buf: [4096]u8 = undefined;
+    const leaf_len = (try pem_mod.decodeFirst(testdata.client_cert_pem, "CERTIFICATE", &leaf_buf)) orelse
+        return error.TestUnexpected;
+    const leaf_der = try allocator.dupe(u8, leaf_buf[0..leaf_len]);
+    errdefer allocator.free(leaf_der);
+    return .{ .creds = creds, .bundle = bundle, .leaf_der = leaf_der };
+}
+
+test "mTLS handlers accept the fixture chain and signature" {
+    const allocator = testing.allocator;
+    var fx = try mtlsTestCreds(allocator);
+    defer allocator.free(fx.creds.cert_der);
+    defer fx.bundle.deinit(allocator);
+    defer allocator.free(fx.leaf_der);
+    var creds = fx.creds;
+    creds.verify_client = true;
+    creds.client_ca = &fx.bundle;
+
+    var sess = TestSession.init(allocator, &creds);
+    defer sess.deinit();
+    sess.stage = .waiting_finished;
+
+    // Client Certificate message: type + len + body(ctx 0, one leaf entry).
+    var cert_msg: [8192]u8 = undefined;
+    cert_msg[0] = 0x0b;
+    const entry_len = 3 + fx.leaf_der.len + 2;
+    const body_len = 1 + 3 + entry_len;
+    std.mem.writeInt(u24, cert_msg[1..4], @intCast(body_len), .big);
+    cert_msg[4] = 0x00; // context len
+    std.mem.writeInt(u24, cert_msg[5..8], @intCast(entry_len), .big);
+    std.mem.writeInt(u24, cert_msg[8..11], @intCast(fx.leaf_der.len), .big);
+    @memcpy(cert_msg[11..][0..fx.leaf_der.len], fx.leaf_der);
+    std.mem.writeInt(u16, cert_msg[11 + fx.leaf_der.len ..][0..2], 0, .big);
+    try sess.onClientCertificate(cert_msg[0 .. 4 + body_len]);
+    try testing.expect(sess.client_cert_seen);
+    try testing.expect(!sess.client_cert_ok);
+
+    // CertificateVerify over the transcript (now includes the Certificate).
+    const digest = sess.sig_transcript.peek();
+    const client_creds = try cert_mod.loadCredentials(allocator, testdata.client_cert_pem, testdata.client_key_pem);
+    defer allocator.free(client_creds.cert_der);
+    const sk = try EcdsaP256.SecretKey.fromBytes(client_creds.key.secret_key[0..EcdsaP256.SecretKey.encoded_length].*);
+    const kp = try EcdsaP256.KeyPair.fromSecretKey(sk);
+    const context = "TLS 1.3, client CertificateVerify";
+    var content: [64 + context.len + 1 + 32]u8 = undefined;
+    @memset(content[0..64], ' ');
+    @memcpy(content[64 .. 64 + context.len], context);
+    content[64 + context.len] = 0;
+    @memcpy(content[64 + context.len + 1 ..], &digest);
+    var h: [32]u8 = undefined;
+    Sha256.hash(content[0..], &h, .{});
+    const sig = try kp.signPrehashed(h, null);
+    var sig_der: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_slice = sig.toDer(&sig_der);
+    var cv_msg: [512]u8 = undefined;
+    cv_msg[0] = 0x0f;
+    std.mem.writeInt(u24, cv_msg[1..4], @intCast(4 + sig_slice.len), .big);
+    std.mem.writeInt(u16, cv_msg[4..6], 0x0403, .big);
+    std.mem.writeInt(u16, cv_msg[6..8], @intCast(sig_slice.len), .big);
+    @memcpy(cv_msg[8..][0..sig_slice.len], sig_slice);
+    try sess.onClientCertificateVerify(cv_msg[0 .. 8 + sig_slice.len]);
+    try testing.expect(sess.client_cert_ok);
+}
+
+test "mTLS handlers reject empty certs, stray verifies and bad signatures" {
+    const allocator = testing.allocator;
+    var fx = try mtlsTestCreds(allocator);
+    defer allocator.free(fx.creds.cert_der);
+    defer fx.bundle.deinit(allocator);
+    defer allocator.free(fx.leaf_der);
+    var creds = fx.creds;
+    creds.verify_client = true;
+    creds.client_ca = &fx.bundle;
+
+    // Verify before Certificate: unexpected.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        sess.stage = .waiting_finished;
+        var cv: [8]u8 = .{ 0x0f, 0x00, 0x00, 0x04, 0x04, 0x03, 0x00, 0x00 };
+        try testing.expectError(error.TlsUnexpectedMessage, sess.onClientCertificateVerify(&cv));
+    }
+    // Empty certificate list: certificate_required path (decode error ->
+    // the Finished gate maps the missing cert to certificate_required).
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        sess.stage = .waiting_finished;
+        const empty_cert = [_]u8{ 0x0b, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00 };
+        try testing.expectError(error.TlsDecodeError, sess.onClientCertificate(&empty_cert));
+        try testing.expect(!sess.client_cert_ok);
+    }
+    // Stranger leaf (the server's own cert): unknown CA.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        sess.stage = .waiting_finished;
+        const leaf = fx.creds.cert_der;
+        var msg: [4096]u8 = undefined;
+        msg[0] = 0x0b;
+        const entry_len = 3 + leaf.len + 2;
+        std.mem.writeInt(u24, msg[1..4], @intCast(1 + 3 + entry_len), .big);
+        msg[4] = 0x00;
+        std.mem.writeInt(u24, msg[5..8], @intCast(entry_len), .big);
+        std.mem.writeInt(u24, msg[8..11], @intCast(leaf.len), .big);
+        @memcpy(msg[11..][0..leaf.len], leaf);
+        std.mem.writeInt(u16, msg[11 + leaf.len ..][0..2], 0, .big);
+        try testing.expectError(error.TlsDecodeError, sess.onClientCertificate(msg[0 .. 11 + leaf.len + 2]));
+    }
+}
+
+/// The captured openssl ClientHello body (handshake.zig test vector),
+/// wrapped as a handshake message + TLS record for session.feed.
+fn mtlsHelloRecord(out: []u8) []u8 {
+    const body = [_]u8{
+        0x03, 0x03, 0xa4, 0xeb, 0x06, 0xdf, 0xbf, 0x46, 0xa1, 0xef, 0x72, 0x29,
+        0xf2, 0x3e, 0x74, 0x96, 0x46, 0x78, 0x04, 0x64, 0x09, 0x93, 0x0c, 0xc8,
+        0xf1, 0xbc, 0xe6, 0x46, 0xac, 0x44, 0x4b, 0xc3, 0x8b, 0xd5, 0x20, 0x51,
+        0x4b, 0x50, 0x93, 0x4a, 0x05, 0x02, 0x5b, 0xb2, 0xce, 0x58, 0xe6, 0x89,
+        0xfe, 0x8c, 0xd0, 0xd6, 0xac, 0x2d, 0xcc, 0x2f, 0x04, 0x51, 0xea, 0xa5,
+        0x21, 0x40, 0x8d, 0x99, 0x84, 0x37, 0xa1, 0x00, 0x08, 0x13, 0x02, 0x13,
+        0x03, 0x13, 0x01, 0x00, 0xff, 0x01, 0x00, 0x00, 0x99, 0x00, 0x0b, 0x00,
+        0x04, 0x03, 0x00, 0x01, 0x02, 0x00, 0x0a, 0x00, 0x16, 0x00, 0x14, 0x00,
+        0x1d, 0x00, 0x17, 0x00, 0x1e, 0x00, 0x19, 0x00, 0x18, 0x01, 0x00, 0x01,
+        0x01, 0x01, 0x02, 0x01, 0x03, 0x01, 0x04, 0x00, 0x23, 0x00, 0x00, 0x00,
+        0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74,
+        0x70, 0x2f, 0x31, 0x2e, 0x31, 0x00, 0x16, 0x00, 0x00, 0x00, 0x17, 0x00,
+        0x00, 0x00, 0x0d, 0x00, 0x1e, 0x00, 0x1c, 0x04, 0x03, 0x05, 0x03, 0x06,
+        0x03, 0x08, 0x07, 0x08, 0x08, 0x08, 0x09, 0x08, 0x0a, 0x08, 0x0b, 0x08,
+        0x04, 0x08, 0x05, 0x08, 0x06, 0x04, 0x01, 0x05, 0x01, 0x06, 0x01, 0x00,
+        0x2b, 0x00, 0x03, 0x02, 0x03, 0x04, 0x00, 0x2d, 0x00, 0x02, 0x01, 0x01,
+        0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20, 0x37, 0xe4,
+        0x6b, 0x62, 0xf7, 0x33, 0xa3, 0x0b, 0x67, 0x8f, 0x64, 0x78, 0x55, 0x92,
+        0xda, 0xb4, 0x75, 0xc8, 0x3f, 0xb3, 0x6b, 0x02, 0xd2, 0x32, 0x55, 0xe2,
+        0xfa, 0x9b, 0x7d, 0xe6, 0x00, 0x49,
+    };
+    var pos: usize = 0;
+    out[pos] = 0x01; // ClientHello
+    pos += 1;
+    std.mem.writeInt(u24, out[pos..][0..3], body.len, .big);
+    pos += 3;
+    @memcpy(out[pos..][0..body.len], &body);
+    pos += body.len;
+    const msg_len = pos;
+    // Prepend the record header by shifting (out must have 5 spare bytes).
+    std.mem.copyBackwards(u8, out[5 .. 5 + msg_len], out[0..msg_len]);
+    out[0] = 0x16;
+    out[1] = 0x03;
+    out[2] = 0x01;
+    std.mem.writeInt(u16, out[3..5], @intCast(msg_len), .big);
+    return out[0 .. 5 + msg_len];
+}
+
+test "mTLS verify flight carries CertificateRequest, plain flight does not" {
+    const allocator = testing.allocator;
+    var plain_creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(plain_creds.cert_der);
+    var verify_creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(verify_creds.cert_der);
+    verify_creds.verify_client = true;
+
+    var hello_buf: [1024]u8 = undefined;
+    const hello_rec = mtlsHelloRecord(&hello_buf);
+
+    var plain = TestSession.init(allocator, &plain_creds);
+    defer plain.deinit();
+    try plain.feed(hello_rec);
+    try testing.expectEqual(Stage.waiting_finished, plain.currentStage());
+
+    var verify = TestSession.init(allocator, &verify_creds);
+    defer verify.deinit();
+    try verify.feed(hello_rec);
+    try testing.expectEqual(Stage.waiting_finished, verify.currentStage());
+
+    // Same hello in, identical messages out — except the 17-byte
+    // CertificateRequest in one encrypted record (5 header + 17 + 16 tag).
+    var plain_out: [32 * 1024]u8 = undefined;
+    var verify_out: [32 * 1024]u8 = undefined;
+    const pn = plain.takeOut(&plain_out);
+    const vn = verify.takeOut(&verify_out);
+    try testing.expect(pn > 0 and vn > pn);
+    // One extra encrypted record: header(5) + CR message(17) + inner
+    // content-type byte(1) + AEAD tag(16) = 39, ±1 because the ECDSA
+    // CertificateVerify DER length varies per signature.
+    try testing.expect(vn - pn >= 38 and vn - pn <= 40);
+}
+
+test "mTLS Finished without a client cert fails closed" {
+    const allocator = testing.allocator;
+    var verify_creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(verify_creds.cert_der);
+    verify_creds.verify_client = true;
+
+    var hello_buf: [1024]u8 = undefined;
+    const hello_rec = mtlsHelloRecord(&hello_buf);
+    var sess = TestSession.init(allocator, &verify_creds);
+    defer sess.deinit();
+    try sess.feed(hello_rec);
+    try testing.expectEqual(Stage.waiting_finished, sess.currentStage());
+    // A Finished with no preceding Certificate/CertificateVerify trips the
+    // gate (certificate_required), never reaching application data.
+    const fake_finished = [_]u8{ 0x14, 0x00, 0x00, 0x0C, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    try testing.expectError(error.TlsUnexpectedMessage, sess.onClientFinished(&fake_finished));
+    try testing.expect(sess.last_alert != null);
 }

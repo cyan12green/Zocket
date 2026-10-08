@@ -363,9 +363,16 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
 - OCSP stapling ✅ SHIPPED 2026-10: `tls ocsp_file` (DER, parsed +
   good-status enforced at startup/`--validate`, fail closed), `status_request`
   parsed from ClientHello, response stapled as the CertificateEntry extension
-  (RFC 8446 §4.4.2.1); unstapled flight byte-identical. mTLS client-cert
-  verify next (config + chain helper, then the CertificateRequest flight —
-  std's client sends no client certs, so e2e needs a hand-rolled flight).
+  (RFC 8446 §4.4.2.1); unstapled flight byte-identical.
+- mTLS client-cert verify ✅ SHIPPED 2026-10: `tls client_ca` (PEM bundle,
+  parsed at startup, fail closed) + `tls verify_client` (refused without a
+  bundle); CertificateRequest flight (both ECDSA schemes advertised),
+  chain verify (leaf or via presented intermediates) + CertificateVerify
+  signature over the transcript; Finished without a verified cert fails
+  `certificate_required`. Tested message-level with openssl fixtures
+  (chain/signature/flight-diff/gate); std's client answers no
+  CertificateRequest, so network e2e stays hand-rolled (next: curl --cert
+  against a verify listener).
 - kTLS offload (attacks the ~15% TLS-over-h2c tax in `bench/BENCH.md`,
   restores sendfile zero-copy under TLS).
 - ACME/auto-HTTPS (http-01 first; certs stay file-loaded, never

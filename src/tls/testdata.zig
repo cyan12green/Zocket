@@ -1,6 +1,7 @@
 //! Test fixtures shared across the TLS module: an ECDSA P-256 certificate
 //! and key pair (self-signed, generated with openssl) used by the unit and
-//! integration tests.
+//! integration tests, plus a client CA + client certificate pair (openssl,
+//! 2026-10) for mTLS verification tests.
 
 pub const cert_pem =
     \\-----BEGIN CERTIFICATE-----
@@ -30,4 +31,38 @@ pub const key_pkcs8_pem =
     \\vALA9AR75nw1zU60F+DjSvLB3QOhRANCAARicdBsxb5aDOJP3vqoTH50fEdXyXTs
     \\i5TglmU+tZ6Lr2LM2ZjgEuFqU8VZ4qfJlqCKpMJAss8OsHRDjLIvpJcX
     \\-----END PRIVATE KEY-----
+;
+pub const client_ca_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBjDCCATGgAwIBAgIUF8G0LfcT3kJ6frUyi+2OJ9WlRQ0wCgYIKoZIzj0EAwIw
+    \\GzEZMBcGA1UEAwwQem9ja2V0LWNsaWVudC1jYTAeFw0yNjEwMDgwNDI4MDlaFw0z
+    \\NjEwMDUwNDI4MDlaMBsxGTAXBgNVBAMMEHpvY2tldC1jbGllbnQtY2EwWTATBgcq
+    \\hkjOPQIBBggqhkjOPQMBBwNCAAStuaB6WKR+jt3Ymo8kIJN6Sl1IWQ8WELNDd5Kp
+    \\hmIokJOkpSy+dAlrha07znz1V0k3g2r8kT6e5ACnhLEugBjNo1MwUTAdBgNVHQ4E
+    \\FgQUm6fMT2sZpNsRHEXUd2NdzTIwnBkwHwYDVR0jBBgwFoAUm6fMT2sZpNsRHEXU
+    \\d2NdzTIwnBkwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEAlkiv
+    \\hZxNDt+orP2/2xFa/rXwY6yROVW2BZ1G0m6wOq8CIQDMKMLTuP+yWs6CZIHtV3pu
+    \\PrFphw/y/88pNn/NGv6ltg==
+    \\-----END CERTIFICATE-----
+;
+
+pub const client_cert_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBpDCCAUqgAwIBAgIUBXOBb9HBXuXpqqNSMWTWF7kKWnEwCgYIKoZIzj0EAwIw
+    \\GzEZMBcGA1UEAwwQem9ja2V0LWNsaWVudC1jYTAeFw0yNjEwMDgwNDI4MDlaFw0z
+    \\NjEwMDUwNDI4MDlaMBgxFjAUBgNVBAMMDXpvY2tldC1jbGllbnQwWTATBgcqhkjO
+    \\PQIBBggqhkjOPQMBBwNCAARAFDfLRO25cJ7Qtvj9aNh+mbZ7iieqry97W7Fq6pWc
+    \\iKzjOgZekqlC2QKliOuxRDo/N4Df4gTFIROTbc8fP+Bko28wbTAJBgNVHRMEAjAA
+    \\MAsGA1UdDwQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDAjAdBgNVHQ4EFgQUs4VC
+    \\GKF6z+yAn/T+uXxd8+vnCYAwHwYDVR0jBBgwFoAUm6fMT2sZpNsRHEXUd2NdzTIw
+    \\nBkwCgYIKoZIzj0EAwIDSAAwRQIhAI30jBxIXWmZQX2e0sTY7zD3wHDjPHFhtjlJ
+    \\94+/WhjcAiBUn0p/+dTFYwCCsYfsLzmwEpiw6p8ng+S1SbdyMSEioQ==
+    \\-----END CERTIFICATE-----
+;
+pub const client_key_pem =
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\MHcCAQEEIAtwpdulBhPF7VVyB/89FHhJgUtun3wCCPO/cF7gXd1IoAoGCCqGSM49
+    \\AwEHoUQDQgAEQBQ3y0TtuXCe0Lb4/WjYfpm2e4onqq8ve1uxauqVnIis4zoGXpKp
+    \\QtkCpYjrsUQ6PzeA3+IExSETk23PHz/gZA==
+    \\-----END EC PRIVATE KEY-----
 ;

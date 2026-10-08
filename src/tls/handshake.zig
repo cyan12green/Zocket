@@ -385,6 +385,35 @@ pub fn buildCertificate(out: []u8, cert_der: []const u8, ocsp: []const u8) !usiz
     return pos;
 }
 
+/// CertificateRequest (RFC 8446 §4.3.2): empty context + the signature
+/// schemes we verify client certs under (both ECDSA curves; the session
+/// enforces its own scheme when the CertificateVerify lands).
+pub fn buildCertificateRequest(out: []u8) !usize {
+    // type(1) + len(3) + context(1) + ext_list(2) + ext(2+2) + algs(2+4) = 17.
+    if (out.len < 17) return error.OutOfMemory;
+    var pos: usize = 0;
+    out[pos] = 0x0d;
+    pos += 1;
+    const len_at = pos;
+    pos += 3;
+    out[pos] = 0x00; // certificate_request_context (empty)
+    pos += 1;
+    std.mem.writeInt(u16, out[pos..][0..2], 8, .big); // extensions len
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 13, .big); // signature_algorithms
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 6, .big); // ext len
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 4, .big); // algs len
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 0x0403, .big); // ecdsa_secp256r1_sha256
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 0x0503, .big); // ecdsa_secp384r1_sha384
+    pos += 2;
+    std.mem.writeInt(u24, out[len_at..][0..3], @intCast(pos - len_at - 3), .big);
+    return pos;
+}
+
 /// CertificateVerify: ECDSA (DER) over the transcript hash so far.
 /// `signature_scheme` must match the certificate curve.
 pub fn buildCertificateVerify(
@@ -681,4 +710,17 @@ test "handshake: status_request extension sets the staple flag" {
     const hello = try parseClientHello(body[0..pos]);
     try testing.expect(!hello.has_supported_versions_13);
     try testing.expect(hello.status_requested);
+}
+
+test "handshake: CertificateRequest advertises ECDSA schemes" {
+    var buf: [64]u8 = undefined;
+    const n = try buildCertificateRequest(&buf);
+    try testing.expectEqual(@as(u8, 0x0d), buf[0]);
+    try testing.expectEqual(@as(usize, 17), n);
+    // extensions carry signature_algorithms { 0x0403, 0x0503 }.
+    try testing.expectEqual(@as(u8, 13), buf[8]); // ext type u16 BE
+    try testing.expectEqual(@as(u8, 0x04), buf[13]); // first scheme hi
+    try testing.expectEqual(@as(u8, 0x03), buf[14]); // first scheme lo
+    try testing.expectEqual(@as(u8, 0x05), buf[15]); // second scheme hi
+    try testing.expectEqual(@as(u8, 0x03), buf[16]); // second scheme lo
 }

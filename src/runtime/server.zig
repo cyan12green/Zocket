@@ -8,6 +8,7 @@ const router_mod = @import("../dsl/router.zig");
 pub const Config = config_mod.Config;
 const tls_cert = @import("../tls/cert.zig");
 const tls_ocsp = @import("../tls/ocsp.zig");
+const Certificate = std.crypto.Certificate;
 const dns_resolver = @import("../net/dns_resolver.zig");
 pub const default_registry = registry.default_registry;
 pub const ServerStats = registry.ServerStats;
@@ -43,6 +44,10 @@ pub const Server = struct {
     /// a native TLS 1.3 session per connection. `cert_der` is
     /// allocator-owned; freed by `deinit`.
     tls_creds: ?tls_cert.Credentials = null,
+    /// mTLS client-CA bundle (process-lifetime; `tls_creds.client_ca`
+    /// borrows it when set). Null bundle + verify_client never coexists —
+    /// loadTls fails closed first.
+    client_ca_bundle: ?Certificate.Bundle = null,
 
     /// Load the TLS credentials when the config enables TLS (reads the PEM
     /// files once at startup — nginx reads `ssl_certificate` at startup too).
@@ -69,6 +74,39 @@ pub const Server = struct {
                     return error.OcspNotGood;
                 }
                 self.tls_creds.?.ocsp_der = der;
+            }
+            // mTLS bundle: PEM CA file, parsed at startup (fail closed).
+            // verify_client without a bundle can never succeed — refuse.
+            if (self.cfg.tls.verify_client and self.cfg.tls.client_ca.len == 0) {
+                allocator.free(@constCast(self.tls_creds.?.cert_der));
+                if (self.tls_creds.?.ocsp_der.len > 0) allocator.free(@constCast(self.tls_creds.?.ocsp_der));
+                self.tls_creds = null;
+                return error.MtlsNeedsClientCa;
+            }
+            if (self.cfg.tls.client_ca.len > 0) {
+                var bundle = Certificate.Bundle.empty;
+                errdefer bundle.deinit(std.heap.page_allocator);
+                const io = std.Io.Threaded.global_single_threaded.io();
+                const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch
+                    return error.MtlsNeedsClientCa;
+                const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
+                const abs = self.cfg.tls.client_ca;
+                if (std.fs.path.isAbsolute(abs)) {
+                    bundle.addCertsFromFilePathAbsolute(std.heap.page_allocator, io, now, abs) catch {
+                        allocator.free(@constCast(self.tls_creds.?.cert_der));
+                        self.tls_creds = null;
+                        return error.MtlsBadBundle;
+                    };
+                } else {
+                    bundle.addCertsFromFilePath(std.heap.page_allocator, io, now, .cwd(), abs) catch {
+                        allocator.free(@constCast(self.tls_creds.?.cert_der));
+                        self.tls_creds = null;
+                        return error.MtlsBadBundle;
+                    };
+                }
+                self.client_ca_bundle = bundle;
+                self.tls_creds.?.client_ca = &self.client_ca_bundle.?;
+                self.tls_creds.?.verify_client = self.cfg.tls.verify_client;
             }
         }
     }
@@ -1462,4 +1500,36 @@ test "loadTls staples a good OCSP response and rejects a revoked one" {
     var srv2 = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .ocsp_file = ocsp_path } });
     try testing.expectError(error.OcspNotGood, srv2.loadTls(testing.allocator));
     try testing.expect(srv2.tls_creds == null);
+}
+
+test "loadTls refuses verify_client without a bundle, loads a good one" {
+    const testdata = @import("../tls/testdata.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cert_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ca_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cert_path = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
+    const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
+    const ca_path = try std.fmt.bufPrint(&ca_buf, ".zig-cache/tmp/{s}/ca.pem", .{tmp.sub_path});
+    try compat.writeFile(cert_path, testdata.cert_pem);
+    try compat.writeFile(key_path, testdata.key_pem);
+    try compat.writeFile(ca_path, testdata.client_ca_pem);
+
+    // verify on, no CA: fail closed.
+    var bare = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .verify_client = true } });
+    try testing.expectError(error.MtlsNeedsClientCa, bare.loadTls(testing.allocator));
+    try testing.expect(bare.tls_creds == null);
+
+    // verify on with CA: bundle loads, creds point at it.
+    var srv = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .client_ca = ca_path, .verify_client = true } });
+    try srv.loadTls(testing.allocator);
+    try testing.expect(srv.tls_creds != null);
+    try testing.expect(srv.tls_creds.?.verify_client);
+    try testing.expect(srv.tls_creds.?.client_ca != null);
+    testing.allocator.free(@constCast(srv.tls_creds.?.cert_der));
+    // Bundle is page-allocator owned (process-lifetime in production).
+    if (srv.client_ca_bundle) |*b| b.deinit(std.heap.page_allocator);
+    srv.tls_creds = null;
+    srv.client_ca_bundle = null;
 }

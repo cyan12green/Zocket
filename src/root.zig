@@ -37,6 +37,7 @@ pub const tls = struct {
     pub const pem = @import("tls/pem.zig");
     pub const testdata = @import("tls/testdata.zig");
     pub const ocsp = @import("tls/ocsp.zig");
+    pub const mtls = @import("tls/mtls.zig");
 };
 pub const http2 = struct {
     pub const hpack = @import("http2/hpack.zig");
@@ -155,6 +156,7 @@ comptime {
     _ = @import("tls/session.zig");
     _ = @import("tls/tickets.zig");
     _ = @import("tls/ocsp.zig");
+    _ = @import("tls/mtls.zig");
 }
 
 comptime {

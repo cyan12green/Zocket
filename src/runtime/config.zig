@@ -27,6 +27,11 @@ pub const TlsConfig = struct {
     key: []const u8 = "",
     /// DER OCSP response file for stapling (empty = no staple).
     ocsp_file: []const u8 = "",
+    /// PEM client-CA bundle for mTLS (empty = none loaded).
+    client_ca: []const u8 = "",
+    /// Request + verify client certificates (needs client_ca; startup
+    /// fails closed without it).
+    verify_client: bool = false,
     /// Whether TLS is enabled at all (a `tls` section present).
     pub fn enabled(self: *const TlsConfig) bool {
         return self.cert.len > 0 and self.key.len > 0;

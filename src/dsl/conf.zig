@@ -84,6 +84,8 @@ const H_tls = keyHash("tls");
 const H_cert = keyHash("cert");
 const H_key = keyHash("key");
 const H_ocsp_file = keyHash("ocsp_file");
+const H_client_ca = keyHash("client_ca");
+const H_verify_client = keyHash("verify_client");
 const H_log_format = keyHash("log_format");
 const H_server = keyHash("server");
 const H_location = keyHash("location");
@@ -558,6 +560,8 @@ const Builder = struct {
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
     tls_ocsp: Str = .{ .src = "" },
+    tls_client_ca: Str = .{ .src = "" },
+    tls_verify_client: bool = false,
     resolver_addrs: ct_pool.CtPool(Str, 3) = .{},
     tls_seen: bool = false,
     listen_port: ?u16 = null,
@@ -1105,6 +1109,14 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
                     H_ocsp_file => {
                         b.tls_ocsp = lx.value(b, "tls ocsp_file");
                         lx.expectTerminator("tls ocsp_file");
+                    },
+                    H_client_ca => {
+                        b.tls_client_ca = lx.value(b, "tls client_ca");
+                        lx.expectTerminator("tls client_ca");
+                    },
+                    H_verify_client => {
+                        b.tls_verify_client = lx.boolOnOff("tls verify_client");
+                        lx.expectTerminator("tls verify_client");
                     },
                     else => lx.fail("unknown tls directive '" ++ dn ++ "'"),
                 }
@@ -2746,6 +2758,8 @@ fn build(b: *const Builder) Config {
             .cert = resolve(b.tls_cert, strings),
             .key = resolve(b.tls_key, strings),
             .ocsp_file = resolve(b.tls_ocsp, strings),
+            .client_ca = resolve(b.tls_client_ca, strings),
+            .verify_client = b.tls_verify_client,
         },
         .listen_port = b.listen_port,
         .listen_spec = b.listen_spec,
@@ -4068,4 +4082,22 @@ test "conf: tls ocsp_file lands on the TLS config" {
         \\}
     );
     try testing.expectEqualStrings("ocsp.der", cfg.tls.ocsp_file);
+}
+
+test "conf: tls client_ca plus verify_client land on the TLS config" {
+    const cfg = parse(
+        \\tls {
+        \\    cert "server.pem";
+        \\    key "server.key";
+        \\    client_ca "clients.pem";
+        \\    verify_client on;
+        \\}
+        \\server {
+        \\    location / {
+        \\        rewrite echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("clients.pem", cfg.tls.client_ca);
+    try testing.expect(cfg.tls.verify_client);
 }
