@@ -53,7 +53,9 @@ pub fn relayPair(a: std.posix.fd_t, b: std.posix.fd_t, idle_ms: i32) void {
     var pb: usize = 0; // bytes staged b->a
     var oa: usize = 0; // consumed offset a->b
     var ob: usize = 0; // consumed offset b->a
+    var iters: usize = 0;
     while (true) {
+        iters += 1;
         var pfds = [_]std.posix.pollfd{
             .{ .fd = a, .events = std.posix.POLL.IN, .revents = 0 },
             .{ .fd = b, .events = std.posix.POLL.IN, .revents = 0 },
@@ -61,7 +63,9 @@ pub fn relayPair(a: std.posix.fd_t, b: std.posix.fd_t, idle_ms: i32) void {
         // Only poll OUT when we hold staged bytes for that direction.
         if (pa > oa) pfds[1].events |= std.posix.POLL.OUT;
         if (pb > ob) pfds[0].events |= std.posix.POLL.OUT;
-        const ready = std.posix.poll(&pfds, idle_ms) catch return;
+        const ready = std.posix.poll(&pfds, idle_ms) catch {
+            return;
+        };
         if (ready == 0) return; // idle timeout
         // Flush staged bytes first.
         if (pa > oa and (pfds[1].revents & std.posix.POLL.OUT) != 0) {
@@ -103,8 +107,12 @@ pub fn relayPair(a: std.posix.fd_t, b: std.posix.fd_t, idle_ms: i32) void {
                 pb = 0;
             }
         }
-        if ((pfds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) return;
-        if ((pfds[1].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) return;
+        // HUP/ERR end the relay; POLLNVAL too (a peer closed under us —
+        // polling a dead fd would otherwise spin forever; NVAL is absent
+        // from std.posix.POLL in this snapshot, hence the literal).
+        const done_mask = std.posix.POLL.HUP | std.posix.POLL.ERR | 0x020;
+        if ((pfds[0].revents & done_mask) != 0) return;
+        if ((pfds[1].revents & done_mask) != 0) return;
     }
 }
 
@@ -166,6 +174,14 @@ test "peekRoute selects on a ClientHello SNI" {
     try testing.expectEqual(hello.len, n);
 }
 
+/// shutdown(2) both directions (wakes threads blocked in poll/read;
+/// close() alone neither interrupts them nor — for a racing poll — avoids
+/// a POLLNVAL spin). Best-effort: test teardown only.
+fn shutdownBoth(fd: std.posix.fd_t) void {
+    const rc = std.os.linux.shutdown(fd, 2); // SHUT_RDWR
+    _ = std.os.linux.errno(rc);
+}
+
 test "relayPair echoes through a socketpair splice" {
     // Client <-> relay <-> echo: relayPair splices two fds; emulate with
     // two socketpairs and a relay thread, then round-trip a payload.
@@ -183,9 +199,15 @@ test "relayPair echoes through a socketpair splice" {
         fn echo(fd: std.posix.fd_t) void {
             var buf: [1024]u8 = undefined;
             while (true) {
-                const n = std.posix.read(fd, &buf) catch break;
-                if (n == 0) break;
-                _ = compat.write(fd, buf[0..n]) catch break;
+                const n = std.posix.read(fd, &buf) catch {
+                    break;
+                };
+                if (n == 0) {
+                    break;
+                }
+                _ = compat.write(fd, buf[0..n]) catch {
+                    break;
+                };
             }
         }
     };
@@ -202,10 +224,13 @@ test "relayPair echoes through a socketpair splice" {
         got += n;
     }
     try testing.expectEqualStrings(msg, out[0..got]);
-    compat.close(c2r[1]); // EOF the relay
+    // Shutdown wakes the blocked readers: relay sees EOF and returns,
+    // then the echoer sees EOF and returns. (close() alone does not
+    // interrupt a blocking read on another thread, and closing the
+    // relay's fd under its poll spins on POLLNVAL.)
+    shutdownBoth(c2r[1]);
     rt.join();
-    compat.close(r2e[0]);
-    compat.close(r2e[1]);
+    shutdownBoth(r2e[0]);
     et.join();
 }
 
