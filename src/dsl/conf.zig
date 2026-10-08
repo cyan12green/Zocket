@@ -371,6 +371,9 @@ const LocationSpec = struct {
     hc_timeout: u32 = 0,
     /// `precompressed gz;` — serve .gz twins when the client accepts them.
     precompressed_gz: bool = false,
+    /// `precompressed br;` / `precompressed zstd;` — same for .br / .zst.
+    precompressed_br: bool = false,
+    precompressed_zstd: bool = false,
     /// `auth_request <uri>;`
     auth_request: ?Str = null,
     /// `proxy_cache on;` / valid / stale-while-revalidate
@@ -1601,12 +1604,17 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             b.cost += 8;
         },
         H_precompressed => {
-            // `precompressed gz;` (only gz is supported today)
+            // `precompressed gz|br|zstd;` (repeatable, one codec each).
             const t = lx.token() orelse lx.fail("precompressed: expected a codec");
             const cs = t.srcOf("precompressed: codec cannot contain escapes");
-            if (!std.mem.eql(u8, cs, "gz")) lx.fail("precompressed: only 'gz' is supported");
+            if (std.mem.eql(u8, cs, "gz")) {
+                spec.precompressed_gz = true;
+            } else if (std.mem.eql(u8, cs, "br")) {
+                spec.precompressed_br = true;
+            } else if (std.mem.eql(u8, cs, "zstd")) {
+                spec.precompressed_zstd = true;
+            } else lx.fail("precompressed: codec must be gz, br or zstd");
             lx.expectTerminator("precompressed");
-            spec.precompressed_gz = true;
             ensureModuleBound(b, spec, .content, "precompressed");
             b.cost += 8;
         },
@@ -2603,6 +2611,8 @@ fn build(b: *const Builder) Config {
                 else
                     &.{},
                 .precompressed = spec.precompressed_gz,
+                .precompressed_br = spec.precompressed_br,
+                .precompressed_zstd = spec.precompressed_zstd,
                 .auth_request_uri = if (spec.auth_request) |u| resolve(u, strings) else null,
                 .cors_enabled = spec.cors_enabled,
                 .cors_origin = if (spec.cors_origin) |s| resolve(s, strings) else null,
@@ -4221,4 +4231,20 @@ test "conf: acme block parses directory plus contact plus domains" {
     try testing.expectEqualStrings("https://acme.example.com/directory", cfg.acme.directory);
     try testing.expectEqual(@as(usize, 2), cfg.acme.domains.len);
     try testing.expectEqualStrings("www.example.com", cfg.acme.domains[1]);
+}
+
+test "conf: precompressed accepts gz br zstd repeatably" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        root testdata;
+        \\        precompressed gz;
+        \\        precompressed br;
+        \\        content static;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.routes[0].precompressed);
+    try testing.expect(cfg.routes[0].precompressed_br);
+    try testing.expect(!cfg.routes[0].precompressed_zstd);
 }

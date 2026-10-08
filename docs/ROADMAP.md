@@ -388,6 +388,25 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
   The account→order→poll→finalize→download→install exchange loop follows;
   certs stay file-loaded, never `@embedFile`.
 
+### Batch D — nginx parity + auto-HTTPS completion (researched 2026-10)
+
+Sized the same way as C1–C3. Goal: every feature below exists in
+nginx/Caddy today; each ships with tests + docs + its own commit, then
+the comparison benchmarks must show Zocket ahead (iterate until green).
+
+- D1 content parity: precompressed `.br`/`.zstd` twins (no encoders —
+  serve sibling twins like gzip_static/brotli_static), `sub_filter`
+  response-body substitution (single + `once` semantics), `proxy_redirect`
+  Location rewriting, X-Accel-Redirect internal file redirect.
+- D2 auth/resilience: JWT ES256 + `jwks_file` (TLS ECDSA verify reuse),
+  `proxy_next_upstream` status retry (`http_502|http_503|...`), upstream
+  TLS keepalive pooling (pool keyed by host/port/tls) + parked-path TLS.
+- D3 ACME issuance loop: account→order→poll→finalize→download→install
+  background renewal on top of the shipped JWS/challenge core.
+- D4 head-to-head: nginx + Caddy + python baseline on this machine
+  (`bench/compare-servers.sh` + `modules-bench.sh`); close any gap found,
+  re-run until Zocket leads every cell; update `bench/BENCH.md`.
+
 ### Explicitly deferred
 
 - HTTP/3 + QUIC (M19): man-year without std support; revisit after async

@@ -205,6 +205,10 @@ pub const Route = struct {
     /// Precompressed serving (precompressed module): look for a `.gz`
     /// sibling of the requested file and serve it with Content-Encoding.
     precompressed: bool = false,
+    /// Brotli / zstd twin serving (`precompressed br|zstd;`): same shape
+    /// as gzip_static/brotli_static — serve disk twins, never encode.
+    precompressed_br: bool = false,
+    precompressed_zstd: bool = false,
     /// Response caching (proxy_cache modules): enable + fresh window and
     /// stale-while-revalidate grace, both in seconds.
     proxy_cache_enabled: bool = false,

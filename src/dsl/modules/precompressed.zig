@@ -31,53 +31,103 @@ pub const precompressed = registry.Module{
     .run = run,
 };
 
+/// One servable encoding: disk suffix + wire token, best-first.
+const Codec = struct {
+    suffix: []const u8,
+    token: []const u8,
+    encoding: []const u8,
+};
+
+const codecs = [_]Codec{
+    .{ .suffix = ".br", .token = "br", .encoding = "br" },
+    .{ .suffix = ".zst", .token = "zstd", .encoding = "zstd" },
+    .{ .suffix = ".gz", .token = "gzip", .encoding = "gzip" },
+};
+
 fn run(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
     const root = route.root orelse return .pass;
-    if (!acceptsGzip(ctx)) return .pass;
+    const accepted = acceptedEncodings(ctx);
 
     // Path-safety: the same rules the static module applies — decoded
     // target must be relative and free of traversal.
     const target = ctx.req.decoded_target;
     if (target.len == 0 or target[0] == '/') return .pass;
     if (std.mem.indexOf(u8, target, "..") != null) return .pass;
-    if (target.len + 3 > 512) return .pass;
+    if (target.len + 4 > 512) return .pass;
 
-    var path_buf: [520]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.gz", .{ root, target }) catch return .pass;
-
-    const file = compat.openFile(path) catch return .pass; // no twin
-    defer compat.close(file);
-    const stat = compat.fstat(file) catch return .pass;
-    if (stat.kind != .file) return .pass;
-    if (stat.size > max_buffered) return .pass;
-
-    const bytes = ctx.sharedAlloc(@intCast(stat.size)) orelse return error.OutOfMemory;
-    var filled: usize = 0;
-    while (filled < bytes.len) {
-        const n = posix.read(file, bytes[filled..]) catch return .pass;
-        if (n == 0) break;
-        filled += n;
+    // Best-first among the enabled codecs the client accepts (nginx serves
+    // each static twin independently; here one module covers all three).
+    for (codecs) |c| {
+        if (!codecEnabled(route, c.token)) continue;
+        if (!accepted.has(c.token)) continue;
+        if (tryTwin(ctx, root, target, c)) return .handled;
     }
-    if (filled != bytes.len) return .pass;
-
-    ctx.resp.status = .ok;
-    ctx.resp.body = bytes;
-    ctx.resp.setHeader("Content-Encoding", "gzip");
-    ctx.resp.setHeader("Vary", "Accept-Encoding");
-    // Content-Type describes the ORIGINAL representation (strip ".gz").
-    ctx.resp.setHeader("Content-Type", mime_mod.mimeForPath(target));
-    return .handled;
+    return .pass;
 }
 
-fn acceptsGzip(ctx: *Context) bool {
-    const ae = ctx.req.header("accept-encoding") orelse return false;
+fn codecEnabled(route: *const registry.Route, token: []const u8) bool {
+    if (std.mem.eql(u8, token, "gzip")) return route.precompressed;
+    if (std.mem.eql(u8, token, "br")) return route.precompressed_br;
+    if (std.mem.eql(u8, token, "zstd")) return route.precompressed_zstd;
+    return false;
+}
+
+const Accepted = struct {
+    gzip: bool = false,
+    br: bool = false,
+    zstd: bool = false,
+    fn has(self: Accepted, token: []const u8) bool {
+        if (std.mem.eql(u8, token, "gzip")) return self.gzip;
+        if (std.mem.eql(u8, token, "br")) return self.br;
+        if (std.mem.eql(u8, token, "zstd")) return self.zstd;
+        return false;
+    }
+};
+
+fn acceptedEncodings(ctx: *Context) Accepted {
+    var out = Accepted{};
+    const ae = ctx.req.header("accept-encoding") orelse return out;
     var it = std.mem.splitScalar(u8, ae, ',');
     while (it.next()) |tok_raw| {
         const tok = std.mem.trim(u8, tok_raw, " \t");
-        if (std.ascii.startsWithIgnoreCase(tok, "gzip")) return true; // gzip / gzip;q=..
+        if (std.ascii.startsWithIgnoreCase(tok, "gzip")) {
+            out.gzip = true;
+        } else if (std.ascii.startsWithIgnoreCase(tok, "br")) {
+            out.br = true;
+        } else if (std.ascii.startsWithIgnoreCase(tok, "zstd")) {
+            out.zstd = true;
+        }
     }
-    return false;
+    return out;
+}
+
+fn tryTwin(ctx: *Context, root: []const u8, target: []const u8, c: Codec) bool {
+    var path_buf: [520]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}{s}", .{ root, target, c.suffix }) catch return false;
+
+    const file = compat.openFile(path) catch return false; // no twin
+    defer compat.close(file);
+    const stat = compat.fstat(file) catch return false;
+    if (stat.kind != .file) return false;
+    if (stat.size > max_buffered) return false;
+
+    const bytes = ctx.sharedAlloc(@intCast(stat.size)) orelse return false;
+    var filled: usize = 0;
+    while (filled < bytes.len) {
+        const n = posix.read(file, bytes[filled..]) catch return false;
+        if (n == 0) break;
+        filled += n;
+    }
+    if (filled != bytes.len) return false;
+
+    ctx.resp.status = .ok;
+    ctx.resp.body = bytes;
+    ctx.resp.setHeader("Content-Encoding", c.encoding);
+    ctx.resp.setHeader("Vary", "Accept-Encoding");
+    // Content-Type describes the ORIGINAL representation (strip suffix).
+    ctx.resp.setHeader("Content-Type", mime_mod.mimeForPath(target));
+    return true;
 }
 
 const Request = registry.Request;
@@ -111,7 +161,7 @@ test "serves the gz twin with the original content type" {
     _ = req.addHeaderParsed("Accept-Encoding", "gzip;q=1.0") catch unreachable;
     var resp = Response.init(.ok);
     var ctx = Context{ .req = &req, .resp = &resp };
-    ctx.route = &.{ .path = "/", .root = "testdata" };
+    ctx.route = &.{ .path = "/", .root = "testdata", .precompressed = true };
 
     try testing.expectEqual(Action.handled, try run(&ctx));
     try testing.expectEqual(registry.Status.ok, resp.status);
@@ -204,7 +254,55 @@ test "uppercase GZIP matches case-insensitively" {
     _ = req.addHeaderParsed("Accept-Encoding", "GZIP") catch unreachable;
     var resp = Response.init(.ok);
     var ctx = Context{ .req = &req, .resp = &resp };
-    ctx.route = &.{ .path = "/", .root = "testdata" };
+    ctx.route = &.{ .path = "/", .root = "testdata", .precompressed = true };
     try testing.expectEqual(Action.handled, try run(&ctx));
     try testing.expectEqual(registry.Status.ok, resp.status);
+}
+
+test "br and zstd twins serve with best-first preference" {
+    // Fixtures are opaque bytes (no std brotli/zstd encoders exist); the
+    // module serves disk bytes verbatim with the right Content-Encoding.
+    try compat.writeFile("testdata/hello.txt.br", "fake-br-payload");
+    defer compat.deleteFile("testdata/hello.txt.br") catch {};
+    try compat.writeFile("testdata/hello.txt.zst", "fake-zst-payload");
+    defer compat.deleteFile("testdata/hello.txt.zst") catch {};
+
+    const serve = struct {
+        fn go(ae: []const u8, br: bool, zstd: bool, gz: bool) ![]const u8 {
+            var req = Request.init(testing.allocator);
+            defer req.deinit();
+            req.decoded_target = "hello.txt";
+            _ = req.addHeaderParsed("Accept-Encoding", ae) catch unreachable;
+            var resp = Response.init(.ok);
+            var ctx = Context{ .req = &req, .resp = &resp };
+            ctx.route = &.{ .path = "/", .root = "testdata", .precompressed = gz, .precompressed_br = br, .precompressed_zstd = zstd };
+            const a = try run(&ctx);
+            try testing.expectEqual(Action.handled, a);
+            for (resp.headers[0..resp.header_count]) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "Content-Encoding")) return h.value;
+            }
+            return "none";
+        }
+    }.go;
+    try makeTwin("testdata/hello.txt", "testdata/hello.txt.gz");
+    defer compat.deleteFile("testdata/hello.txt.gz") catch {};
+    // Best-first: br wins when accepted + enabled, even with gzip listed first.
+    try testing.expectEqualStrings("br", try serve("gzip, br", true, false, true));
+    try testing.expectEqualStrings("zstd", try serve("gzip, zstd", false, true, true));
+    try testing.expectEqualStrings("gzip", try serve("gzip, br", false, false, true));
+    // Enabled but not accepted: falls through to the next codec.
+    try testing.expectEqualStrings("gzip", try serve("gzip", true, true, true));
+}
+
+test "disabled codecs never serve even when accepted" {
+    try compat.writeFile("testdata/hello.txt.br", "fake-br-payload");
+    defer compat.deleteFile("testdata/hello.txt.br") catch {};
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.decoded_target = "hello.txt";
+    _ = req.addHeaderParsed("Accept-Encoding", "br") catch unreachable;
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &.{ .path = "/", .root = "testdata" };
+    try testing.expectEqual(Action.pass, try run(&ctx));
 }
