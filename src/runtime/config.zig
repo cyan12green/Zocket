@@ -25,6 +25,8 @@ pub const MapDef = vars.MapDef;
 pub const TlsConfig = struct {
     cert: []const u8 = "",
     key: []const u8 = "",
+    /// DER OCSP response file for stapling (empty = no staple).
+    ocsp_file: []const u8 = "",
     /// Whether TLS is enabled at all (a `tls` section present).
     pub fn enabled(self: *const TlsConfig) bool {
         return self.cert.len > 0 and self.key.len > 0;

@@ -7,6 +7,7 @@ const router_mod = @import("../dsl/router.zig");
 
 pub const Config = config_mod.Config;
 const tls_cert = @import("../tls/cert.zig");
+const tls_ocsp = @import("../tls/ocsp.zig");
 const dns_resolver = @import("../net/dns_resolver.zig");
 pub const default_registry = registry.default_registry;
 pub const ServerStats = registry.ServerStats;
@@ -52,6 +53,23 @@ pub const Server = struct {
             const key_pem = try compat.readFileAlloc(allocator, self.cfg.tls.key, 1 << 20);
             defer allocator.free(key_pem);
             self.tls_creds = try tls_cert.loadCredentials(allocator, cert_pem, key_pem);
+            // OCSP staple: DER file, parsed at startup (fail closed — a bad
+            // response disables the server rather than stapling garbage).
+            if (self.cfg.tls.ocsp_file.len > 0) {
+                const der = try compat.readFileAlloc(allocator, self.cfg.tls.ocsp_file, 1 << 20);
+                errdefer allocator.free(der);
+                const parsed = tls_ocsp.parseResponse(der) catch {
+                    allocator.free(@constCast(self.tls_creds.?.cert_der));
+                    self.tls_creds = null;
+                    return error.OcspInvalid;
+                };
+                if (parsed.cert != .good) {
+                    allocator.free(@constCast(self.tls_creds.?.cert_der));
+                    self.tls_creds = null;
+                    return error.OcspNotGood;
+                }
+                self.tls_creds.?.ocsp_der = der;
+            }
         }
     }
 
@@ -1410,4 +1428,38 @@ test "deinitPrepared frees hostname upstream dupes without leaking" {
     routes[0] = .{ .path = "/", .upstreams = heap_ups };
     var srv = Server.init(.{ .routes = routes });
     srv.deinitPrepared(testing.allocator);
+}
+
+test "loadTls staples a good OCSP response and rejects a revoked one" {
+    const testdata = @import("../tls/testdata.zig");
+    const ocsp_mod = @import("../tls/ocsp.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cert_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ocsp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cert_path = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
+    const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
+    const ocsp_path = try std.fmt.bufPrint(&ocsp_buf, ".zig-cache/tmp/{s}/ocsp.der", .{tmp.sub_path});
+    try compat.writeFile(cert_path, testdata.cert_pem);
+    try compat.writeFile(key_path, testdata.key_pem);
+    const good = try ocsp_mod.buildResponse(testing.allocator, .good);
+    defer testing.allocator.free(good);
+    try compat.writeFile(ocsp_path, good);
+
+    var srv = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .ocsp_file = ocsp_path } });
+    try srv.loadTls(testing.allocator);
+    try testing.expect(srv.tls_creds != null);
+    try testing.expectEqual(good.len, srv.tls_creds.?.ocsp_der.len);
+    testing.allocator.free(@constCast(srv.tls_creds.?.cert_der));
+    testing.allocator.free(@constCast(srv.tls_creds.?.ocsp_der));
+    srv.tls_creds = null;
+
+    // Revoked: fail closed.
+    const bad = try ocsp_mod.buildResponse(testing.allocator, .revoked);
+    defer testing.allocator.free(bad);
+    try compat.writeFile(ocsp_path, bad);
+    var srv2 = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .ocsp_file = ocsp_path } });
+    try testing.expectError(error.OcspNotGood, srv2.loadTls(testing.allocator));
+    try testing.expect(srv2.tls_creds == null);
 }

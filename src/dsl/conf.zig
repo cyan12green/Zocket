@@ -83,6 +83,7 @@ const H_server_name = keyHash("server_name");
 const H_tls = keyHash("tls");
 const H_cert = keyHash("cert");
 const H_key = keyHash("key");
+const H_ocsp_file = keyHash("ocsp_file");
 const H_log_format = keyHash("log_format");
 const H_server = keyHash("server");
 const H_location = keyHash("location");
@@ -556,6 +557,7 @@ const Builder = struct {
     stream_sni: ct_pool.CtPool(StreamSniSpec, 64) = .{},
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
+    tls_ocsp: Str = .{ .src = "" },
     resolver_addrs: ct_pool.CtPool(Str, 3) = .{},
     tls_seen: bool = false,
     listen_port: ?u16 = null,
@@ -1099,6 +1101,10 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
                         seen_key = true;
                         b.tls_key = lx.value(b, "tls key");
                         lx.expectTerminator("tls key");
+                    },
+                    H_ocsp_file => {
+                        b.tls_ocsp = lx.value(b, "tls ocsp_file");
+                        lx.expectTerminator("tls ocsp_file");
                     },
                     else => lx.fail("unknown tls directive '" ++ dn ++ "'"),
                 }
@@ -2739,6 +2745,7 @@ fn build(b: *const Builder) Config {
         .tls = .{
             .cert = resolve(b.tls_cert, strings),
             .key = resolve(b.tls_key, strings),
+            .ocsp_file = resolve(b.tls_ocsp, strings),
         },
         .listen_port = b.listen_port,
         .listen_spec = b.listen_spec,
@@ -4045,4 +4052,20 @@ test "conf: stream block parses listen plus default plus sni routes" {
     try testing.expectEqualStrings("api.example.com", s.sni_routes[0].pattern);
     try testing.expectEqual(@as(u16, 8001), s.sni_routes[0].port);
     try testing.expectEqualStrings("*.example.com", s.sni_routes[1].pattern);
+}
+
+test "conf: tls ocsp_file lands on the TLS config" {
+    const cfg = parse(
+        \\tls {
+        \\    cert "server.pem";
+        \\    key "server.key";
+        \\    ocsp_file "ocsp.der";
+        \\}
+        \\server {
+        \\    location / {
+        \\        rewrite echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("ocsp.der", cfg.tls.ocsp_file);
 }

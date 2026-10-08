@@ -360,7 +360,12 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
   (HMAC-SHA256 `?e=&s=` over `{path}|{e}`, 403 on bad/expired), JWT-lite
   (`auth_jwt_secret` HS256 + `exp` + leeway, 401 on bad/missing/expired;
   static `jwks_file`/ES256 deferred — TLS ECDSA verify is the path).
-- OCSP stapling + mTLS client-cert verify in the native TLS stack.
+- OCSP stapling ✅ SHIPPED 2026-10: `tls ocsp_file` (DER, parsed +
+  good-status enforced at startup/`--validate`, fail closed), `status_request`
+  parsed from ClientHello, response stapled as the CertificateEntry extension
+  (RFC 8446 §4.4.2.1); unstapled flight byte-identical. mTLS client-cert
+  verify next (config + chain helper, then the CertificateRequest flight —
+  std's client sends no client certs, so e2e needs a hand-rolled flight).
 - kTLS offload (attacks the ~15% TLS-over-h2c tax in `bench/BENCH.md`,
   restores sendfile zero-copy under TLS).
 - ACME/auto-HTTPS (http-01 first; certs stay file-loaded, never

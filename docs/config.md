@@ -288,6 +288,7 @@ upstreams follow the proxy resolver path next).
 | Directive | Syntax | Description |
 |---|---|---|
 | `tls { cert file; key file; }` | — | Enable TLS 1.3 (ECDSA only, no RSA). One block max. |
+| `tls { ocsp_file der; }` | — | Staple a DER OCSP response when clients send `status_request` (RFC 8446 §4.4.2.1). Loaded + parsed at startup; revoked/garbage responses fail startup closed (`--validate` covers it). |
 
 ### Response headers
 

@@ -85,6 +85,9 @@ pub fn Session(
         encrypted_read: bool = false,
         cipher_suite: u16 = 0,
         alpn: []const u8 = "",
+        /// Client sent status_request (carried from the final ClientHello;
+        /// second hello after HRR wins, like the rest of negotiation).
+        status_requested: bool = false,
         in_buf: std.ArrayList(u8) = .empty,
         handshake_buf: std.ArrayList(u8) = .empty,
         out_buf: std.ArrayList(u8) = .empty,
@@ -415,6 +418,7 @@ pub fn Session(
             if (self.stage == .waiting_hello) {
                 self.alpn = handshake_mod.selectAlpn(hello.alpn) orelse "";
             }
+            self.status_requested = hello.status_requested;
 
             // PSK resumption: open the ticket, require psk_dhe_ke
             // mode, and verify the binder over the truncated ClientHello.
@@ -499,7 +503,15 @@ pub fn Session(
             try self.emitEncryptedHandshake(msg[0..n_ee]);
 
             if (!resumed) {
-                const n_cert = handshake_mod.buildCertificate(&msg, self.creds.cert_der) catch
+                // OCSP stapling (C3): the client asked via status_request
+                // and startup loaded a validated response — staple it in
+                // the CertificateEntry. Anything else sends the
+                // byte-identical unstapled flight.
+                const staple: []const u8 = if (self.status_requested and self.creds.ocsp_der.len > 0)
+                    self.creds.ocsp_der
+                else
+                    &.{};
+                const n_cert = handshake_mod.buildCertificate(&msg, self.creds.cert_der, staple) catch
                     return error.OutOfMemory;
                 self.hashMessage(msg[0..n_cert]);
                 try self.emitEncryptedHandshake(msg[0..n_cert]);

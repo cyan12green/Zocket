@@ -54,6 +54,10 @@ pub const Credentials = struct {
     /// The DER certificate bytes (first certificate of the chain).
     cert_der: []const u8,
     key: KeyPair,
+    /// Validated DER OCSP response for stapling (empty = no staple).
+    /// Loaded from `tls ocsp_file` at startup; the session staples it
+    /// only when the client sent status_request.
+    ocsp_der: []const u8 = &.{},
 };
 
 /// Minimal DER reader (only what the key formats need: lengths, OIDs,

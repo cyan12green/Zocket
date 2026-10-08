@@ -61,6 +61,9 @@ pub const ClientHello = struct {
     signature_algorithms: []const u8 = &.{},
     alpn: []const u8 = &.{},
     has_supported_versions_13: bool = false,
+    /// RFC 6066 §8: the client sent a status_request extension and wants
+    /// a stapled OCSP response in our CertificateEntry.
+    status_requested: bool = false,
     random: [32]u8 = undefined,
     /// PSK resumption: the session-ticket identity and the binder, as
     /// well as the psk_key_exchange_modes list. Empty when the client sent
@@ -193,6 +196,9 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
                     const modes_len = ext.decode(u8);
                     ext.ensure(modes_len) catch return error.TlsDecodeError;
                     out.psk_modes = ext.slice(modes_len);
+                },
+                .status_request => {
+                    out.status_requested = true;
                 },
                 .signature_algorithms => {
                     ext.ensure(2) catch return error.TlsDecodeError;
@@ -339,8 +345,11 @@ pub fn buildEncryptedExtensions(out: []u8, alpn: ?[]const u8) !usize {
 }
 
 /// Certificate message with a single certificate entry (the leaf; we send
-/// no chain and no extensions).
-pub fn buildCertificate(out: []u8, cert_der: []const u8) !usize {
+/// no chain and extensions only when stapling).
+/// `ocsp` (DER OCSPResponse, validated at load) is stapled as the
+/// status_request extension when non-empty; otherwise the entry carries
+/// empty extensions exactly as before (byte-identical flight).
+pub fn buildCertificate(out: []u8, cert_der: []const u8, ocsp: []const u8) !usize {
     var pos: usize = 0;
     out[pos] = 0x0b;
     pos += 1;
@@ -352,13 +361,25 @@ pub fn buildCertificate(out: []u8, cert_der: []const u8) !usize {
     // certificate_list length
     const list_len_at = pos;
     pos += 3;
-    // one CertificateEntry: cert_data + empty extensions
+    // one CertificateEntry: cert_data + extensions
     std.mem.writeInt(u24, out[pos..][0..3], @intCast(cert_der.len), .big);
     pos += 3;
     @memcpy(out[pos..][0..cert_der.len], cert_der);
     pos += cert_der.len;
-    std.mem.writeInt(u16, out[pos..][0..2], 0, .big); // extensions (empty)
-    pos += 2;
+    if (ocsp.len == 0) {
+        std.mem.writeInt(u16, out[pos..][0..2], 0, .big); // extensions (empty)
+        pos += 2;
+    } else {
+        // extensions len + status_request(5) { ocsp bytes }.
+        std.mem.writeInt(u16, out[pos..][0..2], @intCast(4 + ocsp.len), .big);
+        pos += 2;
+        std.mem.writeInt(u16, out[pos..][0..2], 5, .big);
+        pos += 2;
+        std.mem.writeInt(u16, out[pos..][0..2], @intCast(ocsp.len), .big);
+        pos += 2;
+        @memcpy(out[pos..][0..ocsp.len], ocsp);
+        pos += ocsp.len;
+    }
     std.mem.writeInt(u24, out[list_len_at..][0..3], @intCast(pos - list_len_at - 3), .big);
     std.mem.writeInt(u24, out[len_at..][0..3], @intCast(pos - body_at), .big);
     return pos;
@@ -498,7 +519,7 @@ test "handshake: message builders produce self-consistent frames" {
     try testing.expect(sh < buf.len);
     const ee = try buildEncryptedExtensions(buf[sh..], "h2");
     try testing.expectEqual(@as(u8, 0x08), buf[sh]);
-    const cert = try buildCertificate(buf[sh + ee ..], "certs");
+    const cert = try buildCertificate(buf[sh + ee ..], "certs", &.{});
     try testing.expectEqual(@as(u8, 0x0b), buf[sh + ee]);
     const f = try buildFinished(buf[sh + ee + cert ..], &(@as([12]u8, @splat(@as(u8, 0xaa)))));
     try testing.expectEqual(@as(u8, 0x14), buf[sh + ee + cert]);
@@ -602,4 +623,62 @@ test "handshake: truncated ClientHello edge cases" {
     const n = truncatedClientHello(&msg, &hello, &out);
     try testing.expectEqual(@as(usize, 8), n);
     try testing.expectEqualSlices(u8, msg[0..8], out[0..n]);
+}
+
+test "handshake: stapled CertificateEntry carries status_request" {
+    var buf: [512]u8 = undefined;
+    const ocsp = [_]u8{ 0x30, 0x03, 0x0A, 0x01, 0x00 };
+    const n = try buildCertificate(&buf, "certs", &ocsp);
+    // Entry extensions: len(4+5)=9, ext type 5, len 5, ocsp bytes.
+    try testing.expect(n > 0);
+    try testing.expectEqual(@as(u8, 0x0b), buf[0]);
+    // Find the status_request extension by scanning for type 0x0005.
+    var found = false;
+    var i: usize = 0;
+    while (i + 4 <= n) : (i += 1) {
+        if (buf[i] == 0x00 and buf[i + 1] == 0x05 and buf[i + 2] == 0x00 and buf[i + 3] == 0x05) {
+            try testing.expectEqualSlices(u8, &ocsp, buf[i + 4 .. i + 9]);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+    // Unstapled flight keeps empty extensions.
+    var plain: [256]u8 = undefined;
+    const m = try buildCertificate(&plain, "certs", &.{});
+    try testing.expectEqual(@as(u8, 0x0b), plain[0]);
+    // Extensions length 0 at the tail of the single entry.
+    try testing.expectEqual(@as(u8, 0), plain[m - 2]);
+    try testing.expectEqual(@as(u8, 0), plain[m - 1]);
+}
+
+test "handshake: status_request extension sets the staple flag" {
+    // Minimal ClientHello body with one empty status_request extension.
+    var body: [64]u8 = undefined;
+    var pos: usize = 0;
+    body[pos] = 0x03;
+    body[pos + 1] = 0x03;
+    pos += 2;
+    @memset(body[pos..][0..32], 0x11);
+    pos += 32;
+    body[pos] = 0x00; // session_id len
+    pos += 1;
+    body[pos] = 0x00;
+    body[pos + 1] = 0x02;
+    body[pos + 2] = 0x13;
+    body[pos + 3] = 0x01;
+    pos += 4;
+    body[pos] = 0x01; // compression len
+    body[pos + 1] = 0x00;
+    pos += 2;
+    body[pos] = 0x00;
+    body[pos + 1] = 0x04; // extensions len 4
+    body[pos + 2] = 0x00;
+    body[pos + 3] = 0x05; // status_request
+    body[pos + 4] = 0x00;
+    body[pos + 5] = 0x00; // ext len 0
+    pos += 6;
+    // A supported_versions extension is needed for the 1.3 gate.
+    const hello = try parseClientHello(body[0..pos]);
+    try testing.expect(!hello.has_supported_versions_13);
+    try testing.expect(hello.status_requested);
 }

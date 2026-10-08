@@ -94,6 +94,12 @@ fn validateConfig(cfg: zocket.runtime.config.Config, opts: ServerOpts, allocator
         defer allocator.free(key_pem);
         const creds = zocket.tls.cert.loadCredentials(allocator, cert_pem, key_pem) catch return error.TlsCredentialsInvalid;
         defer allocator.free(creds.cert_der);
+        if (cfg.tls.ocsp_file.len > 0) {
+            const der = compat.readFileAlloc(allocator, cfg.tls.ocsp_file, 1 << 20) catch return error.TlsFilesUnreadable;
+            defer allocator.free(der);
+            const parsed = zocket.tls.ocsp.parseResponse(der) catch return error.TlsCredentialsInvalid;
+            if (parsed.cert != .good) return error.TlsCredentialsInvalid;
+        }
     }
     // Effective listen port (CLI wins, else conf, else default), resolved
     // the same way runServer resolves it.
