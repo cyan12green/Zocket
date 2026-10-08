@@ -160,8 +160,24 @@ pub fn build(b: *std.Build) void {
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
+    //
+    // exe_tests gets its OWN root module (same source + imports as the exe):
+    // under -Dcoverage the exe module carries covstubs.o (runner_* stubs
+    // for the -ffuzz main binary), which collides with the current test
+    // runner's own runner_* symbols. The stubs stay on the exe artifact
+    // only, where they are still needed for the instrumented server binary.
+    const exe_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zocket", .module = mod },
+            .{ .name = "embeds", .module = embeds_mod },
+            .{ .name = "build_options", .module = build_options_mod },
+        },
+    });
     const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = exe_test_mod,
     });
 
     // A run step that will run the second test executable.
