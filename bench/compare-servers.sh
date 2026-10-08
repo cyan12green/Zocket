@@ -51,7 +51,10 @@ CADDY_BIN="$ROOT/bench/.cache/caddy/caddy"
 CADDY_TEMPLATE="$ROOT/bench/foreign/caddy/Caddyfile.template"
 
 echo "== ensuring builds =="
-[ -x "$TCP_BIN" ] || (cd "$ROOT" && zig build -Doptimize=ReleaseFast)
+# ALWAYS rebuild ReleaseFast: `zig build test` (and plain `zig build`)
+# overwrite zig-out/bin/zocket with a Debug build at the same path, and a
+# benchmark on that binary is meaningless.
+(cd "$ROOT" && zig build -Doptimize=ReleaseFast)
 # Optional competitors: built only when their toolchains/binaries are
 # present (cargo/bun/httpx are not on every machine). SERVERS overrides
 # the default subset.
