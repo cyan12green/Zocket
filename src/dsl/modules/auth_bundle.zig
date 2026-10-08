@@ -134,17 +134,101 @@ fn forbidden(ctx: *Context) Action {
 
 fn runAuthJwt(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
-    const secret = route.auth_jwt_secret orelse return .pass;
-    const auth = ctx.req.header("authorization") orelse return jwtUnauthorized(ctx);
+    const auth = ctx.req.header("authorization") orelse {
+        if (route.auth_jwt_secret == null and route.auth_jwt_key_file == null) return .pass;
+        return jwtUnauthorized(ctx);
+    };
     const trimmed = std.mem.trim(u8, auth, " \t");
     if (trimmed.len < 8 or !std.ascii.eqlIgnoreCase(trimmed[0..6], "Bearer") or trimmed[6] != ' ') {
+        if (route.auth_jwt_secret == null and route.auth_jwt_key_file == null) return .pass;
         return jwtUnauthorized(ctx);
     }
     const token = std.mem.trim(u8, trimmed[7..], " \t");
+    // ES256 wins when a key file is configured (asymmetric first).
+    if (route.auth_jwt_key_file) |kf| {
+        const pubkey_bytes = jwtPubkey(kf) orelse return jwtUnauthorized(ctx);
+        if (!verifyJwtEs256(&pubkey_bytes, token, nowSeconds(ctx), route.auth_jwt_leeway_s)) {
+            return jwtUnauthorized(ctx);
+        }
+        return .pass;
+    }
+    const secret = route.auth_jwt_secret orelse return .pass;
     if (!verifyJwtHs256(secret, token, nowSeconds(ctx), route.auth_jwt_leeway_s)) {
         return jwtUnauthorized(ctx);
     }
     return .pass;
+}
+
+/// Process-wide SEC1 pubkey cache keyed by PEM path (4 slots; DER lives
+/// until replaced — same convention as the proxy CA bundle cache).
+/// Null when the file is missing or holds no P-256 certificate.
+const max_jwt_keys = 4;
+var jwt_key_mutex = compat.Mutex{};
+var jwt_key_paths: [max_jwt_keys][]const u8 = @as([max_jwt_keys][]const u8, @splat(@as([]const u8, "")));
+var jwt_key_pubs: [max_jwt_keys][65]u8 = undefined;
+var jwt_key_filled: usize = 0;
+
+fn jwtPubkey(path: []const u8) ?[65]u8 {
+    jwt_key_mutex.lock();
+    defer jwt_key_mutex.unlock();
+    for (jwt_key_paths[0..jwt_key_filled], 0..) |p, i| {
+        if (std.mem.eql(u8, p, path)) return jwt_key_pubs[i];
+    }
+    if (jwt_key_filled >= max_jwt_keys) return null;
+    const pem_mod = @import("../../tls/pem.zig");
+    const Certificate = std.crypto.Certificate;
+    const pem_bytes = compat.readFileAlloc(std.heap.page_allocator, path, 1 << 20) catch return null;
+    defer std.heap.page_allocator.free(pem_bytes);
+    var der_buf: [4096]u8 = undefined;
+    const der_len = (pem_mod.decodeFirst(pem_bytes, "CERTIFICATE", &der_buf) catch return null) orelse return null;
+    const parsed = Certificate.parse(.{ .buffer = der_buf[0..der_len], .index = 0 }) catch return null;
+    if (parsed.pub_key_algo != .X9_62_id_ecPublicKey) return null;
+    const point = parsed.pubKey();
+    if (point.len != 65 or point[0] != 0x04) return null;
+    @memcpy(jwt_key_pubs[jwt_key_filled][0..65], point);
+    jwt_key_paths[jwt_key_filled] = path;
+    jwt_key_filled += 1;
+    return jwt_key_pubs[jwt_key_filled - 1];
+}
+
+/// Verify `header.payload.sig` (base64url, ES256): header must claim
+/// ES256 (confusion with HS256/none fails closed), signature checks
+/// against the SEC1 key, `exp` enforced as in the HS256 path.
+pub fn verifyJwtEs256(pub_sec1: *const [65]u8, token: []const u8, now_s: i64, leeway_s: u32) bool {
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    var it = std.mem.splitScalar(u8, token, '.');
+    const h = it.next() orelse return false;
+    const p = it.next() orelse return false;
+    const s = it.next() orelse return false;
+    if (it.next() != null) return false;
+    if (h.len == 0 or p.len == 0 or s.len == 0) return false;
+    // Header must say ES256 (decode + substring; no JSON parser needed).
+    const hlen = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(h) catch return false;
+    if (hlen > 256) return false;
+    var hbuf: [256]u8 = undefined;
+    std.base64.url_safe_no_pad.Decoder.decode(hbuf[0..hlen], h) catch return false;
+    if (std.mem.indexOf(u8, hbuf[0..hlen], "\"alg\":\"ES256\"") == null) return false;
+    const pubkey = Ecdsa.PublicKey.fromSec1(pub_sec1) catch return false;
+    const sig_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(s) catch return false;
+    if (sig_len != 64) return false;
+    var sig_raw: [64]u8 = undefined;
+    std.base64.url_safe_no_pad.Decoder.decode(&sig_raw, s) catch return false;
+    const sig = Ecdsa.Signature.fromBytes(sig_raw);
+    // ES256 signs the ASCII header.payload directly (SHA-256).
+    var msg = std.ArrayList(u8).empty;
+    defer msg.deinit(std.heap.page_allocator);
+    msg.appendSlice(std.heap.page_allocator, h) catch return false;
+    msg.append(std.heap.page_allocator, '.') catch return false;
+    msg.appendSlice(std.heap.page_allocator, p) catch return false;
+    sig.verify(msg.items, pubkey) catch return false;
+    const plen = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(p) catch return false;
+    if (plen > 4096) return false;
+    var pbuf: [4096]u8 = undefined;
+    std.base64.url_safe_no_pad.Decoder.decode(pbuf[0..plen], p) catch return false;
+    if (findExp(pbuf[0..plen])) |exp| {
+        if (now_s > exp + @as(i64, leeway_s)) return false;
+    }
+    return true;
 }
 
 fn jwtUnauthorized(ctx: *Context) Action {
@@ -338,4 +422,78 @@ test "jwt handler 401s without a bearer token" {
     ctx.route = &.{ .path = "/", .auth_jwt_secret = "k" };
     try testing.expectEqual(Action.handled, try runAuthJwt(&ctx));
     try testing.expectEqual(Status.unauthorized, resp.status);
+}
+
+test "jwt es256 verifies with the fixture pair, rejects confusion" {
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const testdata = @import("../../tls/testdata.zig");
+    const cert_mod = @import("../../tls/cert.zig");
+    // Sign header.payload with the fixture client key.
+    const creds = try cert_mod.loadCredentials(testing.allocator, testdata.client_cert_pem, testdata.client_key_pem);
+    defer testing.allocator.free(creds.cert_der);
+    const h = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9"; // {"alg":"ES256","typ":"JWT"}
+    const p = "eyJleHAiOjk5OTk5OTk5OTl9"; // {"exp":9999999999}
+    var msg: [256]u8 = undefined;
+    const m = std.fmt.bufPrint(&msg, "{s}.{s}", .{ h, p }) catch unreachable;
+    var digest: [32]u8 = undefined;
+    Ecdsa.Hash.hash(m, &digest, .{});
+    const sk = try Ecdsa.SecretKey.fromBytes(creds.key.secret_key[0..Ecdsa.SecretKey.encoded_length].*);
+    const kp = try Ecdsa.KeyPair.fromSecretKey(sk);
+    const sig = kp.sign(m, null) catch unreachable;
+    const raw = sig.toBytes();
+    var sig_b64: [128]u8 = undefined;
+    const sig_s = std.base64.url_safe_no_pad.Encoder.encode(&sig_b64, &raw);
+    var tok: [512]u8 = undefined;
+    const token = std.fmt.bufPrint(&tok, "{s}.{s}.{s}", .{ h, p, sig_s }) catch unreachable;
+    // Pubkey from the fixture leaf.
+    const leaf = blk: {
+        const pem_mod = @import("../../tls/pem.zig");
+        var lb: [4096]u8 = undefined;
+        const ll = (try pem_mod.decodeFirst(testdata.client_cert_pem, "CERTIFICATE", &lb)) orelse return error.TestUnexpected;
+        const parsed = try std.crypto.Certificate.parse(.{ .buffer = lb[0..ll], .index = 0 });
+        var sec1: [65]u8 = undefined;
+        @memcpy(&sec1, parsed.pubKey());
+        break :blk sec1;
+    };
+    try testing.expect(verifyJwtEs256(&leaf, token, 1_000, 60));
+    // HS256 token against the EC key: alg confusion fails closed.
+    const hs = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjk5OTk5OTk5OTl9.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    try testing.expect(!verifyJwtEs256(&leaf, hs, 1_000, 60));
+    // Tampered payload fails.
+    var bad_tok: [512]u8 = undefined;
+    @memcpy(bad_tok[0..token.len], token);
+    bad_tok[token.len - 3] ^= 0x01;
+    try testing.expect(!verifyJwtEs256(&leaf, bad_tok[0..token.len], 1_000, 60));
+}
+
+test "jwt es256 handler gates on the key file" {
+    const testdata = @import("../../tls/testdata.zig");
+    const path = "/tmp/zocket-jwt-key-test.pem";
+    compat.deleteFile(path) catch {};
+    try compat.writeFile(path, testdata.client_cert_pem);
+    defer compat.deleteFile(path) catch {};
+    // Missing Authorization with key configured: 401 (fail closed).
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &.{ .path = "/", .auth_jwt_key_file = path };
+    try testing.expectEqual(Action.handled, try runAuthJwt(&ctx));
+    try testing.expectEqual(Status.unauthorized, resp.status);
+    // Garbage token: 401.
+    var req2 = registry.Request.init(testing.allocator);
+    defer req2.deinit();
+    req2.addHeaderParsed("Authorization", "Bearer junk") catch unreachable;
+    var resp2 = registry.Response.init(.ok);
+    var ctx2 = Context{ .req = &req2, .resp = &resp2 };
+    ctx2.route = &.{ .path = "/", .auth_jwt_key_file = path };
+    try testing.expectEqual(Action.handled, try runAuthJwt(&ctx2));
+    // Bad key path: 401, never pass.
+    var req3 = registry.Request.init(testing.allocator);
+    defer req3.deinit();
+    req3.addHeaderParsed("Authorization", "Bearer junk") catch unreachable;
+    var resp3 = registry.Response.init(.ok);
+    var ctx3 = Context{ .req = &req3, .resp = &resp3 };
+    ctx3.route = &.{ .path = "/", .auth_jwt_key_file = "/nonexistent/key.pem" };
+    try testing.expectEqual(Action.handled, try runAuthJwt(&ctx3));
 }

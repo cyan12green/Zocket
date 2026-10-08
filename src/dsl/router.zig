@@ -244,6 +244,9 @@ pub const Route = struct {
     /// ES256/JWKS stays deferred (TLS ECDSA verify reuse is the path).
     auth_jwt_secret: ?[]const u8 = null,
     auth_jwt_leeway_s: u32 = 0,
+    /// ES256 key file (PEM certificate; `auth_jwt_key_file`). Wins over
+    /// the shared secret when both are set.
+    auth_jwt_key_file: ?[]const u8 = null,
     /// Active health checks (proxy module): when `health_check_path` is
     /// set a module-owned checker thread probes every backend on the
     /// interval and applies rise/fall thresholds to flip liveness.

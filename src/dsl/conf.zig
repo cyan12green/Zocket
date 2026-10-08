@@ -126,6 +126,7 @@ const H_cors_max_age = keyHash("cors_max_age");
 const H_secure_link_secret = keyHash("secure_link_secret");
 const H_auth_jwt_secret = keyHash("auth_jwt_secret");
 const H_auth_jwt_leeway = keyHash("auth_jwt_leeway");
+const H_auth_jwt_key_file = keyHash("auth_jwt_key_file");
 const H_proxy_ws = keyHash("proxy_ws");
 const H_proxy_cache = keyHash("proxy_cache");
 const H_client_header_timeout = keyHash("client_header_timeout");
@@ -363,6 +364,7 @@ const LocationSpec = struct {
     /// `auth_jwt_secret "...";` + `auth_jwt_leeway seconds;`.
     auth_jwt_secret: ?Str = null,
     auth_jwt_leeway: u32 = 0,
+    auth_jwt_key_file: ?Str = null,
     /// `proxy_ws on|off;` (WebSocket upgrade forwarding).
     proxy_ws: bool = false,
     /// `sticky_cookie name;` (cookie-based backend affinity)
@@ -1605,6 +1607,12 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             ensureModuleBound(b, spec, .access, "auth_jwt");
             b.cost += 8;
         },
+        H_auth_jwt_key_file => {
+            spec.auth_jwt_key_file = lx.value(b, "auth_jwt_key_file");
+            lx.expectTerminator("auth_jwt_key_file");
+            ensureModuleBound(b, spec, .access, "auth_jwt");
+            b.cost += 8;
+        },
         H_auth_jwt_leeway => {
             spec.auth_jwt_leeway = lx.number("auth_jwt_leeway", u32);
             lx.expectTerminator("auth_jwt_leeway");
@@ -2673,6 +2681,7 @@ fn build(b: *const Builder) Config {
                 .secure_link_secret = if (spec.secure_link_secret) |s| resolve(s, strings) else null,
                 .auth_jwt_secret = if (spec.auth_jwt_secret) |s| resolve(s, strings) else null,
                 .auth_jwt_leeway_s = spec.auth_jwt_leeway,
+                .auth_jwt_key_file = if (spec.auth_jwt_key_file) |s| resolve(s, strings) else null,
                 .proxy_ws = spec.proxy_ws,
                 .proxy_cache_enabled = spec.cache_enabled,
                 .cache_ttl_seconds = spec.cache_ttl,
@@ -4338,4 +4347,17 @@ test "conf: accel on binds the log module" {
         \\}
     );
     try testing.expect(cfg.routes[0].accel_enabled);
+}
+
+test "conf: auth_jwt_key_file binds the jwt module" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        auth_jwt_key_file keys/jwt.pem;
+        \\        auth_jwt_leeway 30;
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("keys/jwt.pem", cfg.routes[0].auth_jwt_key_file.?);
+    try testing.expectEqual(@as(u32, 30), cfg.routes[0].auth_jwt_leeway_s);
 }
