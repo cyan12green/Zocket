@@ -44,19 +44,27 @@ Body sizes 1 KB / 8 KB / 64 KB × connections 10 / 100 / 1000.
 ![Matrix 8 KB](graphs/matrix_8192.png)
 ![Matrix 64 KB](graphs/matrix_65536.png)
 
-### Results table (req/s × 1000)
+### Results table (req/s × 1000, 2026-10-08 re-run)
 
-| Body | Conns | Zocket | actix | Bun | httpx | nginx | Caddy |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 1 KB | 10 | 133.8 | 119.6 | 65.1 | 3.6 | 110.2 | 48.2 |
-| 1 KB | 100 | 197.2 | 188.9 | 63.2 | 3.5 | 145.8 | 48.0 |
-| 1 KB | 1000 | 171.8 | 163.6 | 56.0 | 4.3 | 130.5 | 41.0 |
-| 8 KB | 10 | 97.5 | 83.0 | 47.8 | 3.5 | 48.4 | 24.0 |
-| 8 KB | 100 | 126.1 | 111.8 | 45.0 | 3.4 | 64.2 | 24.2 |
-| 8 KB | 1000 | 97.2 | 84.3 | 41.1 | 4.3 | 62.6 | 23.4 |
-| 64 KB | 10 | 63.4 | 39.3 | 21.9 | 3.0 | 19.9 | 9.5 |
-| 64 KB | 100 | 35.0 | 23.3 | 19.3 | 3.0 | 23.0 | 9.4 |
-| 64 KB | 1000 | 25.4 | 18.0 | 18.9 | 3.8 | 21.4 | 9.4 |
+Zocket vs nginx vs Caddy on this machine (actix/Bun/httpx need toolchains
+that are not installed here; `SERVERS=` selects the subset). Medians of 3
+interleaved reps in both port layouts, 6 s per rep, 4 threads / 4 workers.
+
+| Body | Conns | Zocket | nginx | Caddy | vs nginx | vs Caddy |
+|---|---|---:|---:|---:|---:|---:|
+| GET / | 100 | 421.7 | 374.3 | 96.7 | 1.13x | 4.36x |
+| 1 KB | 10 | 226.1 | 146.2 | 75.4 | 1.55x | 3.00x |
+| 1 KB | 100 | 365.2 | 218.6 | 70.0 | 1.67x | 5.22x |
+| 1 KB | 1000 | 298.7 | 202.0 | 58.8 | 1.48x | 5.08x |
+| 8 KB | 10 | 137.4 | 59.2 | 32.3 | 2.32x | 4.26x |
+| 8 KB | 100 | 193.9 | 80.6 | 33.1 | 2.41x | 5.86x |
+| 8 KB | 1000 | 156.0 | 100.5 | 32.7 | 1.55x | 4.77x |
+| 64 KB | 10 | 58.1 | 20.6 | 10.5 | 2.82x | 5.52x |
+| 64 KB | 100 | 124.8 | 32.6 | 11.7 | 3.83x | 10.7x |
+| 64 KB | 1000 | 43.2 | 42.0 | 13.1 | 1.03x | 3.31x |
+
+The one near-tie (64 KB @ c=1000) is a tail-latency cell: Zocket p99 27 ms
+vs nginx 202 ms — equal throughput, an order of magnitude steadier tail.
 
 ## Static file serving (GET, req/s)
 
