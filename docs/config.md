@@ -69,6 +69,7 @@ top-level directives + `server {}` blocks holding `location {}` blocks. No
 | `post_read realip` | — | post_read | Real client IP from trusted proxies (auto-bound by `set_real_ip_from` et al.) |
 | `content precompressed` | — | content | Precompressed sibling serving (`precompressed gz|br|zstd;`, repeatable; best-first br → zstd → gzip among accepted) |
 | `filter sub_filter` | — | filter | Response body substitution (`sub_filter match repl;` + `sub_filter_once on|off`, default on; text bodies only) |
+| `accel` | `accel on|off;` | off | Honor upstream `X-Accel-Redirect` as an internal redirect (log phase; GET/HEAD only) |
 | `rewrite proxy_cache` | — | rewrite | Response cache lookup |
 | `content try_files` | — | content | Probe files, fall back (auto-bound by `try_files`) |
 | `log error_page` | — | log | Status → alternate URI (auto-bound by `error_page`) |
