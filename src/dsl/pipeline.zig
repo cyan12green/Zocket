@@ -43,7 +43,12 @@ pub fn run(comptime Registry: type, routes: []const router.Route, ctx: *Context)
 /// the final response. The walk loop skips the log phase; this function runs
 /// it once at the end, in declaration order.
 pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr: ?*const router.Router, ctx: *Context) !Outcome {
-    const route = if (rtr) |r| blk: {
+    const route = if (ctx.force_route) |fr| blk: {
+        // Named-location redirect: the route is chosen by name, not by
+        // path; consumed here so the next hop matches normally.
+        ctx.force_route = null;
+        break :blk fr;
+    } else if (rtr) |r| blk: {
         // M-D: the router records regex captures; copy them into the context
         // (the winning route may be a regex route).
         var caps = router.MatchCaps{ .subject = ctx.req.decoded_target };

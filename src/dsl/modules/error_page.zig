@@ -41,6 +41,12 @@ fn run(ctx: *Context) anyerror!Action {
             }
             return .pass;
         }
+        // Named-location form (`error_page 502 = @fallback;`): internal
+        // redirect to the named location, method preserved (nginx rule).
+        if (ep.target.len > 1 and ep.target[0] == '@') {
+            ctx.internal_redirect_named = ep.target;
+            return .pass;
+        }
         // URI form: nginx switches to GET for non-GET/HEAD so the alternate
         // page (usually a static file) is fetched, not posted to.
         if (ctx.req.method != .get and ctx.req.method != .head) ctx.req.method = .get;
@@ -127,4 +133,21 @@ test "ErrorPage helpers parse the =code form" {
     const bad = router_mod.ErrorPage{ .status = 500, .target = "=oops" };
     try testing.expect(bad.isCodeForm());
     try testing.expectEqual(@as(u16, 0), bad.codeOf());
+}
+
+test "error_page: @name target redirects to the named location" {
+    const allocator = testing.allocator;
+    var req = registry.Request.init(allocator);
+    defer req.deinit();
+    req.method = .post;
+    var resp = registry.Response.init(.ok);
+    var ctx = registry.Context{ .req = &req, .resp = &resp };
+    const pages = [_]router_mod.ErrorPage{.{ .status = 502, .target = "@fallback" }};
+    const route = registry.Route{ .path = "/", .error_pages = &pages };
+    ctx.route = &route;
+    ctx.effective_status = 502;
+    _ = try error_page.run(&ctx);
+    try testing.expectEqualStrings("@fallback", ctx.internal_redirect_named.?);
+    // Method preserved for named redirects (nginx rule).
+    try testing.expect(req.method == .post);
 }

@@ -44,7 +44,7 @@ top-level directives + `server {}` blocks holding `location {}` blocks. No
 | `server` | `server { ... }` | — | main | Virtual host block (up to 16). Own routes, port, hostname. |
 | `server_name` | `server_name name;` (repeatable) | — | server | Hostname(s) for vhost matching. Repeat the directive for multiple names. `*.domain` wildcards supported. |
 | `host_select` | `host_select on\|off;` | on | main | Host-based vhost routing. `off` always uses first server. |
-| `location` | `location [= ~ ~* ^~] uri { ... }` | — | server | Route declaration. Modifiers: exact/regex/prefix. |
+| `location` | `location [= ~ ~* ^~] uri { ... }` | — | server | Route declaration. Modifiers: exact/regex/prefix. A `@name` target declares a **named location**: excluded from path matching entirely, reachable only via internal redirects (`try_files ... @name`, `error_page 5xx = @name`); the URI is unchanged and the method is preserved. |
 | `return` | `return code [value];` | — | location | Fixed-response template (pre-serialised). |
 | `root` | `root path;` | — | location | Document root for `static` module. |
 | `embed` | `embed path;` | — | location | Comptime-embedded static file. |
@@ -144,8 +144,8 @@ spinning).
 
 | Directive | Syntax | Default | Description |
 |---|---|---|---|
-| `try_files` | `try_files $uri $uri/ /fallback;` or `try_files $uri =404;` | — | Probe each candidate against `root` in order; redirect to the first that exists. `$uri` is the request target, `$uri/` appends `index`. The last entry is the fallback: a URI redirects to it, `=code` answers that status in place. |
-| `error_page` | `error_page 404 500 /50x.html;` or `error_page 503 =200;` | — | After the walk, when the outgoing status matches, redirect to the URI (methods other than GET/HEAD become GET) or rewrite the status in place (`=code`). Matches the status the request is heading out with — including 404 when no module claimed it. |
+| `try_files` | `try_files $uri $uri/ /fallback;` or `try_files $uri =404;` or `try_files $uri @app;` | — | Probe each candidate against `root` in order; redirect to the first that exists. `$uri` is the request target, `$uri/` appends `index`. The last entry is the fallback: a URI redirects to it, `=code` answers that status in place, `@name` redirects to a named location. |
+| `error_page` | `error_page 404 500 /50x.html;`, `error_page 503 =200;`, or `error_page 502 = @fallback;` | — | After the walk, when the outgoing status matches, redirect to the URI (methods other than GET/HEAD become GET), redirect to a named location (`@name`, method preserved), or rewrite the status in place (`=code`). Matches the status the request is heading out with — including 404 when no module claimed it. |
 
 ### Access control & real client IP
 
@@ -280,15 +280,16 @@ acme {
 location /.well-known/acme-challenge/ { acme_challenge; }
 ```
 
-Full issuance loop (`src/acme/client.zig`): on startup the server runs
-one ACME v2 exchange per configured domain — account (ES256 JWS, RFC 7638
+Full issuance + renewal (`src/acme/client.zig`): the server runs one ACME
+v2 exchange per configured domain — account (ES256 JWS, RFC 7638
 thumbprints), order, http-01 challenge publish (the `acme_challenge`
 module serves the tokens), poll, CSR finalize (`src/acme/der.zig` builds
 and signs a PKCS#10 request), certificate download — and writes the
 chain + key over `tls { cert; key; }` (restart picks them up; the loop is
-best-effort and never affects a running server). Account keys are
-generated on first use and reused from `account_key`. HTTPS transport
-verifies against `/etc/ssl/certs`.
+best-effort and never affects a running server). A detached daemon
+re-checks every 12 h and renews when the certificate is missing or has
+under 30 days left. Account keys are generated on first use and reused
+from `account_key`. HTTPS transport verifies against `/etc/ssl/certs`.
 
 ### TCP stream proxy with SNI routing
 

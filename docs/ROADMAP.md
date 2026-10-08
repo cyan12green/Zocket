@@ -399,6 +399,11 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   response-body substitution (single + `once` semantics), `proxy_redirect`
   Location rewriting, X-Accel-Redirect internal file redirect. All shipped
   2026-10.
+- D1.8 location ergonomics ✅ SHIPPED 2026-10: named locations
+  (`location @name`, excluded from path matching; reached via
+  `try_files ... @name` and `error_page 5xx = @name`, URI preserved,
+  method preserved) with a forced-route hop in the server's internal
+  redirect loop.
 - D1.7 proxy parity ✅ SHIPPED 2026-10: `proxy_pass http://host/uri/;`
   URI-tail rewriting (nginx location-prefix replacement, query preserved).
 - D1.6 protocol extras ✅ SHIPPED 2026-10: `Expect: 100-continue` answered
@@ -420,8 +425,9 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   OpenSSL-verified) — account key generated/persisted, directory/nonce,
   newAccount, newOrder, http-01 publish via the challenge module, poll,
   finalize, download, install over the configured cert/key paths.
-  Startup-triggered, best-effort, transport over HTTP/TLS (system roots).
-  Covered end-to-end by a fake-CA test. Renewal scheduling next.
+  Startup-triggered renewal daemon: re-checks every 12 h, renews inside
+  the last 30 days (or when the file is missing), best-effort, transport
+  over HTTP/TLS (system roots). Covered end-to-end by a fake-CA test.
 - D4 head-to-head: nginx + Caddy + python baseline on this machine
   (`bench/compare-servers.sh` + `modules-bench.sh`); close any gap found,
   re-run until Zocket leads every cell; update `bench/BENCH.md`.

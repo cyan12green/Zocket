@@ -45,6 +45,10 @@ pub const ModuleBinding = struct {
 /// A declared route: a target pattern plus the modules attached to each phase.
 pub const Route = struct {
     path: []const u8,
+    /// Named location (`location @name`): never part of path matching;
+    /// reachable only through internal redirects (try_files / error_page
+    /// targets). Path is empty for named routes.
+    name: ?[]const u8 = null,
     match: Match = .prefix,
     modules: []const ModuleBinding = &.{},
     /// Comptime-specialised dispatch function. Set for
@@ -297,6 +301,7 @@ pub const Route = struct {
 pub fn matchRoutes(route_list: []const Route, target: []const u8) ?*const Route {
     var best: ?*const Route = null;
     for (route_list) |*r| {
+        if (r.name != null) continue;
         switch (r.match) {
             .exact => {
                 if (std.mem.eql(u8, target, r.path)) return r;
@@ -321,6 +326,7 @@ pub fn buildRegexTable(comptime routes: []const Route) []const RegexRoute {
         var table: [128]RegexRoute = undefined;
         var n: usize = 0;
         for (routes, 0..) |*r, i| {
+            if (r.name != null) continue;
             if (r.match == .regex or r.match == .regex_ci) {
                 const re = r.pattern_regex orelse
                     @compileError("regex route '" ++ r.path ++ "' has no compiled pattern (M-D)");
@@ -629,6 +635,9 @@ fn buildCore(routes: []const Route, nodes: []TrieNode, edges: []TrieEdge) error{
     nodes[0] = .{};
 
     for (routes, 0..) |r, ri| {
+        // Named locations are not trie material: they are looked up by
+        // name only, never by path.
+        if (r.name != null) continue;
         var cur: u32 = 0;
         for (r.path) |byte| {
             const found = findEdgeInRange(edges, nodes[cur].edges_start, nodes[cur].edge_count, byte);
@@ -683,6 +692,7 @@ fn buildCore(routes: []const Route, nodes: []TrieNode, edges: []TrieEdge) error{
 pub fn comptimeCheckAmbiguous(comptime routes: []const Route) void {
     inline for (routes, 0..) |r, i| {
         inline for (routes[i + 1 ..]) |o| {
+            if (r.name != null or o.name != null) continue;
             if (std.mem.eql(u8, r.path, o.path) and r.match == o.match) {
                 @compileError("ambiguous routes: duplicate " ++ r.path ++ " (" ++
                     (if (r.match == .exact) "exact" else "prefix") ++ ")");
@@ -825,6 +835,17 @@ pub const Router = struct {
         }
         // 4. longest plain prefix.
         return best_prefix;
+    }
+
+    /// Look up a named location (`location @name`). Named locations are
+    /// excluded from path matching, so this is the only route to them.
+    pub fn matchNamed(self: *const Router, name: []const u8) ?*const Route {
+        for (self.routes) |*r| {
+            if (r.name) |n| {
+                if (std.mem.eql(u8, n, name)) return r;
+            }
+        }
+        return null;
     }
 
     pub fn deinit(self: *const Router, allocator: std.mem.Allocator) void {
@@ -1173,4 +1194,20 @@ test "template serialisation covers statuses and header lists" {
     const fb = serializeResponseTemplate(t);
     try testing.expectEqualStrings("HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nCache-Control: no-cache\r\n", fb.head);
     try testing.expectEqualStrings("", fb.body);
+}
+
+test "named locations are excluded from path matching" {
+    const rs = [_]Route{
+        .{ .path = "/", .match = .prefix },
+        .{ .path = "", .name = "@fallback", .match = .prefix },
+    };
+    // Path matching never lands on the named route (its empty path would
+    // otherwise swallow every request).
+    try testing.expectEqual(&rs[0], matchRoutes(&rs, "/anything").?);
+    const trie = buildTrie(&rs);
+    var rt = Router{ .routes = &rs, .trie = trie, .regex_routes = &.{} };
+    try testing.expectEqual(&rs[0], rt.match("/x", null).?);
+    // Named lookup is the only way in.
+    try testing.expectEqual(&rs[1], rt.matchNamed("@fallback").?);
+    try testing.expect(rt.matchNamed("@missing") == null);
 }

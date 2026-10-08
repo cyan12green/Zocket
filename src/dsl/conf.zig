@@ -306,6 +306,8 @@ const PoolStr = struct { start: usize, len: usize };
 /// A location as parsed (strings unresolved until the pools are frozen).
 const LocationSpec = struct {
     path: Str = .{ .src = "" },
+    /// `location @name`: a named location (not path-matched).
+    name: ?Str = null,
     match: Match = .prefix,
     no_regex: bool = false,
     /// Comptime-compiled NFA for .regex / .regex_ci locations (M-D).
@@ -1973,6 +1975,11 @@ fn parseLocation(lx: *Lexer, b: *Builder) void {
         spec.no_regex = true;
         const second = lx.token() orelse lx.fail("location: expected a target after '^~'");
         spec.path = second;
+    } else if (f.len > 1 and f[0] == '@') {
+        // Named location: never path-matched; reached via try_files /
+        // error_page internal redirects.
+        spec.name = first;
+        spec.match = .prefix;
     } else {
         spec.path = first;
     }
@@ -2716,6 +2723,7 @@ fn build(b: *const Builder) Config {
             const pr = proxy_table.ranges[ri];
             items[len] = .{
                 .path = resolve(spec.path, strings),
+                .name = if (spec.name) |n| resolve(n, strings) else null,
                 .match = spec.match,
                 .no_regex = spec.no_regex,
                 .pattern_regex = spec.pattern_regex,
@@ -4531,4 +4539,21 @@ test "conf: acme account_key lands on the acme config" {
         \\}
     );
     try testing.expectEqualStrings("/etc/zocket/acct.pem", cfg.acme.account_key);
+}
+
+test "conf: named location parses and is not path-matched" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        try_files $uri @app;
+        \\    }
+        \\    location @app {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 2), cfg.routes.len);
+    try testing.expect(cfg.routes[0].name == null);
+    try testing.expectEqualStrings("@app", cfg.routes[1].name.?);
+    try testing.expectEqualStrings("", cfg.routes[1].path);
 }

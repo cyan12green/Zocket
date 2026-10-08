@@ -149,6 +149,12 @@ pub const Context = struct {
     /// Ask the connection to close after the response is flushed (e.g. an
     /// error the client cannot keep alive past).
     close_after_write: bool = false,
+    /// Internal redirect to a named location (`location @name`), set by
+    /// try_files / error_page; consumed by Server.handleRequest.
+    internal_redirect_named: ?[]const u8 = null,
+    /// Route forced for the next pipeline walk (named-location redirects
+    /// bypass path matching). Consumed once by pipeline.runWithRouter.
+    force_route: ?*const Route = null,
     /// Allocator for modules that allocate response data (gzip compression).
     /// Set by the reactor; null where allocation is unsupported.
     allocator: ?std.mem.Allocator = null,

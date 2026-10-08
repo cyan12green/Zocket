@@ -274,8 +274,7 @@ pub const Server = struct {
         ctx.maps = self.cfg.maps;
         var outcome = try pipeline.runWithRouter(registry.default_registry, self.cfg.routes, &self.router, ctx);
         var hops: u8 = 0;
-        while (ctx.internal_redirect_target) |target| {
-            ctx.internal_redirect_target = null;
+        while (ctx.internal_redirect_target != null or ctx.internal_redirect_named != null) {
             hops += 1;
             // Published on the context: log-phase modules (error_page)
             // read it to keep chains short; one log line per client
@@ -285,13 +284,25 @@ pub const Server = struct {
                 // Backstop: refuse the redirect, keep the current response.
                 // nginx reports 500 here; we keep the last response, which is
                 // what a rewrite loop in a hand-written config should show.
+                ctx.internal_redirect_target = null;
+                ctx.internal_redirect_named = null;
                 break;
             }
-            // The new URI lives in the request arena: it must outlive this
-            // walk (the reactor reclaims the arena per request, not per hop).
-            const uri = ctx.req.arena.asAllocator().dupe(u8, target) catch break;
-            ctx.req.target = uri;
-            ctx.req.decoded_target = uri;
+            if (ctx.internal_redirect_target) |target| {
+                ctx.internal_redirect_target = null;
+                // The new URI lives in the request arena: it must outlive this
+                // walk (the reactor reclaims the arena per request, not per hop).
+                const uri = ctx.req.arena.asAllocator().dupe(u8, target) catch break;
+                ctx.req.target = uri;
+                ctx.req.decoded_target = uri;
+            } else {
+                // Named-location redirect: the request URI is unchanged;
+                // the forced route bypasses path matching for this hop.
+                const name = ctx.internal_redirect_named.?;
+                ctx.internal_redirect_named = null;
+                const route = self.router.matchNamed(name) orelse break;
+                ctx.force_route = route;
+            }
             // Re-resolve: the previous route's modules must not re-run
             // against the new target, and captures belong to the old match.
             ctx.route = null;
@@ -1577,4 +1588,63 @@ test "selectServerTls picks the SNI vhost, falls back to a server with creds" {
     const servers2 = [_]Server{ s1, s2, s4 };
     const group2 = ServerGroup{ .servers = &servers2, .default_idx = 0 };
     try testing.expectEqual(&servers2[2], group2.selectServerTls("v1.wild.test"));
+}
+
+test "internal redirect: try_files falls to a named location" {
+    // /missing.txt not on disk -> try_files @app -> the named location's
+    // echo module answers (the name bypasses path matching entirely).
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location / {
+        \\        root "testdata";
+        \\        try_files $uri @app;
+        \\    }
+        \\    location @app {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/missing.txt";
+    req.decoded_target = "/missing.txt";
+
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+    try testing.expectEqual(@as(u8, 1), ctx.redirect_hops);
+    // The URI is unchanged; the named route answered.
+    try testing.expectEqualStrings("/missing.txt", req.decoded_target);
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expect(ctx.route != null);
+    try testing.expectEqualStrings("@app", ctx.route.?.name.?);
+}
+
+test "named location exists but is unreachable by path" {
+    // GET @app-equivalent path never resolves to the named location: a
+    // request to /app (or anything else) falls to the / route.
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\    location @app {
+        \\        content echo;
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/must-not-hit-named";
+    req.decoded_target = "/must-not-hit-named";
+
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+    try testing.expect(ctx.route.?.name == null);
+    try testing.expectEqual(@as(u8, 0), ctx.redirect_hops);
 }

@@ -41,6 +41,12 @@ fn run(ctx: *Context) anyerror!Action {
             ctx.effective_status = code;
             return .handled;
         }
+        // `@name` fallback: internal redirect to a named location
+        // (nginx requires it last; we accept it anywhere but stop there).
+        if (cand.len > 1 and cand[0] == '@') {
+            ctx.internal_redirect_named = ctx.sharedDupe(cand) orelse return error.OutOfMemory;
+            return .pass;
+        }
         const rel = expandCandidate(ctx, cand) orelse continue;
         if (rel.len == 0) continue;
         if (fileExists(root, rel)) {
@@ -176,4 +182,18 @@ test "try_files: traversal candidates never escape the root" {
     try testing.expect(!fileExists("testdata", "../../etc/passwd"));
     try testing.expect(!fileExists("testdata", "/etc/passwd"));
     try testing.expect(fileExists("testdata", "/hello.txt"));
+}
+
+test "try_files: @name candidate redirects to the named location" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.decoded_target = "/missing";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    const cands = [_][]const u8{ "$uri", "@app" };
+    const route = registry.Route{ .path = "/", .root = "testdata", .try_files = &cands };
+    ctx.route = &route;
+    try testing.expectEqual(Action.pass, try run(&ctx));
+    try testing.expectEqualStrings("@app", ctx.internal_redirect_named.?);
+    try testing.expect(ctx.internal_redirect_target == null);
 }
