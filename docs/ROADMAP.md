@@ -399,6 +399,11 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   response-body substitution (single + `once` semantics), `proxy_redirect`
   Location rewriting, X-Accel-Redirect internal file redirect. All shipped
   2026-10.
+- D1.6 protocol extras ✅ SHIPPED 2026-10: `Expect: 100-continue` answered
+  immediately on HTTP/1.1 (plaintext + TLS) and HTTP/2 (interim :status 100
+  HEADERS), so waiting clients upload without the ~1 s continue timer;
+  upstream responses may now be arbitrarily large (arena-backed, 64 MiB
+  cap) and `Transfer-Encoding: chunked` upstream bodies are decoded.
 - D1.5 TLS parity ✅ SHIPPED 2026-10: server-scope `tls {}` blocks with
   SNI-based certificate selection at handshake time (exact > wildcard >
   default; cert-less vhost falls back to a server with creds;

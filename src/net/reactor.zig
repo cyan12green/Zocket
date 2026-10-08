@@ -814,6 +814,23 @@ pub const Reactor = struct {
         }
     }
 
+    /// Queue and flush the HTTP/1.1 interim `100 Continue` line. Tiny
+    /// (25 bytes): one immediate send; if the socket buffer is full the
+    /// OUT arm flushes it before any final response (which is queued
+    /// later, so ordering is preserved).
+    fn sendInterimContinue(self: *Reactor, fd: posix.fd_t, conn: *connection.Connection) void {
+        _ = conn.send_buf.writeSlice("HTTP/1.1 100 Continue\r\n\r\n");
+        _ = conn.send() catch {
+            self.removeConnection(fd);
+            return;
+        };
+        if (conn.send_buf.availableRead() > 0) {
+            self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
+        } else {
+            self.markWriting(fd);
+        }
+    }
+
     /// Stub-status accounting: the session moved from reading to writing
     /// (a response has been queued).
     fn markWriting(self: *Reactor, fd: posix.fd_t) void {
@@ -1046,6 +1063,12 @@ pub const Reactor = struct {
             const outcome = session.parser.parse(&conn.recv_buf, &session.req);
             switch (outcome) {
                 .incomplete => {
+                    // Expect: 100-continue — answer the interim status so
+                    // the client starts uploading instead of waiting out
+                    // its continue timer (~1 s in curl).
+                    if (session.parser.takeContinue()) {
+                        self.sendInterimContinue(fd, conn);
+                    }
                     // The buffer can hold the whole request, so an incomplete
                     // parse with a full buffer can never finish: header flood
                     // or oversized body.
@@ -2255,6 +2278,42 @@ pub const Reactor = struct {
         const outcome = session.parser.parse(plain, &session.req);
         switch (outcome) {
             .incomplete => {
+                // Expect: 100-continue over TLS: encrypt the interim line
+                // and flush it before the client uploads.
+                if (session.parser.takeContinue()) {
+                    const tc = &(session.tls orelse return);
+                    const conn = self.connections.get(fd) orelse return;
+                    tc.write("HTTP/1.1 100 Continue\r\n\r\n") catch {
+                        self.removeConnection(fd);
+                        return;
+                    };
+                    while (true) {
+                        const oslice = tc.takeOutSlice();
+                        if (oslice.len == 0) break;
+                        if (conn.send_buf.availableWrite() < oslice.len) {
+                            const grown = conn.send_buf.data.len + oslice.len;
+                            if (conn.send_buf.data.len < connection.Connection.max_recv_buffer) {
+                                conn.send_buf.grow(self.allocator, @min(connection.Connection.max_recv_buffer, grown)) catch {
+                                    self.removeConnection(fd);
+                                    return;
+                                };
+                            } else {
+                                self.removeConnection(fd);
+                                return;
+                            }
+                        }
+                        _ = conn.send_buf.writeSlice(oslice);
+                        tc.consumeOut(oslice.len);
+                    }
+                    self.flushHttp(fd);
+                    if (!self.connections.contains(fd)) return;
+                    const s = self.http_sessions.getPtr(fd) orelse return;
+                    if (s.writing) {
+                        s.out_armed = true;
+                        self.ep.modify(fd, epoll.Events.In | epoll.Events.Out | epoll.Events.EdgeTriggered, fd) catch {};
+                        return;
+                    }
+                }
                 if (plain.availableWrite() == 0) {
                     // Plaintext staging exhausted without a complete request:
                     // keep the partial parse state; more plaintext arrives on
@@ -4284,4 +4343,36 @@ test "reactor limit_rate paces file and echo bodies byte-exact" {
         try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
         try testing.expectEqualSlices(u8, &payload, buf[res.head_len..][0..res.body_len]);
     }
+}
+
+test "reactor answers Expect: 100-continue before the body arrives" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Headers only: the client is waiting for the interim status.
+    try writeAll(pair[0], "POST /up HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const n1 = try readUntil(pair[0], &buf, "HTTP/1.1 100 Continue\r\n\r\n".len, 3000);
+    try testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", buf[0..n1]);
+
+    // Now the body; the final echo response follows on the same connection.
+    try writeAll(pair[0], "hello");
+    var date_buf: [96]u8 = undefined;
+    var want_buf: [512]u8 = undefined;
+    const want = std.fmt.bufPrint(&want_buf, "HTTP/1.1 200 OK\r\n{s}Content-Length: 5\r\n\r\nhello", .{testDateLine(&date_buf)}) catch unreachable;
+    const n2 = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n2]);
 }

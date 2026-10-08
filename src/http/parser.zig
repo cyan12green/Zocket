@@ -475,6 +475,8 @@ pub const Parser = struct {
     max_line_bytes: usize = max_line_bytes,
     max_chunked_body: usize = max_chunked_body,
     body_remaining: usize = 0,
+    /// Client asked for `Expect: 100-continue` and the body is pending.
+    continue_pending: bool = false,
 
     const State = enum {
         request_line,
@@ -515,6 +517,16 @@ pub const Parser = struct {
         self.state = .request_line;
         self.line.clearRetainingCapacity();
         self.body_remaining = 0;
+        self.continue_pending = false;
+    }
+
+    /// Take the pending `Expect: 100-continue` signal (get-and-clear).
+    /// Set once per request, when the header block ends and a body is
+    /// still owed; the reactor answers with the interim 100 status.
+    pub fn takeContinue(self: *Parser) bool {
+        const v = self.continue_pending;
+        self.continue_pending = false;
+        return v;
     }
 
     fn lineErrorToOutcome(e: LineError) Outcome {
@@ -554,12 +566,21 @@ pub const Parser = struct {
                             // classic request-smuggling signal (CL.TE / TE.CL).
                             if (req.transfer_chunked and req.seen_content_length) return .bad_request;
                             finalizeKeepAlive(req);
+                            // Expect: 100-continue — the reactor sends the
+                            // interim status before the body is read (the
+                            // client waits for it before uploading).
+                            const wants_continue = if (req.header("expect")) |v|
+                                ascii.eqlIgnoreCase(std.mem.trim(u8, v, " \t"), "100-continue")
+                            else
+                                false;
                             if (req.transfer_chunked) {
+                                self.continue_pending = wants_continue;
                                 self.state = .chunk_size;
                                 self.body_remaining = 0;
                                 continue;
                             }
                             if (req.content_length > 0) {
+                                self.continue_pending = wants_continue;
                                 self.body_remaining = req.content_length;
                                 self.state = .body;
                                 continue;
@@ -1530,4 +1551,34 @@ test "version edge cases: malformed yields 501, HTTP/1.x accepted" {
         try testing.expectEqual(c.major, req.version.major);
         try testing.expectEqual(c.minor, req.version.minor);
     }
+}
+
+test "expect 100-continue sets the continue flag when a body is pending" {
+    const allocator = testing.allocator;
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    const buf = try fill(allocator, "POST /up HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 10\r\n\r\n");
+    defer buf.deinit(allocator);
+    try testing.expectEqual(Outcome.incomplete, parser.parse(buf, &req));
+    try testing.expect(parser.takeContinue());
+    try testing.expect(!parser.takeContinue()); // get-and-clear
+    buf.compact();
+    _ = buf.writeSlice("0123456789");
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+
+    // No Expect header: no interim signal (fresh request, like the reactor).
+    req.reset();
+    buf.compact();
+    _ = buf.writeSlice("POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc");
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(!parser.takeContinue());
+
+    // Expect with no body: complete immediately, no interim.
+    req.reset();
+    buf.compact();
+    _ = buf.writeSlice("GET / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n");
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(!parser.takeContinue());
 }

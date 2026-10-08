@@ -98,7 +98,10 @@ Filters (run after every outcome, reverse declaration order):
 | `proxy_send_timeout` | `proxy_send_timeout seconds;` | 1 | Upstream request-write deadline. |
 | `proxy_read_timeout` | `proxy_read_timeout seconds;` | 5 | Upstream response-read deadline (SO_RCVTIMEO; sync-driver cap). |
 
-Upstream responses may be arbitrarily large (bodies beyond the
+Requests carrying `Expect: 100-continue` get the interim
+`HTTP/1.1 100 Continue` line (or the HTTP/2 interim HEADERS frame) as soon
+as the header block arrives, so waiting clients start uploading without
+their 1 s continue timer. Upstream responses may be arbitrarily large (bodies beyond the
 embedded 16 KiB buffer are arena-backed, capped at 64 MiB) and either
 `Content-Length`-framed or `Transfer-Encoding: chunked` — chunk framing
 is decoded, extensions and trailers are consumed and dropped.

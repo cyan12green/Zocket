@@ -120,6 +120,9 @@ pub const Session = struct {
         send_window: u32 = default_window,
         end_stream_received: bool = false,
         end_stream_sent: bool = false,
+        /// Interim 100 already emitted for an `Expect: 100-continue`
+        /// upload in progress.
+        continue_sent: bool = false,
         headers: std.ArrayList(hpack.Field) = .empty,
         body: std.ArrayList(u8) = .empty,
         /// Assembled request (owned: headers copied from the arena).
@@ -449,6 +452,7 @@ pub const Session = struct {
 
         if (hdr.flag_bits & frames.flags.end_headers != 0) {
             try self.decodeAndDispatch(hdr.stream_id, block);
+            try self.maybeSendContinue(hdr.stream_id, send);
         } else {
             // Continuation expected.
             self.pending_headers_stream = hdr.stream_id;
@@ -482,6 +486,7 @@ pub const Session = struct {
             const sid = ps;
             self.pending_headers_stream = null;
             try self.decodeAndDispatch(sid, block);
+            try self.maybeSendContinue(sid, send);
             // A HEADERS frame may have carried END_STREAM before the
             // CONTINUATION completed (RFC 9113 §6.2); dispatch now.
             if (self.streams.getPtr(sid)) |st| {
@@ -575,6 +580,26 @@ pub const Session = struct {
     /// When a stream has both headers (END_HEADERS) and the full body
     /// (END_STREAM), assemble the request, run the pipeline, and frame the
     /// response.
+    /// `Expect: 100-continue` on h2: emit an interim HEADERS frame with
+    /// :status 100 as soon as the header block arrives and the body is
+    /// still pending (RFC 9113 §8.1 accepts interim responses).
+    fn maybeSendContinue(self: *Session, stream_id: u31, send: *std.ArrayList(u8)) !void {
+        const st = self.streams.getPtr(stream_id) orelse return;
+        if (st.end_stream_received or st.continue_sent) return;
+        for (st.headers.items) |f| {
+            if (std.ascii.eqlIgnoreCase(f.name, "expect")) {
+                const v = std.mem.trim(u8, f.value, " \t");
+                if (std.ascii.eqlIgnoreCase(v, "100-continue")) {
+                    st.continue_sent = true;
+                    self.block_scratch.clearRetainingCapacity();
+                    try hpack.encodeField(&self.block_scratch, self.allocator, ":status", "100");
+                    try frames.writeHeaders(send, self.allocator, stream_id, self.block_scratch.items, false, self.peer_max_frame_size);
+                    return;
+                }
+            }
+        }
+    }
+
     fn maybeRunRequest(
         self: *Session,
         stream_id: u31,
@@ -2005,4 +2030,53 @@ test "session: lookup helpers and preface emission" {
     try testing.expect(s.preface_seen);
     try testing.expect(s.settings_sent);
     try testing.expect(h2tHasFrame(send.items, .settings, 0));
+}
+
+test "session: expect 100-continue emits an interim HEADERS frame" {
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var s = Session.init(testing.allocator);
+    defer s.deinit();
+
+    // POST headers with expect: 100-continue, no END_STREAM (upload pending).
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try hpack.encodeField(&hb, testing.allocator, ":method", "POST");
+    try hpack.encodeField(&hb, testing.allocator, ":scheme", "http");
+    try hpack.encodeField(&hb, testing.allocator, ":authority", "localhost");
+    try hpack.encodeField(&hb, testing.allocator, ":path", "/up");
+    try hpack.encodeField(&hb, testing.allocator, "expect", "100-continue");
+
+    var hdr: [9]u8 = undefined;
+    var fhdr = frames.FrameHeader{ .length = @intCast(hb.items.len), .type = .headers, .flag_bits = frames.flags.end_headers, .stream_id = 1 };
+    fhdr.encode(&hdr);
+
+    var req_bytes = std.ArrayList(u8).empty;
+    defer req_bytes.deinit(testing.allocator);
+    try req_bytes.appendSlice(testing.allocator, Session.preface);
+    try req_bytes.appendSlice(testing.allocator, &hdr);
+    try req_bytes.appendSlice(testing.allocator, hb.items);
+
+    var handler = Session.Handler{
+        .server = &server_mod.Server.default(),
+        .allocator = testing.allocator,
+        .limits = &limits_mod.Limits{},
+        .date_header = "Sat, 15 Aug 2026 00:00:00 GMT",
+        .version_string = "Zocket/1.0.0",
+    };
+    _ = try s.process(req_bytes.items, &send, &handler);
+    // An interim HEADERS frame with :status 100 must be present.
+    var off: usize = 0;
+    var found100 = false;
+    while (off + 9 <= send.items.len) {
+        const fh = frames.parseHeader(send.items[off..][0..9]) orelse break;
+        const payload = send.items[off + 9 ..][0..fh.length];
+        if (fh.type == .headers and fh.stream_id == 1 and
+            std.mem.indexOf(u8, payload, "100") != null)
+        {
+            found100 = true;
+        }
+        off += 9 + fh.length;
+    }
+    try testing.expect(found100);
 }
