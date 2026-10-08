@@ -53,11 +53,16 @@ pub const Status = enum(u16) {
 
 pub const max_headers = 8;
 
+/// Response header slots (independent of the request parser cap above:
+/// Server + Date + module/proxy headers exceed 8 on real configs —
+/// 11-full.conf crashed here). Sized for nginx-style header sets.
+pub const max_resp_headers = 32;
+
 /// Maximum number of writev segments a response can emit: status line
 /// (5 parts: "HTTP/1.1 ", digits, " ", phrase, "\r\n") + 4 per header
 /// (name, ": ", value, "\r\n") + Content-Length (3: prefix, digits,
 /// "\r\n\r\n") + body.
-pub const max_writev_parts = 5 + 4 * max_headers + 3 + 1;
+pub const max_writev_parts = 5 + 4 * max_resp_headers + 3 + 1;
 
 /// digits4[i] holds the 4 ASCII digits of i (0..9999) packed so that a
 /// little-endian write of the u32 produces "dddd" in memory order:
@@ -182,7 +187,7 @@ pub fn reasonPhraseForCode(comptime code: u16) []const u8 {
 pub const Response = struct {
     status: Status,
     body: []const u8 = &.{},
-    headers: [max_headers]Header = undefined,
+    headers: [max_resp_headers]Header = undefined,
     header_count: usize = 0,
     /// True when `body` was allocated by a module (e.g. gzip) and the caller
     /// must free it after serialising.
@@ -225,7 +230,7 @@ pub const Response = struct {
     /// where the caller controls header names; the pipeline's order tests
     /// rely on append semantics, so no implicit dedup happens here.
     pub fn setHeader(self: *Response, name: []const u8, value: []const u8) void {
-        std.debug.assert(self.header_count < max_headers);
+        std.debug.assert(self.header_count < max_resp_headers);
         self.headers[self.header_count] = .{ .name = name, .value = value };
         self.header_count += 1;
     }
@@ -1011,4 +1016,23 @@ test "responses with every redirect/auth status serialize" {
         try testing.expectEqualStrings(c.want, out);
         try testing.expectEqual(out.len, resp.wireSize());
     }
+}
+
+test "response holds nginx-sized header sets past the old 8 cap" {
+    // Regression: 11-full.conf routes emit Server + Date + module/proxy
+    // headers (>8) and crashed on the assert. Fill 20 headers, serialize.
+    var resp = Response.init(.ok);
+    resp.setBody("hi");
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        resp.setHeader("X-Extra", "1");
+    }
+    resp.setHeader("Server", "Zocket/test");
+    try testing.expectEqual(@as(usize, 21), resp.header_count);
+    var storage: [4096]u8 = undefined;
+    var buf = buffer_mod.Buffer.fromSlice(&storage);
+    try resp.writeHeadToBuffer(&buf);
+    const head = buf.data[buf.read_pos..buf.write_pos];
+    try testing.expect(head.len > 0);
+    try testing.expect(std.mem.indexOf(u8, head, "X-Extra: 1\r\n") != null);
 }
