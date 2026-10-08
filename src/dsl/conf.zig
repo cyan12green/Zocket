@@ -2735,6 +2735,7 @@ fn build(b: *const Builder) Config {
                 .path = resolve(spec.path, strings),
                 .name = if (spec.name) |n| resolve(n, strings) else null,
                 .internal = spec.internal,
+                .close_without_response = spec.return_status == 444,
                 .match = spec.match,
                 .no_regex = spec.no_regex,
                 .pattern_regex = spec.pattern_regex,
@@ -4584,4 +4585,20 @@ test "conf: internal directive marks the route" {
     );
     try testing.expect(!cfg.routes[0].internal);
     try testing.expect(cfg.routes[1].internal);
+}
+
+test "conf: return 444 marks the route as close-without-response" {
+    const cfg = parse(
+        \\server {
+        \\    location /drop {
+        \\        return 444;
+        \\    }
+        \\    location / {
+        \\        return 200 "ok";
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.routes[0].close_without_response);
+    try testing.expectEqual(@as(u16, 444), cfg.routes[0].response.?.status);
+    try testing.expect(!cfg.routes[1].close_without_response);
 }

@@ -346,6 +346,8 @@ pub const Server = struct {
     pub fn matchFast(self: *const Server, ctx: *pipeline.Context) ?router_mod.FastResponse {
         var caps = router_mod.MatchCaps{ .subject = ctx.req.decoded_target };
         const route = self.router.match(ctx.req.decoded_target, &caps) orelse return null;
+        // `return 444;` writes nothing: no fast path, the reactor closes.
+        if (route.close_without_response) return null;
         if (caps.count > 0) {
             ctx.capture_subject = caps.subject;
             ctx.captures = caps.ranges;
@@ -1704,4 +1706,25 @@ test "internal locations: external 404-free fallback, internal redirect reaches"
         try testing.expectEqualStrings("/private/", ctx.route.?.path);
         try testing.expectEqual(registry.Status.ok, resp.status);
     }
+}
+
+test "return 444: pipeline yields the no-response status" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /drop {
+        \\        return 444;
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/drop";
+    req.decoded_target = "/drop";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+    try testing.expectEqual(registry.Status.no_response, resp.status);
+    // The fast path must not pre-serialise bytes for such routes.
+    try testing.expect(srv.matchFast(&ctx) == null);
 }

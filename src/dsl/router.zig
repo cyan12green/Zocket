@@ -53,6 +53,10 @@ pub const Route = struct {
     /// redirects may land on it (nginx semantics — a public location with
     /// a shorter match serves external hits instead).
     internal: bool = false,
+    /// `return 444;`: close the connection without writing a response.
+    /// The reactor checks the status, not this flag (it travels on the
+    /// response); the flag keeps the fast path off such routes.
+    close_without_response: bool = false,
     match: Match = .prefix,
     modules: []const ModuleBinding = &.{},
     /// Comptime-specialised dispatch function. Set for

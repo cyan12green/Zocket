@@ -46,7 +46,7 @@ top-level directives + `server {}` blocks holding `location {}` blocks. No
 | `host_select` | `host_select on\|off;` | on | main | Host-based vhost routing. `off` always uses first server. |
 | `location` | `location [= ~ ~* ^~] uri { ... }` | — | server | Route declaration. Modifiers: exact/regex/prefix. A `@name` target declares a **named location**: excluded from path matching entirely, reachable only via internal redirects (`try_files ... @name`, `error_page 5xx = @name`); the URI is unchanged and the method is preserved. |
 | `internal` | `internal;` | — | location | Hide this location from direct client requests: external matching skips it (a shorter public prefix serves instead, nginx semantics); only internal redirects (`try_files`/`error_page`/`X-Accel-Redirect`) can land on it. |
-| `return` | `return code [value];` | — | location | Fixed-response template (pre-serialised). |
+| `return` | `return code [value];` | — | location | Fixed-response template (pre-serialised). `return 444;` is nginx's silent drop: the connection closes with no response bytes (HTTP/1.1; over HTTP/2 the stream is closed). |
 | `root` | `root path;` | — | location | Document root for `static` module. |
 | `embed` | `embed path;` | — | location | Comptime-embedded static file. |
 | `set` | `set $name value;` | — | location | User variable (max 8 per location). |

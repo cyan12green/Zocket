@@ -1986,6 +1986,12 @@ pub const Reactor = struct {
             session.resp = http_response.Response.init(.not_found);
             session.resp.setBody(http_response.Status.not_found.reasonPhrase());
         }
+        // `return 444;` (nginx): drop the connection without writing a
+        // single response byte.
+        if (session.resp.status == .no_response) {
+            self.removeConnection(fd);
+            return false;
+        }
         const close = ctx.close_after_write or !session.req.keep_alive;
         // HTTP/1.1 defaults to keep-alive: skip the redundant header
         // (~25 bytes/response saved on the hot path).
@@ -4375,4 +4381,41 @@ test "reactor answers Expect: 100-continue before the body arrives" {
     const want = std.fmt.bufPrint(&want_buf, "HTTP/1.1 200 OK\r\n{s}Content-Length: 5\r\n\r\nhello", .{testDateLine(&date_buf)}) catch unreachable;
     const n2 = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n2]);
+}
+
+test "reactor closes the connection for return 444 without a byte" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    // A handler whose /drop route is `return 444;`.
+    const cfg = comptime runtime_server.Config.fromConfComptime(
+        \\server {
+        \\    location /drop {
+        \\        return 444;
+        \\    }
+        \\}
+    );
+    const srv = runtime_server.Server.init(cfg);
+    var r = try Reactor.initWithHandler(allocator, 0, .http, &srv);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "GET /drop HTTP/1.1\r\nHost: x\r\n\r\n");
+    // Wait for readability, then a 0-byte read: the server closed with no
+    // response bytes.
+    var pfds = [_]std.posix.pollfd{.{ .fd = pair[0], .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&pfds, 3000) catch 0;
+    try testing.expect(ready > 0);
+    var buf: [64]u8 = undefined;
+    const n = std.posix.read(pair[0], &buf) catch 0;
+    try testing.expectEqual(@as(usize, 0), n);
 }
