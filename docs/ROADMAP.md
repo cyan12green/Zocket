@@ -415,8 +415,13 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   verify reuse done; JWKS rotation still deferred),
   `proxy_next_upstream` status retry (`http_502|http_503|...`), upstream
   TLS keepalive pooling (pool keyed by host/port/tls) + parked-path TLS.
-- D3 ACME issuance loop: account→order→poll→finalize→download→install
-  background renewal on top of the shipped JWS/challenge core.
+- D3 ACME issuance loop ✅ SHIPPED 2026-10: full v2 exchange in
+  `src/acme/client.zig` + PKCS#10/CSR/PEM writer (`src/acme/der.zig`,
+  OpenSSL-verified) — account key generated/persisted, directory/nonce,
+  newAccount, newOrder, http-01 publish via the challenge module, poll,
+  finalize, download, install over the configured cert/key paths.
+  Startup-triggered, best-effort, transport over HTTP/TLS (system roots).
+  Covered end-to-end by a fake-CA test. Renewal scheduling next.
 - D4 head-to-head: nginx + Caddy + python baseline on this machine
   (`bench/compare-servers.sh` + `modules-bench.sh`); close any gap found,
   re-run until Zocket leads every cell; update `bench/BENCH.md`.

@@ -43,4 +43,6 @@ comptime {
     _ = @import("dsl/modules/sub_filter.zig");
     _ = @import("dsl/modules/accel.zig");
     _ = @import("acme/jws.zig");
+    _ = @import("acme/der.zig");
+    _ = @import("acme/client.zig");
 }

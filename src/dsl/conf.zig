@@ -641,6 +641,7 @@ const Builder = struct {
     stream_sni: ct_pool.CtPool(StreamSniSpec, 64) = .{},
     acme_dir: Str = .{ .src = "" },
     acme_contact: Str = .{ .src = "" },
+    acme_account_key: Str = .{ .src = "" },
     acme_domains: ct_pool.CtPool(Str, 8) = .{},
     tls_spec: TlsSpec = .{},
     /// Per-server TLS overrides (`tls {}` inside a server block).
@@ -2076,6 +2077,14 @@ fn parseAcme(lx: *Lexer, b: *Builder) void {
             b.cost += 8;
             continue;
         }
+        if (std.mem.eql(u8, dn, "account_key")) {
+            const v = lx.value(b, "acme account_key");
+            lx.expectTerminator("acme account_key");
+            if (v.src.len == 0) lx.fail("acme account_key: empty path");
+            b.acme_account_key = v;
+            b.cost += 8;
+            continue;
+        }
         if (std.mem.eql(u8, dn, "domain")) {
             if (b.acme_domains.len >= 8) lx.fail("too many acme domains (max 8)");
             const v = lx.value(b, "acme domain");
@@ -2986,6 +2995,7 @@ fn build(b: *const Builder) Config {
         .acme = .{
             .directory = resolve(b.acme_dir, strings),
             .contact = resolve(b.acme_contact, strings),
+            .account_key = resolve(b.acme_account_key, strings),
             .domains = domains_built.items[0..domains_built.len],
         },
         .limits = b.limits,
@@ -4505,4 +4515,20 @@ test "conf: proxy_pass URI tail lands on the route" {
     try testing.expectEqualStrings("/v1/", cfg.routes[0].proxy_pass_uri.?);
     try testing.expect(cfg.routes[1].proxy_pass_uri == null);
     try testing.expectEqual(@as(u16, 9000), cfg.routes[0].upstreams[0].port);
+}
+
+test "conf: acme account_key lands on the acme config" {
+    const cfg = parse(
+        \\acme {
+        \\    directory https://acme.example.com/directory;
+        \\    account_key /etc/zocket/acct.pem;
+        \\    domain example.com;
+        \\}
+        \\server {
+        \\    location / {
+        \\        rewrite echo;
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("/etc/zocket/acct.pem", cfg.acme.account_key);
 }

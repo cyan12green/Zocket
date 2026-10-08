@@ -273,17 +273,22 @@ The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
 acme {
     directory https://acme-v02.api.letsencrypt.org/directory;
     contact mailto:ops@example.com;
+    account_key /var/lib/zocket/acct.pem;   # optional; default: <cert>.acct.pem
     domain example.com;
     domain www.example.com;
 }
 location /.well-known/acme-challenge/ { acme_challenge; }
 ```
 
-v1 ships the stable core: ES256 JWS (`src/acme/jws.zig`: compact
-sign/verify, RFC 7638 thumbprints for keyAuthorizations) + the http-01
-challenge responder (`acme_challenge` content module, bounded 64-token
-table, 404s unknown tokens). The order/poll/finalize/download/install
-exchange loop follows (certs stay file-loaded, never `@embedFile`).
+Full issuance loop (`src/acme/client.zig`): on startup the server runs
+one ACME v2 exchange per configured domain — account (ES256 JWS, RFC 7638
+thumbprints), order, http-01 challenge publish (the `acme_challenge`
+module serves the tokens), poll, CSR finalize (`src/acme/der.zig` builds
+and signs a PKCS#10 request), certificate download — and writes the
+chain + key over `tls { cert; key; }` (restart picks them up; the loop is
+best-effort and never affects a running server). Account keys are
+generated on first use and reused from `account_key`. HTTPS transport
+verifies against `/etc/ssl/certs`.
 
 ### TCP stream proxy with SNI routing
 

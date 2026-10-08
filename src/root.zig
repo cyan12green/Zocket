@@ -6,6 +6,7 @@ pub const dispatcher = @import("net/dispatcher.zig");
 pub const eventfd = @import("net/eventfd.zig");
 pub const sockets = @import("net/sockets.zig");
 pub const stream_proxy = @import("net/stream_proxy.zig");
+pub const acme_client = @import("acme/client.zig");
 pub const ktls = @import("net/ktls.zig");
 pub const sni = @import("net/sni.zig");
 pub const buffer = @import("net/buffer.zig");
@@ -120,6 +121,8 @@ comptime {
     _ = @import("dsl/modules/sub_filter.zig");
     _ = @import("dsl/modules/accel.zig");
     _ = @import("acme/jws.zig");
+    _ = @import("acme/der.zig");
+    _ = @import("acme/client.zig");
     _ = @import("dsl/htpasswd.zig");
     _ = @import("http/arena.zig");
     _ = @import("http2/hpack.zig");

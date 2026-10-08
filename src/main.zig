@@ -379,6 +379,53 @@ fn runServer(
     }
     defer for (stream_buf[0..stream_len]) |s| s.stop();
 
+    // ACME auto-HTTPS (D3): one issuance run at startup when `acme {}` is
+    // configured. The worker is detached and best-effort — failures log
+    // and never touch the running server; a successful issuance rewrites
+    // the configured cert/key files (a restart picks them up).
+    if (embedded) |cfg| {
+        if (cfg.acme.enabled() and cfg.tls.cert.len > 0) {
+            const AcmeArgs = struct {
+                acme: @import("zocket").runtime.config.AcmeConfig,
+                cert: []const u8,
+                key: []const u8,
+                fn run(args: @This()) void {
+                    const pa = std.heap.page_allocator;
+                    var key_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                    const acct_key = if (args.acme.account_key.len > 0)
+                        args.acme.account_key
+                    else blk: {
+                        const p = std.fmt.bufPrint(&key_path_buf, "{s}.acct.pem", .{args.cert}) catch "";
+                        break :blk p;
+                    };
+                    const logFn = struct {
+                        fn log(msg: []const u8) void {
+                            std.debug.print("zocket: {s}\n", .{msg});
+                        }
+                    }.log;
+                    var transport = @import("zocket").acme_client.HttpTransport.init(pa);
+                    defer transport.deinit();
+                    @import("zocket").acme_client.runOnce(pa, .{
+                        .directory = args.acme.directory,
+                        .contact = args.acme.contact,
+                        .domains = args.acme.domains,
+                        .account_key_path = acct_key,
+                        .cert_path = args.cert,
+                        .key_path = args.key,
+                    }, &transport, logFn) catch |e| {
+                        std.debug.print("zocket: acme issuance failed: {s}\n", .{@errorName(e)});
+                    };
+                }
+            };
+            const t2 = std.Thread.spawn(.{}, AcmeArgs.run, .{AcmeArgs{
+                .acme = cfg.acme,
+                .cert = cfg.tls.cert,
+                .key = cfg.tls.key,
+            }}) catch null;
+            if (t2) |th| th.detach();
+        }
+    }
+
     // Signal handlers: SIGTERM/SIGINT graceful stop.
     zocket.multireactor.installSignalHandlers();
 

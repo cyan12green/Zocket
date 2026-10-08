@@ -44,6 +44,9 @@ pub const TlsConfig = struct {
 pub const AcmeConfig = struct {
     directory: []const u8 = "",
     contact: []const u8 = "",
+    /// PEM account key path (generated on first use when empty — main
+    /// derives `<tls.cert>.acct.pem` next to the certificate).
+    account_key: []const u8 = "",
     domains: []const []const u8 = &.{},
     pub fn enabled(self: *const AcmeConfig) bool {
         return self.directory.len > 0;
