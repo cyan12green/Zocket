@@ -374,7 +374,13 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
   CertificateRequest, so network e2e stays hand-rolled (next: curl --cert
   against a verify listener).
 - kTLS offload (attacks the ~15% TLS-over-h2c tax in `bench/BENCH.md`,
-  restores sendfile zero-copy under TLS).
+  restores sendfile zero-copy under TLS) — FOUNDATION SHIPPED 2026-10
+  (`net/ktls.zig`: linux/tls.h-exact crypto_info for AES-GCM/ChaCha,
+  cached probe, TX/RX configure with fail-closed fallback; session
+  `exportTxKeys`; `tls ktls` toggle + startup probe log). Cutover
+  (processHttpTls post-application arm via exportTxKeys→configure, then
+  sendfile) needs a kTLS kernel to validate — this machine lacks it
+  (CONFIG_TLS=m unloaded), so activation stays off by default.
 - ACME/auto-HTTPS (http-01 first; certs stay file-loaded, never
   `@embedFile`).
 

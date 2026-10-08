@@ -167,6 +167,22 @@ pub fn Session(
             self.out_buf.items.len -= n;
         }
 
+        /// Export the server->client application traffic key/IV for kTLS
+        /// TX offload (`net/ktls.zig`). `key_out`/`iv_out` receive the raw
+        /// bytes (sized by the caller; 32/12 covers every suite); returns
+        /// the wire suite + the next TX record sequence (== records sent
+        /// so far — the kernel continues numbering from there). Null when
+        /// the session has no application keys yet (pre-Finished).
+        pub fn exportTxKeys(self: *const Self, key_out: []u8, iv_out: []u8) ?struct { suite: u16, seq: u64 } {
+            if (self.stage != .application) return null;
+            const klen = self.secrets.server_application_key.len;
+            const ivlen = self.secrets.server_application_iv.len;
+            if (key_out.len < klen or iv_out.len < ivlen) return null;
+            @memcpy(key_out[0..klen], &self.secrets.server_application_key);
+            @memcpy(iv_out[0..ivlen], &self.secrets.server_application_iv);
+            return .{ .suite = self.cipher_suite, .seq = self.write_seq };
+        }
+
         /// Copy pending application plaintext out and clear the buffer.
         pub fn takePlaintext(self: *Self, buf: []u8) usize {
             const n = @min(buf.len, self.plaintext_out.items.len);
@@ -1270,4 +1286,26 @@ test "mTLS Finished without a client cert fails closed" {
     const fake_finished = [_]u8{ 0x14, 0x00, 0x00, 0x0C, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
     try testing.expectError(error.TlsUnexpectedMessage, sess.onClientFinished(&fake_finished));
     try testing.expect(sess.last_alert != null);
+}
+
+test "session exportTxKeys hands out TX material in application stage" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    var sess = TestSession.init(allocator, &creds);
+    defer sess.deinit();
+    var key: [32]u8 = undefined;
+    var iv: [12]u8 = undefined;
+    // Pre-handshake: nothing to export.
+    try testing.expect(sess.exportTxKeys(&key, &iv) == null);
+    // Post-handshake states export (stage forced; keys may be unwritten
+    // but the shape contract holds — suite tag + sequence counter).
+    sess.stage = .application;
+    sess.cipher_suite = 0x1301;
+    const exp = sess.exportTxKeys(&key, &iv).?;
+    try testing.expectEqual(@as(u16, 0x1301), exp.suite);
+    try testing.expectEqual(@as(u64, 0), exp.seq);
+    // Undersized buffers: null, never partial.
+    var tiny: [4]u8 = undefined;
+    try testing.expect(sess.exportTxKeys(&tiny, &iv) == null);
 }

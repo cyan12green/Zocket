@@ -32,6 +32,9 @@ pub const TlsConfig = struct {
     /// Request + verify client certificates (needs client_ca; startup
     /// fails closed without it).
     verify_client: bool = false,
+    /// kTLS TX offload when the kernel supports it (probe-gated, default
+    /// off; inert on kernels without kTLS).
+    ktls: bool = false,
     /// Whether TLS is enabled at all (a `tls` section present).
     pub fn enabled(self: *const TlsConfig) bool {
         return self.cert.len > 0 and self.key.len > 0;

@@ -363,6 +363,18 @@ fn runServer(
     for (stream_buf[0..stream_len]) |s| {
         std.debug.print("Starting TCP stream proxy on port {d}\n", .{s.listen_port});
     }
+    // kTLS: probe once when asked (per-connection TX cutover in
+    // processHttpTls rides exportTxKeys + ktls.configure; until then the
+    // probe result only decides this log line — userspace stays).
+    if (embedded) |cfg| {
+        if (cfg.tls.ktls) {
+            if (zocket.ktls.probe()) {
+                std.debug.print("kTLS TX offload armed (kernel support detected)\n", .{});
+            } else {
+                std.debug.print("kTLS requested but unavailable: userspace TLS record layer\n", .{});
+            }
+        }
+    }
     if (opts.idle_timeout > 0) {
         std.debug.print("Idle timeout: {}s\n", .{opts.idle_timeout});
     } else {

@@ -6,6 +6,7 @@ pub const dispatcher = @import("net/dispatcher.zig");
 pub const eventfd = @import("net/eventfd.zig");
 pub const sockets = @import("net/sockets.zig");
 pub const stream_proxy = @import("net/stream_proxy.zig");
+pub const ktls = @import("net/ktls.zig");
 pub const sni = @import("net/sni.zig");
 pub const buffer = @import("net/buffer.zig");
 pub const connection = @import("net/connection.zig");

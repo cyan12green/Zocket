@@ -86,6 +86,7 @@ const H_key = keyHash("key");
 const H_ocsp_file = keyHash("ocsp_file");
 const H_client_ca = keyHash("client_ca");
 const H_verify_client = keyHash("verify_client");
+const H_ktls = keyHash("ktls");
 const H_log_format = keyHash("log_format");
 const H_server = keyHash("server");
 const H_location = keyHash("location");
@@ -562,6 +563,7 @@ const Builder = struct {
     tls_ocsp: Str = .{ .src = "" },
     tls_client_ca: Str = .{ .src = "" },
     tls_verify_client: bool = false,
+    tls_ktls: bool = false,
     resolver_addrs: ct_pool.CtPool(Str, 3) = .{},
     tls_seen: bool = false,
     listen_port: ?u16 = null,
@@ -1117,6 +1119,10 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
                     H_verify_client => {
                         b.tls_verify_client = lx.boolOnOff("tls verify_client");
                         lx.expectTerminator("tls verify_client");
+                    },
+                    H_ktls => {
+                        b.tls_ktls = lx.boolOnOff("tls ktls");
+                        lx.expectTerminator("tls ktls");
                     },
                     else => lx.fail("unknown tls directive '" ++ dn ++ "'"),
                 }
@@ -2760,6 +2766,7 @@ fn build(b: *const Builder) Config {
             .ocsp_file = resolve(b.tls_ocsp, strings),
             .client_ca = resolve(b.tls_client_ca, strings),
             .verify_client = b.tls_verify_client,
+            .ktls = b.tls_ktls,
         },
         .listen_port = b.listen_port,
         .listen_spec = b.listen_spec,
@@ -4100,4 +4107,20 @@ test "conf: tls client_ca plus verify_client land on the TLS config" {
     );
     try testing.expectEqualStrings("clients.pem", cfg.tls.client_ca);
     try testing.expect(cfg.tls.verify_client);
+}
+
+test "conf: tls ktls toggle lands on the TLS config" {
+    const cfg = parse(
+        \\tls {
+        \\    cert "server.pem";
+        \\    key "server.key";
+        \\    ktls on;
+        \\}
+        \\server {
+        \\    location / {
+        \\        rewrite echo;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.tls.ktls);
 }
