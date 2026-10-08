@@ -32,9 +32,10 @@ See [`docs/config.md`](docs/config.md) for the full config reference.
 
 ## Benchmarks
 
-Zocket leads every measured workload — HTTP echo up to 3.8x nginx, static
-up to 2.1x, module features up to 2.0x, HTTP/2 over TLS 1.03–1.07x. Full
-methodology and tables: [`bench/BENCH.md`](bench/BENCH.md).
+Zocket leads every measured workload — HTTP echo up to 2.8x nginx, static
+up to 2.2x, module features up to 2.1x, unified cells up to 2.7x, HTTP/2
+and HTTP/1.1 over TLS 1.03–1.15x. Full methodology and tables:
+[`bench/BENCH.md`](bench/BENCH.md).
 
 ![Zocket vs nginx — HTTP/1.1](bench/graphs/readme_http.png)
 

@@ -44,7 +44,7 @@ Body sizes 1 KB / 8 KB / 64 KB × connections 10 / 100 / 1000.
 ![Matrix 8 KB](graphs/matrix_8192.png)
 ![Matrix 64 KB](graphs/matrix_65536.png)
 
-### Results table (req/s × 1000, 2026-10-08 re-run)
+### Results table (req/s × 1000, 2026-10 re-run, re-verified)
 
 Zocket vs nginx vs Caddy on this machine (actix/Bun/httpx need toolchains
 that are not installed here; `SERVERS=` selects the subset). Medians of 3
@@ -52,19 +52,22 @@ interleaved reps in both port layouts, 6 s per rep, 4 threads / 4 workers.
 
 | Body | Conns | Zocket | nginx | Caddy | vs nginx | vs Caddy |
 |---|---|---:|---:|---:|---:|---:|
-| GET / | 100 | 421.7 | 374.3 | 96.7 | 1.13x | 4.36x |
-| 1 KB | 10 | 226.1 | 146.2 | 75.4 | 1.55x | 3.00x |
-| 1 KB | 100 | 365.2 | 218.6 | 70.0 | 1.67x | 5.22x |
-| 1 KB | 1000 | 298.7 | 202.0 | 58.8 | 1.48x | 5.08x |
-| 8 KB | 10 | 137.4 | 59.2 | 32.3 | 2.32x | 4.26x |
-| 8 KB | 100 | 193.9 | 80.6 | 33.1 | 2.41x | 5.86x |
-| 8 KB | 1000 | 156.0 | 100.5 | 32.7 | 1.55x | 4.77x |
-| 64 KB | 10 | 58.1 | 20.6 | 10.5 | 2.82x | 5.52x |
-| 64 KB | 100 | 124.8 | 32.6 | 11.7 | 3.83x | 10.7x |
-| 64 KB | 1000 | 43.2 | 42.0 | 13.1 | 1.03x | 3.31x |
+| GET / | 100 | 440.0 | 385.7 | 96.9 | 1.14x | 4.54x |
+| 1 KB | 10 | 231.8 | 157.1 | 77.5 | 1.48x | 2.99x |
+| 1 KB | 100 | 379.4 | 221.4 | 70.8 | 1.71x | 5.36x |
+| 1 KB | 1000 | 307.5 | 202.6 | 60.1 | 1.52x | 5.11x |
+| 8 KB | 10 | 151.4 | 61.5 | 32.7 | 2.46x | 4.63x |
+| 8 KB | 100 | 204.2 | 80.6 | 34.0 | 2.53x | 6.00x |
+| 8 KB | 1000 | 156.2 | 101.9 | 33.5 | 1.53x | 4.67x |
+| 64 KB | 10 | 59.1 | 21.0 | 10.6 | 2.81x | 5.57x |
+| 64 KB | 100 | 44.9 | 32.9 | 11.8 | 1.37x | 3.81x |
+| 64 KB | 1000 | 43.6 | 42.1 | 13.3 | 1.04x | 3.28x |
 
-The one near-tie (64 KB @ c=1000) is a tail-latency cell: Zocket p99 27 ms
-vs nginx 202 ms — equal throughput, an order of magnitude steadier tail.
+The one near-tie (64 KB @ c=1000) is a tail-latency cell: Zocket p99 26 ms
+vs nginx 201 ms — equal throughput, an order of magnitude steadier tail.
+(An earlier 64 KB @ c=100 outlier — 124.8k — did not reproduce; the
+re-verified numbers above are internally consistent with the c=10/c=1000
+cells. This whole table was re-run after the location/trie changes.)
 
 ## Static file serving (GET, req/s)
 
@@ -75,12 +78,12 @@ to batch the HTTP head + sendfile body into one TCP segment.
 
 | File | Conns | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
-| 1 KB | 10 | 233,009 | 135,975 | 1.71x |
-| 1 KB | 100 | 380,125 | 179,204 | 2.12x |
-| 1 KB | 1000 | 317,658 | 155,049 | 2.05x |
-| 1 MB | 10 | 15,914 | 13,165 | 1.21x |
-| 1 MB | 100 | 15,885 | 12,857 | 1.24x |
-| 1 MB | 1000 | 15,563 | 12,653 | 1.23x |
+| 1 KB | 10 | 244,786 | 142,430 | 1.72x |
+| 1 KB | 100 | 392,152 | 180,957 | 2.17x |
+| 1 KB | 1000 | 321,558 | 148,694 | 2.16x |
+| 1 MB | 10 | 16,314 | 14,071 | 1.16x |
+| 1 MB | 100 | 16,001 | 13,095 | 1.22x |
+| 1 MB | 1000 | 15,677 | 12,769 | 1.23x |
 
 ## Zocket vs nginx (all cells)
 
@@ -96,11 +99,11 @@ Feature-specific comparison on module endpoints (100 conns, interleaved reps).
 
 | Cell | Zocket | nginx | Ratio |
 |---|---|---:|---:|
-| headers (3 ops/req) | 464,972 | 358,563 | 1.30x |
-| auth_basic ({SHA}) | 393,894 | 215,147 | 1.83x |
-| precompressed (.gz 8K) | 317,758 | 165,172 | 1.92x |
-| proxy_cache (HIT) | 402,369 | 197,964 | 2.03x |
-| limit_req (pass-through) | 414,925 | 356,881 | 1.16x |
+| headers (3 ops/req) | 459,233 | 396,580 | 1.16x |
+| auth_basic ({SHA}) | 394,351 | 217,094 | 1.82x |
+| precompressed (.gz 8K) | 329,123 | 168,706 | 1.95x |
+| proxy_cache (HIT) | 416,010 | 200,496 | 2.07x |
+| limit_req (pass-through) | 419,293 | 356,618 | 1.18x |
 
 ## Unified benchmark (web/file/LB)
 
@@ -112,14 +115,14 @@ or set `ENVOY_BIN=` to include them). 8 workload cells.
 
 | Cell | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
-| h1_echo | 422,412 | 214,367 | 1.97x |
-| static_small | 318,157 | 168,293 | 1.89x |
-| static_large | 21,960 | 20,551 | 1.07x |
-| precompressed | 318,692 | 167,176 | 1.91x |
-| headers_ops | 404,099 | 367,565 | 1.10x |
-| auth_basic | 396,261 | 217,861 | 1.82x |
-| cache_hit | 402,292 | 203,728 | 1.97x |
-| lb_rr | 403,032 | 147,109 | 2.74x |
+| h1_echo | 420,798 | 230,884 | 1.82x |
+| static_small | 311,590 | 168,204 | 1.85x |
+| static_large | 22,056 | 20,551 | 1.07x |
+| precompressed | 328,473 | 169,595 | 1.94x |
+| headers_ops | 398,918 | 378,942 | 1.05x |
+| auth_basic | 410,957 | 216,408 | 1.90x |
+| cache_hit | 417,176 | 202,354 | 2.06x |
+| lb_rr | 402,308 | 150,990 | 2.66x |
 
 ## HTTP/2 over TLS (h2load) — 2026-10
 
