@@ -52,11 +52,25 @@ CADDY_TEMPLATE="$ROOT/bench/foreign/caddy/Caddyfile.template"
 
 echo "== ensuring builds =="
 [ -x "$TCP_BIN" ] || (cd "$ROOT" && zig build -Doptimize=ReleaseFast)
-[ -x "$ACTIX_BIN" ] || (cd "$ROOT/bench/foreign/actix" && cargo build --release >/dev/null)
-[ -x "$BUN_BIN" ] || bash "$ROOT/bench/fetch-bun.sh"
-[ -x "$HX_BIN" ] || bash "$ROOT/bench/build-httpx.sh" >/dev/null
-[ -x "$NGINX_BIN" ] || bash "$ROOT/bench/build-nginx.sh" >/dev/null
-[ -x "$CADDY_BIN" ] || bash "$ROOT/bench/build-caddy.sh" >/dev/null
+# Optional competitors: built only when their toolchains/binaries are
+# present (cargo/bun/httpx are not on every machine). SERVERS overrides
+# the default subset.
+HAS_ACTIX=0; [ -x "$ACTIX_BIN" ] && HAS_ACTIX=1
+HAS_BUN=0; [ -x "$BUN_BIN" ] && HAS_BUN=1
+HAS_HX=0; [ -x "$HX_BIN" ] && HAS_HX=1
+HAS_NGINX=0; [ -x "$NGINX_BIN" ] || bash "$ROOT/bench/build-nginx.sh" >/dev/null
+[ -x "$NGINX_BIN" ] && HAS_NGINX=1
+HAS_CADDY=0; [ -x "$CADDY_BIN" ] || bash "$ROOT/bench/build-caddy.sh" >/dev/null
+[ -x "$CADDY_BIN" ] && HAS_CADDY=1
+SERVERS="${SERVERS:-tcp nginx caddy}"
+sel() { case " $SERVERS " in *" $1 "*) return 0 ;; esac; return 1; }
+sel tcp || { echo "SERVERS must include tcp (Zocket)"; exit 1; }
+sel actix && [ "$HAS_ACTIX" = 0 ] && { echo "actix not built -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^actix$' | tr '\n' ' ')"; }
+sel bun && [ "$HAS_BUN" = 0 ] && { echo "bun not fetched -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^bun$' | tr '\n' ' ')"; }
+sel hx && [ "$HAS_HX" = 0 ] && { echo "httpx.zig not built -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^hx$' | tr '\n' ' ')"; }
+sel nginx && [ "$HAS_NGINX" = 0 ] && { echo "nginx unavailable -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^nginx$' | tr '\n' ' ')"; }
+sel caddy && [ "$HAS_CADDY" = 0 ] && { echo "caddy unavailable -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^caddy$' | tr '\n' ' ')"; }
+echo "== servers: $SERVERS =="
 
 pkill_servers() {
     pkill -f "actix_benc[h]" 2>/dev/null || true
@@ -119,14 +133,14 @@ start_servers() {
     # $5 = nginx port, $6 = caddy port
     if [ "$STATIC_MODE" = "1" ]; then
         "$TCP_BIN" --http --port "$1" --threads 4 >/dev/null 2>&1 &
-        ACTIX_STATIC="$STATIC_FILE" "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 &
-        BUN_STATIC="$STATIC_FILE" "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 &
-        "$HX_BIN" --port "$4" --static "$STATIC_FILE" >/dev/null 2>&1 &
+        sel actix && { ACTIX_STATIC="$STATIC_FILE" "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 & }
+        sel bun && { BUN_STATIC="$STATIC_FILE" "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 & }
+        sel hx && { "$HX_BIN" --port "$4" --static "$STATIC_FILE" >/dev/null 2>&1 & }
     else
         "$TCP_BIN" --port "$1" --threads 4 >/dev/null 2>&1 &
-        "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 &
-        "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 &
-        "$HX_BIN" --port "$4" >/dev/null 2>&1 &
+        sel actix && { "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 & }
+        sel bun && { "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 & }
+        sel hx && { "$HX_BIN" --port "$4" >/dev/null 2>&1 & }
     fi
     # nginx: per-port runtime prefix (pid file) and config.
     NGINX_PREFIX="$ROOT/bench/.cache/nginx-p$5"
@@ -168,7 +182,8 @@ run_cell() {
         local pref="$1" tcp_port=$2 actix_port=$3 bun_port=$4 hx_port=$5 nginx_port=$6 caddy_port=$7
         start_servers "$tcp_port" "$actix_port" "$bun_port" "$hx_port" "$nginx_port" "$caddy_port"
 
-        for srv in "$tcp_port" "$actix_port" "$bun_port" "$hx_port" "$nginx_port" "$caddy_port"; do
+        local all_ports=("$tcp_port" "$actix_port" "$bun_port" "$hx_port" "$nginx_port" "$caddy_port")
+        for srv in "${all_ports[@]}"; do
             path="/"
             if [ "$STATIC_MODE" = "1" ]; then
                 path="/static"
@@ -180,7 +195,7 @@ run_cell() {
         done
 
         for r in $(seq 1 "$REPS"); do
-            for srv in tcp actix bun hx nginx caddy; do
+            for srv in $SERVERS; do
                 case "$srv" in
                     tcp) port="$tcp_port" ;;
                     actix) port="$actix_port" ;;
@@ -236,7 +251,7 @@ else
     mkdir -p "$RESROOT"
     body=0
     [ "$WORKLOAD" = "post" ] && body=33
-    CELLS=""
+    CELLS="cell|cell"
     run_cell "cell" "$CONNS" "$body"
 fi
 
