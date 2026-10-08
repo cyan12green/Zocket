@@ -57,6 +57,9 @@ pub const Route = struct {
     /// The reactor checks the status, not this flag (it travels on the
     /// response); the flag keeps the fast path off such routes.
     close_without_response: bool = false,
+    /// `proxy_hide_header <name>;` names: upstream response headers to
+    /// drop before the client sees them (case-insensitive).
+    proxy_hide: []const []const u8 = &.{},
     match: Match = .prefix,
     modules: []const ModuleBinding = &.{},
     /// Comptime-specialised dispatch function. Set for

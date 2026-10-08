@@ -83,6 +83,16 @@ fn park(ctx: *Context) anyerror!Action {
 /// Adopt an upstream response into the context (buffer-ownership contract:
 /// every slice copied into the request arena — reader memory dies with the
 /// transaction). Shared by the inline fast path and the reactor driver.
+/// `proxy_hide_header` lookup (case-insensitive), shared by both adopt
+/// paths.
+fn routeHidden(route: ?*const registry.Route, name: []const u8) bool {
+    const r = route orelse return false;
+    for (r.proxy_hide) |hidden| {
+        if (std.ascii.eqlIgnoreCase(hidden, name)) return true;
+    }
+    return false;
+}
+
 pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_name: []const u8, backend_idx: usize) !void {
     ctx.resp.status = @enumFromInt(res.status);
     const ws101 = isWs101(ctx, res.status);
@@ -96,7 +106,7 @@ pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_nam
             => true,
             else => false,
         };
-        if (skip) continue;
+        if (skip or routeHidden(route, h.name)) continue;
         const name_c = arena_a.dupe(u8, h.name) catch return error.OutOfMemory;
         const value_src = if (route) |r| redirectRewrite(r, h.name, h.value, arena_a) orelse h.value else h.value;
         const value_c = arena_a.dupe(u8, value_src) catch return error.OutOfMemory;
@@ -584,7 +594,7 @@ fn attemptForward(
             http_parser.header_hasher.hash("transfer-encoding") => true,
             else => false,
         };
-        if (skip) continue;
+        if (skip or routeHidden(route, h.name)) continue;
         // proxy_redirect rewrites Location/Refresh (arena-owned copy).
         if (redirectRewrite(route, h.name, h.value, ctx.req.arena.asAllocator())) |v| {
             ctx.resp.setHeader(h.name, v);
@@ -3598,4 +3608,48 @@ test "upstreamTarget rewriting rules are pure and defensive" {
     // No URI configured: identity.
     const plain = registry.Route{ .path = "/api/" };
     try testing.expectEqualStrings("/other", upstreamTarget(&ctx, &plain));
+}
+
+test "proxy_hide_header strips upstream headers before the client" {
+    const wire = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Powered-By: bench\r\nX-Keep: yes\r\n\r\nok";
+    const fake = try FakeUpstream.start(wire, 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = fake.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", fake.port).?,
+    }};
+    const hidden = [_][]const u8{ "x-powered-by", "X-Secret" };
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+        .proxy_hide = &hidden,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("ok", resp.body);
+    // Hidden (case-insensitive); everything else survives.
+    try testing.expect(respHeader(&resp, "x-powered-by") == null);
+    try testing.expect(respHderEq(respHeader(&resp, "x-keep"), "yes"));
+}
+
+fn respHeader(resp: *const registry.Response, comptime name: []const u8) ?[]const u8 {
+    for (resp.headers[0..resp.header_count]) |h| {
+        if (http_parser.header_hasher.hash(h.name) == comptime http_parser.header_hasher.hash(name)) return h.value;
+    }
+    return null;
+}
+
+fn respHderEq(v: ?[]const u8, want: []const u8) bool {
+    return v != null and std.mem.eql(u8, v.?, want);
 }

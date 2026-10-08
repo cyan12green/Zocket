@@ -165,6 +165,7 @@ const H_gunzip = keyHash("gunzip");
 const H_map = keyHash("map");
 const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
+const H_proxy_hide_header = keyHash("proxy_hide_header");
 const H_access_log = keyHash("access_log");
 const H_error_page = keyHash("error_page");
 const H_try_files = keyHash("try_files");
@@ -337,6 +338,10 @@ const LocationSpec = struct {
     return_body: ?Str = null,
     return_headers_start: usize = 0,
     return_headers_len: usize = 0,
+    /// `proxy_hide_header <name>;` entries: range into the builder's
+    /// proxy_hide pool (Str values, resolved at build).
+    proxy_hide_start: usize = 0,
+    proxy_hide_len: usize = 0,
     /// `proxy_set_header <name> "<cv>";` overrides (M-E): range into the
     /// builder's proxy-header pool.
     proxy_headers_start: usize = 0,
@@ -647,6 +652,8 @@ const Builder = struct {
     acme_contact: Str = .{ .src = "" },
     acme_account_key: Str = .{ .src = "" },
     acme_domains: ct_pool.CtPool(Str, 8) = .{},
+    /// `proxy_hide_header` names across all locations (max 256).
+    proxy_hide_pool: ct_pool.CtPool(Str, 256) = .{},
     tls_spec: TlsSpec = .{},
     /// Per-server TLS overrides (`tls {}` inside a server block).
     server_tls: [max_servers]TlsSpec = @as([max_servers]TlsSpec, @splat(TlsSpec{})),
@@ -1572,6 +1579,17 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             ensureModuleBound(b, spec, .post_read, "realip");
             b.cost += 8;
         },
+        H_proxy_hide_header => {
+            // `proxy_hide_header <name>;`: drop this upstream response
+            // header before it reaches the client (nginx parity).
+            const hname = lx.value(b, "proxy_hide_header");
+            lx.expectTerminator("proxy_hide_header");
+            if (b.proxy_hide_pool.len >= 256) lx.fail("too many proxy_hide_header entries (max 256)");
+            if (spec.proxy_hide_len == 0) spec.proxy_hide_start = b.proxy_hide_pool.len;
+            _ = b.proxy_hide_pool.create(hname);
+            spec.proxy_hide_len += 1;
+            b.cost += 4;
+        },
         H_proxy_set_header => {
             // `proxy_set_header <name> "<cv>";` (M-E): an upstream request
             // header override; the value is a complex value.
@@ -2363,6 +2381,23 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .ranges = ranges };
     };
 
+    // `proxy_hide_header` names per route (resolved into the string pool).
+    const hide_specs = b.proxy_hide_pool.freeze();
+    const HideTable = struct { items: [256][]const u8, ranges: [route_cap]Range };
+    const hide_table: HideTable = comptime blk: {
+        var items: [256][]const u8 = undefined;
+        var ranges: [route_cap]Range = undefined;
+        var pos: usize = 0;
+        for (route_specs, 0..) |spec, ri| {
+            ranges[ri] = .{ .start = pos, .len = spec.proxy_hide_len };
+            for (hide_specs[spec.proxy_hide_start..][0..spec.proxy_hide_len]) |hs| {
+                items[pos] = resolve(hs, strings);
+                pos += 1;
+            }
+        }
+        break :blk .{ .items = items, .ranges = ranges };
+    };
+
     const UpTable = struct { items: [upstream_cap]Upstream, ranges: [route_cap]Range };
     const up_table: UpTable = comptime blk: {
         var items: [upstream_cap]Upstream = undefined;
@@ -2736,6 +2771,7 @@ fn build(b: *const Builder) Config {
                 .name = if (spec.name) |n| resolve(n, strings) else null,
                 .internal = spec.internal,
                 .close_without_response = spec.return_status == 444,
+                .proxy_hide = hide_table.items[hide_table.ranges[ri].start..][0..hide_table.ranges[ri].len],
                 .match = spec.match,
                 .no_regex = spec.no_regex,
                 .pattern_regex = spec.pattern_regex,
@@ -4601,4 +4637,20 @@ test "conf: return 444 marks the route as close-without-response" {
     try testing.expect(cfg.routes[0].close_without_response);
     try testing.expectEqual(@as(u16, 444), cfg.routes[0].response.?.status);
     try testing.expect(!cfg.routes[1].close_without_response);
+}
+
+test "conf: proxy_hide_header lands on the route" {
+    const cfg = parse(
+        \\server {
+        \\    location /api {
+        \\        rewrite proxy;
+        \\        proxy_pass 127.0.0.1:9000;
+        \\        proxy_hide_header X-Powered-By;
+        \\        proxy_hide_header Server;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 2), cfg.routes[0].proxy_hide.len);
+    try testing.expectEqualStrings("X-Powered-By", cfg.routes[0].proxy_hide[0]);
+    try testing.expectEqualStrings("Server", cfg.routes[0].proxy_hide[1]);
 }

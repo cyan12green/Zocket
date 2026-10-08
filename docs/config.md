@@ -93,6 +93,7 @@ Filters (run after every outcome, reverse declaration order):
 | `upstream` | `upstream [http://\|https://]host[:port];` | — | Append backend (max 8 per route; same scheme rules as `proxy_pass`). |
 | `balance` | `balance round_robin\|least_connections\|ip_hash\|random\|consistent_hash\|least_time` | round_robin | LB strategy. |
 | `proxy_set_header` | `proxy_set_header name value;` | — | Override upstream request header. |
+| `proxy_hide_header` | `proxy_hide_header name;` | — | Drop a header from the upstream response before the client sees it (repeatable, case-insensitive; nginx parity). |
 | `max_fails` | `max_fails number;` | 3 | Failures before marking backend down. |
 | `fail_timeout` | `fail_timeout number;` | 30 | Seconds backend stays down. |
 | `proxy_connect_timeout` | `proxy_connect_timeout seconds;` | 1 | Upstream connect deadline. |

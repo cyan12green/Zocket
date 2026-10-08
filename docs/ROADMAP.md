@@ -399,6 +399,9 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   response-body substitution (single + `once` semantics), `proxy_redirect`
   Location rewriting, X-Accel-Redirect internal file redirect. All shipped
   2026-10.
+- D1.10 `proxy_hide_header` ✅ SHIPPED 2026-10: route-scoped upstream
+  response-header filtering (repeatable, case-insensitive, both adopt
+  paths).
 - D1.9 `return 444;` ✅ SHIPPED 2026-10: nginx's silent connection drop
   (no response bytes, keep-alive forced off for the route; the fast path
   declines such routes).
