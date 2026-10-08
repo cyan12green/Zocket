@@ -102,7 +102,7 @@ PYEOF
     cd "$ROOT"
 }
 
-build_cov default
+build_cov "" default
 run_traffic_default
 build_cov examples/11-full.conf full
 run_traffic_full
