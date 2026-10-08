@@ -822,9 +822,17 @@ fn markFailure(idx: usize, route: *const registry.Route, now_ns: u64) void {
 /// backend whose interval elapsed and applies rise/fall thresholds. Also
 /// called directly by tests with an injected probeFn.
 pub fn runHealthChecksOnce(now_ns: u64) void {
-    hc_mutex.lock();
-    const snapshot = hc_routes.items;
-    hc_mutex.unlock();
+    // Copy the route list under lock (page-allocator, freed after the
+    // sweep): unregistration mutates the shared list, so iterating it
+    // directly races. Entries are borrowed route pointers (static in
+    // production; tests unregister theirs in testResetRoute).
+    const snapshot = blk: {
+        hc_mutex.lock();
+        defer hc_mutex.unlock();
+        // OOM: skip the sweep (next 250 ms tick retries).
+        break :blk std.heap.page_allocator.dupe(*const registry.Route, hc_routes.items) catch return;
+    };
+    defer std.heap.page_allocator.free(snapshot);
     for (snapshot) |route| {
         const path = route.health_check_path orelse continue;
         const timeout: u32 = if (route.health_check_timeout_s != 0) route.health_check_timeout_s else 1;
@@ -875,6 +883,21 @@ fn registerHealthRoute(route: *const registry.Route) bool {
     return true;
 }
 
+/// Drop a route from periodic checking (test isolation: stack routes
+/// must never outlive the test — the detached prober would otherwise keep
+/// dereferencing them every 250 ms). Production routes are static and
+/// never unregistered, so the prober thread never exits there.
+fn unregisterHealthRoute(route: *const registry.Route) void {
+    hc_mutex.lock();
+    defer hc_mutex.unlock();
+    for (hc_routes.items, 0..) |r, i| {
+        if (r == route) {
+            _ = hc_routes.swapRemove(i);
+            return;
+        }
+    }
+}
+
 fn ensureHealthChecker(route: *const registry.Route) void {
     if (!registerHealthRoute(route)) {
         // Already registered (or not health-checked): thread is running.
@@ -898,6 +921,13 @@ var epoch_zero: compat.Instant = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
 
 fn healthThread() void {
     while (true) {
+        hc_mutex.lock();
+        const empty = hc_routes.items.len == 0;
+        if (empty) hc_thread_started = false;
+        hc_mutex.unlock();
+        // Idle exit: no routes left (tests unregistered theirs) — a later
+        // ensureHealthChecker restarts the prober on demand.
+        if (empty) return;
         const t = compat.Instant.now() catch {
             compat.nanosleep(1, 0);
             continue;
@@ -2077,6 +2107,7 @@ fn drainPool(idx: usize) void {
 /// process-wide zones, and stack-allocated test routes alias addresses
 /// across tests — call this at the start of any test that forwards.
 pub fn testResetRoute(route: *const registry.Route) void {
+    unregisterHealthRoute(route);
     health_zone.mutex.lock();
     defer health_zone.mutex.unlock();
     for (0..max_backends) |i| {
@@ -2747,4 +2778,23 @@ test "proxy non-101 still strips connection headers" {
     for (resp.headers[0..resp.header_count]) |h| {
         try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "connection"));
     }
+}
+
+test "health unregister drops routes so the prober never touches them" {
+    const route = registry.Route{
+        .path = "/hc-gone",
+        .health_check_path = "/hz",
+        .health_check_interval_s = 1000000,
+        .upstreams = &hc_test_upstreams,
+    };
+    _ = registerHealthRoute(&route);
+    unregisterHealthRoute(&route);
+    unregisterHealthRoute(&route); // idempotent
+    hc_mutex.lock();
+    var found = false;
+    for (hc_routes.items) |r| {
+        if (r == &route) found = true;
+    }
+    hc_mutex.unlock();
+    try testing.expect(!found);
 }
