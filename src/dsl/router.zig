@@ -101,6 +101,10 @@ pub const Route = struct {
     /// failures. Sync forward path only (the parked/async path marks the
     /// failure and answers 502 as before).
     proxy_next_upstream: bool = false,
+    /// Status retry mask (`proxy_next_upstream error timeout http_502
+    /// http_503 http_504;`): bit0 = transport (error/timeout), bit1 = 502,
+    /// bit2 = 503, bit3 = 504. Bare `on` = bit0 only.
+    proxy_next_upstream_mask: u8 = 0,
     /// WebSocket passthrough (`proxy_ws on`): forward `Connection: Upgrade`
     /// + `Upgrade` to the backend and relay a 101 back (headers preserved).
     /// v1 covers the handshake only; post-101 duplex byte-pipe rides the

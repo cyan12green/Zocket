@@ -418,8 +418,18 @@ fn stickyBackendFromCookie(
 /// error or timeout) retries each remaining usable backend once, in index
 /// order, instead of answering 502 immediately. A failover onto a
 /// different backend re-offers the sticky tag (the client's pinned backend
-/// just proved dead). HTTP error statuses from a live backend are final —
-/// only transport failures retry.
+/// just proved dead). Statuses in the `proxy_next_upstream` mask (502/503/
+/// 504) retry the same way; anything else from a live backend is final.
+fn statusRetryable(route: *const registry.Route, status: registry.Status) bool {
+    const mask = route.proxy_next_upstream_mask;
+    if (mask == 0) return false;
+    const code: u16 = @intFromEnum(status);
+    if (code == 502) return mask & 0x02 != 0;
+    if (code == 503) return mask & 0x04 != 0;
+    if (code == 504) return mask & 0x08 != 0;
+    return false;
+}
+
 fn forward(
     ctx: *Context,
     route: *const registry.Route,
@@ -437,19 +447,32 @@ fn forward(
         _ = attemptForward(ctx, route, upstreams, pick, started_ns, offer_sticky or failed_over) catch |e| {
             if (e != error.UpstreamTransport or !route.proxy_next_upstream) return badGateway(ctx);
             failed_over = true;
-            var advanced = false;
-            for (0..upstreams.len) |i| {
-                if (tried & (@as(u64, 1) << @intCast(i)) != 0) continue;
-                if (!backendUsable(route, i, nowNs())) continue;
-                pick = i;
-                advanced = true;
-                break;
-            }
-            if (!advanced) return badGateway(ctx);
+            if (!advanceBackend(route, upstreams, &tried, &pick)) return badGateway(ctx);
             continue;
         };
+        // Status retry: a masked 502/503/504 counts as a backend failure
+        // (marked, for LB health) and moves on; exhaustion keeps the last
+        // response instead of replacing it with a 502.
+        if (route.proxy_next_upstream and statusRetryable(route, ctx.resp.status)) {
+            markFailure(pick, route, started_ns);
+            failed_over = true;
+            if (!advanceBackend(route, upstreams, &tried, &pick)) return .handled;
+            continue;
+        }
         return .handled;
     }
+}
+
+/// Pick the next untried usable backend into `pick` (marking it tried).
+/// False when every backend is tried or unusable.
+fn advanceBackend(route: *const registry.Route, upstreams: []const router.Upstream, tried: *u64, pick: *usize) bool {
+    for (0..upstreams.len) |i| {
+        if (tried.* & (@as(u64, 1) << @intCast(i)) != 0) continue;
+        if (!backendUsable(route, i, nowNs())) continue;
+        pick.* = i;
+        return true;
+    }
+    return false;
 }
 
 /// Rewrite an upstream redirect target per `proxy_redirect <from> <to>;`:
@@ -2878,4 +2901,72 @@ test "proxy_redirect 302 round-trips rewritten through a fake origin" {
         if (std.ascii.eqlIgnoreCase(h.name, "location")) loc = h.value;
     }
     try testing.expectEqualStrings("https://example.com/login", loc.?);
+}
+
+test "proxy_next_upstream status mask retries 502 onto the next backend" {
+    const bad = try FakeUpstream.start("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 3\r\n\r\nbad", 4);
+    defer bad.stop();
+    const good = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 4);
+    defer good.stop();
+    var ups = [_]router.Upstream{
+        .{ .host = "127.0.0.1", .port = bad.port, .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", bad.port).? },
+        .{ .host = "127.0.0.1", .port = good.port, .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", good.port).? },
+    };
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_next_upstream = true,
+        .proxy_next_upstream_mask = 0x01 | 0x02,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("ok", resp.body);
+}
+
+test "proxy_next_upstream keeps the last response when backends exhaust" {
+    const bad = try FakeUpstream.start("HTTP/1.1 503 Busy\r\nContent-Length: 3\r\n\r\nbad", 4);
+    defer bad.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = bad.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", bad.port).?,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_next_upstream = true,
+        .proxy_next_upstream_mask = 0x01 | 0x04,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    // No backend left: the live 503 stands (not replaced by a 502).
+    try testing.expectEqual(registry.Status.service_unavailable, resp.status);
+}
+
+test "statusRetryable matches only masked codes" {
+    const r = registry.Route{ .path = "/", .proxy_next_upstream = true, .proxy_next_upstream_mask = 0x02 };
+    try testing.expect(statusRetryable(&r, .bad_gateway));
+    try testing.expect(!statusRetryable(&r, .service_unavailable));
+    try testing.expect(!statusRetryable(&r, .ok));
+    const off = registry.Route{ .path = "/" };
+    try testing.expect(!statusRetryable(&off, .bad_gateway));
 }

@@ -408,6 +408,7 @@ const LocationSpec = struct {
     /// `proxy_next_upstream on|off;` — retry transport failures on the next
     /// backend (default off: retries re-send the request body).
     proxy_next_upstream: bool = false,
+    proxy_next_upstream_mask: u8 = 0,
     /// `proxy_keepalive N;` / `proxy_keepalive_timeout S;` (0 = default).
     proxy_keepalive_max: u32 = 0,
     proxy_keepalive_timeout: u32 = 0,
@@ -1443,8 +1444,35 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             lx.expectTerminator("proxy_read_timeout");
         },
         H_proxy_next_upstream => {
-            spec.proxy_next_upstream = lx.boolOnOff("proxy_next_upstream");
+            // `on|off` (transport-only) or a condition list:
+            // `error timeout http_502 http_503 http_504`.
+            var mask: u8 = 0;
+            var any = false;
+            while (true) {
+                lx.skipWs();
+                if (lx.pos < lx.src.len and lx.src[lx.pos] == ';') break;
+                const t = lx.token() orelse lx.fail("proxy_next_upstream: expected a condition");
+                const s = t.srcOf("proxy_next_upstream: condition cannot contain escapes");
+                any = true;
+                if (std.mem.eql(u8, s, "on")) {
+                    mask |= 0x01;
+                } else if (std.mem.eql(u8, s, "off")) {
+                    mask = 0;
+                } else if (std.mem.eql(u8, s, "error") or std.mem.eql(u8, s, "timeout")) {
+                    mask |= 0x01;
+                } else if (std.mem.eql(u8, s, "http_502")) {
+                    mask |= 0x02;
+                } else if (std.mem.eql(u8, s, "http_503")) {
+                    mask |= 0x04;
+                } else if (std.mem.eql(u8, s, "http_504")) {
+                    mask |= 0x08;
+                } else lx.fail("proxy_next_upstream: expected on|off|error|timeout|http_502|http_503|http_504");
+            }
+            if (!any) lx.fail("proxy_next_upstream: expected a value");
             lx.expectTerminator("proxy_next_upstream");
+            spec.proxy_next_upstream_mask = mask;
+            spec.proxy_next_upstream = mask != 0;
+            b.cost += 8;
         },
         H_proxy_keepalive => {
             spec.proxy_keepalive_max = lx.number("proxy_keepalive", u32);
@@ -2711,6 +2739,7 @@ fn build(b: *const Builder) Config {
                 .proxy_send_timeout_s = spec.proxy_send_timeout,
                 .proxy_read_timeout_s = spec.proxy_read_timeout,
                 .proxy_next_upstream = spec.proxy_next_upstream,
+                .proxy_next_upstream_mask = spec.proxy_next_upstream_mask,
                 .proxy_keepalive_max = spec.proxy_keepalive_max,
                 .proxy_keepalive_timeout_s = spec.proxy_keepalive_timeout,
                 .proxy_ssl_verify = spec.proxy_ssl_verify,
@@ -4360,4 +4389,18 @@ test "conf: auth_jwt_key_file binds the jwt module" {
     );
     try testing.expectEqualStrings("keys/jwt.pem", cfg.routes[0].auth_jwt_key_file.?);
     try testing.expectEqual(@as(u32, 30), cfg.routes[0].auth_jwt_leeway_s);
+}
+
+test "conf: proxy_next_upstream accepts condition lists" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite proxy;
+        \\        proxy_pass 127.0.0.1:9000;
+        \\        proxy_next_upstream error timeout http_502 http_503;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.routes[0].proxy_next_upstream);
+    try testing.expectEqual(@as(u8, 0x01 | 0x02 | 0x04), cfg.routes[0].proxy_next_upstream_mask);
 }
