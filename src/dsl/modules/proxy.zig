@@ -68,11 +68,15 @@ fn park(ctx: *Context) anyerror!Action {
 
     const now_ns = nowNs();
     if (route.sticky_cookie) |name| {
-        if (stickyBackendFromCookie(ctx, name, upstreams, route, now_ns)) |idx|
+        if (stickyBackendFromCookie(ctx, name, upstreams, route, now_ns)) |idx| {
+            // TLS upstreams run the sync driver (no parked path in v1).
+            if (upstreams[idx].tls) return forward(ctx, route, upstreams, idx, now_ns, false);
             return parkAt(ctx, route, upstreams, idx, now_ns, false);
+        }
     }
     const pick = try pickBackend(route, upstreams, ctx, now_ns) orelse
         return badGateway(ctx);
+    if (upstreams[pick].tls) return forward(ctx, route, upstreams, pick, now_ns, route.sticky_cookie != null);
     return parkAt(ctx, route, upstreams, pick, now_ns, route.sticky_cookie != null);
 }
 
@@ -457,6 +461,10 @@ fn attemptForward(
     offer_sticky: bool,
 ) anyerror!Action {
     const up = &upstreams[pick];
+    // TLS upstreams skip the pool (single-use sessions — the Client state
+    // cannot be reattached to a bare fd) and the parked path (sync driver
+    // only in v1); handshake + record I/O run inline here.
+    if (up.tls) return attemptForwardTls(ctx, route, upstreams, pick, started_ns, offer_sticky);
     var fd = acquirePooled(pick, started_ns, keepaliveIdleNs(route));
     if (fd < 0) {
         fd = connectUpstream(up, connectTimeoutMs(route)) catch {
@@ -527,6 +535,141 @@ fn attemptForward(
         }
     }
     return .handled;
+}
+
+/// TLS variant of one forward attempt: fresh TCP connect, handshake,
+/// record-layer send/read, then close (single-use — no pooling, no parked
+/// path in v1). Returns .handled on success; error.UpstreamTransport feeds
+/// the next_upstream retry loop exactly like plaintext transport failures.
+fn attemptForwardTls(
+    ctx: *Context,
+    route: *const registry.Route,
+    upstreams: []const router.Upstream,
+    pick: usize,
+    started_ns: u64,
+    offer_sticky: bool,
+) anyerror!Action {
+    ensureHealthChecker(route);
+    const up = &upstreams[pick];
+    const fail = struct {
+        fn call(p: usize, r: *const registry.Route, start: u64, fd: posix_fd) anyerror!Action {
+            if (fd >= 0) posix_close(fd);
+            active[p] -|= 1;
+            markFailure(p, r, start);
+            return error.UpstreamTransport;
+        }
+    }.call;
+
+    const fd = connectUpstream(up, connectTimeoutMs(route)) catch {
+        return fail(pick, route, started_ns, -1);
+    };
+    var bufs = tlsBuffers(ctx) orelse {
+        return fail(pick, route, started_ns, fd);
+    };
+    var sock: TlsUpstream = undefined;
+    tlsHandshake(fd, route, up, &bufs, &sock) catch {
+        return fail(pick, route, started_ns, fd);
+    };
+
+    // Record-layer send (poll-bounded writer iface; flush pushes the
+    // client buffer into the socket buffer, then onto the wire).
+    const req = buildUpstreamRequest(ctx, up) catch {
+        return fail(pick, route, started_ns, fd);
+    };
+    sock.client.writer.writeAll(req) catch {
+        return fail(pick, route, started_ns, fd);
+    };
+    sock.client.writer.flush() catch {
+        return fail(pick, route, started_ns, fd);
+    };
+    sock.writer_iface.flush() catch {
+        return fail(pick, route, started_ns, fd);
+    };
+
+    // Record-layer read through the same parse state machine.
+    var reader = UpstreamReader.init();
+    const read_result: ?UpstreamReader.Parsed = while (true) {
+        const res = reader.tryParse() catch |e| switch (e) {
+            error.Incomplete => {
+                const n = tlsFill(&reader, &sock) catch break null;
+                if (n == 0) break null; // clean close_notify EOF
+                continue;
+            },
+            else => break null,
+        };
+        break res;
+    };
+    if (read_result == null) {
+        return fail(pick, route, started_ns, fd);
+    }
+
+    // Success: same bookkeeping as the plaintext path, minus pooling.
+    if (healthSlot(route, pick)) |slot| {
+        slot.fails.store(0, .monotonic);
+        slot.last_fail_ns.store(0, .monotonic);
+    }
+    active[pick] -|= 1;
+    const elapsed = nowNs() -% started_ns;
+    ewma_ns[pick] = if (ewma_ns[pick] == 0)
+        elapsed
+    else
+        ewma_ns[pick] - (ewma_ns[pick] >> 3) + (elapsed >> 3);
+
+    const r = read_result.?;
+    ctx.resp.status = @enumFromInt(r.status);
+    for (r.headers) |h| {
+        const skip = switch (http_parser.header_hasher.hash(h.name)) {
+            http_parser.header_hasher.hash("connection") => true,
+            http_parser.header_hasher.hash("content-length") => true,
+            http_parser.header_hasher.hash("transfer-encoding") => true,
+            else => false,
+        };
+        if (skip) continue;
+        const arena_a = ctx.req.arena.asAllocator();
+        const name_c = arena_a.dupe(u8, h.name) catch {
+            sock.client.end() catch {};
+            sock.writer_iface.flush() catch {};
+            return fail(pick, route, started_ns, fd);
+        };
+        const value_c = arena_a.dupe(u8, h.value) catch {
+            sock.client.end() catch {};
+            sock.writer_iface.flush() catch {};
+            return fail(pick, route, started_ns, fd);
+        };
+        ctx.resp.setHeader(name_c, value_c);
+    }
+    const body = ctx.sharedDupe(r.body) orelse {
+        sock.client.end() catch {};
+        sock.writer_iface.flush() catch {};
+        return fail(pick, route, started_ns, fd);
+    };
+    ctx.resp.body = body;
+    if (offer_sticky) {
+        if (ctx.route.?.sticky_cookie) |name| {
+            var tag_buf: [32]u8 = undefined;
+            const tag = std.fmt.bufPrint(&tag_buf, "{s}=s{d}; Path=/", .{ name, pick }) catch "";
+            if (tag.len > 0) ctx.resp.setHeader("Set-Cookie", tag);
+        }
+    }
+    // Single-use: close_notify (best-effort) then close, never pooled.
+    sock.client.end() catch {};
+    sock.writer_iface.flush() catch {};
+    posix_close(fd);
+    return .handled;
+}
+
+/// Fill an UpstreamReader buffer from a TLS session. Clean EOF
+/// (close_notify) reads as 0 — the caller maps it to UpstreamClosed,
+/// mirroring the plaintext path.
+fn tlsFill(reader: *UpstreamReader, sock: *TlsUpstream) !usize {
+    if (reader.used == reader.buf.len) return error.UpstreamBufferFull;
+    // readSliceShort returns 0 on clean EOF (close_notify) — the caller
+    // maps it to UpstreamClosed, mirroring the plaintext path.
+    const n = sock.client.reader.readSliceShort(reader.buf[reader.used..]) catch {
+        return error.UpstreamTransport;
+    };
+    reader.used += n;
+    return n;
 }
 
 fn badGateway(ctx: *Context) Action {
@@ -1262,6 +1405,272 @@ pub const UpstreamReader = struct {
     }
 };
 
+/// ---- upstream TLS (C3) ----
+
+const tls_client = std.crypto.tls.Client;
+const Certificate = std.crypto.Certificate;
+
+/// Shared single-threaded Io for upstream TLS handshakes and record I/O.
+/// No worker threads (blocking syscalls inline); safe to share across
+/// reactor threads — each operation is self-contained on its own fd.
+fn tlsIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// Process-wide CA bundle cache keyed by file path (loaded once each;
+/// DER bytes live forever — same convention as server credentials).
+const max_bundles = 4;
+var bundle_mutex = compat.Mutex{};
+var bundle_paths: [max_bundles][]const u8 = @as([max_bundles][]const u8, @splat(@as([]const u8, "")));
+var bundle_slots: [max_bundles]Certificate.Bundle = @as([max_bundles]Certificate.Bundle, @splat(Certificate.Bundle.empty));
+var bundle_filled: usize = 0;
+var bundle_lock = std.Io.RwLock.init;
+
+/// Load (or reuse) the PEM bundle at `path`. Returns null when the file
+/// is missing or unparsable — the caller fails the handshake loudly
+/// instead of silently running unverified.
+fn trustedBundle(path: []const u8) ?*Certificate.Bundle {
+    bundle_mutex.lock();
+    defer bundle_mutex.unlock();
+    for (bundle_paths[0..bundle_filled], 0..) |p, i| {
+        if (std.mem.eql(u8, p, path)) return &bundle_slots[i];
+    }
+    if (bundle_filled >= max_bundles) return null;
+    const io = tlsIo();
+    const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return null;
+    const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
+    var bundle = Certificate.Bundle.empty;
+    // Absolute paths (the normal case: /etc/ssl/certs/...) open directly;
+    // relative paths resolve from the process cwd.
+    if (std.fs.path.isAbsolute(path)) {
+        bundle.addCertsFromFilePathAbsolute(std.heap.page_allocator, io, now, path) catch return null;
+    } else {
+        bundle.addCertsFromFilePath(std.heap.page_allocator, io, now, .cwd(), path) catch return null;
+    }
+    bundle_paths[bundle_filled] = path;
+    bundle_slots[bundle_filled] = bundle;
+    bundle_filled += 1;
+    return &bundle_slots[bundle_filled - 1];
+}
+
+/// SNI + verification hostname for an upstream: explicit override, else
+/// the DNS hostname, else (literals) null — literals verify only with an
+/// explicit name. Pure (unit-tested).
+fn tlsServerName(route: *const registry.Route, up: *const router.Upstream) ?[]const u8 {
+    if (route.proxy_ssl_name) |n| return n;
+    if (up.hostname) |h| return h;
+    return null;
+}
+
+/// One live upstream TLS session (single-use: closed, not pooled, after
+/// the response — see attemptForward). Buffers are request-arena owned;
+/// the whole struct lives on the attempt's stack frame.
+const TlsUpstream = struct {
+    fd: posix_fd,
+    read_ms: i32,
+    write_ms: i32,
+    reader_iface: std.Io.Reader,
+    writer_iface: std.Io.Writer,
+    client: tls_client,
+};
+
+/// Poll-bounded socket Reader/Writer for the TLS record layer. The std
+/// client needs blocking-ish semantics, but SO_RCVTIMEO expiry surfaces as
+/// EAGAIN — which std treats as a programmer-bug panic, not a catchable
+/// timeout. So the fd stays NONBLOCK and every op polls first (timeout →
+/// ReadFailed/WriteFailed → UpstreamTransport → 502/failover, never a
+/// panic, never an unbounded block).
+const tls_reader_vtable = std.Io.Reader.VTable{ .stream = tlsStream };
+const tls_writer_vtable = std.Io.Writer.VTable{ .drain = tlsDrain };
+
+fn tlsStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    const s: *TlsUpstream = @fieldParentPtr("reader_iface", r);
+    var pfds = [_]std.posix.pollfd{.{ .fd = s.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&pfds, s.read_ms) catch {
+        return error.ReadFailed;
+    };
+    if (ready == 0) {
+        return error.ReadFailed; // timeout
+    }
+    const dest = limit.slice(w.writableSliceGreedy(1) catch return error.WriteFailed);
+    var data: [1][]u8 = .{dest};
+    // Clean EOF (close_notify-less FIN included) MUST surface as
+    // EndOfStream, not ReadFailed: the record layer turns it into
+    // "return what we have" (or Truncated under strict mode). Mapping it
+    // to ReadFailed discards already-decrypted bytes.
+    const n = tlsRawRead(s, &data) catch |e| switch (e) {
+        error.Eof => return error.EndOfStream,
+        else => return error.ReadFailed,
+    };
+    w.advance(n);
+    return n;
+}
+
+fn tlsRawRead(s: *TlsUpstream, data: [][]u8) !usize {
+    var total: usize = 0;
+    for (data) |buf| {
+        if (buf.len == 0) continue;
+        const rc = linux.read(s.fd, buf.ptr, buf.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                if (n == 0) {
+                    if (total > 0) return total;
+                    return error.Eof;
+                }
+                total += n;
+                if (n < buf.len) return total; // short read: more later
+            },
+            .INTR => continue, // signal: retry the slice once via loop
+            else => return error.ReadFailed,
+        }
+    }
+    return total;
+}
+
+fn tlsDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    const s: *TlsUpstream = @fieldParentPtr("writer_iface", w);
+    // Buffered bytes first, then the slices (splat repeats the last).
+    var consumed: usize = 0;
+    if (w.end > 0) {
+        const n = tlsRawWrite(s, w.buffer[0..w.end]) catch return error.WriteFailed;
+        w.end -= n;
+        if (n > 0 and w.end > 0) {
+            // Shift the remainder down (partial write progress).
+            std.mem.copyForwards(u8, w.buffer[0..w.end], w.buffer[n .. n + w.end]);
+        }
+        if (w.end > 0) return consumed;
+    }
+    for (data, 0..) |slice, i| {
+        const reps: usize = if (i + 1 == data.len) @max(splat, 1) else 1;
+        var r: usize = 0;
+        while (r < reps) : (r += 1) {
+            const n = tlsRawWrite(s, slice) catch {
+                if (consumed > 0 or r > 0) return consumed;
+                return error.WriteFailed;
+            };
+            consumed += n;
+            if (n < slice.len) return consumed;
+        }
+    }
+    return consumed;
+}
+
+fn tlsRawWrite(s: *TlsUpstream, bytes: []const u8) !usize {
+    if (bytes.len == 0) return 0;
+    var pfds = [_]std.posix.pollfd{.{ .fd = s.fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+    const ready = std.posix.poll(&pfds, s.write_ms) catch return error.WriteFailed;
+    if (ready == 0) return error.WriteFailed; // timeout
+    var total: usize = 0;
+    var rest = bytes;
+    while (rest.len > 0) {
+        const rc = linux.write(s.fd, rest.ptr, rest.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                total += n;
+                rest = rest[n..];
+            },
+            .INTR => continue,
+            else => {
+                if (total > 0) return total;
+                return error.WriteFailed;
+            },
+        }
+    }
+    return total;
+}
+
+/// Handshake a connected fd as a TLS client. Errors (alert, bad cert,
+/// timeout) surface for the caller to map to UpstreamTransport.
+fn tlsHandshake(
+    fd: posix_fd,
+    route: *const registry.Route,
+    up: *const router.Upstream,
+    bufs: *TlsBuffers,
+    sock: *TlsUpstream,
+) anyerror!void {
+    sock.* = .{
+        .fd = fd,
+        .read_ms = @intCast(readTimeoutS(route) * 1000),
+        .write_ms = sendTimeoutMs(route),
+        .reader_iface = .{
+            .vtable = &tls_reader_vtable,
+            .buffer = bufs.io_read[0..],
+            .seek = 0,
+            .end = 0,
+        },
+        .writer_iface = .{
+            .vtable = &tls_writer_vtable,
+            .buffer = bufs.io_write[0..],
+            .end = 0,
+        },
+        .client = undefined,
+    };
+    const io = tlsIo();
+    var entropy: [tls_client.Options.entropy_len]u8 = undefined;
+    compat.randomBytes(&entropy);
+    // Real wall clock: certificate expiry/host verification needs true
+    // time (verify-off handshakes don't care, but always pass it).
+    const ts: std.posix.timespec = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch .{ .sec = 0, .nsec = 0 };
+    const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
+    const sni = tlsServerName(route, up);
+    const HostOpt = @FieldType(tls_client.Options, "host");
+    const CaOpt = @FieldType(tls_client.Options, "ca");
+    const host_opt: HostOpt = if (sni) |n| .{ .explicit = n } else .no_verification;
+    const ca_opt: CaOpt = if (route.proxy_ssl_verify) blk: {
+        const name = sni orelse return error.TlsNoVerifyName;
+        _ = name;
+        const bundle = trustedBundle(route.proxy_ssl_trusted_certificate orelse return error.TlsNoBundle) orelse
+            return error.TlsBadBundle;
+        break :blk .{ .bundle = .{
+            .gpa = std.heap.page_allocator,
+            .io = io,
+            .lock = &bundle_lock,
+            .bundle = bundle,
+        } };
+    } else .no_verification;
+    sock.client = tls_client.init(&sock.reader_iface, &sock.writer_iface, .{
+        .host = host_opt,
+        .ca = ca_opt,
+        .write_buffer = bufs.tls_write[0..],
+        .read_buffer = bufs.tls_read[0..],
+        .entropy = &entropy,
+        .realtime_now = now,
+        // Origins that close without close_notify (python http.server, our
+        // own test origin, many embedded servers) would 502 every response
+        // under strict truncation checking. Safe here: UpstreamReader
+        // demands exact Content-Length bytes (a short body ends as
+        // UpstreamClosed → 502), so truncation fails closed at the HTTP
+        // layer instead of corrupting silently.
+        .allow_truncation_attacks = true,
+    }) catch {
+        std.log.info("upstream TLS handshake failed", .{});
+        return error.UpstreamTransport;
+    };
+}
+
+/// Allocate handshake scratch from the request arena (single-use session:
+/// freed with the request — no pooling, no free path).
+fn tlsBuffers(ctx: *Context) ?TlsBuffers {
+    const a = ctx.req.arena.asAllocator();
+    const n = tls_client.min_buffer_len;
+    return .{
+        .io_read = a.alloc(u8, n) catch return null,
+        .io_write = a.alloc(u8, n) catch return null,
+        .tls_read = a.alloc(u8, n) catch return null,
+        .tls_write = a.alloc(u8, n) catch return null,
+    };
+}
+
+/// 4 × min_buffer_len scratch for one TLS session (request-arena owned).
+const TlsBuffers = struct {
+    io_read: []u8,
+    io_write: []u8,
+    tls_read: []u8,
+    tls_write: []u8,
+};
+
 const testing = std.testing;
 
 test "upstream reader converges on byte-split delivery" {
@@ -1933,4 +2342,253 @@ test "proxy hostname upstream resolves via refresh then forwards" {
     try testing.expectEqual(registry.Status.ok, resp.status);
     try testing.expectEqualStrings("hello", resp.body);
     drainPool(0);
+}
+
+test "proxy tlsServerName prefers override, then hostname, then null" {
+    const lit = router.Upstream{ .host = "127.0.0.1", .port = 443, .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", 443).? };
+    const dns = router.Upstream{ .host = "api.example.com", .port = 443, .hostname = "api.example.com" };
+    const plain = registry.Route{ .path = "/" };
+    try testing.expect(tlsServerName(&plain, &lit) == null);
+    try testing.expectEqualStrings("api.example.com", tlsServerName(&plain, &dns).?);
+    const named = registry.Route{ .path = "/", .proxy_ssl_name = "override.internal" };
+    try testing.expectEqualStrings("override.internal", tlsServerName(&named, &lit).?);
+    try testing.expectEqualStrings("override.internal", tlsServerName(&named, &dns).?);
+}
+
+test "proxy TLS against a plaintext origin fails transport, not panic" {
+    // A TLS handshake against an HTTP-speaking origin dies on the first
+    // garbage flight: UpstreamTransport → 502 (or failover), never a hang.
+    const fake = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi", 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = fake.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", fake.port).?,
+        .tls = true,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_ssl_verify = false,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+/// TLS origin for end-to-end proxy tests: our own TlsConn server side over
+/// TCP loopback, answering one canned HTTP response per connection.
+const TlsOrigin = struct {
+    listener: posix_fd,
+    port: u16,
+    response: []const u8,
+    stop_flag: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn start(response: []const u8) !*TlsOrigin {
+        const self = try testing.allocator.create(TlsOrigin);
+        const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+        addr[0] = 2;
+        addr[4] = 127;
+        addr[7] = 1;
+        try compat.bind(lfd, @ptrCast(&addr), 16);
+        try compat.listen(lfd, 8);
+        var slen: posix.socklen_t = 16;
+        var bound: [16]u8 align(@alignOf(u16)) = undefined;
+        try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+        self.* = .{
+            .listener = lfd,
+            .port = (@as(u16, bound[2]) << 8) | bound[3],
+            .response = response,
+        };
+        self.thread = try std.Thread.spawn(.{}, runFn, .{self});
+        return self;
+    }
+
+    fn runFn(self: *TlsOrigin) void {
+        const cert_mod = @import("../../tls/cert.zig");
+        const testdata = @import("../../tls/testdata.zig");
+        var creds = cert_mod.loadCredentials(testing.allocator, testdata.cert_pem, testdata.key_pem) catch return;
+        defer testing.allocator.free(creds.cert_der);
+        while (!self.stop_flag.load(.acquire)) {
+            var pfds = [_]std.posix.pollfd{.{ .fd = self.listener, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&pfds, 100) catch break;
+            if (ready == 0) continue;
+            const cfd = linux.accept4(self.listener, null, null, 0);
+            if (linux.errno(cfd) != .SUCCESS) break;
+            const fd: posix_fd = @intCast(cfd);
+            serveOne(fd, &creds, self.response);
+            compat.close(fd);
+        }
+    }
+
+    fn serveOne(fd: posix_fd, creds: *const @import("../../tls/cert.zig").Credentials, response: []const u8) void {
+        const tls_conn = @import("../../tls/conn.zig");
+        var conn = tls_conn.TlsConn.init(creds);
+        defer conn.deinit();
+        var in_buf: [16 * 1024]u8 = undefined;
+        var out_buf: [16 * 1024]u8 = undefined;
+        var plain: [16 * 1024]u8 = undefined;
+        var plain_used: usize = 0;
+        while (true) {
+            var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&pfds, 5000) catch return;
+            if (ready == 0) return;
+            const n = posix.read(fd, &in_buf) catch {
+                return;
+            };
+            if (n == 0) {
+                return;
+            }
+            conn.feed(in_buf[0..n]) catch {
+                return;
+            };
+            flushOut(fd, &conn, &out_buf);
+            if (conn.stage() != .application) continue;
+            const p = switch (conn.inner) {
+                inline else => |*s| s.takePlaintext(&plain),
+            };
+            if (p == 0) continue;
+            plain_used += p;
+            if (std.mem.indexOf(u8, plain[0..plain_used], "\r\n\r\n") == null) continue;
+            switch (conn.inner) {
+                inline else => |*s| s.write(response) catch {
+                    return;
+                },
+            }
+            flushOut(fd, &conn, &out_buf);
+            return;
+        }
+    }
+
+    fn flushOut(fd: posix_fd, conn: *@import("../../tls/conn.zig").TlsConn, out_buf: []u8) void {
+        while (true) {
+            const m = switch (conn.inner) {
+                inline else => |*s| s.takeOut(out_buf),
+            };
+            if (m == 0) return;
+            _ = compat.write(fd, out_buf[0..m]) catch {
+                return;
+            };
+        }
+    }
+
+    fn stop(self: *TlsOrigin) void {
+        self.stop_flag.store(true, .release);
+        compat.close(self.listener);
+        self.thread.join();
+        testing.allocator.destroy(self);
+    }
+};
+
+test "proxy TLS end to end against our own server session" {
+    const origin = try TlsOrigin.start("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntls-hello");
+    defer origin.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = origin.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", origin.port).?,
+        .tls = true,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_ssl_verify = false,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/secure";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("tls-hello", resp.body);
+}
+
+
+test "proxy TLS verify-on trusts the testdata cert via bundle file" {
+    // Bundle file carrying the origin's own (self-signed) cert: chain of
+    // one verifies, and SNI/hostname matches the CN via proxy_ssl_name.
+    const path = "/tmp/zocket-upstream-ca-test.pem";
+    {
+        const testdata = @import("../../tls/testdata.zig");
+        compat.deleteFile(path) catch {};
+        try compat.writeFile(path, testdata.cert_pem);
+    }
+    defer compat.deleteFile(path) catch {};
+    const origin = try TlsOrigin.start("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntls-hello");
+    defer origin.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = origin.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", origin.port).?,
+        .tls = true,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_ssl_verify = true,
+        .proxy_ssl_trusted_certificate = path,
+        .proxy_ssl_name = "zocket-test",
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/secure";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("tls-hello", resp.body);
+}
+
+test "proxy TLS iso: sock ifaces round-trip bytes over socketpair" {
+    // No TLS involved: proves the poll-bounded vtables move bytes
+    // correctly in both directions (the TLS failures are elsewhere).
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    defer compat.close(pair[0]);
+    defer compat.close(pair[1]);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sock = TlsUpstream{
+        .fd = pair[0],
+        .read_ms = 2000,
+        .write_ms = 2000,
+        .reader_iface = .{ .vtable = &tls_reader_vtable, .buffer = rbuf[0..], .seek = 0, .end = 0 },
+        .writer_iface = .{ .vtable = &tls_writer_vtable, .buffer = wbuf[0..], .end = 0 },
+        .client = undefined,
+    };
+    // Outbound: iface write must land on the peer (raw read there).
+    const msg = "iface round-trip payload 12345";
+    try sock.writer_iface.writeAll(msg);
+    try sock.writer_iface.flush();
+    var raw: [64]u8 = undefined;
+    const n = try posix.read(pair[1], &raw);
+    try testing.expectEqual(msg.len, n);
+    try testing.expectEqualStrings(msg, raw[0..n]);
+    // Inbound: raw peer write must surface through the iface.
+    const back = "peer reply ok";
+    _ = try compat.write(pair[1], back);
+    var out: [64]u8 = undefined;
+    try sock.reader_iface.readSliceAll(out[0..back.len]);
+    try testing.expectEqualStrings(back, out[0..back.len]);
 }

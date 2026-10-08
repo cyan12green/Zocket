@@ -86,8 +86,8 @@ Filters (run after every outcome, reverse declaration order):
 
 | Directive | Syntax | Default | Description |
 |---|---|---|---|
-| `proxy_pass` | `proxy_pass host:port;` | — | Single upstream (IPv4 literal). |
-| `upstream` | `upstream host:port;` | — | Append backend (max 8 per route). |
+| `proxy_pass` | `proxy_pass [http://\|https://]host[:port];` | — | Single upstream (IPv4 literal or DNS hostname; `https://` enables upstream TLS, default port 443; `http://` default 80; bare `host:port` stays plaintext). |
+| `upstream` | `upstream [http://\|https://]host[:port];` | — | Append backend (max 8 per route; same scheme rules as `proxy_pass`). |
 | `balance` | `balance round_robin\|least_connections\|ip_hash\|random\|consistent_hash\|least_time` | round_robin | LB strategy. |
 | `proxy_set_header` | `proxy_set_header name value;` | — | Override upstream request header. |
 | `max_fails` | `max_fails number;` | 3 | Failures before marking backend down. |
@@ -96,6 +96,9 @@ Filters (run after every outcome, reverse declaration order):
 | `proxy_send_timeout` | `proxy_send_timeout seconds;` | 1 | Upstream request-write deadline. |
 | `proxy_read_timeout` | `proxy_read_timeout seconds;` | 5 | Upstream response-read deadline (SO_RCVTIMEO; sync-driver cap). |
 | `proxy_next_upstream` | `proxy_next_upstream on\|off;` | off | Retry transport failures (connect/send/read error or timeout) on the next usable backend, once each. Failover re-offers the sticky tag. HTTP error statuses from a live backend are final. Sync forward path only. |
+| `proxy_ssl_verify` | `proxy_ssl_verify on\|off;` | off | Verify upstream TLS chain + hostname (needs `proxy_ssl_trusted_certificate`; build fails without it). Off still negotiates TLS without verification (nginx parity). |
+| `proxy_ssl_trusted_certificate` | `proxy_ssl_trusted_certificate path;` | — | PEM CA bundle file for upstream verification (absolute or cwd-relative). Loaded once per path, cached process-wide. |
+| `proxy_ssl_name` | `proxy_ssl_name name;` | upstream hostname | SNI + verify hostname override (required to verify IP-literal backends). |
 | `proxy_keepalive` | `proxy_keepalive number;` | 8 | Pooled keepalive connections per backend per thread (clamped to 32). |
 | `proxy_keepalive_timeout` | `proxy_keepalive_timeout seconds;` | 60 | Idle expiry for pooled connections (reaped on next use). |
 | `health_check` | `health_check path=... interval=... rise=... fall=... timeout=...` | — | Active backend probing. |

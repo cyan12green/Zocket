@@ -128,6 +128,9 @@ const H_proxy_read_timeout = keyHash("proxy_read_timeout");
 const H_proxy_next_upstream = keyHash("proxy_next_upstream");
 const H_proxy_keepalive = keyHash("proxy_keepalive");
 const H_proxy_keepalive_timeout = keyHash("proxy_keepalive_timeout");
+const H_proxy_ssl_verify = keyHash("proxy_ssl_verify");
+const H_proxy_ssl_trusted_certificate = keyHash("proxy_ssl_trusted_certificate");
+const H_proxy_ssl_name = keyHash("proxy_ssl_name");
 const H_allow = keyHash("allow");
 const H_deny = keyHash("deny");
 const H_set_real_ip_from = keyHash("set_real_ip_from");
@@ -362,6 +365,12 @@ const LocationSpec = struct {
     /// `proxy_keepalive N;` / `proxy_keepalive_timeout S;` (0 = default).
     proxy_keepalive_max: u32 = 0,
     proxy_keepalive_timeout: u32 = 0,
+    /// `proxy_ssl_verify on|off;` (default off).
+    proxy_ssl_verify: bool = false,
+    /// `proxy_ssl_trusted_certificate <path>;` (PEM bundle file).
+    proxy_ssl_trusted_certificate: ?Str = null,
+    /// `proxy_ssl_name <name>;` (SNI/verify override).
+    proxy_ssl_name: ?Str = null,
     /// `limit_req_status` / `limit_conn_status` (429 or 503, 0 = default).
     limit_req_status: u16 = 0,
     limit_conn_status: u16 = 0,
@@ -640,16 +649,41 @@ fn resolve(str: Str, strings: []const u8) []const u8 {
     };
 }
 
-/// Build an Upstream from a parsed host:port. IP literals pre-compute
+/// Split an `upstream`/`proxy_pass` value into scheme/host/port.
+/// `https://` enables upstream TLS (default port 443); `http://` is
+/// explicit plaintext (default 80); bare values keep the historical
+/// host:port shape (port required).
+fn splitEndpoint(lx: *Lexer, comptime dir: []const u8, s: []const u8) struct { host: []const u8, port: u16, tls: bool } {
+    var rest = s;
+    var tls = false;
+    if (std.mem.startsWith(u8, rest, "https://")) {
+        tls = true;
+        rest = rest["https://".len..];
+    } else if (std.mem.startsWith(u8, rest, "http://")) {
+        rest = rest["http://".len..];
+    }
+    if (std.mem.indexOfScalar(u8, rest, ':')) |colon| {
+        const host = rest[0..colon];
+        const port = std.fmt.parseInt(u16, rest[colon + 1 ..], 10) catch
+            lx.fail(dir ++ ": expected host:port");
+        return .{ .host = host, .port = port, .tls = tls };
+    }
+    if (std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://")) {
+        return .{ .host = rest, .port = if (tls) 443 else 80, .tls = tls };
+    }
+    lx.fail(dir ++ ": expected host:port");
+}
+
+/// Build an Upstream from a split endpoint. IP literals pre-compute
 /// the sockaddr (zero runtime cost); DNS names keep family-0 (the
 /// resolver fills the octets at startup/refresh). Anything else is a
 /// compile error — a typo'd literal must not become a DNS lookup.
-fn parseUpstream(lx: *Lexer, comptime dir: []const u8, host: []const u8, port: u16) Upstream {
+fn parseUpstream(lx: *Lexer, comptime dir: []const u8, host: []const u8, port: u16, tls: bool) Upstream {
     if (Upstream.makeSockaddr(host, port)) |sa| {
-        return .{ .host = host, .port = port, .sockaddr = sa };
+        return .{ .host = host, .port = port, .sockaddr = sa, .tls = tls };
     }
     if (sockets_mod.isValidHostname(host)) {
-        return .{ .host = host, .port = port, .hostname = host };
+        return .{ .host = host, .port = port, .hostname = host, .tls = tls };
     }
     lx.fail(dir ++ ": host is neither an IPv4 literal nor a valid DNS name");
 }
@@ -1269,13 +1303,9 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const t = lx.value(b, "proxy_pass");
             const s = resolve(t, b.strings.items[0..]);
             lx.expectTerminator("proxy_pass");
-            const colon = std.mem.indexOfScalar(u8, s, ':') orelse
-                lx.fail("proxy_pass: expected host:port");
-            const host = s[0..colon];
-            const port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch
-                lx.fail("proxy_pass: expected host:port");
+            const ep = splitEndpoint(lx, "proxy_pass", s);
             if (spec.upstreams_len == 0) spec.upstreams_start = b.upstreams.len;
-            _ = b.upstreams.create(parseUpstream(lx, "proxy_pass", host, port));
+            _ = b.upstreams.create(parseUpstream(lx, "proxy_pass", ep.host, ep.port, ep.tls));
             spec.upstreams_len += 1;
             b.cost += 8;
         },
@@ -1283,13 +1313,9 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const t = lx.value(b, "upstream");
             const s = resolve(t, b.strings.items[0..]);
             lx.expectTerminator("upstream");
-            const colon = std.mem.indexOfScalar(u8, s, ':') orelse
-                lx.fail("upstream: expected host:port");
-            const host = s[0..colon];
-            const port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch
-                lx.fail("upstream: expected host:port");
+            const ep = splitEndpoint(lx, "upstream", s);
             if (spec.upstreams_len == 0) spec.upstreams_start = b.upstreams.len;
-            _ = b.upstreams.create(parseUpstream(lx, "upstream", host, port));
+            _ = b.upstreams.create(parseUpstream(lx, "upstream", ep.host, ep.port, ep.tls));
             spec.upstreams_len += 1;
             b.cost += 8;
         },
@@ -1339,6 +1365,21 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
         H_proxy_keepalive_timeout => {
             spec.proxy_keepalive_timeout = lx.number("proxy_keepalive_timeout", u32);
             lx.expectTerminator("proxy_keepalive_timeout");
+        },
+        H_proxy_ssl_verify => {
+            spec.proxy_ssl_verify = lx.boolOnOff("proxy_ssl_verify");
+            lx.expectTerminator("proxy_ssl_verify");
+            b.cost += 8;
+        },
+        H_proxy_ssl_trusted_certificate => {
+            spec.proxy_ssl_trusted_certificate = lx.value(b, "proxy_ssl_trusted_certificate");
+            lx.expectTerminator("proxy_ssl_trusted_certificate");
+            b.cost += 8;
+        },
+        H_proxy_ssl_name => {
+            spec.proxy_ssl_name = lx.value(b, "proxy_ssl_name");
+            lx.expectTerminator("proxy_ssl_name");
+            b.cost += 8;
         },
         H_allow, H_deny => {
             // `allow 192.168.1.0/24;` / `deny all;` — first match wins.
@@ -2338,6 +2379,9 @@ fn build(b: *const Builder) Config {
                 .proxy_next_upstream = spec.proxy_next_upstream,
                 .proxy_keepalive_max = spec.proxy_keepalive_max,
                 .proxy_keepalive_timeout_s = spec.proxy_keepalive_timeout,
+                .proxy_ssl_verify = spec.proxy_ssl_verify,
+                .proxy_ssl_trusted_certificate = if (spec.proxy_ssl_trusted_certificate) |s| resolve(s, strings) else null,
+                .proxy_ssl_name = if (spec.proxy_ssl_name) |s| resolve(s, strings) else null,
                 .access_rules = access_table.items[access_table.ranges[ri].start..][0..access_table.ranges[ri].len],
                 .realip_from = realip_table.items[realip_table.ranges[ri].start..][0..realip_table.ranges[ri].len],
                 .real_ip_header = if (spec.real_ip_header) |h| resolve(h, strings) else null,
@@ -2346,6 +2390,11 @@ fn build(b: *const Builder) Config {
                 .tcp_nopush = spec.tcp_nopush,
                 .log_format = logFormatIndex(spec.log_format, log_table.items[0..log_table.len], strings),
             };
+            // Validate: verification without a bundle can never succeed —
+            // fail the build instead of handshaking doomed every request.
+            if (items[len].proxy_ssl_verify and items[len].proxy_ssl_trusted_certificate == null) {
+                @compileError("proxy_ssl_verify needs proxy_ssl_trusted_certificate on this route");
+            }
             // Validate: if a route has header ops AND filters, at least one
             // filter must touch headers — otherwise the header ops are silently
             // lost when the filter transforms the response.
@@ -3675,4 +3724,30 @@ test "conf: resolver directive parses up to 3 nameservers" {
         \\}
     );
     try testing.expectEqual(@as(usize, 0), cfg2.resolver.len);
+}
+
+test "conf: https scheme enables TLS with default ports" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite proxy;
+        \\        proxy_pass https://api.example.com;
+        \\        upstream http://127.0.0.1:8001;
+        \\        upstream 127.0.0.1:8002;
+        \\        proxy_ssl_verify off;
+        \\        proxy_ssl_name api.internal;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 3), cfg.routes[0].upstreams.len);
+    const tls_up = cfg.routes[0].upstreams[0];
+    try testing.expect(tls_up.tls);
+    try testing.expectEqual(@as(u16, 443), tls_up.port);
+    try testing.expectEqualStrings("api.example.com", tls_up.hostname.?);
+    const plain_up = cfg.routes[0].upstreams[1];
+    try testing.expect(!plain_up.tls);
+    try testing.expectEqual(@as(u16, 8001), plain_up.port);
+    try testing.expect(!cfg.routes[0].proxy_ssl_verify);
+    try testing.expectEqualStrings("api.internal", cfg.routes[0].proxy_ssl_name.?);
+    try testing.expect(cfg.routes[0].proxy_ssl_trusted_certificate == null);
 }

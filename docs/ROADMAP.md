@@ -323,11 +323,20 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
 
 ### Batch C3 — cloud and protocol reach (M each)
 
-- DNS resolver (async, TTL-respecting): hostnames in `proxy_pass`/`upstream`.
-  Needs non-blocking DNS + hot-swap of comptime-frozen sockaddrs (first
-  runtime-mutated upstream table). Biggest adoption ceiling after C1.
-- Upstream TLS (`proxy_pass https://`): SNI, verify, client cert, session
-  reuse. `std.crypto.tls.Client` already used as test oracle; config
+- DNS resolver (async, TTL-respecting) ✅ SHIPPED 2026-10: hostnames in
+  `proxy_pass`/`upstream` (`resolver 1.1.1.1 valid=30s;`, family-0 sockaddrs
+  as unresolved markers, startup warn + 502 never startup failure, refresh
+  thread with TTL cache + loopback Stub in tests).
+- Upstream TLS (`proxy_pass https://`) ✅ SHIPPED 2026-10 (v1): SNI
+  (`proxy_ssl_name` orelse hostname), verify
+  (`proxy_ssl_verify on` + `proxy_ssl_trusted_certificate` bundle, cached
+  process-wide, build fails without bundle), poll-bounded nonblocking record
+  I/O (no EAGAIN panic, timeouts from route timeouts), `allow_truncation`
+  on (origins closing without close_notify still 502 on short bodies via
+  exact Content-Length). Sync driver only, single-use connections (no
+  keepalive pooling, no parked-path TLS yet). No client-cert or session
+  reuse in v1 (`std.crypto.tls.Client` has no client-cert surface).
+  `std.crypto.tls.Client` already used as test oracle; config
   surface is the bulk; pool keyed by (host, port, tls).
 - `ws://` proxy passthrough (left open by M18): Upgrade forwarding +
   byte-pipe handoff; needs the streaming escape hatch.

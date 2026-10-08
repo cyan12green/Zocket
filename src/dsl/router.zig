@@ -101,6 +101,15 @@ pub const Route = struct {
     /// failures. Sync forward path only (the parked/async path marks the
     /// failure and answers 502 as before).
     proxy_next_upstream: bool = false,
+    /// Upstream TLS verification (`proxy_ssl_verify on` + trusted
+    /// bundle): reject backends whose chain/hostname don't verify.
+    /// Default off (nginx parity) — handshake still negotiates TLS.
+    proxy_ssl_verify: bool = false,
+    /// PEM CA bundle for upstream verification (`proxy_ssl_trusted_certificate`).
+    proxy_ssl_trusted_certificate: ?[]const u8 = null,
+    /// SNI/verify hostname override (`proxy_ssl_name`; default: the
+    /// upstream hostname, or the literal when verification is off).
+    proxy_ssl_name: ?[]const u8 = null,
     /// Keepalive pool tuning (proxy module): max pooled connections per
     /// backend per reactor thread (default 8, clamped to a hard cap of 32)
     /// and pooled-connection idle expiry in seconds (default 60; an idle
@@ -377,6 +386,11 @@ pub const Upstream = struct {
     /// resolver fills the octets in at startup/refresh. Never mutated in
     /// .rodata — embeddedInit copies hostname routes onto the heap first.
     hostname: ?[]const u8 = null,
+    /// TLS to this backend (`https://` scheme in proxy_pass/upstream).
+    /// Handshake uses SNI = proxy_ssl_name orelse hostname orelse (literals
+    /// only with verification off). Sync driver only; single-use
+    /// connections (no keepalive pooling) in v1.
+    tls: bool = false,
 
     /// Build the kernel sockaddr for an IPv4 host literal ("127.0.0.1").
     /// Works at comptime (struct-literal configs) and at runtime (JSON).
