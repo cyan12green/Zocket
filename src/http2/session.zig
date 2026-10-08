@@ -769,6 +769,13 @@ pub const Session = struct {
             resp = response_mod.Response.init(.internal_error);
             resp.setBody(response_mod.Status.internal_error.reasonPhrase());
         }
+        // `return 444;` over HTTP/2: send nothing — reset the stream with
+        // CANCEL (the h2 equivalent of the h1 silent drop).
+        if (resp.status == .no_response) {
+            st.responded = true;
+            self.streamErrorCode(stream_id, send, 0x8); // CANCEL
+            return;
+        }
         st.responded = true;
         try self.frameResponse(stream_id, &resp, req.method == .head, send, handler);
     }
@@ -2079,4 +2086,63 @@ test "session: expect 100-continue emits an interim HEADERS frame" {
         off += 9 + fh.length;
     }
     try testing.expect(found100);
+}
+
+test "session: return 444 resets the stream instead of answering" {
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var s = Session.init(testing.allocator);
+    defer s.deinit();
+
+    // A handler whose only route is `return 444;`.
+    const cfg = @import("../runtime/config.zig").Config.fromConfComptime(
+        \\server {
+        \\    location /drop {
+        \\        return 444;
+        \\    }
+        \\}
+    );
+    var srv = server_mod.Server.init(cfg);
+    var handler = Session.Handler{
+        .server = &srv,
+        .allocator = testing.allocator,
+        .limits = &limits_mod.Limits{},
+        .date_header = "Sat, 15 Aug 2026 00:00:00 GMT",
+        .version_string = "Zocket/1.0.0",
+    };
+
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try hpack.encodeField(&hb, testing.allocator, ":method", "GET");
+    try hpack.encodeField(&hb, testing.allocator, ":scheme", "http");
+    try hpack.encodeField(&hb, testing.allocator, ":authority", "localhost");
+    try hpack.encodeField(&hb, testing.allocator, ":path", "/drop");
+    var hdr: [9]u8 = undefined;
+    var fhdr = frames.FrameHeader{ .length = @intCast(hb.items.len), .type = .headers, .flag_bits = frames.flags.end_headers | frames.flags.end_stream, .stream_id = 1 };
+    fhdr.encode(&hdr);
+    var req_bytes = std.ArrayList(u8).empty;
+    defer req_bytes.deinit(testing.allocator);
+    try req_bytes.appendSlice(testing.allocator, Session.preface);
+    try req_bytes.appendSlice(testing.allocator, &hdr);
+    try req_bytes.appendSlice(testing.allocator, hb.items);
+    _ = try s.process(req_bytes.items, &send, &handler);
+
+    // No HEADERS frame for stream 1; a RST_STREAM with CANCEL instead.
+    var off: usize = 0;
+    var saw_rst = false;
+    var saw_headers = false;
+    while (off + 9 <= send.items.len) {
+        const fh = frames.parseHeader(send.items[off..][0..9]) orelse break;
+        if (fh.stream_id == 1) {
+            if (fh.type == .headers) saw_headers = true;
+            if (fh.type == .rst_stream) {
+                const payload = send.items[off + 9 ..][0..fh.length];
+                const code = (@as(u32, payload[0]) << 24) | (@as(u32, payload[1]) << 16) | (@as(u32, payload[2]) << 8) | payload[3];
+                if (code == 0x8) saw_rst = true;
+            }
+        }
+        off += 9 + fh.length;
+    }
+    try testing.expect(saw_rst);
+    try testing.expect(!saw_headers);
 }

@@ -403,7 +403,7 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   response-header filtering (repeatable, case-insensitive, both adopt
   paths).
 - D1.9 `return 444;` ✅ SHIPPED 2026-10: nginx's silent connection drop
-  (no response bytes, keep-alive forced off for the route; the fast path
+  (no response bytes on h1, `RST_STREAM` CANCEL on h2; the fast path
   declines such routes).
 - D1.8 location ergonomics ✅ SHIPPED 2026-10: named locations
   (`location @name`, excluded from path matching; reached via
