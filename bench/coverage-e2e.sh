@@ -51,8 +51,11 @@ run_traffic_default() { # default echo config on $PORT
 }
 
 run_traffic_full() { # 11-full.conf on $PORT (8080->override not possible; use --port? conf pins 8080; run as-is on 8080)
+    # NOTE: the server runs with CWD=$ROOT: 11-full.conf uses repo-relative
+    # paths (src/testdata/*, testdata/*). Its .zcov lands in $ROOT and is
+    # moved into $dir afterwards (all *.zcov are gitignored anyway).
     local dir="$OUT/full" bin="$OUT/zocket-full"
-    mkdir -p "$dir" && cd "$dir"
+    mkdir -p "$dir"
     # keepalive python origins for /cached (9000) and /auth (9100)
     python3 - "$ROOT" >origin.log 2>&1 <<'PYEOF' &
 import sys
@@ -75,8 +78,11 @@ import time
 time.sleep(3600)
 PYEOF
     local orig=$!
-    "$bin" --threads 2 >/dev/null 2>&1 &
+    rm -f "$ROOT"/coverage-*.zcov
+    cd "$ROOT"
+    "$bin" --threads 2 >"$dir"/server.log 2>&1 &
     local srv=$!
+    cd "$dir"
     sleep 1.5
     H="Host: app.example.com"
     get() { curl -s -o /dev/null -w "%{http_code}\n" --max-time 5 -H "$H" "http://127.0.0.1:8080$1" || echo "000"; }
@@ -99,6 +105,7 @@ PYEOF
     kill -TERM "$srv" 2>/dev/null || true
     wait "$srv" 2>/dev/null || true
     kill "$orig" 2>/dev/null || true
+    mv "$ROOT"/coverage-*.zcov "$dir"/ 2>/dev/null || true
     cd "$ROOT"
 }
 
