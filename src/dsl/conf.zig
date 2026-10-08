@@ -109,6 +109,15 @@ const H_http = keyHash("http");
 const H_gzip = keyHash("gzip");
 const H_precompressed = keyHash("precompressed");
 const H_auth_request = keyHash("auth_request");
+const H_cors = keyHash("cors");
+const H_cors_origin = keyHash("cors_origin");
+const H_cors_methods = keyHash("cors_methods");
+const H_cors_headers = keyHash("cors_headers");
+const H_cors_credentials = keyHash("cors_credentials");
+const H_cors_max_age = keyHash("cors_max_age");
+const H_secure_link_secret = keyHash("secure_link_secret");
+const H_auth_jwt_secret = keyHash("auth_jwt_secret");
+const H_auth_jwt_leeway = keyHash("auth_jwt_leeway");
 const H_proxy_cache = keyHash("proxy_cache");
 const H_client_header_timeout = keyHash("client_header_timeout");
 const H_client_body_timeout = keyHash("client_body_timeout");
@@ -333,6 +342,18 @@ const LocationSpec = struct {
     /// of either binds the access-phase auth_basic module.
     auth_realm: ?Str = null,
     auth_file: ?Str = null,
+    /// CORS helper: `cors on;` + origin/methods/headers/credentials/max_age.
+    cors_enabled: bool = false,
+    cors_origin: ?Str = null,
+    cors_methods: ?Str = null,
+    cors_headers: ?Str = null,
+    cors_credentials: bool = false,
+    cors_max_age: u32 = 0,
+    /// `secure_link_secret "...";` (enables the secure_link access module).
+    secure_link_secret: ?Str = null,
+    /// `auth_jwt_secret "...";` + `auth_jwt_leeway seconds;`.
+    auth_jwt_secret: ?Str = null,
+    auth_jwt_leeway: u32 = 0,
     /// `sticky_cookie name;` (cookie-based backend affinity)
     sticky: ?Str = null,
     /// `health_check path=... interval=N rise=N fall=N timeout=N;`
@@ -1471,6 +1492,60 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             ensureModuleBound(b, spec, .access, "auth_request");
             b.cost += 8;
         },
+        H_cors => {
+            spec.cors_enabled = lx.boolOnOff("cors");
+            lx.expectTerminator("cors");
+            ensureModuleBound(b, spec, .access, "cors");
+            b.cost += 8;
+        },
+        H_cors_origin => {
+            spec.cors_origin = lx.value(b, "cors_origin");
+            lx.expectTerminator("cors_origin");
+            ensureModuleBound(b, spec, .access, "cors");
+            b.cost += 8;
+        },
+        H_cors_methods => {
+            spec.cors_methods = lx.value(b, "cors_methods");
+            lx.expectTerminator("cors_methods");
+            ensureModuleBound(b, spec, .access, "cors");
+            b.cost += 8;
+        },
+        H_cors_headers => {
+            spec.cors_headers = lx.value(b, "cors_headers");
+            lx.expectTerminator("cors_headers");
+            ensureModuleBound(b, spec, .access, "cors");
+            b.cost += 8;
+        },
+        H_cors_credentials => {
+            spec.cors_credentials = lx.boolOnOff("cors_credentials");
+            lx.expectTerminator("cors_credentials");
+            ensureModuleBound(b, spec, .access, "cors");
+            b.cost += 8;
+        },
+        H_cors_max_age => {
+            spec.cors_max_age = lx.number("cors_max_age", u32);
+            lx.expectTerminator("cors_max_age");
+            ensureModuleBound(b, spec, .access, "cors");
+            b.cost += 8;
+        },
+        H_secure_link_secret => {
+            spec.secure_link_secret = lx.value(b, "secure_link_secret");
+            lx.expectTerminator("secure_link_secret");
+            ensureModuleBound(b, spec, .access, "secure_link");
+            b.cost += 8;
+        },
+        H_auth_jwt_secret => {
+            spec.auth_jwt_secret = lx.value(b, "auth_jwt_secret");
+            lx.expectTerminator("auth_jwt_secret");
+            ensureModuleBound(b, spec, .access, "auth_jwt");
+            b.cost += 8;
+        },
+        H_auth_jwt_leeway => {
+            spec.auth_jwt_leeway = lx.number("auth_jwt_leeway", u32);
+            lx.expectTerminator("auth_jwt_leeway");
+            ensureModuleBound(b, spec, .access, "auth_jwt");
+            b.cost += 8;
+        },
         H_precompressed => {
             // `precompressed gz;` (only gz is supported today)
             const t = lx.token() orelse lx.fail("precompressed: expected a codec");
@@ -2349,6 +2424,15 @@ fn build(b: *const Builder) Config {
                     &.{},
                 .precompressed = spec.precompressed_gz,
                 .auth_request_uri = if (spec.auth_request) |u| resolve(u, strings) else null,
+                .cors_enabled = spec.cors_enabled,
+                .cors_origin = if (spec.cors_origin) |s| resolve(s, strings) else null,
+                .cors_methods = if (spec.cors_methods) |s| resolve(s, strings) else null,
+                .cors_headers = if (spec.cors_headers) |s| resolve(s, strings) else null,
+                .cors_credentials = spec.cors_credentials,
+                .cors_max_age = spec.cors_max_age,
+                .secure_link_secret = if (spec.secure_link_secret) |s| resolve(s, strings) else null,
+                .auth_jwt_secret = if (spec.auth_jwt_secret) |s| resolve(s, strings) else null,
+                .auth_jwt_leeway_s = spec.auth_jwt_leeway,
                 .proxy_cache_enabled = spec.cache_enabled,
                 .cache_ttl_seconds = spec.cache_ttl,
                 .cache_swr_seconds = spec.cache_swr,
@@ -3750,4 +3834,28 @@ test "conf: https scheme enables TLS with default ports" {
     try testing.expect(!cfg.routes[0].proxy_ssl_verify);
     try testing.expectEqualStrings("api.internal", cfg.routes[0].proxy_ssl_name.?);
     try testing.expect(cfg.routes[0].proxy_ssl_trusted_certificate == null);
+}
+
+test "conf: cors plus secure_link plus jwt directives bind access modules" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite proxy;
+        \\        cors on;
+        \\        cors_origin https://a.example;
+        \\        cors_methods "GET, POST";
+        \\        cors_max_age 600;
+        \\        secure_link_secret sek;
+        \\        auth_jwt_secret jkey;
+        \\        auth_jwt_leeway 30;
+        \\    }
+        \\}
+    );
+    const r = cfg.routes[0];
+    try testing.expect(r.cors_enabled);
+    try testing.expectEqualStrings("https://a.example", r.cors_origin.?);
+    try testing.expectEqual(@as(u32, 600), r.cors_max_age);
+    try testing.expectEqualStrings("sek", r.secure_link_secret.?);
+    try testing.expectEqualStrings("jkey", r.auth_jwt_secret.?);
+    try testing.expectEqual(@as(u32, 30), r.auth_jwt_leeway_s);
 }

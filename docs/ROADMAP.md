@@ -347,8 +347,11 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
   `ServerStats` counters) + `status_json` (same counters as JSON) +
   `jsonEscape` helper + JSON `log_format` preset documented (shmem
   per-module counters and comptime-tokenized renderer reuse deferred).
-- Auth bundle: CORS helper, `secure_link` (HMAC-expiring URLs), JWT-lite
-  (static `jwks_file` first; reuse TLS ECDSA verify).
+- Auth bundle ✅ SHIPPED 2026-10 (v1): CORS helper (`cors on` + origin/
+  methods/headers/credentials/max_age, preflight 204), `secure_link`
+  (HMAC-SHA256 `?e=&s=` over `{path}|{e}`, 403 on bad/expired), JWT-lite
+  (`auth_jwt_secret` HS256 + `exp` + leeway, 401 on bad/missing/expired;
+  static `jwks_file`/ES256 deferred — TLS ECDSA verify is the path).
 - OCSP stapling + mTLS client-cert verify in the native TLS stack.
 - kTLS offload (attacks the ~15% TLS-over-h2c tax in `bench/BENCH.md`,
   restores sendfile zero-copy under TLS).

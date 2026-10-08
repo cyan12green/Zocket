@@ -477,6 +477,9 @@ pub const default_registry = Registry(.{
     @import("modules/gunzip.zig").gunzip,
     @import("modules/prometheus.zig").prometheus,
     @import("modules/prometheus.zig").status_json,
+    @import("modules/auth_bundle.zig").cors,
+    @import("modules/auth_bundle.zig").secure_link,
+    @import("modules/auth_bundle.zig").auth_jwt,
 });
 
 const testing = std.testing;

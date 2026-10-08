@@ -208,6 +208,21 @@ pub const Route = struct {
     /// Subrequest authorization (auth_request module): forward this URI
     /// through an internal subrequest; 2xx admits, anything else copies.
     auth_request_uri: ?[]const u8 = null,
+    /// CORS helper (cors module): enabled flag + response headers.
+    /// `cors_origin` null with enabled = "*" default at run time.
+    cors_enabled: bool = false,
+    cors_origin: ?[]const u8 = null,
+    cors_methods: ?[]const u8 = null,
+    cors_headers: ?[]const u8 = null,
+    cors_credentials: bool = false,
+    cors_max_age: u32 = 0,
+    /// Expiring-URL guard (secure_link module): HMAC-SHA256 secret;
+    /// requests need `?e=<unix>&s=<hex>` over `{path}|{e}`.
+    secure_link_secret: ?[]const u8 = null,
+    /// JWT-lite (auth_jwt module): HS256 shared secret + expiry leeway.
+    /// ES256/JWKS stays deferred (TLS ECDSA verify reuse is the path).
+    auth_jwt_secret: ?[]const u8 = null,
+    auth_jwt_leeway_s: u32 = 0,
     /// Active health checks (proxy module): when `health_check_path` is
     /// set a module-owned checker thread probes every backend on the
     /// interval and applies rise/fall thresholds to flip liveness.

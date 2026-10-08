@@ -240,6 +240,20 @@ The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
 | `log_format` | `log_format name value;` | combined | Named log format (max 16). Use `log_format json '{"time":"$date","req":"$request","status":$status}';` for JSON lines (values via `jsonEscape` semantics: quotes/backslashes/controls escaped). |
 | `access_log` | `access_log format\|off;` | combined | Per-route log format. |
 
+### Auth bundle: CORS, secure_link, JWT-lite
+
+| Directive | Default | Description |
+|---|---|---|
+| `cors on\|off;` | off | Enable CORS helper (binds `cors` access module). Always attaches `Access-Control-Allow-Origin` + `Vary: Origin`; OPTIONS preflights answer 204 in place. |
+| `cors_origin` | `*` | Allowed origin value (`*` or explicit origin). |
+| `cors_methods` | `GET, HEAD, POST, PUT, DELETE, OPTIONS` | Preflight `Allow-Methods`. |
+| `cors_headers` | — | Preflight `Allow-Headers` (sent only when set). |
+| `cors_credentials on\|off;` | off | Emit `Access-Control-Allow-Credentials: true`. |
+| `cors_max_age` | 0 | Preflight `Access-Control-Max-Age` seconds (0 = omitted). |
+| `secure_link_secret` | — | HMAC-SHA256 secret for expiring URLs; requests need `?e=<unix>&s=<hex(secret, path\|e)>`, else 403. Binds `secure_link`. |
+| `auth_jwt_secret` | — | HS256 shared secret for `Authorization: Bearer` JWTs (signature + `exp` enforced); failures 401 + `WWW-Authenticate: Bearer`. Binds `auth_jwt`. ES256/JWKS deferred. |
+| `auth_jwt_leeway` | 0 | Expiry leeway seconds for clock skew. |
+
 ### Observability: Prometheus & status API
 
 | Directive | Phase | Description |
