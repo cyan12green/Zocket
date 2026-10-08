@@ -338,8 +338,12 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
   reuse in v1 (`std.crypto.tls.Client` has no client-cert surface).
   `std.crypto.tls.Client` already used as test oracle; config
   surface is the bulk; pool keyed by (host, port, tls).
-- `ws://` proxy passthrough (left open by M18): Upgrade forwarding +
-  byte-pipe handoff; needs the streaming escape hatch.
+- `ws://` proxy passthrough ✅ SHIPPED 2026-10 (v1 handshake): `proxy_ws on`
+  forwards `Connection: Upgrade` (only when the client sent `Upgrade`) and
+  relays 101s with `Connection` preserved end-to-end (sync + TLS + parked
+  adopt paths); non-101s still strip hop-by-hop headers. Full duplex
+  byte-pipe handoff needs the streaming escape hatch (Stage 2 upstream
+  seam) — documented, not silent.
 - TCP stream proxy + SNI preread routing: L4 `stream {}` reusing
   multireactor + LB + shmem health; ClientHello peek parser.
 - Prometheus `/metrics` + JSON access logs + status API ✅ SHIPPED 2026-10

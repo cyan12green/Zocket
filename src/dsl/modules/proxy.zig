@@ -85,10 +85,11 @@ fn park(ctx: *Context) anyerror!Action {
 /// transaction). Shared by the inline fast path and the reactor driver.
 pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_name: []const u8, backend_idx: usize) !void {
     ctx.resp.status = @enumFromInt(res.status);
+    const ws101 = isWs101(ctx, res.status);
     const arena_a = ctx.req.arena.asAllocator();
     for (res.headers) |h| {
         const skip = switch (http_parser.header_hasher.hash(h.name)) {
-            http_parser.header_hasher.hash("connection"),
+            http_parser.header_hasher.hash("connection") => !ws101,
             http_parser.header_hasher.hash("content-length"),
             http_parser.header_hasher.hash("transfer-encoding"),
             => true,
@@ -449,6 +450,15 @@ fn forward(
     }
 }
 
+/// True when this response is a proxied WebSocket handshake: route opted
+/// into `proxy_ws` and the backend answered 101. The `Connection` header
+/// is end-to-end here (not hop-by-hop), so adopt sites preserve it.
+fn isWs101(ctx: *Context, status: u16) bool {
+    if (status != 101) return false;
+    const route = ctx.route orelse return false;
+    return route.proxy_ws;
+}
+
 /// One connect/send/read attempt against backend `idx`: transport failures
 /// surface as `error.UpstreamTransport` (retryable); anything else answers
 /// directly. See `forward` for the bookkeeping contract.
@@ -482,7 +492,16 @@ fn attemptForward(
         return error.UpstreamTransport;
     };
 
-    // Read the upstream response (status + headers + body).
+    // Read the upstream response (status + headers + body). Bound the
+    // first-byte wait by the read timeout: the fd is nonblocking, so a
+    // fast-but-not-instant origin would otherwise surface WouldBlock as a
+    // 502 (WebSocket 101 handshakes reliably lost this race in tests).
+    if (!waitReadable(fd, @intCast(readTimeoutS(route) * 1000))) {
+        posix_close(fd);
+        active[pick] -|= 1;
+        markFailure(pick, route, started_ns);
+        return error.UpstreamTransport;
+    }
     var reader = UpstreamReader.init();
     const read_result = reader.read(fd) catch blk: {
         break :blk null;
@@ -510,10 +529,12 @@ fn attemptForward(
 
     const r = read_result.?;
     ctx.resp.status = @enumFromInt(r.status);
+    const ws101 = isWs101(ctx, r.status);
     for (r.headers) |h| {
-        // Skip hop-by-hop headers the reactor controls.
+        // Skip hop-by-hop headers the reactor controls (except Connection
+        // on a proxied 101, which is end-to-end).
         const skip = switch (http_parser.header_hasher.hash(h.name)) {
-            http_parser.header_hasher.hash("connection") => true,
+            http_parser.header_hasher.hash("connection") => !ws101,
             http_parser.header_hasher.hash("content-length") => true,
             http_parser.header_hasher.hash("transfer-encoding") => true,
             else => false,
@@ -617,9 +638,10 @@ fn attemptForwardTls(
 
     const r = read_result.?;
     ctx.resp.status = @enumFromInt(r.status);
+    const ws101 = isWs101(ctx, r.status);
     for (r.headers) |h| {
         const skip = switch (http_parser.header_hasher.hash(h.name)) {
-            http_parser.header_hasher.hash("connection") => true,
+            http_parser.header_hasher.hash("connection") => !ws101,
             http_parser.header_hasher.hash("content-length") => true,
             http_parser.header_hasher.hash("transfer-encoding") => true,
             else => false,
@@ -1076,6 +1098,16 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
         }
     }
 
+    // WebSocket upgrade: forward `Connection: Upgrade` when the route
+    // enables it and the client asked (the `Upgrade` + `Sec-WebSocket-*`
+    // headers flow through the loop below; `Connection` is otherwise
+    // stripped as hop-by-hop).
+    const ws_upgrade = blk: {
+        const route = ctx.route orelse break :blk false;
+        if (!route.proxy_ws) break :blk false;
+        break :blk ctx.req.header("upgrade") != null;
+    };
+    if (ws_upgrade) total += "Connection: Upgrade\r\n".len;
     // Forwarded client headers.
     for (0..ctx.req.headerCount()) |i| {
         const h = ctx.req.headerAt(i);
@@ -1146,6 +1178,7 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
     write(buf, &pos, "\r\nX-Real-IP: ");
     write(buf, &pos, ip);
     write(buf, &pos, "\r\n");
+    if (ws_upgrade) write(buf, &pos, "Connection: Upgrade\r\n");
 
     // Forwarded client headers.
     for (0..ctx.req.headerCount()) |i| {
@@ -2591,4 +2624,127 @@ test "proxy TLS iso: sock ifaces round-trip bytes over socketpair" {
     var out: [64]u8 = undefined;
     try sock.reader_iface.readSliceAll(out[0..back.len]);
     try testing.expectEqualStrings(back, out[0..back.len]);
+}
+
+test "proxy_ws forwards Connection Upgrade and relays a 101" {
+    // Request construction carries Connection: Upgrade upstream only when
+    // the route opts into proxy_ws and the client sent Upgrade.
+    const mkReq = struct {
+        fn go(with_upgrade: bool) !registry.Request {
+            var req = registry.Request.init(testing.allocator);
+            req.method = .get;
+            req.target = "/ws";
+            req.decoded_target = "/ws";
+            if (with_upgrade) {
+                try req.addHeaderParsed("Upgrade", "websocket");
+                try req.addHeaderParsed("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+            }
+            return req;
+        }
+    }.go;
+    const ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = 9999,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", 9999).?,
+    }};
+    {
+        var req = try mkReq(true);
+        defer req.deinit();
+        var resp = registry.Response.init(.ok);
+        const route = registry.Route{ .path = "/", .proxy_ws = true, .upstreams = &ups };
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &route;
+        const wire = try buildUpstreamRequest(&ctx, &ups[0]);
+        try testing.expect(std.mem.indexOf(u8, wire, "Connection: Upgrade\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, wire, "Upgrade: websocket") != null);
+    }
+    {
+        // Disabled: no Connection header leaks upstream.
+        var req = try mkReq(true);
+        defer req.deinit();
+        var resp = registry.Response.init(.ok);
+        const route = registry.Route{ .path = "/", .upstreams = &ups };
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &route;
+        const wire = try buildUpstreamRequest(&ctx, &ups[0]);
+        try testing.expect(std.mem.indexOf(u8, wire, "Connection:") == null);
+    }
+    {
+        // No client Upgrade: enabled but nothing to forward.
+        var req = try mkReq(false);
+        defer req.deinit();
+        var resp = registry.Response.init(.ok);
+        const route = registry.Route{ .path = "/", .proxy_ws = true, .upstreams = &ups };
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &route;
+        const wire = try buildUpstreamRequest(&ctx, &ups[0]);
+        try testing.expect(std.mem.indexOf(u8, wire, "Connection:") == null);
+    }
+}
+
+test "proxy_ws 101 round-trips through a fake origin" {
+    const fake = try FakeUpstream.start("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n", 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = fake.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", fake.port).?,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_ws = true,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/ws";
+    req.decoded_target = "/ws";
+    try req.addHeaderParsed("Upgrade", "websocket");
+    try req.addHeaderParsed("Connection", "Upgrade");
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.switching_protocols, resp.status);
+    // Connection survives on 101 (end-to-end); Upgrade was never stripped.
+    var saw_conn = false;
+    var saw_upgrade = false;
+    for (resp.headers[0..resp.header_count]) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "connection")) saw_conn = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "upgrade")) saw_upgrade = true;
+    }
+    try testing.expect(saw_conn and saw_upgrade);
+}
+
+test "proxy non-101 still strips connection headers" {
+    const fake = try FakeUpstream.start("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nhi", 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = fake.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", fake.port).?,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_ws = true,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    for (resp.headers[0..resp.header_count]) |h| {
+        try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "connection"));
+    }
 }

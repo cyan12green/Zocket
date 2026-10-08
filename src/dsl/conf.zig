@@ -118,6 +118,7 @@ const H_cors_max_age = keyHash("cors_max_age");
 const H_secure_link_secret = keyHash("secure_link_secret");
 const H_auth_jwt_secret = keyHash("auth_jwt_secret");
 const H_auth_jwt_leeway = keyHash("auth_jwt_leeway");
+const H_proxy_ws = keyHash("proxy_ws");
 const H_proxy_cache = keyHash("proxy_cache");
 const H_client_header_timeout = keyHash("client_header_timeout");
 const H_client_body_timeout = keyHash("client_body_timeout");
@@ -354,6 +355,8 @@ const LocationSpec = struct {
     /// `auth_jwt_secret "...";` + `auth_jwt_leeway seconds;`.
     auth_jwt_secret: ?Str = null,
     auth_jwt_leeway: u32 = 0,
+    /// `proxy_ws on|off;` (WebSocket upgrade forwarding).
+    proxy_ws: bool = false,
     /// `sticky_cookie name;` (cookie-based backend affinity)
     sticky: ?Str = null,
     /// `health_check path=... interval=N rise=N fall=N timeout=N;`
@@ -1546,6 +1549,11 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             ensureModuleBound(b, spec, .access, "auth_jwt");
             b.cost += 8;
         },
+        H_proxy_ws => {
+            spec.proxy_ws = lx.boolOnOff("proxy_ws");
+            lx.expectTerminator("proxy_ws");
+            b.cost += 8;
+        },
         H_precompressed => {
             // `precompressed gz;` (only gz is supported today)
             const t = lx.token() orelse lx.fail("precompressed: expected a codec");
@@ -2433,6 +2441,7 @@ fn build(b: *const Builder) Config {
                 .secure_link_secret = if (spec.secure_link_secret) |s| resolve(s, strings) else null,
                 .auth_jwt_secret = if (spec.auth_jwt_secret) |s| resolve(s, strings) else null,
                 .auth_jwt_leeway_s = spec.auth_jwt_leeway,
+                .proxy_ws = spec.proxy_ws,
                 .proxy_cache_enabled = spec.cache_enabled,
                 .cache_ttl_seconds = spec.cache_ttl,
                 .cache_swr_seconds = spec.cache_swr,
@@ -3858,4 +3867,17 @@ test "conf: cors plus secure_link plus jwt directives bind access modules" {
     try testing.expectEqualStrings("sek", r.secure_link_secret.?);
     try testing.expectEqualStrings("jkey", r.auth_jwt_secret.?);
     try testing.expectEqual(@as(u32, 30), r.auth_jwt_leeway_s);
+}
+
+test "conf: proxy_ws toggles upgrade forwarding" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite proxy;
+        \\        proxy_pass 127.0.0.1:9000;
+        \\        proxy_ws on;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.routes[0].proxy_ws);
 }

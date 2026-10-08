@@ -101,6 +101,11 @@ pub const Route = struct {
     /// failures. Sync forward path only (the parked/async path marks the
     /// failure and answers 502 as before).
     proxy_next_upstream: bool = false,
+    /// WebSocket passthrough (`proxy_ws on`): forward `Connection: Upgrade`
+    /// + `Upgrade` to the backend and relay a 101 back (headers preserved).
+    /// v1 covers the handshake only; post-101 duplex byte-pipe rides the
+    /// Stage-2 upstream seam.
+    proxy_ws: bool = false,
     /// Upstream TLS verification (`proxy_ssl_verify on` + trusted
     /// bundle): reject backends whose chain/hostname don't verify.
     /// Default off (nginx parity) — handshake still negotiates TLS.
