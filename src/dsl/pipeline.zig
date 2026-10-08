@@ -299,7 +299,10 @@ fn assignDispatchImpl(comptime Registry: type, comptime routes: []const router.R
         // set `.sockaddr` via `Upstream.makeSockaddr`. A stale default
         // (family 0) would fail the connect at runtime, so reject it here.
         inline for (r.upstreams) |up| {
-            if (up.sockaddr.family == 0) {
+            // Literals pre-compute (family != 0); hostnames resolve at
+            // startup (family 0 + hostname set — embeddedInit copies them
+            // onto the heap before the resolver rewrites the octets).
+            if (up.sockaddr.family == 0 and up.hostname == null) {
                 @compileError("proxy upstream needs a pre-computed sockaddr (Upstream.makeSockaddr): " ++ up.host);
             }
         }

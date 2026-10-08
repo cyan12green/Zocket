@@ -50,6 +50,9 @@ pub const Config = struct {
     /// Compiled `map` blocks (`map` directives, top-level). Referenced by
     /// `Frag.map` through `Context.maps` (set per request by the server).
     maps: []const MapDef = &.{},
+    /// Explicit DNS nameservers (`resolver` directive, top-level). Empty =
+    /// /etc/resolv.conf at first use. Consumed once at startup.
+    resolver: []const [16]u8 = &.{},
     /// Multi-server specs: each server {} block gets its own listen port,
     /// server_name, and route range. When empty (single-server), the top-
     /// level listen_port + routes are used directly.

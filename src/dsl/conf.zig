@@ -136,6 +136,7 @@ const H_real_ip_recursive = keyHash("real_ip_recursive");
 const H_limit_req_status = keyHash("limit_req_status");
 const H_limit_conn_status = keyHash("limit_conn_status");
 const H_limit_rate = keyHash("limit_rate");
+const H_resolver = keyHash("resolver");
 const H_expires = keyHash("expires");
 const H_etag = keyHash("etag");
 const H_gunzip = keyHash("gunzip");
@@ -503,6 +504,7 @@ const Builder = struct {
     limits: Limits = .{},
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
+    resolver_addrs: ct_pool.CtPool(Str, 3) = .{},
     tls_seen: bool = false,
     listen_port: ?u16 = null,
     listen_spec: ?sockets_mod.ListenSpec = null,
@@ -636,6 +638,20 @@ fn resolve(str: Str, strings: []const u8) []const u8 {
         .src => |s| s,
         .pool => |p| strings[p.start..][0..p.len],
     };
+}
+
+/// Build an Upstream from a parsed host:port. IP literals pre-compute
+/// the sockaddr (zero runtime cost); DNS names keep family-0 (the
+/// resolver fills the octets at startup/refresh). Anything else is a
+/// compile error — a typo'd literal must not become a DNS lookup.
+fn parseUpstream(lx: *Lexer, comptime dir: []const u8, host: []const u8, port: u16) Upstream {
+    if (Upstream.makeSockaddr(host, port)) |sa| {
+        return .{ .host = host, .port = port, .sockaddr = sa };
+    }
+    if (sockets_mod.isValidHostname(host)) {
+        return .{ .host = host, .port = port, .hostname = host };
+    }
+    lx.fail(dir ++ ": host is neither an IPv4 literal nor a valid DNS name");
 }
 
 /// Validate a `map` variable operand (`$name`). Destinations must also be
@@ -1055,6 +1071,17 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
             _ = b.maps.create(.{ .source = src_t, .dest = dst_t, .entries_start = entries_start, .entries_len = entries_len });
             b.cost += 16;
         },
+        H_resolver => {
+            // `resolver 8.8.8.8 1.1.1.1;` — up to 3 IPv4 nameservers.
+            // Parsed to octets at build (compile error on garbage).
+            while (lx.peek() != ';') {
+                const a = lx.token() orelse lx.fail("resolver: expected an IPv4 address");
+                _ = b.resolver_addrs.create(a);
+                if (b.resolver_addrs.len > 3) lx.fail("resolver: at most 3 nameservers");
+            }
+            lx.expectTerminator("resolver");
+            b.cost += 8;
+        },
         H_log_format => {
             const fmt_name = lx.value(b, "log_format");
             const fmt_value = lx.value(b, "log_format");
@@ -1248,12 +1275,7 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch
                 lx.fail("proxy_pass: expected host:port");
             if (spec.upstreams_len == 0) spec.upstreams_start = b.upstreams.len;
-            _ = b.upstreams.create(.{
-                .host = host,
-                .port = port,
-                .sockaddr = Upstream.makeSockaddr(host, port) orelse
-                    lx.fail("proxy_pass: host '" ++ host ++ "' is not a valid IPv4 literal"),
-            });
+            _ = b.upstreams.create(parseUpstream(lx, "proxy_pass", host, port));
             spec.upstreams_len += 1;
             b.cost += 8;
         },
@@ -1267,12 +1289,7 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             const port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch
                 lx.fail("upstream: expected host:port");
             if (spec.upstreams_len == 0) spec.upstreams_start = b.upstreams.len;
-            _ = b.upstreams.create(.{
-                .host = host,
-                .port = port,
-                .sockaddr = Upstream.makeSockaddr(host, port) orelse
-                    lx.fail("upstream: host '" ++ host ++ "' is not a valid IPv4 literal"),
-            });
+            _ = b.upstreams.create(parseUpstream(lx, "upstream", host, port));
             spec.upstreams_len += 1;
             b.cost += 8;
         },
@@ -1984,6 +2001,19 @@ fn build(b: *const Builder) Config {
         break :blk .{ .items = items, .ranges = ranges };
     };
 
+    const ResolverTable = struct { items: [3][16]u8, len: usize };
+    const resolver_table: ResolverTable = comptime blk: {
+        var items: [3][16]u8 = undefined;
+        var len: usize = 0;
+        for (b.resolver_addrs.freeze()) |rs| {
+            const text = resolve(rs, strings);
+            items[len] = sockets_mod.parseIpv4(text) orelse
+                @compileError("resolver: not an IPv4 literal");
+            len += 1;
+        }
+        break :blk .{ .items = items, .len = len };
+    };
+
     const LogTable = struct { items: [16]LogFormat, len: usize };
     const log_table: LogTable = comptime blk: {
         var items: [16]LogFormat = undefined;
@@ -2432,6 +2462,7 @@ fn build(b: *const Builder) Config {
         .listen_port = b.listen_port,
         .listen_spec = b.listen_spec,
         .log_formats = log_table.items[0..log_table.len],
+        .resolver = resolver_table.items[0..resolver_table.len],
         .maps = map_table.items[0..map_table.len],
         .servers = servers_built.items[0..servers_built.len],
         .select_fn = select_fn,
@@ -3601,4 +3632,47 @@ test "conf: expires, etag and gunzip parse" {
         if (std.mem.eql(u8, fb.module, "gunzip")) found = true;
     }
     try testing.expect(found);
+}
+
+test "conf: hostname upstreams keep family-0 with hostname set" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite proxy;
+        \\        upstream backend.internal:8001;
+        \\        proxy_pass api.example.com:9000;
+        \\        upstream 127.0.0.1:8002;
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 3), cfg.routes[0].upstreams.len);
+    const dns1 = cfg.routes[0].upstreams[0];
+    try testing.expectEqual(@as(u16, 0), dns1.sockaddr.family);
+    try testing.expectEqualStrings("backend.internal", dns1.hostname.?);
+    try testing.expectEqual(@as(u16, 8001), dns1.port);
+    const dns2 = cfg.routes[0].upstreams[1];
+    try testing.expectEqual(@as(u16, 0), dns2.sockaddr.family);
+    try testing.expectEqualStrings("api.example.com", dns2.hostname.?);
+    // Literals still pre-compute.
+    const lit = cfg.routes[0].upstreams[2];
+    try testing.expect(lit.sockaddr.family != 0);
+    try testing.expect(lit.hostname == null);
+}
+
+test "conf: resolver directive parses up to 3 nameservers" {
+    const cfg = parse(
+        \\resolver 8.8.8.8 1.1.1.1;
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 2), cfg.resolver.len);
+    try testing.expectEqual(sockets_mod.parseIpv4("8.8.8.8").?, cfg.resolver[0]);
+    try testing.expectEqual(sockets_mod.parseIpv4("1.1.1.1").?, cfg.resolver[1]);
+    const cfg2 = parse(
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 0), cfg2.resolver.len);
 }

@@ -5,6 +5,7 @@ const sockets = @import("../../net/sockets.zig");
 const router = @import("../router.zig");
 const http_parser = @import("../../http/parser.zig");
 const vars = @import("../vars.zig");
+const dns_resolver = @import("../../net/dns_resolver.zig");
 
 pub const Context = registry.Context;
 pub const Action = registry.Action;
@@ -1893,4 +1894,43 @@ test "proxy pool reaps idle entries and returns fresh ones" {
     }
     try testing.expectEqual(@as(u32, 2), pool_lens[idx]);
     drainPool(idx);
+}
+
+test "proxy hostname upstream resolves via refresh then forwards" {
+    // Heap record: refresh rewrites the octets (never .rodata).
+    const stub = try dns_resolver.Stub.start();
+    defer stub.stopStub();
+    const fake = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{ .host = "loopback", .port = fake.port, .hostname = "loopback" }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    // Resolve + register against the stub, then refresh into the record.
+    var srv = dns_resolver.Servers{};
+    srv.addrs[0] = sockets.parseIpv4("127.0.0.1").?;
+    srv.len = 1;
+    dns_resolver.resolveAndRegister("loopback", &ups[0], srv, stub.port);
+    try testing.expectEqual(@as(u16, 2), ups[0].sockaddr.family); // AF_INET now
+    // Seed backend 0 with a blocking socket (deterministic read).
+    const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try compat.connect(seed, &ups[0].sockaddr, 16);
+    setRecvTimeout(seed, default_read_timeout_s);
+    releasePooled(0, seed, nowNs(), pool_default_max);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("hello", resp.body);
+    drainPool(0);
 }

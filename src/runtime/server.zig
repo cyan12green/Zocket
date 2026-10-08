@@ -7,6 +7,7 @@ const router_mod = @import("../dsl/router.zig");
 
 pub const Config = config_mod.Config;
 const tls_cert = @import("../tls/cert.zig");
+const dns_resolver = @import("../net/dns_resolver.zig");
 pub const default_registry = registry.default_registry;
 pub const ServerStats = registry.ServerStats;
 
@@ -93,6 +94,35 @@ pub const Server = struct {
     /// static roots at startup, but
     /// the comptime route table is immutable .rodata, so the rooted routes
     /// are copied into `allocator` with `root_real` (symlink-escape anchor)
+    /// True when any upstream on the route resolves via DNS.
+    fn hasHostnameUpstream(r: router_mod.Route) bool {
+        for (r.upstreams) |up| {
+            if (up.hostname != null) return true;
+        }
+        return false;
+    }
+
+    /// Heap-copy a route's upstream table when it holds hostnames, resolve
+    /// each synchronously (warn + unresolved on failure; refresh retries),
+    /// and register for background refresh. Literal-only routes keep the
+    /// .rodata slice (zero startup cost).
+    fn prepareUpstreams(
+        allocator: std.mem.Allocator,
+        r: router_mod.Route,
+        dns_servers: dns_resolver.Servers,
+    ) ![]const router_mod.Upstream {
+        if (!hasHostnameUpstream(r)) return r.upstreams;
+        const owned = try allocator.dupe(router_mod.Upstream, r.upstreams);
+        for (owned) |*up| {
+            const host = up.hostname orelse continue;
+            dns_resolver.resolveAndRegister(host, up, dns_servers, 53);
+            if (up.sockaddr.family == 0) {
+                std.log.warn("dns: {s} unresolved at startup; serving 502 until refresh succeeds", .{host});
+            }
+        }
+        return owned;
+    }
+
     /// and `root_fd` (O_PATH|O_DIRECTORY for the openat2 fast path) filled
     /// in. The dispatch functions, trie and everything else stay comptime;
     /// the trie's positional route indices apply to the copy unchanged.
@@ -116,9 +146,15 @@ pub const Server = struct {
         errdefer for (routes[0..prepared_len]) |r| {
             if (r.root_real) |rr| allocator.free(rr);
             if (r.root_fd >= 0) compat.close(r.root_fd);
+            if (hasHostnameUpstream(r)) allocator.free(r.upstreams);
         };
+        // Explicit nameservers apply process-wide, once (first server wins;
+        // group siblings share the resolver thread and cache anyway).
+        if (base.cfg.resolver.len > 0) dns_resolver.setServers(base.cfg.resolver);
+        const dns_servers = dns_resolver.currentServers();
         for (base.cfg.routes, 0..) |r, i| {
             var copy = r;
+            copy.upstreams = try prepareUpstreams(allocator, r, dns_servers);
             if (r.root) |root| {
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
                 const resolved = compat.realpath(root, &buf) catch null;
@@ -155,6 +191,7 @@ pub const Server = struct {
         for (self.cfg.routes) |r| {
             if (r.root_real) |rr| allocator.free(rr);
             if (r.root_fd >= 0) compat.close(r.root_fd);
+            if (hasHostnameUpstream(r)) allocator.free(r.upstreams);
         }
         allocator.free(self.cfg.routes);
         // Free per-server stats only if they were allocated (not the global default).
@@ -1077,6 +1114,7 @@ pub const ServerGroup = struct {
                     .tls = cfg.tls,
                     .listen_port = spec.listen_port,
                     .log_formats = cfg.log_formats,
+                    .maps = cfg.maps,
                     .server_names = spec.server_names,
                 };
                 arr[i] = Server.comptimeInit(sub_cfg);
@@ -1106,6 +1144,8 @@ pub const ServerGroup = struct {
                 .tls = cfg.tls,
                 .listen_port = spec.listen_port,
                 .log_formats = cfg.log_formats,
+                .maps = cfg.maps,
+                .resolver = cfg.resolver,
                 .server_names = spec.server_names,
             };
             srvs[i] = Server.init(sub_cfg);
@@ -1138,6 +1178,8 @@ pub const ServerGroup = struct {
                 .tls = cfg.tls,
                 .listen_port = spec.listen_port,
                 .log_formats = cfg.log_formats,
+                .maps = cfg.maps,
+                .resolver = cfg.resolver,
                 .server_names = spec.server_names,
             };
             srvs[i] = try Server.embeddedInitWithTls(allocator, sub_cfg);
@@ -1335,4 +1377,37 @@ test "map dest feeds set vars and second-request caching is per-request" {
         try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
         try testing.expectEqualStrings(c.want, resp.body);
     }
+}
+
+test "prepareUpstreams dupes hostname routes, passes literals through" {
+    // Literal-only route: same slice back (zero startup cost, no free).
+    const lit_ups = [_]router_mod.Upstream{
+        .{ .host = "127.0.0.1", .port = 80, .sockaddr = router_mod.Upstream.makeSockaddr("127.0.0.1", 80).? },
+    };
+    const lit_route = router_mod.Route{ .path = "/", .upstreams = &lit_ups };
+    const lit_out = try Server.prepareUpstreams(testing.allocator, lit_route, .{});
+    try testing.expect(lit_out.ptr == lit_route.upstreams.ptr);
+
+    // Hostname route with no servers: duped array, unresolved, registered.
+    const dns_ups = [_]router_mod.Upstream{
+        .{ .host = "backend.internal", .port = 8001, .hostname = "backend.internal" },
+    };
+    const dns_route = router_mod.Route{ .path = "/", .upstreams = &dns_ups };
+    const dns_out = try Server.prepareUpstreams(testing.allocator, dns_route, .{});
+    defer testing.allocator.free(dns_out);
+    try testing.expect(dns_out.ptr != dns_route.upstreams.ptr);
+    try testing.expectEqual(@as(u16, 0), dns_out[0].sockaddr.family);
+    try testing.expectEqualStrings("backend.internal", dns_out[0].hostname.?);
+}
+
+test "deinitPrepared frees hostname upstream dupes without leaking" {
+    // Mimics embeddedInit's hostname path: heap routes + heap upstream
+    // array. testing.allocator fails on leak → proves the free branch ran.
+    const heap_ups = try testing.allocator.dupe(router_mod.Upstream, &[_]router_mod.Upstream{
+        .{ .host = "backend.internal", .port = 8001, .hostname = "backend.internal" },
+    });
+    const routes = try testing.allocator.alloc(router_mod.Route, 1);
+    routes[0] = .{ .path = "/", .upstreams = heap_ups };
+    var srv = Server.init(.{ .routes = routes });
+    srv.deinitPrepared(testing.allocator);
 }

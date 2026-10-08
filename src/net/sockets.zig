@@ -537,6 +537,26 @@ pub fn parseCidr(s: []const u8) ?Cidr {
     return .{ .addr = addr, .bits = if (isIPv4Mapped(addr)) 32 else 128 };
 }
 
+/// True when `s` is a plausible DNS hostname (RFC 1035 labels: alnum +
+/// hyphen, not leading/trailing hyphen, label <= 63, total <= 253). Used
+/// to tell `upstream bad-literal` (compile error) from `upstream name`
+/// (resolver path). Purely syntactic — resolution failure is a runtime
+/// (startup warn + refresh retry), not a parse, concern.
+pub fn isValidHostname(s: []const u8) bool {
+    if (s.len == 0 or s.len > 253) return false;
+    var labels: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '.');
+    while (it.next()) |label| {
+        if (label.len == 0 or label.len > 63) return false;
+        if (label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |c| {
+            if (!(std.ascii.isAlphanumeric(c) or c == '-')) return false;
+        }
+        labels += 1;
+    }
+    return labels > 0;
+}
+
 /// Parse a v4 or v6 literal (v6 takes precedence when both could match —
 /// in practice dotted form only parses v4, colon form only v6).
 pub fn parseIp(s: []const u8) ?[16]u8 {
@@ -607,4 +627,20 @@ test "sockets: cidrContains matches prefixes and boundaries" {
     // Cross-family prefixes never match (except a /0).
     try testing.expect(!cidrContains(parseCidr("10.0.0.0/8").?, parseIp("::1").?));
     try testing.expect(!cidrContains(parseCidr("2001:db8::/32").?, parseIp("10.1.2.3").?));
+}
+
+test "sockets: isValidHostname accepts names, rejects garbage" {
+    try testing.expect(isValidHostname("example.com"));
+    try testing.expect(isValidHostname("a"));
+    try testing.expect(isValidHostname("xn--nxasmq6b.example"));
+    try testing.expect(isValidHostname("host-1.internal"));
+    try testing.expect(!isValidHostname(""));
+    try testing.expect(!isValidHostname("-bad.example"));
+    try testing.expect(!isValidHostname("bad-.example"));
+    try testing.expect(!isValidHostname("bad..example"));
+    try testing.expect(!isValidHostname("has space.example"));
+    try testing.expect(!isValidHostname("under_score.example"));
+    var long: [64]u8 = undefined;
+    @memset(&long, 'a');
+    try testing.expect(!isValidHostname(&long));
 }

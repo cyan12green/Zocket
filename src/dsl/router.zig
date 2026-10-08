@@ -372,6 +372,11 @@ pub const Upstream = struct {
     host: []const u8,
     port: u16,
     sockaddr: std.posix.sockaddr = .{ .family = 0, .data = @as([14]u8, @splat(@as(u8, 0))) },
+    /// DNS hostname when `host` is not an IP literal (null for literals).
+    /// Family-0 sockaddrs are the "unresolved" marker for these: the
+    /// resolver fills the octets in at startup/refresh. Never mutated in
+    /// .rodata — embeddedInit copies hostname routes onto the heap first.
+    hostname: ?[]const u8 = null,
 
     /// Build the kernel sockaddr for an IPv4 host literal ("127.0.0.1").
     /// Works at comptime (struct-literal configs) and at runtime (JSON).

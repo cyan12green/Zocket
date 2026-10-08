@@ -178,6 +178,16 @@ captures only — route `set` vars and other maps are out of scope there
 shadow builtins or the header/arg/cookie families (compile error); each
 map consumes one user-variable slot on every route (budget: 16 total).
 
+### DNS resolver
+
+Top-level `resolver 8.8.8.8 1.1.1.1;` (up to 3 IPv4 nameservers; default
+`/etc/resolv.conf`). One detached thread per process owns all DNS I/O;
+reactor threads never block on it. A-record lookup only in v1 (the proxy
+dial path is IPv4-only), CNAMEs chased in-response, TTLs clamped to
+5 s–1 h and refreshed on expiry with in-place sockaddr swaps (pooled
+connections drain naturally). Unresolvable-at-startup names serve 502
+until the refresh succeeds — never a startup failure.
+
 ### Listen directive
 
 | Syntax | Description |

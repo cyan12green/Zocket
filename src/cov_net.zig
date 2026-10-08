@@ -15,4 +15,5 @@ comptime {
     _ = @import("net/body_storage.zig");
     _ = @import("net/proxy_proto.zig");
     _ = @import("net/dns.zig");
+    _ = @import("net/dns_resolver.zig");
 }
