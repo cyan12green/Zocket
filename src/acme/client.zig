@@ -960,3 +960,67 @@ test "acme runOnce completes a full issuance against the fake CA" {
     try testing.expect(std.mem.startsWith(u8, acct_pem, "-----BEGIN EC PRIVATE KEY-----"));
     try testing.expect(fake.challenge_ok.load(.acquire));
 }
+
+/// Renewal thresholds: re-issue when the certificate is missing or has
+/// less than 30 days left (Let's Encrypt certs last 90); re-check twice a
+/// day otherwise.
+pub const renew_before_seconds: u64 = 30 * 24 * 60 * 60;
+pub const check_interval_seconds: u64 = 12 * 60 * 60;
+
+/// Seconds until the certificate chain at `path` expires; null when the
+/// file is missing or unparseable (treat as "issue now").
+pub fn certRemainingSeconds(allocator: std.mem.Allocator, path: []const u8) ?u64 {
+    const pem = compat.readFileAlloc(allocator, path, 1 << 20) catch return null;
+    defer allocator.free(pem);
+    const pem_mod = @import("../tls/pem.zig");
+    var buf: [8192]u8 = undefined;
+    const len = (pem_mod.decodeFirst(pem, "CERTIFICATE", &buf) catch return null) orelse return null;
+    const parsed = Certificate.parse(.{ .buffer = buf[0..len], .index = 0 }) catch return null;
+    const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return null;
+    const now: u64 = @intCast(ts.sec);
+    return if (parsed.validity.not_after > now) parsed.validity.not_after - now else 0;
+}
+
+/// Renewal daemon: issue when the cert is missing/close to expiry, then
+/// re-check every `check_interval_seconds`. Runs forever on the ACME
+/// worker thread; every failure is logged and retried next cycle (a
+/// broken renewal must never take the server down).
+pub fn runDaemon(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    transport: anytype,
+    logFn: ?*const fn (msg: []const u8) void,
+) void {
+    const log = struct {
+        fn call(f: ?*const fn ([]const u8) void, msg: []const u8) void {
+            if (f) |ff| ff(msg);
+        }
+    }.call;
+    while (true) {
+        const remaining = certRemainingSeconds(allocator, cfg.cert_path);
+        const needs = if (remaining) |r| r < renew_before_seconds else true;
+        if (needs) {
+            runOnce(allocator, cfg, transport, logFn) catch |e| {
+                var mb: [256]u8 = undefined;
+                const m = std.fmt.bufPrint(&mb, "acme: renewal failed: {s}", .{@errorName(e)}) catch "acme: renewal failed";
+                log(logFn, m);
+            };
+        }
+        compat.nanosleep(check_interval_seconds, 0);
+    }
+}
+
+test "certRemainingSeconds reports the fixture certificate's lifetime" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const testdata = @import("../tls/testdata.zig");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/crt.pem", .{tmp.sub_path});
+    try compat.writeFile(path, testdata.cert_pem);
+    const remaining = certRemainingSeconds(allocator, path) orelse return error.TestUnexpected;
+    // The fixture is valid for years; anything sane is > 30 days.
+    try testing.expect(remaining > renew_before_seconds);
+    // Missing file -> null (issue now).
+    try testing.expect(certRemainingSeconds(allocator, ".zig-cache/tmp/does-not-exist.pem") == null);
+}

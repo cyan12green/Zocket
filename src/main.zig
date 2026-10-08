@@ -379,10 +379,11 @@ fn runServer(
     }
     defer for (stream_buf[0..stream_len]) |s| s.stop();
 
-    // ACME auto-HTTPS (D3): one issuance run at startup when `acme {}` is
-    // configured. The worker is detached and best-effort — failures log
-    // and never touch the running server; a successful issuance rewrites
-    // the configured cert/key files (a restart picks them up).
+    // ACME auto-HTTPS (D3): renewal daemon when `acme {}` is configured.
+    // The worker is detached and best-effort — failures log and never touch
+    // the running server; a successful issuance rewrites the configured
+    // cert/key files (a restart picks them up), then re-checks twice a day
+    // and renews inside the last 30 days of validity.
     if (embedded) |cfg| {
         if (cfg.acme.enabled() and cfg.tls.cert.len > 0) {
             const AcmeArgs = struct {
@@ -405,16 +406,16 @@ fn runServer(
                     }.log;
                     var transport = @import("zocket").acme_client.HttpTransport.init(pa);
                     defer transport.deinit();
-                    @import("zocket").acme_client.runOnce(pa, .{
+                    // Renewal daemon: issues when the cert is missing or
+                    // close to expiry, then re-checks twice a day.
+                    @import("zocket").acme_client.runDaemon(pa, .{
                         .directory = args.acme.directory,
                         .contact = args.acme.contact,
                         .domains = args.acme.domains,
                         .account_key_path = acct_key,
                         .cert_path = args.cert,
                         .key_path = args.key,
-                    }, &transport, logFn) catch |e| {
-                        std.debug.print("zocket: acme issuance failed: {s}\n", .{@errorName(e)});
-                    };
+                    }, &transport, logFn);
                 }
             };
             const t2 = std.Thread.spawn(.{}, AcmeArgs.run, .{AcmeArgs{
