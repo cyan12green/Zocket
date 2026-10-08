@@ -160,6 +160,7 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
     }
 
     var reader = UpstreamReader{};
+    reader.alloc = ctx.req.arena.asAllocator();
     while (true) {
         if (reader.tryParse()) |res| {
             try adoptUpstream(ctx, res, offer_sticky, route.sticky_cookie orelse "", pick);
@@ -546,6 +547,7 @@ fn attemptForward(
         return error.UpstreamTransport;
     }
     var reader = UpstreamReader.init();
+    reader.alloc = ctx.req.arena.asAllocator();
     const read_result = reader.read(fd) catch blk: {
         break :blk null;
     };
@@ -668,6 +670,7 @@ fn attemptForwardTls(
         // Record-layer round trip; any transport failure lands below.
         // The reader lives here so the parsed body can borrow it.
         var reader = UpstreamReader.init();
+        reader.alloc = ctx.req.arena.asAllocator();
         const res = tlsRoundTrip(ctx, up, sock, &reader) catch {
             const retry = reused;
             destroyTls(ps.?);
@@ -776,10 +779,23 @@ fn tlsFill(reader: *UpstreamReader, sock: *TlsUpstream) !usize {
     // Instead: drain buffered plaintext, else advance the record layer by
     // exactly one record (a NewSessionTicket yields zero app bytes and
     // simply loops), returning as soon as bytes are available.
+    // Content-Length overflow bodies fill the store directly; chunked
+    // bodies decode INTO the store, so raw bytes go to `buf` instead.
+    const to_store = reader.big != null and !reader.chunked;
     while (true) {
         const buffered = sock.client.reader.buffered();
         if (buffered.len > 0) {
+            if (to_store) {
+                const store = reader.big.?;
+                const n = @min(buffered.len, store.len - reader.big_used);
+                if (n == 0) return error.UpstreamBufferFull;
+                @memcpy(store[reader.big_used..][0..n], buffered[0..n]);
+                sock.client.reader.toss(n);
+                reader.big_used += n;
+                return n;
+            }
             const n = @min(buffered.len, reader.buf.len - reader.used);
+            if (n == 0) return error.UpstreamBufferFull;
             @memcpy(reader.buf[reader.used..][0..n], buffered[0..n]);
             sock.client.reader.toss(n);
             reader.used += n;
@@ -1417,10 +1433,41 @@ fn fmtIp(ip: [16]u8, buf: []u8) []const u8 {
 const max_upstream_headers = 16;
 const UpstreamHeader = struct { name: []const u8, value: []const u8 };
 
+/// Cap for allocator-backed upstream bodies (matching the server's own
+/// response-size sanity limits; larger responses are a 502).
+const max_upstream_body: usize = 64 * 1024 * 1024;
+
+/// Comma/space separated token match (case-insensitive), for
+/// `Transfer-Encoding: chunked` style values.
+fn containsToken(value: []const u8, comptime token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t");
+        if (std.ascii.eqlIgnoreCase(part, token)) return true;
+    }
+    return false;
+}
+
 pub const UpstreamReader = struct {
     buf: [16 * 1024]u8 = undefined,
     used: usize = 0,
     pos: usize = 0,
+    /// Set by the caller: backs bodies larger than the embedded buffer
+    /// (small responses never touch it). Request-arena in the reactor;
+    /// null in tests without an allocator (big bodies then 502).
+    alloc: ?std.mem.Allocator = null,
+    /// Overflow body store: when a Content-Length body does not fit
+    /// `buf`, it is allocated once at full size and filled in place —
+    /// header slices stay valid (they live in the struct), and `Parsed`
+    /// returns a slice of this store.
+    big: ?[]u8 = null,
+    big_used: usize = 0,
+    /// Chunked transfer-encoding response (no Content-Length): the body
+    /// is decoded from chunk framing into `big`.
+    chunked: bool = false,
+    chunk_state: enum { size, data, trailer } = .size,
+    chunk_remaining: usize = 0,
+    chunked_done: bool = false,
     status: u16 = 0,
     headers: [max_upstream_headers]UpstreamHeader = undefined,
     header_count: usize = 0,
@@ -1481,13 +1528,61 @@ pub const UpstreamReader = struct {
             }
 
             var content_length: usize = 0;
+            var chunked = false;
             for (self.headers[0..self.header_count]) |h| {
-                if (http_parser.header_hasher.hash(h.name) == comptime http_parser.header_hasher.hash("content-length")) {
+                const hh = http_parser.header_hasher.hash(h.name);
+                if (hh == comptime http_parser.header_hasher.hash("content-length")) {
                     content_length = std.fmt.parseInt(usize, h.value, 10) catch return error.BadUpstreamResponse;
+                } else if (hh == comptime http_parser.header_hasher.hash("transfer-encoding")) {
+                    if (containsToken(h.value, "chunked")) chunked = true;
                 }
             }
             self.content_length = content_length;
+            self.chunked = chunked;
             self.headers_complete = true;
+        }
+        if (self.chunked) {
+            if (!self.decodeChunked()) return error.Incomplete;
+            const store = self.big orelse &.{};
+            const body: []const u8 = store[0..self.big_used];
+            const res: Parsed = .{ .status = self.status, .headers = self.headers[0..self.header_count], .body = body };
+            self.headers_complete = false;
+            self.content_length = 0;
+            self.header_count = 0;
+            self.status = 0;
+            self.chunked = false;
+            self.chunk_state = .size;
+            self.chunk_remaining = 0;
+            self.chunked_done = false;
+            self.big = null;
+            self.big_used = 0;
+            return res;
+        }
+        // Large bodies: migrate once to an allocator-backed store (the
+        // embedded 16 KiB only covers small responses).
+        if (self.big == null and self.content_length > self.buf.len - self.pos) {
+            if (self.content_length > max_upstream_body) return error.BadUpstreamResponse;
+            const a = self.alloc orelse return error.OutOfMemory;
+            const bytes = a.alloc(u8, self.content_length) catch return error.OutOfMemory;
+            const have = self.used - self.pos;
+            @memcpy(bytes[0..have], self.buf[self.pos..self.used]);
+            self.big = bytes;
+            self.big_used = have;
+            self.pos = 0;
+            self.used = 0;
+        }
+        if (self.big) |store| {
+            if (self.big_used < self.content_length) return error.Incomplete;
+            const body = store[0..self.content_length];
+            const res: Parsed = .{ .status = self.status, .headers = self.headers[0..self.header_count], .body = body };
+            // Reset for a pipelined next response on a reused reader.
+            self.headers_complete = false;
+            self.content_length = 0;
+            self.header_count = 0;
+            self.status = 0;
+            self.big = null;
+            self.big_used = 0;
+            return res;
         }
         if (self.used - self.pos < self.content_length) {
             // Compact so the next fill appends at a sane offset. Safe now:
@@ -1558,9 +1653,100 @@ pub const UpstreamReader = struct {
         }
     }
 
+    /// Decode chunked framing from the buffer into the (growing) body
+    /// store. Returns false when more input is needed (caller refills).
+    fn decodeChunked(self: *UpstreamReader) bool {
+        while (true) {
+            switch (self.chunk_state) {
+                .size => {
+                    const line = self.lineFromBuffer() orelse return false;
+                    if (line.len == 0) return false;
+                    // "1a" or "1a;ext=..." — hex size up to the first ';'.
+                    const sz = if (std.mem.indexOfScalar(u8, line, ';')) |i| line[0..i] else line;
+                    self.chunk_remaining = std.fmt.parseInt(usize, sz, 16) catch return false;
+                    if (self.chunk_remaining == 0) {
+                        self.chunk_state = .trailer;
+                    } else {
+                        self.chunk_state = .data;
+                    }
+                },
+                .data => {
+                    const avail = self.used - self.pos;
+                    const take = @min(avail, self.chunk_remaining);
+                    if (take > 0) {
+                        if (!self.appendBodyChunk(self.buf[self.pos .. self.pos + take])) return false;
+                        self.pos += take;
+                        self.chunk_remaining -= take;
+                    }
+                    if (self.chunk_remaining > 0) {
+                        self.compact();
+                        return false;
+                    }
+                    // Chunk data is followed by CRLF.
+                    if (self.used - self.pos < 2) {
+                        self.compact();
+                        return false;
+                    }
+                    if (self.buf[self.pos] != '\r' or self.buf[self.pos + 1] != '\n') return false;
+                    self.pos += 2;
+                    self.chunk_state = .size;
+                },
+                .trailer => {
+                    // Consume trailer lines through the terminating CRLF.
+                    while (true) {
+                        const line = self.lineFromBuffer() orelse {
+                            self.compact();
+                            return false;
+                        };
+                        if (line.len == 0) return true;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Append decoded bytes to the body store, growing it geometrically.
+    fn appendBodyChunk(self: *UpstreamReader, bytes: []const u8) bool {
+        const want = self.big_used + bytes.len;
+        if (want > max_upstream_body) return false;
+        if (self.big == null) {
+            const a = self.alloc orelse return false;
+            self.big = a.alloc(u8, @max(16 * 1024, want)) catch return false;
+            self.big_used = 0;
+        }
+        var store = self.big.?;
+        if (want > store.len) {
+            const a = self.alloc orelse return false;
+            // Arena realloc copies; pointer-identity is not required to
+            // survive (no slices into the store are held mid-decode).
+            store = a.realloc(store, @max(store.len * 2, want)) catch return false;
+            self.big = store;
+        }
+        @memcpy(store[self.big_used..][0..bytes.len], bytes);
+        self.big_used += bytes.len;
+        return true;
+    }
+
+    /// Slide unconsumed bytes to the front of the buffer.
+    fn compact(self: *UpstreamReader) void {
+        if (self.pos == 0) return;
+        const remaining = self.buf[self.pos..self.used];
+        std.mem.copyForwards(u8, self.buf[0..remaining.len], remaining);
+        self.used -= self.pos;
+        self.pos = 0;
+    }
+
     fn fill(self: *UpstreamReader, fd: posix_fd) !usize {
         // WouldBlock propagates: the caller yields back to the event loop
         // and level-triggered readability re-fires this exact spot.
+        // Content-Length overflow bodies fill the store directly; chunked
+        // bodies decode INTO the store, so raw bytes go to `buf` instead.
+        if (self.big != null and !self.chunked) {
+            const store = self.big.?;
+            const n = try std.posix.read(fd, store[self.big_used..]);
+            self.big_used += n;
+            return n;
+        }
         const n = try std.posix.read(fd, self.buf[self.used..]);
         self.used += n;
         return n;
@@ -3157,4 +3343,179 @@ test "tls sock iface poll reads available bytes" {
     const n = try sock.reader_iface.vtable.stream(&sock.reader_iface, &w, .limited(out.len));
     try testing.expect(n > 0);
     try testing.expectEqualStrings("hello-poll", out[0..n]);
+}
+
+test "proxy handles upstream responses larger than the reader buffer" {
+    // 100 KB body via a fake origin: must round-trip byte-exact (the
+    // reader's embedded buffer is 16 KB).
+    const body_len = 100 * 1024;
+    var resp_buf = std.ArrayList(u8).empty;
+    defer resp_buf.deinit(testing.allocator);
+    try resp_buf.print(testing.allocator, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body_len});
+    var i: usize = 0;
+    while (i < body_len) : (i += 1) resp_buf.append(testing.allocator, @intCast('a' + (i % 26))) catch unreachable;
+    const fake = try FakeUpstream.start(resp_buf.items, 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = fake.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", fake.port).?,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqual(@as(usize, body_len), resp.body.len);
+    try testing.expectEqual(@as(u8, 'a'), resp.body[0]);
+}
+
+test "proxy decodes chunked upstream responses" {
+    const wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n" ++
+        "6\r\n world\r\n" ++
+        "0\r\n\r\n";
+    const fake = try FakeUpstream.start(wire, 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = fake.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", fake.port).?,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("hello world", resp.body);
+}
+
+test "proxy decodes chunked bodies larger than the buffer" {
+    var wire = std.ArrayList(u8).empty;
+    defer wire.deinit(testing.allocator);
+    try wire.appendSlice(testing.allocator, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+    // 64 chunks x 4096 = 256 KB decoded.
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        try wire.print(testing.allocator, "1000\r\n", .{});
+        var j: usize = 0;
+        while (j < 4096) : (j += 1) try wire.append(testing.allocator, @intCast('a' + (i % 26)));
+        try wire.appendSlice(testing.allocator, "\r\n");
+    }
+    try wire.appendSlice(testing.allocator, "0\r\n\r\n");
+    const fake = try FakeUpstream.start(wire.items, 4);
+    defer fake.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = fake.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", fake.port).?,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(@as(usize, 256 * 1024), resp.body.len);
+    try testing.expectEqual(@as(u8, 'a'), resp.body[0]);
+}
+
+test "chunked reader ignores chunk extensions and trailers" {
+    const wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5;ext=1\r\nhello\r\n" ++
+        "0\r\nX-Trailer: v\r\n\r\n";
+    // Arena mirrors the production backing (leaks reclaimed wholesale).
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var r = UpstreamReader{};
+    r.alloc = arena_state.allocator();
+    @memcpy(r.buf[0..wire.len], wire);
+    r.used = wire.len;
+    const p = try r.tryParse();
+    try testing.expectEqual(@as(u16, 200), p.status);
+    try testing.expectEqualStrings("hello", p.body);
+}
+
+test "proxy TLS handles large and chunked upstream bodies" {
+    // Large Content-Length body over TLS.
+    var big_resp = std.ArrayList(u8).empty;
+    defer big_resp.deinit(testing.allocator);
+    try big_resp.print(testing.allocator, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{64 * 1024});
+    var i: usize = 0;
+    while (i < 64 * 1024) : (i += 1) big_resp.append(testing.allocator, @intCast('x')) catch unreachable;
+    const origin1 = try TlsOrigin.start(big_resp.items);
+    defer origin1.stop();
+    var ups1 = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = origin1.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", origin1.port).?,
+        .tls = true,
+    }};
+    const route1 = registry.Route{ .path = "/", .balance = .round_robin, .max_fails = 10, .upstreams = &ups1 };
+    testResetRoute(&route1);
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.method = .get;
+        req.target = "/big";
+        var resp = registry.Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &route1;
+        try testing.expectEqual(Action.handled, try run(&ctx));
+        try testing.expectEqual(@as(usize, 64 * 1024), resp.body.len);
+        try testing.expectEqual(@as(u8, 'x'), resp.body[0]);
+    }
+    // Chunked body over TLS.
+    const origin2 = try TlsOrigin.start("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    defer origin2.stop();
+    var ups2 = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = origin2.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", origin2.port).?,
+        .tls = true,
+    }};
+    const route2 = registry.Route{ .path = "/", .balance = .round_robin, .max_fails = 10, .upstreams = &ups2 };
+    testResetRoute(&route2);
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.method = .get;
+        req.target = "/chunked";
+        var resp = registry.Response.init(.ok);
+        var ctx = Context{ .req = &req, .resp = &resp };
+        ctx.route = &route2;
+        try testing.expectEqual(Action.handled, try run(&ctx));
+        try testing.expectEqualStrings("hello", resp.body);
+    }
 }

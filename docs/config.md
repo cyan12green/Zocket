@@ -97,6 +97,11 @@ Filters (run after every outcome, reverse declaration order):
 | `proxy_connect_timeout` | `proxy_connect_timeout seconds;` | 1 | Upstream connect deadline. |
 | `proxy_send_timeout` | `proxy_send_timeout seconds;` | 1 | Upstream request-write deadline. |
 | `proxy_read_timeout` | `proxy_read_timeout seconds;` | 5 | Upstream response-read deadline (SO_RCVTIMEO; sync-driver cap). |
+
+Upstream responses may be arbitrarily large (bodies beyond the
+embedded 16 KiB buffer are arena-backed, capped at 64 MiB) and either
+`Content-Length`-framed or `Transfer-Encoding: chunked` — chunk framing
+is decoded, extensions and trailers are consumed and dropped.
 | `proxy_next_upstream` | `proxy_next_upstream on\|off;` or `proxy_next_upstream error timeout http_502 http_503 http_504;` | off | Retry transport failures (and masked live-backend 502/503/504, which count toward max_fails) on the next usable backend, once each. Exhaustion keeps the last response. Sync forward path only. |
 | `proxy_ssl_verify` | `proxy_ssl_verify on\|off;` | off | Verify upstream TLS chain + hostname (needs `proxy_ssl_trusted_certificate`; build fails without it). Off still negotiates TLS without verification (nginx parity). |
 | `proxy_ssl_trusted_certificate` | `proxy_ssl_trusted_certificate path;` | — | PEM CA bundle file for upstream verification (absolute or cwd-relative). Loaded once per path, cached process-wide. |
