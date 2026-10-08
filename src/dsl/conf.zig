@@ -308,6 +308,8 @@ const LocationSpec = struct {
     path: Str = .{ .src = "" },
     /// `location @name`: a named location (not path-matched).
     name: ?Str = null,
+    /// `internal;`: exclude from external path matching.
+    internal: bool = false,
     match: Match = .prefix,
     no_regex: bool = false,
     /// Comptime-compiled NFA for .regex / .regex_ci locations (M-D).
@@ -1250,7 +1252,15 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
 }
 
 /// Parse the phase-directive bindings and route directives inside a location.
+const H_internal = keyHash("internal");
+
 fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime name: []const u8) void {
+    if (keyHash(name) == H_internal) {
+        spec.internal = true;
+        lx.expectTerminator("internal");
+        b.cost += 2;
+        return;
+    }
     // `rewrite` is BOTH a phase name (`rewrite <module>;`) and a directive
     // (`rewrite <pattern> <replacement> [flag];`). The directive form has
     // two or more values before the terminator; the phase form has exactly
@@ -2724,6 +2734,7 @@ fn build(b: *const Builder) Config {
             items[len] = .{
                 .path = resolve(spec.path, strings),
                 .name = if (spec.name) |n| resolve(n, strings) else null,
+                .internal = spec.internal,
                 .match = spec.match,
                 .no_regex = spec.no_regex,
                 .pattern_regex = spec.pattern_regex,
@@ -4556,4 +4567,21 @@ test "conf: named location parses and is not path-matched" {
     try testing.expect(cfg.routes[0].name == null);
     try testing.expectEqualStrings("@app", cfg.routes[1].name.?);
     try testing.expectEqualStrings("", cfg.routes[1].path);
+}
+
+test "conf: internal directive marks the route" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\    location /private/ {
+        \\        internal;
+        \\        content static;
+        \\        root "testdata";
+        \\    }
+        \\}
+    );
+    try testing.expect(!cfg.routes[0].internal);
+    try testing.expect(cfg.routes[1].internal);
 }

@@ -49,6 +49,10 @@ pub const Route = struct {
     /// reachable only through internal redirects (try_files / error_page
     /// targets). Path is empty for named routes.
     name: ?[]const u8 = null,
+    /// `internal;`: invisible to direct client requests; only internal
+    /// redirects may land on it (nginx semantics — a public location with
+    /// a shorter match serves external hits instead).
+    internal: bool = false,
     match: Match = .prefix,
     modules: []const ModuleBinding = &.{},
     /// Comptime-specialised dispatch function. Set for
@@ -299,9 +303,16 @@ pub const Route = struct {
 /// walked separately by the router's precedence). `matchRoutes` is called
 /// from the `find_config` phase of the pipeline.
 pub fn matchRoutes(route_list: []const Route, target: []const u8) ?*const Route {
+    return matchRoutesAt(route_list, target, false);
+}
+
+/// Linear fallback with `internal` filtering: external requests skip
+/// `internal;` routes; internal redirects see everything.
+pub fn matchRoutesAt(route_list: []const Route, target: []const u8, allow_internal: bool) ?*const Route {
     var best: ?*const Route = null;
     for (route_list) |*r| {
         if (r.name != null) continue;
+        if (r.internal and !allow_internal) continue;
         switch (r.match) {
             .exact => {
                 if (std.mem.eql(u8, target, r.path)) return r;
@@ -555,6 +566,12 @@ pub const TrieNode = struct {
     /// Deepest prefix route along the walk to this node (longest-prefix
     /// candidate for the current traversal).
     best_prefix: u32 = no_route,
+    /// External-request variants: same as the fields above but only for
+    /// non-`internal` routes (client requests skip internal locations;
+    /// internal redirects see the full tables).
+    prefix_route_ext: u32 = no_route,
+    exact_route_ext: u32 = no_route,
+    best_prefix_ext: u32 = no_route,
     /// Index of the parent node (for the best-prefix propagation pass).
     parent: u32 = no_route,
 };
@@ -659,10 +676,12 @@ fn buildCore(routes: []const Route, nodes: []TrieNode, edges: []TrieEdge) error{
             .prefix => {
                 if (n.prefix_route != no_route) return error.AmbiguousRoutes;
                 n.prefix_route = @intCast(ri);
+                if (!r.internal) n.prefix_route_ext = @intCast(ri);
             },
             .exact => {
                 if (n.exact_route != no_route) return error.AmbiguousRoutes;
                 n.exact_route = @intCast(ri);
+                if (!r.internal) n.exact_route_ext = @intCast(ri);
             },
             // Regex routes are not trie material (M-D): they are walked
             // separately in declaration order.
@@ -678,6 +697,11 @@ fn buildCore(routes: []const Route, nodes: []TrieNode, edges: []TrieEdge) error{
             nodes[i].best_prefix = nodes[i].prefix_route;
         } else if (nodes[i].parent != no_route) {
             nodes[i].best_prefix = nodes[nodes[i].parent].best_prefix;
+        }
+        if (nodes[i].prefix_route_ext != no_route) {
+            nodes[i].best_prefix_ext = nodes[i].prefix_route_ext;
+        } else if (nodes[i].parent != no_route) {
+            nodes[i].best_prefix_ext = nodes[nodes[i].parent].best_prefix_ext;
         }
     }
 
@@ -754,10 +778,13 @@ fn findEdge(trie: *const Trie, node: u32, byte: u8) ?u32 {
 /// the target ends at their node; otherwise the deepest prefix route along
 /// the walk wins (longest-prefix semantics). Returns the winning route index
 /// or null.
-pub fn trieMatch(trie: *const Trie, target: []const u8) ?u32 {
+/// `ext` = external-request view: `internal;` routes are invisible.
+pub fn trieMatch(trie: *const Trie, target: []const u8, ext: bool) ?u32 {
     var node: u32 = 0;
     var best: u32 = no_route;
-    if (trie.nodes[0].best_prefix != no_route) best = trie.nodes[0].best_prefix;
+    const root = trie.nodes[0];
+    const root_best = if (ext) root.best_prefix_ext else root.best_prefix;
+    if (root_best != no_route) best = root_best;
     var consumed = true;
     for (target) |byte| {
         const child = findEdge(trie, node, byte) orelse {
@@ -766,10 +793,13 @@ pub fn trieMatch(trie: *const Trie, target: []const u8) ?u32 {
         };
         node = child;
         const n = trie.nodes[node];
-        if (n.best_prefix != no_route) best = n.best_prefix;
+        const bp = if (ext) n.best_prefix_ext else n.best_prefix;
+        if (bp != no_route) best = bp;
     }
-    if (consumed and trie.nodes[node].exact_route != no_route) {
-        return trie.nodes[node].exact_route;
+    if (consumed) {
+        const n = trie.nodes[node];
+        const er = if (ext) n.exact_route_ext else n.exact_route;
+        if (er != no_route) return er;
     }
     return if (best != no_route) best else null;
 }
@@ -808,9 +838,17 @@ pub const Router = struct {
     /// 3. first regex (~ / ~*) match in declaration order wins (captures
     ///    recorded into `caps`);
     /// 4. longest plain prefix wins; else null.
+    /// External-request match: `internal;` locations are invisible.
     pub fn match(self: *const Router, target: []const u8, caps: ?*MatchCaps) ?*const Route {
-        if (self.trie.nodes.len == 0) return matchRoutes(self.routes, target);
-        const idx = trieMatch(&self.trie, target) orelse return null;
+        return self.matchAt(target, caps, false);
+    }
+
+    /// Match with `internal` visibility control: `allow_internal` is set
+    /// for internal redirect hops (try_files / error_page / accel), where
+    /// `internal;` locations become reachable.
+    pub fn matchAt(self: *const Router, target: []const u8, caps: ?*MatchCaps, allow_internal: bool) ?*const Route {
+        if (self.trie.nodes.len == 0) return matchRoutesAt(self.routes, target, allow_internal);
+        const idx = trieMatch(&self.trie, target, !allow_internal) orelse return null;
         const trie_route = &self.routes[idx];
 
         // 1. exact match wins immediately.
@@ -824,6 +862,7 @@ pub const Router = struct {
         const best_prefix: ?*const Route = if (trie_route.match == .prefix) trie_route else null;
         for (self.regex_routes) |rr| {
             const r = &self.routes[rr.route];
+            if (r.internal and !allow_internal) continue;
             if (r.pattern_regex) |*re| {
                 var mcaps: MatchCaps = .{ .subject = target };
                 if (regex_mod.match(re, target, &mcaps.ranges, 0, rr.ci)) {
@@ -943,7 +982,7 @@ test "comptime trie agrees with the linear matcher on shared prefixes" {
     const trie = buildTrie(&trie_routes);
     for (trie_targets) |t| {
         const want = matchRoutes(&trie_routes, t);
-        const got = trieMatch(&trie, t);
+        const got = trieMatch(&trie, t, false);
         if (want) |w| {
             try testing.expect(got != null);
             try testing.expectEqualStrings(w.path, trie_routes[got.?].path);
@@ -959,9 +998,9 @@ test "trie: exact beats prefix at the same path" {
         .{ .path = "/a", .match = .exact },
     };
     const trie = buildTrie(&rs);
-    try testing.expectEqual(@as(u32, 1), trieMatch(&trie, "/a").?);
+    try testing.expectEqual(@as(u32, 1), trieMatch(&trie, "/a", false).?);
     // The prefix route still serves longer targets.
-    try testing.expectEqual(@as(u32, 0), trieMatch(&trie, "/a/b").?);
+    try testing.expectEqual(@as(u32, 0), trieMatch(&trie, "/a/b", false).?);
 }
 
 test "trie: longest prefix wins across a deep chain" {
@@ -975,7 +1014,7 @@ test "trie: longest prefix wins across a deep chain" {
     const targets = [_][]const u8{ "/a/b/c/d/e", "/a/b/x", "/a/y", "/z" };
     for (targets) |t| {
         const want = matchRoutes(&rs, t).?;
-        try testing.expectEqualStrings(want.path, rs[trieMatch(&trie, t).?].path);
+        try testing.expectEqualStrings(want.path, rs[trieMatch(&trie, t, false).?].path);
     }
 }
 
@@ -985,8 +1024,8 @@ test "trie: exact does not match a longer target" {
         .match = .exact,
     }};
     const trie = buildTrie(&rs);
-    try testing.expectEqual(@as(u32, 0), trieMatch(&trie, "/only").?);
-    try testing.expectEqual(@as(?u32, null), trieMatch(&trie, "/only/x"));
+    try testing.expectEqual(@as(u32, 0), trieMatch(&trie, "/only", false).?);
+    try testing.expectEqual(@as(?u32, null), trieMatch(&trie, "/only/x", false));
 }
 
 test "trie: single-segment paths" {
@@ -995,9 +1034,9 @@ test "trie: single-segment paths" {
         .{ .path = "/b", .match = .prefix },
     };
     const trie = buildTrie(&rs);
-    try testing.expectEqual(@as(u32, 0), trieMatch(&trie, "/a").?);
-    try testing.expectEqual(@as(u32, 1), trieMatch(&trie, "/b").?);
-    try testing.expectEqual(@as(?u32, null), trieMatch(&trie, "/c"));
+    try testing.expectEqual(@as(u32, 0), trieMatch(&trie, "/a", false).?);
+    try testing.expectEqual(@as(u32, 1), trieMatch(&trie, "/b", false).?);
+    try testing.expectEqual(@as(?u32, null), trieMatch(&trie, "/c", false));
 }
 
 test "Router.match falls back to the linear matcher without a trie" {
@@ -1210,4 +1249,26 @@ test "named locations are excluded from path matching" {
     // Named lookup is the only way in.
     try testing.expectEqual(&rs[1], rt.matchNamed("@fallback").?);
     try testing.expect(rt.matchNamed("@missing") == null);
+}
+
+test "internal routes are invisible to external matching, reachable internally" {
+    const rs = [_]Route{
+        .{ .path = "/", .match = .prefix },
+        .{ .path = "/private", .match = .prefix, .internal = true },
+        .{ .path = "/private/exact", .match = .exact, .internal = true },
+    };
+    var rt = Router{ .routes = &rs, .trie = buildTrie(&rs), .regex_routes = &.{} };
+    // External: the internal prefixes are skipped; the public / serves.
+    try testing.expectEqualStrings("/", rt.match("/private/x", null).?.path);
+    try testing.expectEqualStrings("/", rt.match("/private/exact", null).?.path);
+    // External: with no public match at all -> no route.
+    const only_internal = [_]Route{.{ .path = "/secret", .match = .prefix, .internal = true }};
+    var rt2 = Router{ .routes = &only_internal, .trie = buildTrie(&only_internal), .regex_routes = &.{} };
+    try testing.expect(rt2.match("/secret/x", null) == null);
+    // Internal redirects see them.
+    try testing.expectEqualStrings("/private", rt.matchAt("/private/x", null, true).?.path);
+    try testing.expectEqualStrings("/private/exact", rt.matchAt("/private/exact", null, true).?.path);
+    // Linear fallback (no trie) honours the same rule.
+    try testing.expectEqualStrings("/", matchRoutes(&rs, "/private/x").?.path);
+    try testing.expectEqualStrings("/private", matchRoutesAt(&rs, "/private/x", true).?.path);
 }

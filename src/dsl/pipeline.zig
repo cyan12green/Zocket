@@ -52,14 +52,15 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
         // M-D: the router records regex captures; copy them into the context
         // (the winning route may be a regex route).
         var caps = router.MatchCaps{ .subject = ctx.req.decoded_target };
-        const matched = r.match(ctx.req.decoded_target, &caps);
+        // Internal redirect hops may land on `internal;` locations.
+        const matched = r.matchAt(ctx.req.decoded_target, &caps, ctx.redirect_hops > 0);
         if (caps.count > 0) {
             ctx.capture_subject = caps.subject;
             ctx.captures = caps.ranges;
             ctx.capture_count = caps.count;
         }
         break :blk matched;
-    } else router.matchRoutes(routes, ctx.req.decoded_target);
+    } else router.matchRoutesAt(routes, ctx.req.decoded_target, ctx.redirect_hops > 0);
     ctx.route = route;
     // No route matched: no module can act on this request.
     const r = route orelse return .not_handled;

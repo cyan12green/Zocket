@@ -1648,3 +1648,60 @@ test "named location exists but is unreachable by path" {
     try testing.expect(ctx.route.?.name == null);
     try testing.expectEqual(@as(u8, 0), ctx.redirect_hops);
 }
+
+test "internal locations: external 404-free fallback, internal redirect reaches" {
+    // GET /private/x from a client: the internal /private/ location is
+    // invisible; the public / echoes instead (nginx semantics).
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\    }
+        \\    location /private/ {
+        \\        internal;
+        \\        content static;
+        \\        root "testdata";
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.target = "/private/hello.txt";
+        req.decoded_target = "/private/hello.txt";
+        var resp = registry.Response.init(.ok);
+        var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+        try testing.expectEqual(pipeline.Outcome.handled, try srv.handleRequest(&ctx));
+        try testing.expectEqual(@as(u8, 0), ctx.redirect_hops);
+        try testing.expectEqualStrings("/", ctx.route.?.path);
+    }
+    // An error_page internal redirect DOES reach /private/ (hop 1).
+    const cfg2 = comptime Config.fromConfComptime(
+        \\server {
+        \\    location /files/ {
+        \\        root "testdata";
+        \\        content static;
+        \\        error_page 404 /private/hello.txt;
+        \\    }
+        \\    location /private/ {
+        \\        internal;
+        \\        content static;
+        \\        root "testdata";
+        \\    }
+        \\}
+    );
+    const srv2 = Server.init(cfg2);
+    {
+        var req = registry.Request.init(testing.allocator);
+        defer req.deinit();
+        req.target = "/files/nope.txt";
+        req.decoded_target = "/files/nope.txt";
+        var resp = registry.Response.init(.ok);
+        var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+        try testing.expectEqual(pipeline.Outcome.handled, try srv2.handleRequest(&ctx));
+        try testing.expectEqual(@as(u8, 1), ctx.redirect_hops);
+        try testing.expectEqualStrings("/private/", ctx.route.?.path);
+        try testing.expectEqual(registry.Status.ok, resp.status);
+    }
+}

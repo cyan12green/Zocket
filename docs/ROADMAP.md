@@ -403,7 +403,8 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   (`location @name`, excluded from path matching; reached via
   `try_files ... @name` and `error_page 5xx = @name`, URI preserved,
   method preserved) with a forced-route hop in the server's internal
-  redirect loop.
+  redirect loop; `internal;` locations (dual exact/prefix trie fields:
+  external matching skips them, internal redirects land on them).
 - D1.7 proxy parity ✅ SHIPPED 2026-10: `proxy_pass http://host/uri/;`
   URI-tail rewriting (nginx location-prefix replacement, query preserved).
 - D1.6 protocol extras ✅ SHIPPED 2026-10: `Expect: 100-continue` answered
