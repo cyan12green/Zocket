@@ -475,6 +475,8 @@ pub const default_registry = Registry(.{
     @import("modules/access.zig").access,
     @import("modules/realip.zig").realip,
     @import("modules/gunzip.zig").gunzip,
+    @import("modules/prometheus.zig").prometheus,
+    @import("modules/prometheus.zig").status_json,
 });
 
 const testing = std.testing;

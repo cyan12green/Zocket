@@ -37,4 +37,5 @@ comptime {
     _ = @import("dsl/modules/access.zig");
     _ = @import("dsl/modules/realip.zig");
     _ = @import("dsl/modules/gunzip.zig");
+    _ = @import("dsl/modules/prometheus.zig");
 }

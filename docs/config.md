@@ -237,8 +237,15 @@ The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
 
 | Directive | Syntax | Default | Description |
 |---|---|---|---|
-| `log_format` | `log_format name value;` | combined | Named log format (max 16). |
+| `log_format` | `log_format name value;` | combined | Named log format (max 16). Use `log_format json '{"time":"$date","req":"$request","status":$status}';` for JSON lines (values via `jsonEscape` semantics: quotes/backslashes/controls escaped). |
 | `access_log` | `access_log format\|off;` | combined | Per-route log format. |
+
+### Observability: Prometheus & status API
+
+| Directive | Phase | Description |
+|---|---|---|
+| `prometheus` | content | `location /metrics { prometheus; }` renders `zocket_*` gauges/counters in Prometheus exposition format (`text/plain; version=0.0.4`) from `ServerStats`. |
+| `status_json` | content | `location /status { status_json; }` renders the same counters as `{"active":..,"accepted":..,"requests":..,...}` (`application/json`). |
 
 ### TLS
 

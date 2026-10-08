@@ -342,8 +342,11 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
   byte-pipe handoff; needs the streaming escape hatch.
 - TCP stream proxy + SNI preread routing: L4 `stream {}` reusing
   multireactor + LB + shmem health; ClientHello peek parser.
-- Prometheus `/metrics` + JSON access logs + status API (shmem counters
-  and the comptime-tokenized log renderer already exist).
+- Prometheus `/metrics` + JSON access logs + status API ✅ SHIPPED 2026-10
+  (v1): `prometheus` content module (exposition gauges from the six
+  `ServerStats` counters) + `status_json` (same counters as JSON) +
+  `jsonEscape` helper + JSON `log_format` preset documented (shmem
+  per-module counters and comptime-tokenized renderer reuse deferred).
 - Auth bundle: CORS helper, `secure_link` (HMAC-expiring URLs), JWT-lite
   (static `jwks_file` first; reuse TLS ECDSA verify).
 - OCSP stapling + mTLS client-cert verify in the native TLS stack.
