@@ -146,9 +146,21 @@ fn exchange(server: [16]u8, port: u16, query: []const u8, resp_buf: []u8) Resolv
         var pfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
         const ready = posix.poll(&pfds, query_timeout_ms) catch return error.Timeout;
         if (ready == 0) continue;
-        const n = posix.read(fd, resp_buf) catch continue;
-        if (n == 0) continue;
-        return n;
+        // Raw errno mapping (not posix.read): a connected UDP socket
+        // reports ICMP errors (ECONNREFUSED from a dead port) on read,
+        // which std maps to an uncatchable panic. They just mean "no
+        // answer here" — wait out the attempts like a timeout.
+        const rc = linux.read(fd, resp_buf.ptr, resp_buf.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                if (n == 0) continue;
+                return n;
+            },
+            .INTR, .AGAIN => continue,
+            .CONNREFUSED, .CONNRESET, .HOSTUNREACH, .NETUNREACH => continue,
+            else => continue,
+        }
     }
     return error.Timeout;
 }
