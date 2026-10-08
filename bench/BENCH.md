@@ -75,10 +75,12 @@ to batch the HTTP head + sendfile body into one TCP segment.
 
 | File | Conns | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
-| 1 KB | 100 | 233,490 | 146,012 | 1.60x |
-| 1 KB | 1000 | 189,346 | 127,745 | 1.48x |
-| 1 MB | 100 | 9,774 | 9,313 | 1.05x |
-| 1 MB | 1000 | 8,406 | 7,717 | 1.09x |
+| 1 KB | 10 | 233,009 | 135,975 | 1.71x |
+| 1 KB | 100 | 380,125 | 179,204 | 2.12x |
+| 1 KB | 1000 | 317,658 | 155,049 | 2.05x |
+| 1 MB | 10 | 15,914 | 13,165 | 1.21x |
+| 1 MB | 100 | 15,885 | 12,857 | 1.24x |
+| 1 MB | 1000 | 15,563 | 12,653 | 1.23x |
 
 ## Zocket vs nginx (all cells)
 
@@ -94,28 +96,30 @@ Feature-specific comparison on module endpoints (100 conns, interleaved reps).
 
 | Cell | Zocket | nginx | Ratio |
 |---|---|---:|---:|
-| headers (3 ops/req) | 233,894 | 217,518 | 1.08x |
-| auth_basic ({SHA}) | 216,632 | 173,749 | 1.25x |
-| precompressed (.gz 8K) | 182,087 | 122,575 | 1.49x |
-| proxy_cache (HIT) | 219,381 | 165,244 | 1.33x |
-| limit_req (pass-through) | 225,491 | 214,374 | 1.05x |
+| headers (3 ops/req) | 464,972 | 358,563 | 1.30x |
+| auth_basic ({SHA}) | 393,894 | 215,147 | 1.83x |
+| precompressed (.gz 8K) | 317,758 | 165,172 | 1.92x |
+| proxy_cache (HIT) | 402,369 | 197,964 | 2.03x |
+| limit_req (pass-through) | 414,925 | 356,881 | 1.16x |
 
 ## Unified benchmark (web/file/LB)
 
-All servers co-resident: Zocket, nginx, HAProxy. 8 workload cells.
+All servers co-resident: Zocket, nginx (HAProxy/Envoy omitted — not
+built on this machine; build `bench/.cache/haproxy-build/sbin/haproxy`
+or set `ENVOY_BIN=` to include them). 8 workload cells.
 
 ![Unified](graphs/unified_web.png)
 
-| Cell | Zocket | nginx | HAProxy |
+| Cell | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
-| h1_echo | 218,172 | 136,354 | — |
-| static_small | 166,438 | 111,769 | — |
-| static_large | 10,415 | 7,659 | — |
-| precompressed | 175,828 | 112,237 | — |
-| headers_ops | 215,776 | 190,317 | — |
-| auth_basic | 164,474 | 159,393 | — |
-| cache_hit | 149,983 | 120,698 | — |
-| lb_rr | 172,818 | 71,890 | 73,756 |
+| h1_echo | 422,412 | 214,367 | 1.97x |
+| static_small | 318,157 | 168,293 | 1.89x |
+| static_large | 21,960 | 20,551 | 1.07x |
+| precompressed | 318,692 | 167,176 | 1.91x |
+| headers_ops | 404,099 | 367,565 | 1.10x |
+| auth_basic | 396,261 | 217,861 | 1.82x |
+| cache_hit | 402,292 | 203,728 | 1.97x |
+| lb_rr | 403,032 | 147,109 | 2.74x |
 
 ## HTTP/2 (h2c, h2load)
 
