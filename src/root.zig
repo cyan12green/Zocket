@@ -118,6 +118,7 @@ comptime {
     _ = @import("dsl/modules/auth_bundle.zig");
     _ = @import("dsl/modules/acme_challenge.zig");
     _ = @import("dsl/modules/sub_filter.zig");
+    _ = @import("dsl/modules/accel.zig");
     _ = @import("acme/jws.zig");
     _ = @import("dsl/htpasswd.zig");
     _ = @import("http/arena.zig");

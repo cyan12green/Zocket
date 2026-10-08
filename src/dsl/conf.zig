@@ -115,6 +115,7 @@ const H_precompressed = keyHash("precompressed");
 const H_sub_filter = keyHash("sub_filter");
 const H_sub_filter_once = keyHash("sub_filter_once");
 const H_proxy_redirect = keyHash("proxy_redirect");
+const H_accel = keyHash("accel");
 const H_auth_request = keyHash("auth_request");
 const H_cors = keyHash("cors");
 const H_cors_origin = keyHash("cors_origin");
@@ -384,6 +385,8 @@ const LocationSpec = struct {
     /// `proxy_redirect <from> <to>;` (single pair, v1).
     proxy_redirect_from: ?Str = null,
     proxy_redirect_to: ?Str = null,
+    /// `accel on|off;` (X-Accel-Redirect internal redirect).
+    accel_enabled: bool = false,
     /// `auth_request <uri>;`
     auth_request: ?Str = null,
     /// `proxy_cache on;` / valid / stale-while-revalidate
@@ -1623,6 +1626,12 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             ensureFilterBound(b, spec, "sub_filter");
             b.cost += 8;
         },
+        H_accel => {
+            spec.accel_enabled = lx.boolOnOff("accel");
+            lx.expectTerminator("accel");
+            ensureModuleBound(b, spec, .log, "accel");
+            b.cost += 8;
+        },
         H_proxy_redirect => {
             // `proxy_redirect <from> <to>;` — two values, then `;`.
             const f = lx.value(b, "proxy_redirect");
@@ -2653,6 +2662,7 @@ fn build(b: *const Builder) Config {
                 .sub_filter_once = spec.sub_filter_once,
                 .proxy_redirect_from = if (spec.proxy_redirect_from) |s| resolve(s, strings) else null,
                 .proxy_redirect_to = if (spec.proxy_redirect_to) |s| resolve(s, strings) else null,
+                .accel_enabled = spec.accel_enabled,
                 .auth_request_uri = if (spec.auth_request) |u| resolve(u, strings) else null,
                 .cors_enabled = spec.cors_enabled,
                 .cors_origin = if (spec.cors_origin) |s| resolve(s, strings) else null,
@@ -4315,4 +4325,17 @@ test "conf: proxy_redirect stores the from-to pair" {
     );
     try testing.expectEqualStrings("http://127.0.0.1:9000", cfg.routes[0].proxy_redirect_from.?);
     try testing.expectEqualStrings("https://example.com", cfg.routes[0].proxy_redirect_to.?);
+}
+
+test "conf: accel on binds the log module" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        rewrite proxy;
+        \\        proxy_pass 127.0.0.1:9000;
+        \\        accel on;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.routes[0].accel_enabled);
 }

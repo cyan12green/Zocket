@@ -218,6 +218,9 @@ pub const Route = struct {
     /// upstream Location/Refresh values starting with `from`. Null = off.
     proxy_redirect_from: ?[]const u8 = null,
     proxy_redirect_to: ?[]const u8 = null,
+    /// X-Accel-Redirect (`accel on;`): honor the backend's internal
+    /// redirect header in the log phase.
+    accel_enabled: bool = false,
     /// Response caching (proxy_cache modules): enable + fresh window and
     /// stale-while-revalidate grace, both in seconds.
     proxy_cache_enabled: bool = false,
