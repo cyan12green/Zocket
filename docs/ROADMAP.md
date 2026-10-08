@@ -381,8 +381,12 @@ shmem zones). S = days, M = 1–2 weeks, L = month+.
   (processHttpTls post-application arm via exportTxKeys→configure, then
   sendfile) needs a kTLS kernel to validate — this machine lacks it
   (CONFIG_TLS=m unloaded), so activation stays off by default.
-- ACME/auto-HTTPS (http-01 first; certs stay file-loaded, never
-  `@embedFile`).
+- ACME/auto-HTTPS ✅ CORE SHIPPED 2026-10 (http-01): `acme { directory;
+  contact; domain ...; }` (validated at build: https directory, mailto
+  contact, DNS names) + ES256 JWS compact sign/verify + RFC 7638
+  thumbprints + `acme_challenge` responder (bounded table, 404s unknown).
+  The account→order→poll→finalize→download→install exchange loop follows;
+  certs stay file-loaded, never `@embedFile`.
 
 ### Explicitly deferred
 

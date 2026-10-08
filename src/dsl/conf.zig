@@ -558,6 +558,9 @@ const Builder = struct {
     limits: Limits = .{},
     streams: ct_pool.CtPool(StreamSpec, 8) = .{},
     stream_sni: ct_pool.CtPool(StreamSniSpec, 64) = .{},
+    acme_dir: Str = .{ .src = "" },
+    acme_contact: Str = .{ .src = "" },
+    acme_domains: ct_pool.CtPool(Str, 8) = .{},
     tls_cert: Str = .{ .src = "" },
     tls_key: Str = .{ .src = "" },
     tls_ocsp: Str = .{ .src = "" },
@@ -1926,6 +1929,50 @@ fn appendServerFilter(b: *Builder, fname: []const u8) void {
     b.server_filters_len += 1;
 }
 
+/// Parse a top-level `acme { ... }` block (auto-HTTPS issuance): the
+/// directory + contact + domain set the renewal loop works from (the
+/// http-01 challenge responder + JWS layer ship in v1; the order/poll/
+/// finalize exchange follows).
+fn parseAcme(lx: *Lexer, b: *Builder) void {
+    lx.expectOpen("acme");
+    var seen_dir = false;
+    while (true) {
+        if (lx.peek() == '}') {
+            lx.pos += 1;
+            break;
+        }
+        const t = lx.token() orelse lx.fail("acme: expected a directive");
+        const dn = t.srcOf("acme: directive cannot contain escapes");
+        if (std.mem.eql(u8, dn, "directory")) {
+            const v = lx.value(b, "acme directory");
+            lx.expectTerminator("acme directory");
+            b.acme_dir = v;
+            seen_dir = true;
+            b.cost += 8;
+            continue;
+        }
+        if (std.mem.eql(u8, dn, "contact")) {
+            const v = lx.value(b, "acme contact");
+            lx.expectTerminator("acme contact");
+            b.acme_contact = v;
+            b.cost += 8;
+            continue;
+        }
+        if (std.mem.eql(u8, dn, "domain")) {
+            if (b.acme_domains.len >= 8) lx.fail("too many acme domains (max 8)");
+            const v = lx.value(b, "acme domain");
+            lx.expectTerminator("acme domain");
+            _ = b.acme_domains.create(v);
+            b.cost += 8;
+            continue;
+        }
+        lx.fail("unknown acme directive");
+    }
+    if (!seen_dir) lx.fail("acme: missing directory");
+    if (b.acme_domains.len == 0) lx.fail("acme: no domains");
+    b.cost += 16;
+}
+
 /// Parse a top-level `stream { ... }` block (L4 TCP proxy): one or more
 /// `server { listen; proxy_pass; sni ...; }` entries. Literals only in v1
 /// (a hostname fails the build — DNS-backed stream upstreams follow the
@@ -2096,6 +2143,10 @@ fn parseTop(lx: *Lexer, b: *Builder) void {
         }
         if (std.mem.eql(u8, dn, "stream")) {
             parseStream(lx, b);
+            continue;
+        }
+        if (std.mem.eql(u8, dn, "acme")) {
+            parseAcme(lx, b);
             continue;
         }
         if (keyHash(dn) == H_filter) {
@@ -2756,9 +2807,36 @@ fn build(b: *const Builder) Config {
     };
     const streams: []const router.StreamServer = streams_built.items[0..streams_built.len];
 
+    // ACME domains by value (same shape as the stream SNI table).
+    const Domains = struct { items: [8][]const u8, len: usize };
+    const domains_built: Domains = comptime blk: {
+        var items: [8][]const u8 = undefined;
+        var len: usize = 0;
+        for (b.acme_domains.freeze()) |d| {
+            const name = resolve(d, strings);
+            if (!sockets_mod.isValidHostname(name)) @compileError("acme domain: not a valid DNS name");
+            items[len] = name;
+            len += 1;
+        }
+        break :blk .{ .items = items, .len = len };
+    };
+
+    // ACME directory/contact validation (fail the build on typos).
+    if (b.acme_domains.len > 0) {
+        const dir = resolve(b.acme_dir, strings);
+        if (!std.mem.startsWith(u8, dir, "https://")) @compileError("acme directory: must be an https:// URL");
+        const contact = resolve(b.acme_contact, strings);
+        if (contact.len > 0 and !std.mem.startsWith(u8, contact, "mailto:")) @compileError("acme contact: must be a mailto: URL");
+    }
+
     return .{
         .routes = routes,
         .streams = streams,
+        .acme = .{
+            .directory = resolve(b.acme_dir, strings),
+            .contact = resolve(b.acme_contact, strings),
+            .domains = domains_built.items[0..domains_built.len],
+        },
         .limits = b.limits,
         .tls = .{
             .cert = resolve(b.tls_cert, strings),
@@ -4123,4 +4201,24 @@ test "conf: tls ktls toggle lands on the TLS config" {
         \\}
     );
     try testing.expect(cfg.tls.ktls);
+}
+
+test "conf: acme block parses directory plus contact plus domains" {
+    const cfg = parse(
+        \\acme {
+        \\    directory https://acme.example.com/directory;
+        \\    contact mailto:ops@example.com;
+        \\    domain example.com;
+        \\    domain www.example.com;
+        \\}
+        \\server {
+        \\    location / {
+        \\        rewrite echo;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.acme.enabled());
+    try testing.expectEqualStrings("https://acme.example.com/directory", cfg.acme.directory);
+    try testing.expectEqual(@as(usize, 2), cfg.acme.domains.len);
+    try testing.expectEqualStrings("www.example.com", cfg.acme.domains[1]);
 }

@@ -41,6 +41,15 @@ pub const TlsConfig = struct {
     }
 };
 
+pub const AcmeConfig = struct {
+    directory: []const u8 = "",
+    contact: []const u8 = "",
+    domains: []const []const u8 = &.{},
+    pub fn enabled(self: *const AcmeConfig) bool {
+        return self.directory.len > 0;
+    }
+};
+
 pub const Config = struct {
     routes: []const Route = &.{},
     /// Runtime-tunable server limits (the `limits` JSON section). The
@@ -83,6 +92,10 @@ pub const Config = struct {
     /// TCP stream servers (`stream { server { ... } }` blocks, C3): L4
     /// passthrough with SNI preread routing. Empty when no stream block.
     streams: []const router.StreamServer = &.{},
+    /// ACME auto-HTTPS (`acme { ... }` block, C3): directory + contact +
+    /// domains for the renewal loop (challenge responder + JWS ship in v1;
+    /// the order exchange follows).
+    acme: AcmeConfig = .{},
 
     /// Per-server virtual host spec.
     pub const ServerSpec = struct {

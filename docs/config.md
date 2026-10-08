@@ -255,6 +255,24 @@ The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
 | `auth_jwt_secret` | — | HS256 shared secret for `Authorization: Bearer` JWTs (signature + `exp` enforced); failures 401 + `WWW-Authenticate: Bearer`. Binds `auth_jwt`. ES256/JWKS deferred. |
 | `auth_jwt_leeway` | 0 | Expiry leeway seconds for clock skew. |
 
+### ACME auto-HTTPS (issuance core)
+
+```conf
+acme {
+    directory https://acme-v02.api.letsencrypt.org/directory;
+    contact mailto:ops@example.com;
+    domain example.com;
+    domain www.example.com;
+}
+location /.well-known/acme-challenge/ { acme_challenge; }
+```
+
+v1 ships the stable core: ES256 JWS (`src/acme/jws.zig`: compact
+sign/verify, RFC 7638 thumbprints for keyAuthorizations) + the http-01
+challenge responder (`acme_challenge` content module, bounded 64-token
+table, 404s unknown tokens). The order/poll/finalize/download/install
+exchange loop follows (certs stay file-loaded, never `@embedFile`).
+
 ### TCP stream proxy with SNI routing
 
 ```conf
