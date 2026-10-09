@@ -28,8 +28,10 @@ Checklist for the docs/bench pass (updated as items land).
 ## Benchmarks
 - [x] Extend `bench/modules-bench.sh` with cells: `ret`, `named`, `accel`, `subf`, `gzip`, `hide` (+ existing proxy cell now in the table); nginx `/ret` uses echo (no rewrite module) — note in BENCH.md
 - [x] Extend the nginx module template + the shared origin (`bench/modules-origin.conf`, `bench/static/{gz,sub,int/f8k}` fixtures)
-- [ ] Run the extended suite (interleaved reps) and collect medians
+- [x] Run the extended suite (interleaved reps) and collect medians — found and fixed: permanent route lock after max_fails (passive retry window now revives), stale pooled upstream connections (retry-once), unified.sh wrong config (its lb_rr/cache_hit zocket cells were 100% 5xx), nginx missing gzip/sub_filter modules
 - [ ] `bench/BENCH.md`: replace the module table with the big all-feature table vs nginx + methodology note
+  - Remaining known gap: proxied-BODY cells (proxy/hide/gzip/subf/accel) are slower than nginx (~40us CPU/req vs ~24us) — next optimization target
+  - Re-run unified (config fixed) and refresh its table too
 - [ ] Re-run `unified.sh`/matrix if the harness changed materially
 
 ## Process
