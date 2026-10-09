@@ -580,7 +580,12 @@ pub const Reactor = struct {
             self.enforceRequestTimeouts();
             self.kickThrottled();
             const loop_t0 = upstreamNowNs();
-            const n = self.ep.wait(&events, 100) catch continue;
+            // While any connection is rate-limited, wake often enough to
+            // refill its byte budget smoothly (the kick list re-drives
+            // paused flushes once per loop iteration; a 100 ms idle wait
+            // would quantise limit_rate to ~10 refills/second).
+            const wait_ms: i32 = if (self.throttle_fds.items.len > 0) 5 else 100;
+            const n = self.ep.wait(&events, wait_ms) catch continue;
             _ = loop_t0;
             // Refresh the cached Date after the wait: a request that just
             // woke the loop is handled with a fresh second (stale by the µs
@@ -726,14 +731,28 @@ pub const Reactor = struct {
     /// burst: 1 s of budget clamped to [4 KiB, 256 KiB]), take up to `want`.
     /// Pure arithmetic over explicit state so the pacing math is unit-tested
     /// without a reactor.
+    /// Fixed-point accumulation: `allowance` is in 1/64-byte units so that
+    /// refills at sub-byte granularity (frequent kick iterations) do not
+    /// lose their fractional remainder to integer truncation — the old
+    /// whole-byte math starved throttled transfers to ~1/4 of the rate.
     fn rateTake(bps: u64, allowance: *i64, last_ns: *u64, now_ns: u64, want: usize) usize {
         if (bps == 0) return want;
+        const frac: u64 = 64;
+        // The first take sees last_ns == 0 (the full uptime): u128 keeps
+        // every product overflow-free for any elapsed/rate combination,
+        // and the burst cap below bounds the result.
         const elapsed = now_ns -| last_ns.*;
         last_ns.* = now_ns;
-        const burst: i64 = @intCast(@max(@min(bps, 1 << 18), 4096));
-        allowance.* = @min(allowance.* + @as(i64, @intCast((elapsed * bps) / std.time.ns_per_s)), burst);
-        const take: usize = @intCast(@min(@max(allowance.*, 0), @as(i64, @intCast(want))));
-        allowance.* -= @intCast(take);
+        // Explicit u64: @min/@max with comptime bounds narrow their result
+        // type, and the narrowed type would overflow on the * frac below.
+        const base: u64 = @max(@min(bps, 1 << 18), 4096);
+        const burst: i64 = @intCast(base * frac);
+        const refill128 = (@as(u128, elapsed) * @as(u128, bps) * frac) / std.time.ns_per_s;
+        const refill: i64 = @intCast(@min(refill128, @as(u128, @intCast(burst))));
+        allowance.* = @min(allowance.* + refill, burst);
+        const avail: i64 = @divTrunc(allowance.*, @as(i64, @intCast(frac)));
+        const take: usize = @intCast(@min(@max(avail, 0), @as(i64, @intCast(want))));
+        allowance.* -= @as(i64, @intCast(take)) * @as(i64, @intCast(frac));
         return take;
     }
 
@@ -1015,7 +1034,10 @@ pub const Reactor = struct {
             // busy event storm (and the latency tail it causes).
             if (self.connections.get(fd) == null) return;
             const s2 = self.http_sessions.getPtr(fd) orelse return;
-            if (!s2.writing and s2.out_armed) {
+            // Disarmed when the response is finished or paused on the rate
+            // budget (the throttle kick re-drives it): an armed OUT on a
+            // writable socket re-fires on every wait otherwise.
+            if ((!s2.writing or s2.throttled) and s2.out_armed) {
                 s2.out_armed = false;
                 self.ep.modify(fd, epoll.Events.In, fd) catch {};
             }
@@ -1118,10 +1140,13 @@ pub const Reactor = struct {
                     if (session.parser.takeContinue()) {
                         self.sendInterimContinue(fd, conn);
                     }
-                    // The buffer can hold the whole request, so an incomplete
-                    // parse with a full buffer can never finish: header flood
-                    // or oversized body.
-                    if (conn.recv_buf.availableWrite() == 0) {
+                    // The buffer grows on demand up to max_recv_buf, so a
+                    // full buffer is only fatal once growth is exhausted
+                    // (header flood or a body beyond the cap); below the cap
+                    // the level-triggered read fills more on the next event.
+                    if (conn.recv_buf.availableWrite() == 0 and
+                        conn.recv_buf.data.len >= conn.max_recv_buf)
+                    {
                         self.respondAndClose(fd, .header_too_large);
                     }
                     return;
@@ -1908,73 +1933,61 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             return; // one ring.submit() per loop iteration (the sweep)
         }
 
-        // writev whatever is pending, draining until the socket buffer
-        // fills (nginx's send-chain model): the common case finishes in one
-        // syscall, and a full socket no longer costs an EPOLLOUT round trip
-        // per partial chunk. Bounded so one hot connection cannot starve the
-        // reactor.
-        var spins: usize = 0;
-        while (true) : (spins += 1) {
-            var iov: [3]posix.iovec_const = undefined;
-            var count: usize = 0;
-            build_iovs(session, conn, &iov, &count);
-            // limit_rate: trim the body iov to this flush's budget (the head
-            // and chunked terminator bypass the bucket — framing is tiny).
-            var budget_limited = false;
-            if (session.rate_bps > 0 and session.pending_body.len > 0) {
-                const take = rateTake(session.rate_bps, &session.rate_allowance, &session.rate_last_ns, self.nowNs(), session.pending_body.len);
-                budget_limited = take < session.pending_body.len;
-                if (budget_limited) trimBodyIov(&iov, count, conn.send_buf.availableRead(), take);
+        // One writev for whatever is pending: the remaining head, the body
+        // and the chunked terminator.
+        var iov: [3]posix.iovec_const = undefined;
+        var count: usize = 0;
+        build_iovs(session, conn, &iov, &count);
+        // limit_rate: trim the body iov to this flush's budget (the head
+        // and chunked terminator bypass the bucket — framing is tiny).
+        var budget_limited = false;
+        if (session.rate_bps > 0 and session.pending_body.len > 0) {
+            const take = rateTake(session.rate_bps, &session.rate_allowance, &session.rate_last_ns, self.nowNs(), session.pending_body.len);
+            budget_limited = take < session.pending_body.len;
+            if (budget_limited) trimBodyIov(&iov, count, conn.send_buf.availableRead(), take);
+        }
+        if (count == 0) {
+            // Push any file body straight into the socket (budgeted
+            // by limit_rate inside pumpFile).
+            if (session.file_remaining > 0) {
+                switch (self.pumpFile(fd, session)) {
+                    .gone, .wait_budget, .wait_io => return,
+                    .done => {},
+                }
             }
-            if (count == 0) {
-                // Push any file body straight into the socket (budgeted
-                // by limit_rate inside pumpFile).
-                if (session.file_remaining > 0) {
-                    switch (self.pumpFile(fd, session)) {
-                        .gone, .wait_budget, .wait_io => return,
-                        .done => {},
-                    }
-                }
-                if (session.pending_tail.len > 0) {
-                    // Chunked sendfile route: the terminator flushes now,
-                    // after the file bytes.
-                    self.flushHttp(fd);
-                    return;
-                }
-                break;
-            }
-            const n = compat.writev(fd, iov[0..count]) catch |e| {
-                if (e == error.WouldBlock) {
-                    // Budget-exhausted stops park on the kick list (EPOLLOUT
-                    // alone would stall: no writable transition is coming).
-                    if (budget_limited) self.parkThrottled(fd, session);
-                    return;
-                }
-                self.freeResponseBody(session);
-                session.pending_body = &.{};
-                session.pending_tail = &.{};
-                self.removeConnection(fd);
-                return;
-            };
-            self.advanceHttpWrite(conn, session, n);
-            const drained = session.pending_body.len == 0 and
-                session.pending_tail.len == 0 and
-                conn.send_buf.availableRead() == 0;
-            if (drained) break;
-            if (budget_limited) {
-                // Budget spent mid-body: wait for the throttle kick.
-                self.parkThrottled(fd, session);
+            if (session.pending_tail.len > 0) {
+                // Chunked sendfile route: the terminator flushes now, after
+                // the file bytes.
+                self.flushHttp(fd);
                 return;
             }
-            if (n == 0 or spins >= 16) {
-                // Socket buffer full: continue on the next EPOLLOUT edge.
+            return self.finalizeFlush(fd);
+        }
+        const n = compat.writev(fd, iov[0..count]) catch |e| {
+            if (e == error.WouldBlock) {
+                // Budget-exhausted stops park on the kick list (EPOLLOUT
+                // alone would stall: no writable transition is coming).
+                if (budget_limited) self.parkThrottled(fd, session);
                 return;
             }
+            self.freeResponseBody(session);
+            session.pending_body = &.{};
+            session.pending_tail = &.{};
+            self.removeConnection(fd);
+            return;
+        };
+        self.advanceHttpWrite(conn, session, n);
+        if (session.pending_body.len > 0 or session.pending_tail.len > 0) {
+            // Socket buffer full (or budget spent); continue on the next
+            // EPOLLOUT edge — or the throttle kick, when budgeted.
+            if (budget_limited) self.parkThrottled(fd, session);
+            return;
         }
         self.freeResponseBody(session);
         session.pending_body_owned = false;
         session.pending_body = &.{};
         session.pending_tail = &.{};
+        if (conn.send_buf.availableRead() > 0) return;
         return self.finalizeFlush(fd);
     }
 
@@ -3927,7 +3940,7 @@ test "upstream driver sends parked request and adopts response" {
     const sess = r.http_sessions.getPtr(cpair[1]).?;
     // The arena-backed body adoption needs a live request arena.
     sess.req.arena = @import("../http/arena.zig").Arena.init(allocator);
-    sess.up = null;
+    sess.up_active = false;
     var route = dsl_registry.Route{ .path = "/", .match = .prefix };
     sess.route_ptr_for_test = &route;
     defer {
@@ -3943,28 +3956,29 @@ test "upstream driver sends parked request and adopts response" {
     // send->read->adopt without hitting the bounded wait.
     _ = try compat.write(pair[1], "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nX-Mid: mid\r\n\r\nhi");
 
-    const tx = try allocator.create(UpTx);
-    tx.* = .{
+    var rt_buf: [16 * 1024]u8 = undefined;
+    sess.up_tx = .{
         .fd = pair[0],
         .backend_idx = 0,
         .route = sess.route_ptr_for_test.?,
         .state = .sending,
         .request = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n",
+        .reader = proxy_mod.UpstreamReader.initBuf(&rt_buf),
         .offer_sticky = false,
         .sticky_name = "",
         .started_ns = upstreamNowNs(),
     };
-    sess.up = tx;
+    sess.up_active = true;
 
-    r.handleUpstreamEvent(pair[0], cpair[1]);
+    r.handleUpstreamEvent(cpair[1]);
 
     // Origin received the exact parked request.
     var buf: [128]u8 = undefined;
     const n = try posix.read(pair[1], &buf);
     try testing.expectEqualStrings("GET /x HTTP/1.1\r\nHost: t\r\n\r\n", buf[0..n]);
 
-    // Response adopted; transaction consumed (driver destroyed it).
-    try testing.expect(sess.up == null);
+    // Response adopted; the inline transaction is retired.
+    try testing.expect(!sess.up_active);
     try testing.expectEqual(http_response.Status.ok, sess.resp.status);
     try testing.expectEqualStrings("hi", sess.resp.body);
     var saw_ct = false;
@@ -4437,12 +4451,13 @@ test "rateTake paces takes against elapsed time with a burst cap" {
         var last2: u64 = 0;
         try testing.expectEqual(@as(usize, 4096), Reactor.rateTake(100, &allow2, &last2, 60 * std.time.ns_per_s, 1_000_000));
     }
-    // Partial takes preserve the remainder.
+    // Partial takes preserve the remainder (allowance is in 1/64-byte
+    // fixed-point units; 500 bytes == 500 * 64 units).
     {
-        var allow: i64 = 500;
+        var allow: i64 = 500 * 64;
         var last: u64 = 1000;
         try testing.expectEqual(@as(usize, 200), Reactor.rateTake(10_000, &allow, &last, 1000, 200));
-        try testing.expectEqual(@as(i64, 300), allow);
+        try testing.expectEqual(@as(i64, 300 * 64), allow);
     }
 }
 

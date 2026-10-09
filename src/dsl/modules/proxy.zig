@@ -1631,7 +1631,7 @@ pub const UpstreamReader = struct {
     headers_complete: bool = false,
     content_length: usize = 0,
 
-    fn initBuf(buf: []u8) UpstreamReader {
+    pub fn initBuf(buf: []u8) UpstreamReader {
         return .{ .buf = buf };
     }
 
