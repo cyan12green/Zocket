@@ -145,14 +145,17 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
             pooled = true;
         } else {
             fd = connectUpstream(up, connectTimeoutMs(route)) catch {
+                std.debug.print("FAILSRC connect {s}\n", .{route.path});
                 markFailure(pick, route, started_ns);
                 return badGateway(ctx);
             };
             setRecvTimeout(fd, readTimeoutS(route));
         }
-        // Pooled-connection failures never count against the backend:
-        // try the next pooled fd / a fresh connection (bounded attempts).
-        const stale_retry = pooled and attempt < 8;
+        // Pooled-connection failures never count against the backend: the
+        // retry walks the pool (a failed pop closes its fd) until it drains
+        // into a fresh connection, which is where failures start counting.
+        // Budget = whole pool + the fresh attempt.
+        const stale_retry = pooled and attempt <= pool_hard_cap;
 
         // HYBRID: try the whole round-trip inline. Fast origins finish right
         // here at sync-driver cost; only real blocks park.
@@ -173,6 +176,7 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
                     }, null);
                 },
                 else => {
+                    std.debug.print("FAILSRC write {s}\n", .{route.path});
                     posix_close(fd);
                     active[pick] -|= 1;
                     if (stale_retry) continue :attempts;
@@ -193,6 +197,7 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
             } else |e| switch (e) {
                 error.Incomplete => {},
                 else => {
+                    std.debug.print("FAILSRC parse {s}\n", .{route.path});
                     posix_close(fd);
                     active[pick] -|= 1;
                     if (stale_retry) continue :attempts;
@@ -264,7 +269,7 @@ const max_backends = 8;
 /// threadlocals. With N reactors and M backends, total pooled conns =
 /// N * M * effective_cap.
 const pool_default_max: u32 = 8;
-const pool_hard_cap: u32 = 32;
+const pool_hard_cap: u32 = 64;
 /// Default idle expiry for pooled connections (overridden per route by
 /// `proxy_keepalive_timeout`).
 const pool_default_idle_s: u64 = 60;
