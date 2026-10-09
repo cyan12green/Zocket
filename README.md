@@ -44,7 +44,7 @@ and HTTP/1.1 over TLS 1.03–1.15x. Full methodology and tables:
 ## Development
 
 ```sh
-zig build test                                     # full test suite
+zig build test                                     # 861 tests
 zig build h2test                                   # HTTP/2 conformance (curl + h2spec)
 bash bench/compare-servers.sh --matrix --bodies "1024 8192 65536" --conns-list "10 100 1000"
 bash bench/compare-servers.sh --static "1024 1048576"

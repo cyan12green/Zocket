@@ -7,8 +7,15 @@
 #   headers      GET /h        — 3 response-header ops per request
 #   auth_sha     GET /auth     — Basic auth verified from an {SHA} htpasswd
 #   precompressed GET /f8k     — .gz twin served with Content-Encoding
+#   proxy        GET /proxied  — raw reverse-proxy path (LB + health state)
 #   cache_hit    GET /cached   — proxy_cache HIT path (warm origin)
-#   limit_req    GET /limited  — overload shedding at rate=2000/s burst=100
+#   limit_req    GET /limited  — limiter pass-through (bucket check cost)
+#   ret          GET /ret      — pre-serialised fixed response
+#   named        GET /named    — try_files miss -> named-location fallback
+#   accel        GET /accel    — X-Accel-Redirect hand-off -> internal file
+#   subf         GET /subf     — proxied 8 KB body, sub_filter rewritten
+#   gzip         GET /gz       — 8 KB static file compressed per request
+#   hide         GET /hide     — proxied response, proxy_hide_header strip
 #
 # Results land in bench/results/modules/<cell>/{zocket,nginx}_r<N>.json;
 # bench/graphs_modules.py renders bench/graphs/modules_compare.png and
@@ -40,11 +47,13 @@ STATIC_DIR="$ROOT/bench/static"
 AUTH_HEADER="Authorization: Basic YmVuY2g6cGFzc3dvcmQ="   # bench:password
 
 echo "== ensuring builds =="
-# Origin runs the DEFAULT config (plain echo) as a separate binary: the
-# comptime -Dconfig embed replaces defaults for every mode of one binary.
+# Origin is a separate binary built with bench/modules-origin.conf (echo +
+# the special responses the accel/sub_filter/hide cells need): the comptime
+# -Dconfig embed replaces defaults for every mode of one binary, so it
+# cannot share the front build.
 mkdir -p "$ROOT/bench/.cache"
-if [ ! -x "$ROOT/bench/.cache/zocket-origin" ] || [ "$ROOT/src/dsl/modules/proxy_cache.zig" -nt "$ROOT/bench/.cache/zocket-origin" ]; then
-    (cd "$ROOT" && zig build -Doptimize=ReleaseFast) 
+if [ ! -x "$ROOT/bench/.cache/zocket-origin" ] || [ "$ROOT/bench/modules-origin.conf" -nt "$ROOT/bench/.cache/zocket-origin" ]; then
+    (cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=bench/modules-origin.conf)
     cp "$TCP_BIN" "$ROOT/bench/.cache/zocket-origin"
 fi
 (cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=bench/modules-zocket.conf)
@@ -52,22 +61,22 @@ fi
 mkdir -p "$RES"
 ORIGIN_BIN="$ROOT/bench/.cache/zocket-origin"
 
-CELLS=(headers auth_sha precompressed proxy cache_hit limit_req)
-PATHS=(/h /auth /f8k /proxied /cached /limited)
+CELLS=(headers auth_sha precompressed proxy cache_hit limit_req ret named accel subf gzip hide)
+PATHS=(/h /auth /f8k /proxied /cached /limited /ret /named /accel /subf /gz /hide)
 
 start_zocket() {
     # Front server with all benchmark routes. ZOCKET_WRAP lets a debugger
     # wrap it: ZOCKET_WRAP="gdb -batch -ex bt -ex 'info threads' --args ".
     ${ZOCKET_WRAP:+$ZOCKET_WRAP} "$TCP_BIN" --port "$ZPORT" --threads 4 >"${ZOCKET_LOG:-/dev/null}" 2>&1 &
     ZPID=$!
-    # Origin for the cache cell: plain default-config Zocket (echo).
-    "$ORIGIN_BIN" --http --port "$ORIGIN" --threads 2 >/dev/null 2>&1 &
+    # Origin: echo + accel/sub/hide fixtures (bench/modules-origin.conf).
+    "$ORIGIN_BIN" --port "$ORIGIN" --threads 2 >/dev/null 2>&1 &
     OPID=$!
 }
 
 start_nginx() {
     local prefix="$ROOT/bench/.cache/nginx-modules-p$NPORT"
-    mkdir -p "$prefix" "$ROOT/bench/.cache/modules-cache"
+    mkdir -p "$prefix" "$prefix/logs" "$ROOT/bench/.cache/modules-cache"
     sed -e "s/@@PORT@@/$NPORT/" \
         -e "s|@@ERRLOG@@|$ROOT/bench/.cache/nginx-modules.err|" \
         -e "s|@@PREFIX@@|$prefix|" \
@@ -146,7 +155,7 @@ def load(f):
     return rps, (good / total * 100 if total else 0)
 
 root = "bench/results/modules"
-cells = ["headers", "auth_sha", "precompressed", "cache_hit", "limit_req"]
+cells = ["headers", "auth_sha", "precompressed", "proxy", "cache_hit", "limit_req", "ret", "named", "accel", "subf", "gzip", "hide"]
 print(f"{'cell':<14}{'metric':<16}{'zocket':>12}{'nginx':>12}{'ratio':>8}")
 for cell in cells:
     vals = {"zocket": [], "nginx": []}

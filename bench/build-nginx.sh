@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build nginx (third_party/nginx @ release-1.28.0) with the echo-nginx-module
 # (third_party/echo-nginx-module @ v0.65), minimal module set for benchmark
-# parity (no rewrite/gzip/ssl; access log off in the config).
+# parity: no rewrite/ssl, but gzip + sub_filter + gzip_static so the
+# filter cells can compare head-to-head (access log off in the config).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,8 +22,9 @@ cd "$NGINX_SRC"
     --prefix="$OUT" \
     --with-cc-opt="-O3" \
     --without-http_rewrite_module \
-    --without-http_gzip_module \
+    --with-http_gzip_module \
     --with-http_gzip_static_module \
+    --with-http_sub_module \
     --add-module="$ECHO_MOD" >/dev/null
 make -j"$(nproc)" >/dev/null
 make install >/dev/null

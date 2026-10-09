@@ -14,9 +14,9 @@ Checklist for the docs/bench pass (updated as items land).
 - [x] One runnable example snippet per new feature (pointing at `examples/`)
 
 ## README
-- [ ] Feature bullets for everything shipped lately (named/internal locations, 444, proxy_hide_header, 100-continue, chunked upstream, sub_filter/accel/precompressed twins, SNI certs, ACME)
-- [ ] Correct the stale test count
-- [ ] Link the `examples/` directory
+- [x] Feature bullets for everything shipped lately (named/internal locations, 444, proxy_hide_header, 100-continue, chunked upstream, sub_filter/accel/precompressed twins, SNI certs, ACME)
+- [x] Correct the stale test count (861/861, `zig build test --summary all`)
+- [x] Link the `examples/` directory
 
 ## Example configs (`examples/`)
 - [x] `12-locations.conf` — named locations, `internal`, `return 444`, `try_files @app` (compiles)
@@ -26,8 +26,8 @@ Checklist for the docs/bench pass (updated as items land).
 - [x] Extend `11-full.conf` with the new directives (compiles)
 
 ## Benchmarks
-- [ ] Extend `bench/modules-bench.sh` with cells: `return` template, named-location fallback, `accel` (X-Accel-Redirect), `sub_filter`, `gzip`, `proxy_hide_header`, `precompressed br` (note: nginx OSS serves gz)
-- [ ] Extend the nginx module template + the shared origin with equivalent routes
+- [x] Extend `bench/modules-bench.sh` with cells: `ret`, `named`, `accel`, `subf`, `gzip`, `hide` (+ existing proxy cell now in the table); nginx `/ret` uses echo (no rewrite module) — note in BENCH.md
+- [x] Extend the nginx module template + the shared origin (`bench/modules-origin.conf`, `bench/static/{gz,sub,int/f8k}` fixtures)
 - [ ] Run the extended suite (interleaved reps) and collect medians
 - [ ] `bench/BENCH.md`: replace the module table with the big all-feature table vs nginx + methodology note
 - [ ] Re-run `unified.sh`/matrix if the harness changed materially

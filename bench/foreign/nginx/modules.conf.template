@@ -64,5 +64,57 @@ http {
             limit_req zone=lim burst=10000 nodelay;
             echo -n "";
         }
+
+        # ret cell: fixed response (this nginx build has no rewrite module,
+        # so the echo module generates the body; Zocket uses `return`)
+        location = /ret {
+            echo -n "ok";
+        }
+
+        # named cell: try_files miss -> named location
+        location = /named {
+            root @@STATICDIR@@;
+            try_files $uri @app;
+        }
+        location @app {
+            echo -n "fallback";
+        }
+
+        # accel cell: upstream X-Accel-Redirect -> internal file
+        location /int/ {
+            internal;
+            root @@STATICDIR@@;
+        }
+        location = /accel {
+            proxy_pass http://origin/accel;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+
+        # sub_filter cell
+        location = /subf {
+            proxy_pass http://origin/sub;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            sub_filter "ORIGIN" "ZOCKET";
+            sub_filter_once off;
+            sub_filter_types text/plain;
+        }
+
+        # gzip cell
+        location = /gz {
+            alias @@STATICDIR@@/gz;
+            default_type text/plain;
+            gzip on;
+            gzip_types text/plain;
+        }
+
+        # proxy_hide_header cell
+        location = /hide {
+            proxy_pass http://origin/hide;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_hide_header X-Powered-By;
+        }
     }
 }
