@@ -1265,9 +1265,12 @@ pub const Reactor = struct {
                 => true,
                 else => false,
             };
-            if (skip) continue;
+            // Same route filters as the inline adopt path: proxy_hide_header
+            // drops headers, proxy_redirect rewrites Location/Refresh.
+            if (skip or proxy_mod.headerHidden(tx.route, h.name)) continue;
+            const value_src = proxy_mod.rewriteAdoptedHeader(tx.route, h.name, h.value, arena_a) orelse h.value;
             const name_c = arena_a.dupe(u8, h.name) catch return self.failUpstream(client_fd);
-            const value_c = arena_a.dupe(u8, h.value) catch return self.failUpstream(client_fd);
+            const value_c = arena_a.dupe(u8, value_src) catch return self.failUpstream(client_fd);
             session.resp.setHeader(name_c, value_c);
         }
         const body = arena_a.dupe(u8, res.body) catch
@@ -1278,31 +1281,10 @@ pub const Reactor = struct {
             const tag = std.fmt.bufPrint(&tag_buf, "{s}=s{d}; Path=/", .{ tx.sticky_name, tx.backend_idx }) catch "";
             if (tag.len > 0) session.resp.setHeader("Set-Cookie", tag);
         }
-        // Parked completions bypass the pipeline walk, so run the route's
-        // response filters here (proxy_cache_store, gzip, headers,
-        // access_log). Without this, parked responses skip caching,
-        // compression, header ops and logging entirely.
-        {
-            var fctx = dsl_pipeline.Context{
-                .req = &session.req,
-                .resp = &session.resp,
-                .route = tx.route,
-                .allocator = self.allocator,
-                .client_ip = if (self.connections.get(client_fd)) |c| c.peer_ip else .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-                .stats = self.stats,
-                .static_cache = &self.static_cache,
-                .limits = &self.limits,
-                .formats = self.handler.formats(),
-                .started = compat.Instant.now() catch compat.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
-                .now_ns = blk: {
-                    const t = compat.Instant.now() catch break :blk 0;
-                    break :blk @intCast(t.since(self.epoch));
-                },
-            };
-            dsl_pipeline.applyResponseFilters(tx.route, &fctx) catch {
-                return self.failUpstream(client_fd);
-            };
-        }
+        // Parked completions bypass the pipeline walk: run the route's
+        // response filters AND log-phase handlers (accel, error_page) and
+        // follow any internal redirect they ask for (see continueParked).
+        self.continueParked(client_fd, session, tx.route);
 
         latchRate(session, tx.route);
         proxy_mod.upstreamSuccess(tx.backend_idx, up_fd, upstreamNowNs(), tx.route);
@@ -1317,6 +1299,9 @@ pub const Reactor = struct {
     fn failUpstream(self: *Reactor, client_fd: posix.fd_t) void {
         const session = self.http_sessions.getPtr(client_fd) orelse return;
         const tx = session.up orelse return;
+        // Route pointer stays valid after the transaction dies (routes are
+        // static for the server's lifetime); captured for the continuation.
+        const route = tx.route;
         latchRate(session, tx.route);
         proxy_mod.upstreamFail(tx.backend_idx, tx.route, upstreamNowNs());
         _ = self.upstream_conns.remove(tx.fd);
@@ -1327,6 +1312,10 @@ pub const Reactor = struct {
 
         session.resp = http_response.Response.init(.bad_gateway);
         session.resp.setBody(http_response.Status.bad_gateway.reasonPhrase());
+        // Log handlers may rewrite the 502 (error_page) or redirect
+        // internally; standard headers are set after that so a replaced
+        // response still carries them.
+        self.continueParked(client_fd, session, route);
         session.resp.setHeader("Connection", "keep-alive");
         session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
         session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
@@ -1351,15 +1340,95 @@ pub const Reactor = struct {
         session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
         const conn = self.connections.get(client_fd) orelse return;
         conn.send_buf.compact();
-        session.resp.writeHeadToBuffer(&conn.send_buf) catch {
-            self.removeConnection(client_fd);
-            return;
-        };
-        session.pending_body = session.resp.body;
+        if (session.resp.body_from_file) {
+            // An internal redirect (accel/error_page) landed on a static
+            // file: same head + sendfile ownership handoff as the main path.
+            session.resp.writeHeadToBufferWithLength(&conn.send_buf, session.resp.file_len) catch {
+                self.removeConnection(client_fd);
+                return;
+            };
+            session.pending_body = &.{};
+            session.file_fd = session.resp.file_fd;
+            session.file_fd_cached = session.resp.file_fd_cached;
+            session.file_offset = session.resp.file_offset;
+            session.file_remaining = if (session.req.method == .head) 0 else session.resp.file_len;
+        } else {
+            session.resp.writeHeadToBuffer(&conn.send_buf) catch {
+                self.removeConnection(client_fd);
+                return;
+            };
+            session.pending_body = session.resp.body;
+        }
         session.pending_body_owned = false;
         session.writing = true;
         self.markWriting(client_fd);
         self.flushHttp(client_fd);
+    }
+
+    /// Parked completion tail: run the route's response filters and
+    /// log-phase handlers (accel, error_page), then follow any internal
+    /// redirect they request — the phases the pipeline walk skipped when
+    /// the proxy parked. The nested walk runs with the synchronous driver
+    /// (async_supported = false): a redirect into another proxied route
+    /// cannot park again from this callback, and blocking there is bounded
+    /// by the upstream timeouts.
+    fn continueParked(self: *Reactor, client_fd: posix.fd_t, session: *HttpSession, route: *const dsl_registry.Route) void {
+        var fctx = dsl_pipeline.Context{
+            .req = &session.req,
+            .resp = &session.resp,
+            .route = route,
+            .allocator = self.allocator,
+            .client_ip = if (self.connections.get(client_fd)) |c| c.peer_ip else .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+            .stats = self.stats,
+            .static_cache = &self.static_cache,
+            .limits = &self.limits,
+            .formats = self.handler.formats(),
+            .started = compat.Instant.now() catch compat.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
+            .now_ns = blk: {
+                const t = compat.Instant.now() catch break :blk 0;
+                break :blk @intCast(t.since(self.epoch));
+            },
+        };
+        dsl_pipeline.applyResponseFilters(route, &fctx) catch {
+            session.resp = http_response.Response.init(.internal_error);
+            session.resp.setBody(http_response.Status.internal_error.reasonPhrase());
+            return;
+        };
+        dsl_pipeline.runLogHandlers(route, &fctx) catch {
+            session.resp = http_response.Response.init(.internal_error);
+            session.resp.setBody(http_response.Status.internal_error.reasonPhrase());
+            return;
+        };
+        // Follow internal redirects (accel, error_page). The first hop is
+        // applied here so the nested handleRequest starts on the NEW
+        // target; further hops are its own loop's business.
+        var hops: u8 = 0;
+        while ((fctx.internal_redirect_target != null or fctx.internal_redirect_named != null) and hops < 8) {
+            hops += 1;
+            if (fctx.internal_redirect_target) |target| {
+                fctx.internal_redirect_target = null;
+                const uri = session.req.arena.asAllocator().dupe(u8, target) catch break;
+                session.req.target = uri;
+                session.req.decoded_target = uri;
+            } else {
+                const name = fctx.internal_redirect_named.?;
+                fctx.internal_redirect_named = null;
+                const named = self.handler.router.matchNamed(name) orelse break;
+                fctx.force_route = named;
+            }
+            fctx.route = null;
+            fctx.capture_count = 0;
+            fctx.redirect_hops = hops;
+            const out = self.handler.handleRequest(&fctx) catch {
+                session.resp = http_response.Response.init(.bad_gateway);
+                session.resp.setBody(http_response.Status.bad_gateway.reasonPhrase());
+                return;
+            };
+            if (out == .not_handled) {
+                session.resp = http_response.Response.init(.not_found);
+                session.resp.setBody(http_response.Status.not_found.reasonPhrase());
+            }
+        }
     }
 
     /// Send the 101 Switching Protocols handshake and flip the session into
@@ -4418,4 +4487,171 @@ test "reactor closes the connection for return 444 without a byte" {
     var buf: [64]u8 = undefined;
     const n = std.posix.read(pair[0], &buf) catch 0;
     try testing.expectEqual(@as(usize, 0), n);
+}
+
+test "reactor parked proxy honors X-Accel-Redirect to a template route" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    const up = try TestUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Accel-Redirect: /fallback\r\n\r\n");
+    defer up.stop();
+
+    const router_mod = @import("../dsl/router.zig");
+    var ups = [_]router_mod.Upstream{.{
+        .host = "127.0.0.1",
+        .port = up.port,
+        .sockaddr = router_mod.Upstream.makeSockaddr("127.0.0.1", up.port).?,
+    }};
+    const bindings = [_]router_mod.ModuleBinding{
+        .{ .phase = .rewrite, .module = "proxy" },
+        .{ .phase = .log, .module = "accel" },
+    };
+    const routes = [_]router_mod.Route{
+        .{
+            .path = "/accel",
+            .match = .exact,
+            .modules = &bindings,
+            .upstreams = &ups,
+            .accel_enabled = true,
+        },
+        .{
+            .path = "/fallback",
+            .match = .exact,
+            .response = .{ .status = 200, .body = "internal-ok" },
+        },
+    };
+    var srv = runtime_server.Server.init(.{ .routes = &routes });
+    proxy_mod.testResetRoute(&routes[0]);
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.handler = &srv;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "GET /accel HTTP/1.1\r\nHost: test\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    const res = try readHeadBody(pair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
+    // The origin's empty 200 was replaced by the internal target's body.
+    try testing.expectEqualStrings("internal-ok", buf[res.head_len..][0..res.body_len]);
+}
+
+test "reactor parked proxy applies proxy_hide_header and proxy_redirect" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    const up = try TestUpstream.start("HTTP/1.1 301 Moved\r\nContent-Length: 0\r\nX-Powered-By: origin\r\nLocation: http://origin.local/x\r\n\r\n");
+    defer up.stop();
+
+    const router_mod = @import("../dsl/router.zig");
+    var ups = [_]router_mod.Upstream{.{
+        .host = "127.0.0.1",
+        .port = up.port,
+        .sockaddr = router_mod.Upstream.makeSockaddr("127.0.0.1", up.port).?,
+    }};
+    const bindings = [_]router_mod.ModuleBinding{.{ .phase = .rewrite, .module = "proxy" }};
+    const hidden = [_][]const u8{"x-powered-by"};
+    const routes = [_]router_mod.Route{.{
+        .path = "/",
+        .modules = &bindings,
+        .upstreams = &ups,
+        .proxy_hide = &hidden,
+        .proxy_redirect_from = "http://origin.local/",
+        .proxy_redirect_to = "https://public.example/",
+    }};
+    var srv = runtime_server.Server.init(.{ .routes = &routes });
+    proxy_mod.testResetRoute(&routes[0]);
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.handler = &srv;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "GET /r HTTP/1.1\r\nHost: test\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    const res = try readHeadBody(pair[0], &buf);
+    const head = buf[0..res.head_len];
+    try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 301 Moved"));
+    try testing.expect(std.mem.indexOf(u8, head, "X-Powered-By") == null);
+    try testing.expect(std.mem.indexOf(u8, head, "https://public.example/x") != null);
+}
+
+test "reactor parked 502 runs error_page to a named location" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    // Reserve-then-close a port so nothing listens.
+    const lfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    addr[0] = 2;
+    addr[4] = 127;
+    addr[7] = 1;
+    try compat.bind(lfd, @ptrCast(&addr), 16);
+    var slen: posix.socklen_t = 16;
+    var bound: [16]u8 align(@alignOf(u16)) = undefined;
+    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+    const dead_port = (@as(u16, bound[2]) << 8) | bound[3];
+    compat.close(lfd);
+
+    const router_mod = @import("../dsl/router.zig");
+    var ups = [_]router_mod.Upstream{.{
+        .host = "127.0.0.1",
+        .port = dead_port,
+        .sockaddr = router_mod.Upstream.makeSockaddr("127.0.0.1", dead_port).?,
+    }};
+    const pages = [_]router_mod.ErrorPage{.{ .status = 502, .target = "@fallback" }};
+    const bindings = [_]router_mod.ModuleBinding{
+        .{ .phase = .rewrite, .module = "proxy" },
+        .{ .phase = .log, .module = "error_page" },
+    };
+    const routes = [_]router_mod.Route{
+        .{
+            .path = "/",
+            .modules = &bindings,
+            .upstreams = &ups,
+            .error_pages = &pages,
+        },
+        .{
+            .path = "",
+            .name = "@fallback",
+            .response = .{ .status = 200, .body = "fallback-ok" },
+        },
+    };
+    var srv = runtime_server.Server.init(.{ .routes = &routes });
+    proxy_mod.testResetRoute(&routes[0]);
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.handler = &srv;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "GET /dead HTTP/1.1\r\nHost: test\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    const res = try readHeadBody(pair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
+    try testing.expectEqualStrings("fallback-ok", buf[res.head_len..][0..res.body_len]);
 }

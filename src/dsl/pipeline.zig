@@ -181,6 +181,19 @@ pub fn applyResponseFilters(route: *const router.Route, ctx: *Context) !void {
     try applyFilters(default_registry, route, ctx);
 }
 
+/// Run a route's log-phase HANDLER modules — the phases a parked upstream
+/// completion bypasses (the walk stops at the parking module, so log
+/// handlers such as accel and error_page would never see the response).
+/// `effective_status` is set the same way the in-walk log pass does.
+pub fn runLogHandlers(route: *const router.Route, ctx: *Context) !void {
+    ctx.effective_status = @intFromEnum(ctx.resp.status);
+    for (route.modules) |b| {
+        if (b.phase != .log) continue;
+        const run_fn = default_registry.resolve(b.module) orelse continue;
+        _ = try run_fn(ctx);
+    }
+}
+
 /// Runtime application of a response template (JSON-config routes, whose
 /// templates cannot be pre-serialised at compile time). Comptime routes with
 /// modules use this too; module-less comptime routes take the reactor fast

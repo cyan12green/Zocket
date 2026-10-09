@@ -84,8 +84,8 @@ fn park(ctx: *Context) anyerror!Action {
 /// every slice copied into the request arena — reader memory dies with the
 /// transaction). Shared by the inline fast path and the reactor driver.
 /// `proxy_hide_header` lookup (case-insensitive), shared by both adopt
-/// paths.
-fn routeHidden(route: ?*const registry.Route, name: []const u8) bool {
+/// paths (the inline one here and the reactor's parked completions).
+pub fn headerHidden(route: ?*const registry.Route, name: []const u8) bool {
     const r = route orelse return false;
     for (r.proxy_hide) |hidden| {
         if (std.ascii.eqlIgnoreCase(hidden, name)) return true;
@@ -106,7 +106,7 @@ pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_nam
             => true,
             else => false,
         };
-        if (skip or routeHidden(route, h.name)) continue;
+        if (skip or headerHidden(route, h.name)) continue;
         const name_c = arena_a.dupe(u8, h.name) catch return error.OutOfMemory;
         const value_src = if (route) |r| redirectRewrite(r, h.name, h.value, arena_a) orelse h.value else h.value;
         const value_c = arena_a.dupe(u8, value_src) catch return error.OutOfMemory;
@@ -490,6 +490,13 @@ fn advanceBackend(route: *const registry.Route, upstreams: []const router.Upstre
 /// when both are set and `name` is Location/Refresh (any case) and `value`
 /// starts with `from`, returns the substituted value (caller-owned copy
 /// into `alloc`); otherwise null (keep the original). Pure (unit-tested).
+/// `proxy_redirect` rewrite for an adopted upstream header (the parked
+/// completion in the reactor shares this with the inline adopt path).
+pub fn rewriteAdoptedHeader(route: ?*const registry.Route, name: []const u8, value: []const u8, alloc: std.mem.Allocator) ?[]const u8 {
+    const r = route orelse return null;
+    return redirectRewrite(r, name, value, alloc);
+}
+
 fn redirectRewrite(route: *const registry.Route, name: []const u8, value: []const u8, alloc: std.mem.Allocator) ?[]const u8 {
     const from = route.proxy_redirect_from orelse return null;
     const to = route.proxy_redirect_to orelse return null;
@@ -594,7 +601,7 @@ fn attemptForward(
             http_parser.header_hasher.hash("transfer-encoding") => true,
             else => false,
         };
-        if (skip or routeHidden(route, h.name)) continue;
+        if (skip or headerHidden(route, h.name)) continue;
         // proxy_redirect rewrites Location/Refresh (arena-owned copy).
         if (redirectRewrite(route, h.name, h.value, ctx.req.arena.asAllocator())) |v| {
             ctx.resp.setHeader(h.name, v);
