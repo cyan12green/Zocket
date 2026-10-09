@@ -1,0 +1,4 @@
+Bombarding http://127.0.0.1:18702/subf for 6s using 100 connection(s)
+ 00m05s 00m04s 00m04s 00m04s 00m04s 00m04s 00m03s 00m03s 00m03s 00m03s 00m03s 00m02s 00m02s 00m02s 00m02s 00m02s 00m01s 00m01s 00m01s 00m01s 00m01s 6s
+Done!
+{"spec":{"numberOfConnections":100,"testType":"timed","testDurationSeconds":6,"method":"GET","url":"http://127.0.0.1:18702/subf","body":"","stream":false,"timeoutSeconds":2,"client":"fasthttp"},"result":{"bytesRead":2260755875,"bytesWritten":18086047,"timeTakenSeconds":6.00272251,"req1xx":0,"req2xx":269941,"req3xx":0,"req4xx":0,"req5xx":0,"others":0,"latency":{"mean":2220.015373729815,"stddev":198.68294845184772,"max":8559,"percentiles":{"50":2279,"75":3015,"90":3264,"95":3361,"99":3603}},"rps":{"mean":44970.54799432085,"stddev":4391.875087252141,"max":56715.1372701374,"percentiles":{"50":46008.343613,"75":48117.512369,"90":49986.550165,"95":51235.141809,"99":54735.935601}}}}

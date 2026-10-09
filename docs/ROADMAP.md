@@ -399,6 +399,13 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   response-body substitution (single + `once` semantics), `proxy_redirect`
   Location rewriting, X-Accel-Redirect internal file redirect. All shipped
   2026-10.
+- D2.1 proxy upstream-path performance (NEXT): the feature benchmark
+  shows every cell that proxies an upstream response body trails nginx
+  (raw proxy 0.45x, hide 0.45x, gzip 0.54x, accel 0.67x, sub_filter
+  0.91x, unified lb_rr 0.41x); local/request-side cells all lead
+  (1.15x-2.06x). Raising `proxy_keepalive` to 64 took the raw cell from
+  0.30x to 0.45x; the remaining ~2x gap is the per-request upstream path
+  (park/continuation overhead + syscall mix) — target: parity, then lead.
 - D1.10 `proxy_hide_header` ✅ SHIPPED 2026-10: route-scoped upstream
   response-header filtering (repeatable, case-insensitive, both adopt
   paths).

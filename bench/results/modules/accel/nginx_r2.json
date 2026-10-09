@@ -1,0 +1,4 @@
+Bombarding http://127.0.0.1:18702/accel for 6s using 100 connection(s)
+ 00m05s 00m04s 00m04s 00m04s 00m04s 00m04s 00m03s 00m03s 00m03s 00m03s 00m03s 00m02s 00m02s 00m02s 00m02s 00m02s 00m01s 00m01s 00m01s 00m01s 00m01s 6s
+Done!
+{"spec":{"numberOfConnections":100,"testType":"timed","testDurationSeconds":6,"method":"GET","url":"http://127.0.0.1:18702/accel","body":"","stream":false,"timeoutSeconds":2,"client":"fasthttp"},"result":{"bytesRead":5367985524,"bytesWritten":43321032,"timeTakenSeconds":6.000616846,"req1xx":0,"req2xx":637074,"req3xx":0,"req4xx":0,"req5xx":0,"others":0,"latency":{"mean":939.296612324471,"stddev":73.8745633350644,"max":4502,"percentiles":{"50":866,"75":1177,"90":1400,"95":1429,"99":1645}},"rps":{"mean":106170.64323681995,"stddev":11472.967266174826,"max":129268.20648461512,"percentiles":{"50":101898.660417,"75":117521.599392,"90":123554.520947,"95":126022.634185,"99":127887.797238}}}}

@@ -91,38 +91,70 @@ Head-to-head across every workload: echo, static, and per-request cost.
 
 ![Zocket vs nginx](graphs/nginx_compare.png)
 
-## Module features vs nginx
+## Feature benchmark: every module vs nginx (2026-10)
 
-Feature-specific comparison on module endpoints (100 conns, interleaved reps).
+Twelve cells on identical endpoints, interleaved port layouts, medians of 6
+samples (3 reps), 100 connections, 6 s each, 4 threads / 4 workers.
+Upstream keepalive is configured on BOTH sides (nginx `keepalive 64`,
+Zocket `proxy_keepalive 64`) — compare fairly.
+
+| Cell | Feature | Zocket | nginx | Ratio |
+|---|---|---:|---:|---:|
+| headers | 3 response-header ops/req | 437,919 | 381,985 | 1.15x |
+| auth_sha | Basic auth from {SHA} htpasswd | 399,898 | 217,240 | 1.84x |
+| precompressed | `.gz` twin serving (8 KB) | 323,261 | 164,600 | 1.96x |
+| ret | pre-serialised `return` template | 418,658 | 347,706 | 1.20x |
+| named | `try_files` miss → named location | 395,041 | 304,804 | 1.30x |
+| limit_req | limiter pass-through | 415,449 | 358,765 | 1.16x |
+| cache_hit | proxy_cache HIT (warm origin) | 402,747 | 195,950 | 2.06x |
+| subf | proxied 8 KB body + `sub_filter` | 43,041 | 47,251 | 0.91x |
+| gzip | proxied 8 KB body compressed | 60,392 | 111,390 | 0.54x |
+| accel | X-Accel-Redirect → internal file | 69,871 | 104,971 | 0.67x |
+| hide | proxied response + `proxy_hide_header` | 71,533 | 159,601 | 0.45x |
+| proxy | raw reverse proxy (single origin) | 73,775 | 163,431 | 0.45x |
+
+Notes:
+- nginx `/ret` uses the echo module (this benchmark build has no rewrite
+  module); Zocket fast-paths the pre-serialised template.
+- **Every cell that proxies an upstream response body trails nginx**
+  (0.45x–0.91x): the front's per-request upstream path costs ~2x nginx
+  today. Raising `proxy_keepalive` from the default 8/thread to 64
+  already moved the raw proxy cell 0.30x → 0.45x. This is the active
+  optimization target; the request-side/local features (top half of the
+  table) all lead.
+- The raw cell definitions and the fixture origin live in
+  `bench/modules-bench.sh`, `bench/modules-origin.conf`,
+  `bench/modules-zocket.conf`, `bench/foreign/nginx/modules.conf.template`.
 
 ![Module features](graphs/modules_compare.png)
 
-| Cell | Zocket | nginx | Ratio |
-|---|---|---:|---:|
-| headers (3 ops/req) | 459,233 | 396,580 | 1.16x |
-| auth_basic ({SHA}) | 394,351 | 217,094 | 1.82x |
-| precompressed (.gz 8K) | 329,123 | 168,706 | 1.95x |
-| proxy_cache (HIT) | 416,010 | 200,496 | 2.07x |
-| limit_req (pass-through) | 419,293 | 356,618 | 1.18x |
 
 ## Unified benchmark (web/file/LB)
 
 All servers co-resident: Zocket, nginx (HAProxy/Envoy omitted — not
 built on this machine; build `bench/.cache/haproxy-build/sbin/haproxy`
-or set `ENVOY_BIN=` to include them). 8 workload cells.
+or set `ENVOY_BIN=` to include them). 8 workload cells, 2026-10 re-run.
 
 ![Unified](graphs/unified_web.png)
 
 | Cell | Zocket | nginx | Ratio |
-|---|---|---:|---:|
-| h1_echo | 420,798 | 230,884 | 1.82x |
-| static_small | 311,590 | 168,204 | 1.85x |
-| static_large | 22,056 | 20,551 | 1.07x |
-| precompressed | 328,473 | 169,595 | 1.94x |
-| headers_ops | 398,918 | 378,942 | 1.05x |
-| auth_basic | 410,957 | 216,408 | 1.90x |
-| cache_hit | 417,176 | 202,354 | 2.06x |
-| lb_rr | 402,308 | 150,990 | 2.66x |
+|---|---|---:|---:|---:|
+| h1_echo | 373,005 | 219,769 | 1.70x |
+| static_small | 316,746 | 155,993 | 2.03x |
+| static_large | 23,354 | 20,831 | 1.12x |
+| precompressed | 306,186 | 152,060 | 2.01x |
+| headers_ops | 390,286 | 352,314 | 1.11x |
+| auth_basic | 384,707 | 204,446 | 1.88x |
+| cache_hit | 392,631 | 189,206 | 2.08x |
+| lb_rr | 59,392 | 144,604 | 0.41x |
+
+`lb_rr` proxies through a 4-origin pool — the same upstream-body cost as
+the feature table's proxy rows (p50 1.67 ms vs nginx 0.63 ms). An earlier
+revision of this table reported `lb_rr 402,308 (2.66x)` for Zocket: those
+runs had `unified.sh` building the front with the wrong config, so every
+lb_rr/cache_hit zocket request was an instant 502. Fixed; raw JSON under
+`bench/results/unified/`.
+
 
 ## HTTP/2 over TLS (h2load) — 2026-10
 
