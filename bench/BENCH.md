@@ -169,23 +169,31 @@ Notes:
 
 All servers co-resident: Zocket, nginx (HAProxy/Envoy omitted — not
 built on this machine; build `bench/.cache/haproxy-build/sbin/haproxy`
-or set `ENVOY_BIN=` to include them). 8 workload cells, 2026-10 re-run.
+or set `ENVOY_BIN=` to include them). 8 workload cells, pinned re-run on
+the final proxy-path source (server on CPUs 0-3, four fixture origins on
+4-7, loader on 8-11; medians of 3 samples).
 
 ![Unified](graphs/unified_web.png)
 
 | Cell | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
-| h1_echo | 240,394 | 221,157 | 1.09x |
-| static_small | 312,135 | 169,686 | 1.84x |
-| static_large | 22,297 | 20,975 | 1.06x |
-| precompressed | 309,794 | 172,814 | 1.79x |
-| headers_ops | 394,080 | 379,067 | 1.04x |
-| auth_basic | 379,641 | 220,983 | 1.72x |
-| cache_hit | 392,064 | 212,242 | 1.85x |
-| lb_rr | 108,874 | 150,486 | 0.72x |
+| h1_echo | 268,838 | 177,847 | 1.51x |
+| static_small | 216,058 | 181,911 | 1.19x |
+| static_large | 15,987 | 15,686 | 1.02x |
+| precompressed | 211,290 | 183,881 | 1.15x |
+| headers_ops | 264,466 | 264,707 | 1.00x |
+| auth_basic | 252,571 | 246,482 | 1.02x |
+| cache_hit | 258,805 | 255,666 | 1.01x |
+| lb_rr | 196,677 | 200,937 | 0.98x |
 
-`lb_rr` proxies through a 4-origin pool — the same upstream-body cost as
-the feature table's proxy rows (0.41x → 0.72x after the parity series).
+`lb_rr` proxies through a 4-origin pool. Across three interleaved
+comparisons it sits at parity within the machine's run-to-run spread:
+0.98x in this run (196,677 vs 200,937; Zocket p50 315 µs vs nginx
+403 µs, but Zocket p99 3.5 ms vs 2.0 ms), 0.90x in the previous run
+(187,781 vs 207,535) and 1.000x in a dedicated 6-rep fresh interleaved
+A/B (209,701 vs 209,654). The single-origin raw proxy cell is the
+verified lead (1.12x/1.02x above); the multi-origin cell's residual
+tail is the remaining item.
 An earlier
 revision of this table reported `lb_rr 402,308 (2.66x)` for Zocket: those
 runs had `unified.sh` building the front with the wrong config, so every
