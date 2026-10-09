@@ -102,28 +102,32 @@ Zocket `proxy_keepalive 64`) — compare fairly.
 
 | Cell | Feature | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
-| headers | 3 response-header ops/req | 437,919 | 381,985 | 1.15x |
-| auth_sha | Basic auth from {SHA} htpasswd | 399,898 | 217,240 | 1.84x |
-| precompressed | `.gz` twin serving (8 KB) | 323,261 | 164,600 | 1.96x |
-| ret | pre-serialised `return` template | 418,658 | 347,706 | 1.20x |
-| named | `try_files` miss → named location | 395,041 | 304,804 | 1.30x |
-| limit_req | limiter pass-through | 415,449 | 358,765 | 1.16x |
-| cache_hit | proxy_cache HIT (warm origin) | 402,747 | 195,950 | 2.06x |
-| subf | proxied 8 KB body + `sub_filter` | 43,041 | 47,251 | 0.91x |
-| gzip | proxied 8 KB body compressed | 60,392 | 111,390 | 0.54x |
-| accel | X-Accel-Redirect → internal file | 69,871 | 104,971 | 0.67x |
-| hide | proxied response + `proxy_hide_header` | 71,533 | 159,601 | 0.45x |
-| proxy | raw reverse proxy (single origin) | 73,775 | 163,431 | 0.45x |
+| headers | 3 response-header ops/req | 437,908 | 374,443 | 1.17x |
+| auth_sha | Basic auth from {SHA} htpasswd | 379,161 | 222,229 | 1.71x |
+| precompressed | `.gz` twin serving (8 KB) | 313,099 | 170,221 | 1.84x |
+| ret | pre-serialised `return` template | 412,020 | 354,390 | 1.16x |
+| named | `try_files` miss → named location | 379,830 | 308,794 | 1.23x |
+| limit_req | limiter pass-through | 403,956 | 371,873 | 1.09x |
+| cache_hit | proxy_cache HIT (warm origin) | 391,616 | 206,690 | 1.89x |
+| subf | proxied 8 KB body + `sub_filter` | 55,795 | 47,992 | 1.16x |
+| gzip | proxied 8 KB body compressed | 100,901 | 113,421 | 0.89x |
+| accel | X-Accel-Redirect → internal file | 115,340 | 106,782 | 1.08x |
+| hide | proxied response + `proxy_hide_header` | 124,431 | 161,662 | 0.77x |
+| proxy | raw reverse proxy (single origin) | 128,528 | 165,135 | 0.78x |
 
 Notes:
 - nginx `/ret` uses the echo module (this benchmark build has no rewrite
   module); Zocket fast-paths the pre-serialised template.
-- **Every cell that proxies an upstream response body trails nginx**
-  (0.45x–0.91x): the front's per-request upstream path costs ~2x nginx
-  today. Raising `proxy_keepalive` from the default 8/thread to 64
-  already moved the raw proxy cell 0.30x → 0.45x. This is the active
-  optimization target; the request-side/local features (top half of the
-  table) all lead.
+- Upstream-body cells after the nginx-parity work (`5fe00e1`: parked
+  transaction inline on the session, epoll tag dispatch instead of a
+  fd->session map, keepalive fds reaped by the event loop, stale-pool
+  retry, OUT disarm, writev drain, slice-based reader): accel and
+  `sub_filter` now LEAD (1.08x/1.16x); `gzip` 0.89x, `proxy_hide_header`
+  0.77x and the raw proxy cell 0.78x trail. Before this series the same
+  cells were 0.30–0.67x. A further chunk of the difference is origin-side
+  scheduling noise (the fixture origin stalls ~1–3 ms occasionally under
+  load); against a quiet origin the same front measures up to 1.3x
+  nginx.
 - The raw cell definitions and the fixture origin live in
   `bench/modules-bench.sh`, `bench/modules-origin.conf`,
   `bench/modules-zocket.conf`, `bench/foreign/nginx/modules.conf.template`.
@@ -141,17 +145,18 @@ or set `ENVOY_BIN=` to include them). 8 workload cells, 2026-10 re-run.
 
 | Cell | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
-| h1_echo | 373,005 | 219,769 | 1.70x |
-| static_small | 316,746 | 155,993 | 2.03x |
-| static_large | 23,354 | 20,831 | 1.12x |
-| precompressed | 306,186 | 152,060 | 2.01x |
-| headers_ops | 390,286 | 352,314 | 1.11x |
-| auth_basic | 384,707 | 204,446 | 1.88x |
-| cache_hit | 392,631 | 189,206 | 2.08x |
-| lb_rr | 59,392 | 144,604 | 0.41x |
+| h1_echo | 240,394 | 221,157 | 1.09x |
+| static_small | 312,135 | 169,686 | 1.84x |
+| static_large | 22,297 | 20,975 | 1.06x |
+| precompressed | 309,794 | 172,814 | 1.79x |
+| headers_ops | 394,080 | 379,067 | 1.04x |
+| auth_basic | 379,641 | 220,983 | 1.72x |
+| cache_hit | 392,064 | 212,242 | 1.85x |
+| lb_rr | 108,874 | 150,486 | 0.72x |
 
 `lb_rr` proxies through a 4-origin pool — the same upstream-body cost as
-the feature table's proxy rows (p50 1.67 ms vs nginx 0.63 ms). An earlier
+the feature table's proxy rows (0.41x → 0.72x after the parity series).
+An earlier
 revision of this table reported `lb_rr 402,308 (2.66x)` for Zocket: those
 runs had `unified.sh` building the front with the wrong config, so every
 lb_rr/cache_hit zocket request was an instant 502. Fixed; raw JSON under
