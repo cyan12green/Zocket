@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("../../compat.zig");
 const registry = @import("../registry.zig");
 const sockets = @import("../../net/sockets.zig");
+const epoll_mod = @import("../../net/epoll.zig");
 const router = @import("../router.zig");
 const http_parser = @import("../../http/parser.zig");
 const vars = @import("../vars.zig");
@@ -49,6 +50,10 @@ pub const ParkedPlan = struct {
     offer_sticky: bool,
     sticky_name: []const u8,
     started_ns: u64,
+    /// The fd came from the keepalive pool: a post-park failure may be the
+    /// upstream having closed an idle connection, which is retried once
+    /// instead of counted against the backend.
+    pooled: bool = false,
 };
 
 /// Resolve the parked plan for the reactor (null when this walk was not a
@@ -103,6 +108,10 @@ pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_nam
             http_parser.header_hasher.hash("connection") => !ws101,
             http_parser.header_hasher.hash("content-length"),
             http_parser.header_hasher.hash("transfer-encoding"),
+            // nginx's default proxy_hide_header set: the front supplies its
+            // own Date/Server; leaking the origin's duplicates them.
+            http_parser.header_hasher.hash("date"),
+            http_parser.header_hasher.hash("server"),
             => true,
             else => false,
         };
@@ -172,9 +181,11 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
                         .offer_sticky = offer_sticky,
                         .sticky_name = route.sticky_cookie orelse "",
                         .started_ns = started_ns,
+                        .pooled = pooled,
                     }, null);
                 },
-                else => {
+                else => |we| {
+                    std.debug.print("CNT write {s} fd={d} attempt={d} pooled={}: {s}\n", .{ route.path, fd, attempt, pooled, @errorName(we) });
                     posix_close(fd);
                     active[pick] -|= 1;
                     if (stale_retry) continue :attempts;
@@ -185,7 +196,8 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
             sent += n;
         }
 
-        var reader = UpstreamReader{};
+        var stack_buf: [16 * 1024]u8 = undefined;
+        var reader = UpstreamReader.initBuf(&stack_buf);
         reader.alloc = ctx.req.arena.asAllocator();
         while (true) {
             if (reader.tryParse()) |res| {
@@ -194,7 +206,8 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
                 return .handled; // normal serialization follows; NO event hop
             } else |e| switch (e) {
                 error.Incomplete => {},
-                else => {
+                else => |pe| {
+                    std.debug.print("CNT parse {s} fd={d} attempt={d} pooled={}: {s}\n", .{ route.path, fd, attempt, pooled, @errorName(pe) });
                     posix_close(fd);
                     active[pick] -|= 1;
                     if (stale_retry) continue :attempts;
@@ -206,7 +219,13 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
                 error.WouldBlock => {
                     const hr = ctx.sharedAlloc(@sizeOf(UpstreamReader)) orelse return error.OutOfMemory;
                     const hr_t: *UpstreamReader = @ptrCast(@alignCast(hr));
+                    // Re-base the working buffer onto the request arena and
+                    // copy only the bytes actually used (typically the header
+                    // block). The parked driver keeps filling into it.
+                    const arena_buf = ctx.sharedAlloc(reader.buf.len) orelse return error.OutOfMemory;
+                    @memcpy(arena_buf[0..reader.used], reader.buf[0..reader.used]);
                     hr_t.* = reader;
+                    hr_t.buf = arena_buf;
                     return parkRemainder(ctx, route, .{
                         .fd = fd,
                         .backend_idx = pick,
@@ -217,10 +236,12 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
                         .offer_sticky = offer_sticky,
                         .sticky_name = route.sticky_cookie orelse "",
                         .started_ns = started_ns,
+                        .pooled = pooled,
                         .reader_ptr = hr_t,
                     }, hr_t);
                 },
-                else => {
+                else => |fe2| {
+                    std.debug.print("CNT fill {s} fd={d} attempt={d} pooled={}: {s}\n", .{ route.path, fd, attempt, pooled, @errorName(fe2) });
                     posix_close(fd);
                     active[pick] -|= 1;
                     if (stale_retry) continue :attempts;
@@ -234,7 +255,10 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
                 // on a fresh connection when it came from the pool.
                 posix_close(fd);
                 active[pick] -|= 1;
-                if (stale_retry) continue :attempts;
+                if (stale_retry) {
+                    continue :attempts;
+                }
+                std.debug.print("CNT eof {s} fd={d} attempt={d} pooled={}\n", .{ route.path, fd, attempt, pooled });
                 markFailure(pick, route, started_ns);
                 return badGateway(ctx);
             }
@@ -265,6 +289,41 @@ const max_backends = 8;
 /// dimensioned at the hard cap so a large directive cannot blow the
 /// threadlocals. With N reactors and M backends, total pooled conns =
 /// N * M * effective_cap.
+/// Epoll data tag for a POOLED upstream connection (see releasePooled).
+/// Bits 29 and 30 are reserved (both positive in i32 — the epoll data
+/// field is an fd-sized integer): bit 30 = in-flight upstream (reactor),
+/// bit 29 = idle pooled upstream (this module).
+pub const pool_tag: u64 = 1 << 29;
+
+/// Reactor epoll owning this thread's pool (set by the reactor at init):
+/// pooled fds stay registered there so an upstream close is observed
+/// immediately and the entry is reaped BEFORE reuse — nginx's keepalive
+/// close-handler model. Null in tests and non-epoll drivers.
+threadlocal var pool_ep: ?*epoll_mod.Epoll = null;
+
+pub fn setPoolEpoll(ep: ?*epoll_mod.Epoll) void {
+    pool_ep = ep;
+}
+
+/// Drop a pooled fd whose connection the upstream closed (FIN/error event).
+/// Called from the reactor event loop via the pool_tag.
+pub fn reapPooledFd(fd: posix_fd) void {
+    for (&pool, 0..) |*entries, backend| {
+        const len = &pool_lens[backend];
+        var i: usize = 0;
+        while (i < len.*) {
+            if (entries[i].fd == fd) {
+                posix_close(fd);
+                entries[i] = entries[len.* - 1];
+                entries[len.* - 1] = .{};
+                len.* -= 1;
+                return;
+            }
+            i += 1;
+        }
+    }
+}
+
 const pool_default_max: u32 = 8;
 const pool_hard_cap: u32 = 64;
 /// Default idle expiry for pooled connections (overridden per route by
@@ -586,7 +645,8 @@ fn attemptForward(
         markFailure(pick, route, started_ns);
         return error.UpstreamTransport;
     }
-    var reader = UpstreamReader.init();
+    var stack_buf: [16 * 1024]u8 = undefined;
+    var reader = UpstreamReader.initBuf(&stack_buf);
     reader.alloc = ctx.req.arena.asAllocator();
     const read_result = reader.read(fd) catch blk: {
         break :blk null;
@@ -709,7 +769,8 @@ fn attemptForwardTls(
 
         // Record-layer round trip; any transport failure lands below.
         // The reader lives here so the parsed body can borrow it.
-        var reader = UpstreamReader.init();
+        var stack_buf: [16 * 1024]u8 = undefined;
+        var reader = UpstreamReader.initBuf(&stack_buf);
         reader.alloc = ctx.req.arena.asAllocator();
         const res = tlsRoundTrip(ctx, up, sock, &reader) catch {
             const retry = reused;
@@ -966,8 +1027,9 @@ fn backendUsable(route: *const registry.Route, idx: usize, now_ns: u64) bool {
 
 fn markFailure(idx: usize, route: *const registry.Route, now_ns: u64) void {
     const slot = healthSlot(route, idx) orelse return;
-    _ = slot.fails.fetchAdd(1, .monotonic);
+    const n = slot.fails.fetchAdd(1, .monotonic) + 1;
     slot.last_fail_ns.store(now_ns, .monotonic);
+    _ = n;
     if (slot.fails.load(.monotonic) >= route.max_fails) {
         slot.alive.store(false, .release);
     }
@@ -1138,6 +1200,14 @@ pub fn upstreamFail(idx: usize, route: *const registry.Route, now_ns: u64) void 
     markFailure(idx, route, now_ns);
 }
 
+/// Release an in-flight slot for a transaction abandoned by the CLIENT
+/// (disconnect mid-request): the backend is not at fault, so the passive
+/// failure counter is untouched. Counting these would trip healthy
+/// backends whenever a client gives up or a load generator shuts down.
+pub fn upstreamAbandoned(idx: usize) void {
+    active[idx] -|= 1;
+}
+
 // ---- upstream connection lifecycle ----
 
 fn acquirePooled(idx: usize, now_ns: u64, idle_ns: u64) posix_fd {
@@ -1168,10 +1238,9 @@ fn acquirePooled(idx: usize, now_ns: u64, idle_ns: u64) posix_fd {
             entries[len.* - 1] = .{};
         }
         len.* -= 1;
-        // Note: no per-acquire stale probe here — a probe costs a syscall
-        // on every pooled request. Staleness is handled by the retry in
-        // `parkAt` (a failed pooled attempt is retired on a fresh
-        // connection and never counted against the backend).
+        // The fd has been registered with the reactor epoll while pooled
+        // (see releasePooled): detach it before it goes in flight again.
+        if (pool_ep) |ep| ep.remove(fd) catch {};
         return fd;
     }
     return -1;
@@ -1184,6 +1253,9 @@ fn releasePooled(idx: usize, fd: posix_fd, now_ns: u64, max_conns: u32) void {
     if (len.* < max_conns) {
         entries[len.*] = .{ .fd = fd, .last_used_ns = now_ns };
         len.* += 1;
+        // Keep the idle connection registered so the upstream's FIN is
+        // reaped by the event loop before the next reuse (nginx model).
+        if (pool_ep) |ep| ep.add(fd, epoll_mod.Events.In, @intCast(@as(u64, @intCast(fd)) | pool_tag)) catch {};
     } else {
         // Pool full: close the oldest entry to make room.
         const oldest: usize = 0;
@@ -1195,6 +1267,14 @@ fn releasePooled(idx: usize, fd: posix_fd, now_ns: u64, max_conns: u32) void {
         }
         entries[len.* - 1] = .{ .fd = fd, .last_used_ns = now_ns };
     }
+}
+
+/// Connect a fresh fd to a route backend (parked-retry / tests).
+pub fn reconnectUpstream(route: *const registry.Route, backend_idx: usize) !posix_fd {
+    const up = &route.upstreams[backend_idx];
+    const fd = try connectUpstream(up, connectTimeoutMs(route));
+    setRecvTimeout(fd, readTimeoutS(route));
+    return fd;
 }
 
 fn connectUpstream(up: *const router.Upstream, connect_ms: i32) !posix_fd {
@@ -1517,7 +1597,11 @@ fn containsToken(value: []const u8, comptime token: []const u8) bool {
 }
 
 pub const UpstreamReader = struct {
-    buf: [16 * 1024]u8 = undefined,
+    /// Response working buffer, caller-provided: the inline drivers point
+    /// it at a stack array; the parked path re-bases it onto a request-arena
+    /// allocation so only the USED bytes are copied when a transaction
+    /// parks (the old embedded array forced a 16 KiB struct copy per park).
+    buf: []u8 = &.{},
     used: usize = 0,
     pos: usize = 0,
     /// Set by the caller: backs bodies larger than the embedded buffer
@@ -1547,8 +1631,8 @@ pub const UpstreamReader = struct {
     headers_complete: bool = false,
     content_length: usize = 0,
 
-    fn init() UpstreamReader {
-        return .{};
+    fn initBuf(buf: []u8) UpstreamReader {
+        return .{ .buf = buf };
     }
 
     pub const Parsed = struct { status: u16, headers: []const UpstreamHeader, body: []const u8 };
@@ -2152,7 +2236,8 @@ test "upstream reader converges on byte-split delivery" {
     // lost wakeups, no stalls.
     const wire = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nX-A: b\r\n\r\nhello world";
     const splits = [_]usize{ 10, 30, 45, wire.len };
-    var reader = UpstreamReader{};
+    var tbuf: [16 * 1024]u8 = undefined;
+    var reader = UpstreamReader.initBuf(&tbuf);
     var prev: usize = 0;
     for (splits) |end| {
         @memcpy(reader.buf[reader.used .. reader.used + (end - prev)], wire[prev..end]);
@@ -3347,7 +3432,8 @@ test "statusRetryable matches only masked codes" {
 
 
 test "tryParse handles the exact 47-byte response" {
-    var r = UpstreamReader.init();
+    var tbuf: [16 * 1024]u8 = undefined;
+    var r = UpstreamReader.initBuf(&tbuf);
     const resp = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntls-hello";
     @memcpy(r.buf[0..resp.len], resp);
     r.used = resp.len;
@@ -3531,7 +3617,8 @@ test "chunked reader ignores chunk extensions and trailers" {
     // Arena mirrors the production backing (leaks reclaimed wholesale).
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    var r = UpstreamReader{};
+    var tbuf: [16 * 1024]u8 = undefined;
+    var r = UpstreamReader.initBuf(&tbuf);
     r.alloc = arena_state.allocator();
     @memcpy(r.buf[0..wire.len], wire);
     r.used = wire.len;
