@@ -9,6 +9,7 @@ const EPOLLOUT = 0x4;
 const EPOLLET = 0x80000000;
 const EPOLLHUP = 0x10;
 const EPOLLERR = 0x8;
+const EPOLLEXCLUSIVE = 1 << 28;
 const EPOLL_CTL_ADD = 1;
 const EPOLL_CTL_MOD = 3;
 const EPOLL_CTL_DEL = 2;
@@ -64,6 +65,9 @@ pub const Epoll = struct {
 
 pub const Events = struct {
     pub const In = EPOLLIN;
+    /// Wake only one waiter per readiness event when several epoll sets
+    /// watch the same fd (the shared listening socket).
+    pub const Exclusive = EPOLLEXCLUSIVE;
     pub const Out = EPOLLOUT;
     pub const EdgeTriggered = EPOLLET;
     pub const Hangup = EPOLLHUP;

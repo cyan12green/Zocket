@@ -1255,7 +1255,17 @@ fn releasePooled(idx: usize, fd: posix_fd, now_ns: u64, max_conns: u32) void {
         len.* += 1;
         // Keep the idle connection registered so the upstream's FIN is
         // reaped by the event loop before the next reuse (nginx model).
-        if (pool_ep) |ep| ep.add(fd, epoll_mod.Events.In, @intCast(@as(u64, @intCast(fd)) | pool_tag)) catch {};
+        // The in-flight path left the fd registered with the up_tag; a MOD
+        // re-tags it in place (an ADD on an already-registered fd would
+        // fail), keeping the per-request epoll cost at one op here instead
+        // of a DEL+ADD pair. Fresh inline completions (never registered)
+        // fall back to ADD.
+        if (pool_ep) |ep| {
+            const data: std.posix.fd_t = @intCast(@as(u64, @intCast(fd)) | pool_tag);
+            ep.modify(fd, epoll_mod.Events.In, data) catch {
+                ep.add(fd, epoll_mod.Events.In, data) catch {};
+            };
+        }
     } else {
         // Pool full: close the oldest entry to make room.
         const oldest: usize = 0;
@@ -1266,6 +1276,12 @@ fn releasePooled(idx: usize, fd: posix_fd, now_ns: u64, max_conns: u32) void {
             entries[j] = entries[j + 1];
         }
         entries[len.* - 1] = .{ .fd = fd, .last_used_ns = now_ns };
+        if (pool_ep) |ep| {
+            const data: std.posix.fd_t = @intCast(@as(u64, @intCast(fd)) | pool_tag);
+            ep.modify(fd, epoll_mod.Events.In, data) catch {
+                ep.add(fd, epoll_mod.Events.In, data) catch {};
+            };
+        }
     }
 }
 

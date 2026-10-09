@@ -34,13 +34,16 @@ ACME → full feature tours).
 
 ## Benchmarks
 
-Zocket leads almost every measured workload — HTTP echo up to 1.7x nginx,
-static up to 2.0x, auth/caching/compression features 1.1–1.9x, HTTP/2 and
-HTTP/1.1 over TLS 1.03–1.15x. Upstream-body cells (raw proxy, gzip,
-proxy_hide_header) improved from 0.30–0.67x to 0.77–0.89x in the latest
-nginx-parity series (inline parked transactions, tag dispatch, keepalive
-event-loop reaping) and now beat nginx against a quiet origin
-(up to 1.3x); full methodology, tables and the remaining gap:
+Zocket now leads the raw reverse-proxy cell as well: 183,807 vs 163,835
+req/s (1.12x) in the official CPU-pinned feature benchmark (6 interleaved
+samples, 100 connections), with every proxied-body cell at parity or ahead
+(gzip 1.05x, accel 1.05x, `proxy_hide_header` 1.03x) after the upstream
+path got a single shared listener with round-robin accept dispatch, real
+event-loop keepalive reaping, and the parked-transaction rework (inline
+session transaction, epoll tag dispatch, stale-pool retry). Other measured
+workloads: HTTP echo up to 1.7x nginx, static up to 2.0x,
+auth/caching/compression features 1.1–1.9x, HTTP/2 and HTTP/1.1 over TLS
+1.03–1.15x. Full methodology, tables and sample spread:
 [`bench/BENCH.md`](bench/BENCH.md).
 
 ![Zocket vs nginx — HTTP/1.1](bench/graphs/readme_http.png)

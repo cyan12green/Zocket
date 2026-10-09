@@ -39,6 +39,25 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# CPU pinning: on asymmetric CPUs (P-cores + E-cores) unpinned runs let
+# thread/process placement decide the result (measured 0.78x-1.5x swings for
+# the same binaries). The server under test gets the performance-core
+# hardware threads; the fixed fixtures (origin, load generator) get disjoint
+# E-core sets. Both servers are pinned to the SAME set so the comparison is
+# fair. Override with BENCH_PIN_SRV / BENCH_PIN_ORIGIN / BENCH_PIN_LOAD, or
+# set them empty to disable.
+PIN_SRV="${BENCH_PIN_SRV-0-3}"
+PIN_ORIGIN="${BENCH_PIN_ORIGIN-4-7}"
+PIN_LOAD="${BENCH_PIN_LOAD-8-11}"
+pin() { # pin <cpuset> <cmd...>
+    local cpus="$1"; shift
+    if [ -n "$cpus" ] && command -v taskset >/dev/null 2>&1 && [ -d "/sys/devices/system/cpu/cpu${cpus%%-*}" ]; then
+        taskset -c "$cpus" "$@"
+    else
+        "$@"
+    fi
+}
+
 TCP_BIN="$ROOT/zig-out/bin/zocket"
 NGINX_BIN="$ROOT/bench/.cache/nginx-build/sbin/nginx"
 BOMB=~/go/bin/bombardier
@@ -67,10 +86,10 @@ PATHS=(/h /auth /f8k /proxied /cached /limited /ret /named /accel /subf /gz /hid
 start_zocket() {
     # Front server with all benchmark routes. ZOCKET_WRAP lets a debugger
     # wrap it: ZOCKET_WRAP="gdb -batch -ex bt -ex 'info threads' --args ".
-    ${ZOCKET_WRAP:+$ZOCKET_WRAP} "$TCP_BIN" --port "$ZPORT" --threads 4 >"${ZOCKET_LOG:-/dev/null}" 2>&1 &
+    pin "$PIN_SRV" ${ZOCKET_WRAP:+$ZOCKET_WRAP} "$TCP_BIN" --port "$ZPORT" --threads 4 >"${ZOCKET_LOG:-/dev/null}" 2>&1 &
     ZPID=$!
     # Origin: echo + accel/sub/hide fixtures (bench/modules-origin.conf).
-    "$ORIGIN_BIN" --port "$ORIGIN" --threads 2 >/dev/null 2>&1 &
+    pin "$PIN_ORIGIN" "$ORIGIN_BIN" --port "$ORIGIN" --threads 2 >/dev/null 2>&1 &
     OPID=$!
 }
 
@@ -86,7 +105,7 @@ start_nginx() {
         -e "s/@@ORIGIN@@/$ORIGIN/" \
         "$ROOT/bench/foreign/nginx/modules.conf.template" \
         > "$ROOT/bench/.cache/nginx-modules.conf"
-    "$NGINX_BIN" -p "$prefix" -c "$ROOT/bench/.cache/nginx-modules.conf" >/dev/null 2>&1 &
+    pin "$PIN_SRV" "$NGINX_BIN" -p "$prefix" -c "$ROOT/bench/.cache/nginx-modules.conf" >/dev/null 2>&1 &
     NPIDS+=($!)
 }
 
@@ -102,7 +121,7 @@ run_cell() {
     local extra=()
     if [ "$cell" = "auth_sha" ]; then extra=(-H "$AUTH_HEADER"); fi
     mkdir -p "$RES/$cell"
-    "$BOMB" -c "$CONNS" -d "$DURATION" -l -o json "${extra[@]}" \
+    pin "$PIN_LOAD" "$BOMB" -c "$CONNS" -d "$DURATION" -l -o json "${extra[@]}" \
         "http://127.0.0.1:$port$path" > "$RES/$cell/${srv}_r${rep}.json" 2>/dev/null || true
 }
 

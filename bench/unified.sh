@@ -19,6 +19,20 @@ NGINX_BIN="$ROOT/bench/.cache/nginx-build/sbin/nginx"
 HAPROXY_BIN="$ROOT/bench/.cache/haproxy-build/sbin/haproxy"
 ENVOY_BIN="${ENVOY_BIN:-}"   # set ENVOY_BIN=/path/to/envoy to enable
 BOMB=~/go/bin/bombardier
+# CPU pinning (see bench/modules-bench.sh): the server under test gets the
+# performance-core threads; each origin gets its own CPU; the loader gets a
+# disjoint set. Override/disable with the BENCH_PIN_* variables.
+PIN_SRV="${BENCH_PIN_SRV-0-3}"
+PIN_ORIGIN_BASE="${BENCH_PIN_ORIGIN_BASE-4}"
+PIN_LOAD="${BENCH_PIN_LOAD-8-11}"
+pin() { # pin <cpuset> <cmd...>
+    local cpus="$1"; shift
+    if [ -n "$cpus" ] && command -v taskset >/dev/null 2>&1 && [ -d "/sys/devices/system/cpu/cpu${cpus%%-*}" ]; then
+        taskset -c "$cpus" "$@"
+    else
+        "$@"
+    fi
+}
 RES="$ROOT/bench/results/unified"
 STATIC_DIR="$ROOT/bench/static"
 AUTH_HEADER="Authorization: Basic YmVuY2g6cGFzc3dvcmQ="
@@ -41,12 +55,12 @@ PATHS=(/echo /f8k /f1m /f8k /cached /h /auth /proxied)
 
 start_origins() {
     for i in 0 1 2 3; do
-        "$ORIGIN_BIN" --http --port $((ORIGIN_BASE + i)) --threads 1 >/dev/null 2>&1 &
+        pin "$((PIN_ORIGIN_BASE + i))" "$ORIGIN_BIN" --http --port $((ORIGIN_BASE + i)) --threads 1 >/dev/null 2>&1 &
         OPIDS+=($!)
     done
 }
 
-start_zocket() { "$TCP_BIN" --port "$ZP" --threads 4 >/dev/null 2>&1 & ZPID=$!; }
+start_zocket() { pin "$PIN_SRV" "$TCP_BIN" --port "$ZP" --threads 4 >/dev/null 2>&1 & ZPID=$!; }
 
 start_haproxy() {
     [ -x "$HAPROXY_BIN" ] || return 0
@@ -73,15 +87,19 @@ start_nginx() {
         -e "s/@@ORIGIN2@@/$((ORIGIN_BASE+2))/" \
         -e "s/@@ORIGIN3@@/$((ORIGIN_BASE+3))/" \
         "$ROOT/bench/foreign/nginx/unified.conf.template" > "$ROOT/bench/.cache/nginx-uni.conf"
-    "$NGINX_BIN" -p "$prefix" -c "$ROOT/bench/.cache/nginx-uni.conf" >/dev/null 2>&1 &
+    pin "$PIN_SRV" "$NGINX_BIN" -p "$prefix" -c "$ROOT/bench/.cache/nginx-uni.conf" >/dev/null 2>&1 &
     NPIDS+=($!)
 }
 
 run_cell() { # cell port server rep path [extra hdr]
     local cell="$1" port="$2" srv="$3" rep="$4" path="$5"; shift 5
     mkdir -p "$RES/$cell"
+    local cmd=("$BOMB")
+    if [ -n "$PIN_LOAD" ] && command -v taskset >/dev/null 2>&1 && [ -d "/sys/devices/system/cpu/cpu${PIN_LOAD%%-*}" ]; then
+        cmd=(taskset -c "$PIN_LOAD" "$BOMB")
+    fi
     timeout $(( $(echo "$DURATION" | tr -dc 0-9) + 20 )) \
-        "$BOMB" -c "$CONNS" -d "$DURATION" -l -o json "$@" \
+        "${cmd[@]}" -c "$CONNS" -d "$DURATION" -l -o json "$@" \
         "http://127.0.0.1:$port$path" > "$RES/$cell/${srv}_r${rep}.json" 2>/dev/null || true
 }
 

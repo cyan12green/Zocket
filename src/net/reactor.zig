@@ -225,6 +225,9 @@ pub const Reactor = struct {
     running: std.atomic.Value(bool),
     thread: ?std.Thread,
     pending: std.ArrayList(*connection.Connection),
+    /// Accepted connection fds handed over by the server's acceptor thread
+    /// (raw fds: the reactor adopts them in its own pool).
+    pending_fds: std.ArrayList(posix.fd_t),
     pending_lock: compat.Mutex,
     /// Total connections this reactor has registered, ever. Bumped on the
     /// reactor thread when a pending connection is added to the registry;
@@ -280,6 +283,14 @@ pub const Reactor = struct {
     /// Per-reactor listener when set, this
     /// reactor accepts connections directly from the kernel; -1 otherwise.
     listener: posix.fd_t = -1,
+    /// True when several reactors share ONE listening socket (the server
+    /// creates a single SO_REUSEPORT listener and every reactor adds it to
+    /// its epoll with EPOLLEXCLUSIVE). Long-lived keep-alive connections
+    /// are then handed to reactors by rotation instead of the kernel's
+    /// per-connection 4-tuple hash, which skews 100-connection bursts ~2:1
+    /// across four threads and caps throughput on the hot pair. A shared
+    /// listener is never closed by a reactor: the owning Server closes it.
+    shared_listener: bool = false,
     /// PROXY protocol expected on accepted connections (set post-init from
     /// the listen spec; `listen ... proxy_protocol`). The header is consumed
     /// in processHttp before any protocol sniffing.
@@ -346,7 +357,10 @@ pub const Reactor = struct {
     ) !Reactor {
         var self = try initWithHandlerTimeout(allocator, id, mode, http_handler, idle_timeout_seconds, server_group);
         self.listener = listener;
-        self.ep.add(listener, epoll.Events.In | epoll.Events.EdgeTriggered, listener) catch {
+        // A listener fd is only registered when this reactor owns one
+        // (tests / standalone); shared-listener servers hand accepted fds
+        // over through `pushAcceptedFd` instead.
+        if (listener >= 0) self.ep.add(listener, epoll.Events.In | epoll.Events.Exclusive, listener) catch {
             self.ep.close();
             self.wakeup.close();
             self.connections.deinit();
@@ -354,6 +368,7 @@ pub const Reactor = struct {
             self.upstream_conns.deinit();
             self.upstream_conns.deinit();
             self.pending.deinit(self.allocator);
+            self.pending_fds.deinit(self.allocator);
             self.expired_fds.deinit(self.allocator);
             return error.ListenerRegisterFailed;
         };
@@ -385,6 +400,7 @@ pub const Reactor = struct {
             .running = std.atomic.Value(bool).init(false),
             .thread = null,
             .pending = .empty,
+            .pending_fds = .empty,
             .pending_lock = .{},
             .registered = std.atomic.Value(usize).init(0),
             .idle_timeout_ticks = timer_wheel.default_wheel.tickForNs(@as(u64, idle_timeout_seconds) * std.time.ns_per_s),
@@ -400,10 +416,10 @@ pub const Reactor = struct {
             .conn_pool = undefined,
             .drain_started = compat.Instant.now() catch compat.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
         };
-        // Pooled upstream connections stay registered on this reactor's
-        // epoll so upstream closes are reaped before reuse (nginx's
-        // keepalive close-handler model).
-        proxy_mod.setPoolEpoll(&self.ep);
+        // NOTE: the pool's epoll hook is set on the reactor THREAD (see
+        // reactorLoop): the Reactor value is returned/copied by the init
+        // chain, so `&self.ep` taken here would point at a dead stack
+        // frame.
         // Apply the config `limits` to the per-reactor caches and pool.
         self.limits = (http_handler orelse &default_http_handler).cfg.limits;
         self.static_cache = static_cache_mod.StaticCache.initWithConfig(
@@ -432,6 +448,7 @@ pub const Reactor = struct {
             self.upstream_conns.deinit();
             self.upstream_conns.deinit();
             self.pending.deinit(self.allocator);
+            self.pending_fds.deinit(self.allocator);
         };
         // Try io_uring; the epoll path remains when it is unavailable.
         // The ring fd is epoll-registered (level-triggered): it is readable
@@ -448,7 +465,7 @@ pub const Reactor = struct {
             }
         }
         if (self.listener >= 0) {
-            self.ep.add(self.listener, epoll.Events.In | epoll.Events.EdgeTriggered, self.listener) catch {
+            self.ep.add(self.listener, epoll.Events.In | epoll.Events.Exclusive, self.listener) catch {
                 self.ep.close();
                 self.wakeup.close();
                 self.connections.deinit();
@@ -456,6 +473,7 @@ pub const Reactor = struct {
                 self.upstream_conns.deinit();
                 self.upstream_conns.deinit();
                 self.pending.deinit(self.allocator);
+            self.pending_fds.deinit(self.allocator);
                 return error.ListenerRegisterFailed;
             };
         }
@@ -468,7 +486,7 @@ pub const Reactor = struct {
         // Tear down connections while the epoll fd is still open: they deregister
         // via epoll_ctl DEL, which would EBADF-panic on a closed epoll fd.
         self.closeAllConnections();
-        if (self.listener >= 0) compat.close(self.listener);
+        if (self.listener >= 0 and !self.shared_listener) compat.close(self.listener);
         self.static_cache.deinit();
         self.conn_pool.deinit();
         self.ring.deinit();
@@ -478,6 +496,7 @@ pub const Reactor = struct {
         self.http_sessions.deinit();
         self.upstream_conns.deinit();
         self.pending.deinit(self.allocator);
+        self.pending_fds.deinit(self.allocator);
         self.expired_fds.deinit(self.allocator);
         self.throttle_fds.deinit(self.allocator);
     }
@@ -522,7 +541,14 @@ pub const Reactor = struct {
     /// while the loop was in epoll_wait).
     fn closeListenerIfRequested(self: *Reactor) void {
         if (self.listener >= 0 and self.listener_close_requested.swap(false, .release)) {
-            compat.close(self.listener);
+            if (self.shared_listener) {
+                // Stop accepting on this reactor without closing the socket:
+                // sibling reactors still accept from it, and the owning
+                // Server closes it once every reactor has detached.
+                self.ep.remove(self.listener) catch {};
+            } else {
+                compat.close(self.listener);
+            }
             self.listener = -1;
         }
     }
@@ -543,6 +569,24 @@ pub const Reactor = struct {
     }
 
     /// Hand a new connection to this reactor. Safe to call from any thread.
+    /// Hand an already-accepted connection fd over to this reactor (the
+    /// server's acceptor thread accepts from the single shared listener and
+    /// round-robins fds, so connection distribution never depends on the
+    /// kernel's wakeup choices). The fd is adopted on the reactor thread.
+    pub fn pushAcceptedFd(self: *Reactor, fd: posix.fd_t) void {
+        if (self.draining.load(.acquire)) {
+            compat.close(fd);
+            return;
+        }
+        self.pending_lock.lock();
+        defer self.pending_lock.unlock();
+        self.pending_fds.append(self.allocator, fd) catch {
+            compat.close(fd);
+            return;
+        };
+        self.wakeup.write();
+    }
+
     /// Rejected (and closed) while the reactor is draining.
     pub fn attach(self: *Reactor, conn: *connection.Connection) void {
         if (self.draining.load(.acquire)) {
@@ -567,6 +611,12 @@ pub const Reactor = struct {
     const drain_timeout_ns = 30 * std.time.ns_per_s;
 
     fn reactorLoop(self: *Reactor) void {
+    // Pooled upstream connections stay registered on this reactor's epoll
+    // (pool_tag) so an upstream close is reaped before reuse — nginx's
+    // keepalive close-handler model. The hook must point at the reactor's
+    // FINAL storage and be set on the thread that owns the pool.
+    proxy_mod.setPoolEpoll(&self.ep);
+    defer proxy_mod.setPoolEpoll(null);
         sockets.pinToCpu(self.id);
         var events: [max_events]linux.epoll_event = undefined;
         while (self.running.load(.acquire)) {
@@ -1404,8 +1454,10 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         self.continueParked(client_fd, session, tx.route);
 
         latchRate(session, tx.route);
+        // upstreamSuccess re-tags the fd for the pool (epoll MOD), so the
+        // completion must NOT unregister it: pooled fds stay registered for
+        // event-loop close reaping (nginx's keepalive close handler).
         proxy_mod.upstreamSuccess(tx.backend_idx, up_fd, upstreamNowNs(), tx.route);
-        if (self.io_mode == .epoll) self.ep.remove(up_fd) catch {}; // pooled fd kept open
         session.up_active = false;
         self.finishProxied(client_fd, session);
     }
@@ -2705,35 +2757,17 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// this batch, so this is bounded to the backlog; connections arriving
     /// after the close go to the sibling listeners (the new daemon).
     fn acceptConnections(self: *Reactor) void {
+        // With a shared listener accept exactly ONE connection per
+        // readiness event (see `pushAcceptedFd` for the server acceptor
+        // path); a private listener drains its whole backlog.
+        const accept_one = self.shared_listener;
         while (true) {
             const conn_fd = sockets.acceptNonBlock(self.listener) catch |e| switch (e) {
                 error.WouldBlock => return,
                 else => return,
             };
-            // Global max_connections ceiling: reject before acquiring a pool
-            // slot or registering the fd. The ServerStats.active atomic is
-            // shared across all reactor threads and already tracks the live
-            // connection count; checking it here costs one atomic load.
-            if (self.limits.max_connections > 0) {
-                if (self.stats) |s| {
-                    if (s.active.load(.monotonic) >= self.limits.max_connections) {
-                        compat.close(conn_fd);
-                        return;
-                    }
-                }
-            }
-            // TCP_NODELAY on accepted connections: nginx (default), Caddy
-            // and Bun all enable it; without it the Nagle/delayed-ACK
-            // interlock adds ~40 ms stalls to small two-part responses.
-            // One setsockopt per connection, amortized over keep-alive.
-            sockets.setTcpNoDelay(conn_fd);
-            if (self.accepted_counter) |c| _ = c.fetchAdd(1, .monotonic);
-            const conn = self.conn_pool.acquire(conn_fd) catch {
-                compat.close(conn_fd);
-                return;
-            };
-            conn.peer_ip = sockets.peerIp(conn_fd);
-            self.registerConnection(conn);
+            self.adoptAcceptedFd(conn_fd);
+            if (accept_one) return;
         }
     }
 
@@ -2858,21 +2892,57 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// use-after-free. `toOwnedSlice` transfers ownership of the allocation to
     /// this thread; the caller frees it.
     fn drainPending(self: *Reactor) void {
-        self.pending_lock.lock();
-        if (self.pending.items.len == 0) {
-            self.pending_lock.unlock();
-            return;
+        var conns: []*connection.Connection = &.{};
+        var fds: []posix.fd_t = &.{};
+        {
+            self.pending_lock.lock();
+            defer self.pending_lock.unlock();
+            if (self.pending.items.len > 0) {
+                conns = self.pending.toOwnedSlice(self.allocator) catch &.{};
+            }
+            if (self.pending_fds.items.len > 0) {
+                fds = self.pending_fds.toOwnedSlice(self.allocator) catch &.{};
+            }
         }
-        const items = self.pending.toOwnedSlice(self.allocator) catch {
-            self.pending_lock.unlock();
-            return;
-        };
-        self.pending_lock.unlock();
-        defer self.allocator.free(items);
+        defer self.allocator.free(conns);
+        defer self.allocator.free(fds);
 
-        for (items) |conn| {
+        for (conns) |conn| {
             self.registerConnection(conn);
         }
+        for (fds) |fd| {
+            self.adoptAcceptedFd(fd);
+        }
+    }
+
+    /// Turn a freshly accepted fd into a registered connection: enforce the
+    /// global connection ceiling, set TCP_NODELAY, take a pool slot and
+    /// register. Closes the fd when the reactor cannot take it.
+    fn adoptAcceptedFd(self: *Reactor, conn_fd: posix.fd_t) void {
+        // Global max_connections ceiling: reject before acquiring a pool
+        // slot or registering the fd. The ServerStats.active atomic is
+        // shared across all reactor threads and already tracks the live
+        // connection count; checking it here costs one atomic load.
+        if (self.limits.max_connections > 0) {
+            if (self.stats) |s| {
+                if (s.active.load(.monotonic) >= self.limits.max_connections) {
+                    compat.close(conn_fd);
+                    return;
+                }
+            }
+        }
+        // TCP_NODELAY on accepted connections: nginx (default), Caddy
+        // and Bun all enable it; without it the Nagle/delayed-ACK
+        // interlock adds ~40 ms stalls to small two-part responses.
+        // One setsockopt per connection, amortized over keep-alive.
+        sockets.setTcpNoDelay(conn_fd);
+        if (self.accepted_counter) |c| _ = c.fetchAdd(1, .monotonic);
+        const conn = self.conn_pool.acquire(conn_fd) catch {
+            compat.close(conn_fd);
+            return;
+        };
+        conn.peer_ip = sockets.peerIp(conn_fd);
+        self.registerConnection(conn);
     }
 
     fn removeConnection(self: *Reactor, fd: posix.fd_t) void {

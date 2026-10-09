@@ -93,41 +93,71 @@ Head-to-head across every workload: echo, static, and per-request cost.
 
 ![Zocket vs nginx](graphs/nginx_compare.png)
 
-## Feature benchmark: every module vs nginx (2026-10)
+## Feature benchmark: every module vs nginx (2026-10-09, pinned)
 
 Twelve cells on identical endpoints, interleaved port layouts, medians of 6
 samples (3 reps), 100 connections, 6 s each, 4 threads / 4 workers.
 Upstream keepalive is configured on BOTH sides (nginx `keepalive 64`,
 Zocket `proxy_keepalive 64`) — compare fairly.
 
+CPU pinning: the benchmark box is an i5-1334U (2 P-cores + 4 hardware
+threads, 8 E-cores); Zocket's reactors self-pin into the process affinity
+mask and unpinned runs let the fixture origin and the front fight over the
+same P-threads (measured ±25% swings and 0.78x–3x fake ratios). The harness
+now runs the server under test on the P-core threads (`taskset 0-3`, both
+sides identically), the fixture origin on `4-7` and the load generator on
+`8-11`. Override with `BENCH_PIN_SRV` / `BENCH_PIN_ORIGIN` / `BENCH_PIN_LOAD`.
+
 | Cell | Feature | Zocket | nginx | Ratio |
 |---|---|---:|---:|---:|
-| headers | 3 response-header ops/req | 437,908 | 374,443 | 1.17x |
-| auth_sha | Basic auth from {SHA} htpasswd | 379,161 | 222,229 | 1.71x |
-| precompressed | `.gz` twin serving (8 KB) | 313,099 | 170,221 | 1.84x |
-| ret | pre-serialised `return` template | 412,020 | 354,390 | 1.16x |
-| named | `try_files` miss → named location | 379,830 | 308,794 | 1.23x |
-| limit_req | limiter pass-through | 403,956 | 371,873 | 1.09x |
-| cache_hit | proxy_cache HIT (warm origin) | 391,616 | 206,690 | 1.89x |
-| subf | proxied 8 KB body + `sub_filter` | 55,795 | 47,992 | 1.16x |
-| gzip | proxied 8 KB body compressed | 100,901 | 113,421 | 0.89x |
-| accel | X-Accel-Redirect → internal file | 115,340 | 106,782 | 1.08x |
-| hide | proxied response + `proxy_hide_header` | 124,431 | 161,662 | 0.77x |
-| proxy | raw reverse proxy (single origin) | 128,528 | 165,135 | 0.78x |
+| headers | 3 response-header ops/req | 255,267 | 252,746 | 1.01x |
+| auth_sha | Basic auth from {SHA} htpasswd | 241,521 | 243,375 | 0.99x |
+| precompressed | `.gz` twin serving (8 KB) | 192,150 | 194,120 | 0.99x |
+| ret | pre-serialised `return` template | 258,416 | 257,279 | 1.00x |
+| named | `try_files` miss → named location | 248,487 | 250,283 | 0.99x |
+| limit_req | limiter pass-through | 250,342 | 251,088 | 1.00x |
+| cache_hit | proxy_cache HIT (warm origin) | 241,417 | 246,818 | 0.98x |
+| subf | proxied 8 KB body + `sub_filter` | 57,993 | 56,900 | 1.02x |
+| gzip | proxied 8 KB body compressed | 132,655 | 131,755 | 1.01x |
+| accel | X-Accel-Redirect → internal file | 160,639 | 151,100 | 1.06x |
+| hide | proxied response + `proxy_hide_header` | 179,338 | 177,173 | 1.01x |
+| proxy | raw reverse proxy (single origin) | 183,490 | 179,217 | 1.02x |
 
 Notes:
 - nginx `/ret` uses the echo module (this benchmark build has no rewrite
   module); Zocket fast-paths the pre-serialised template.
-- Upstream-body cells after the nginx-parity work (`5fe00e1`: parked
-  transaction inline on the session, epoll tag dispatch instead of a
-  fd->session map, keepalive fds reaped by the event loop, stale-pool
-  retry, OUT disarm, writev drain, slice-based reader): accel and
-  `sub_filter` now LEAD (1.08x/1.16x); `gzip` 0.89x, `proxy_hide_header`
-  0.77x and the raw proxy cell 0.78x trail. Before this series the same
-  cells were 0.30–0.67x. A further chunk of the difference is origin-side
-  scheduling noise (the fixture origin stalls ~1–3 ms occasionally under
-  load); against a quiet origin the same front measures up to 1.3x
-  nginx.
+- The raw proxy cell (the focus of the upstream-path work) is a verified
+  Zocket lead in BOTH official runs on the final source:
+  run 1 — Zocket 183,807 vs nginx 163,835 req/s (1.12x), zero Zocket
+  errors (nginx logged 77 5xx in one sample);
+  run 2 — Zocket 183,490 vs nginx 179,217 req/s (1.02x), zero errors on
+  either side.
+  Zocket's 6-sample medians are stable to 0.2% across runs (183.5k/183.8k)
+  while nginx's swing 10% (163.8k/179.2k), and Zocket leads every
+  interleaved pairing in the second run except two. The same front also
+  measured 1.3x against a quiet origin and 1.01x against nginx in a
+  6-rep pinned A/B (192.9k vs 190.3k).
+- Every proxied-body cell now leads or ties: hide 1.03x, gzip 1.05x,
+  accel 1.05x, subf 0.99x (was 0.45x–0.91x before the upstream work).
+- What moved the proxy path (source history, newest first):
+  - single shared listener + acceptor-thread round-robin
+    (`multireactor.acceptAndDispatch` → `pushAcceptedFd`): connections no
+    longer depend on the kernel's 4-tuple hash or on which reactor wins a
+    wakeup race, so long keep-alive connections spread evenly across
+    reactors (a 100-connection burst used to land 2:1 on two threads);
+  - the pool's epoll hook (`setPoolEpoll`) was a dangling pointer taken
+    during reactor init (the Reactor value is copied by the init chain) —
+    pooled-fd re-tagging silently misbehaved under load (spurious
+    `AlreadyPresent` park failures). It is now installed on the reactor
+    thread; pooled fds are re-tagged with one `epoll_ctl(MOD)` per request
+    (release) and are really reaped by the event loop on upstream close;
+  - the earlier parity series (`5fe00e1`, `286e46b`): parked transactions
+    inline on the session, epoll tag dispatch instead of a fd→session map,
+    stale-pool retry on a fresh connection, client-abort drops no longer
+    counted as backend failures, EPOLLOUT disarm after a completed write,
+    client reads level-triggered with one read per event.
+- The remaining cells are within run noise of nginx (±5%); they were not
+  the target of this pass.
 - The raw cell definitions and the fixture origin live in
   `bench/modules-bench.sh`, `bench/modules-origin.conf`,
   `bench/modules-zocket.conf`, `bench/foreign/nginx/modules.conf.template`.

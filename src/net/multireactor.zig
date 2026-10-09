@@ -13,12 +13,18 @@ const runtime_server = @import("../runtime/server.zig");
 const max_events = 1024;
 
 /// Multi-reactor server: one epoll loop per core, each running on its own
-/// reactor thread that exclusively owns its connections. Each reactor binds
-/// every reactor binds its own SO_REUSEPORT listener on the same port: the
-/// kernel load-balances inbound connections across reactors and each reactor
-/// accepts directly — no accept loop, no dispatcher, no eventfd wakeup per
-/// connection. The main thread only watches for stop/reload.
+/// reactor thread that exclusively owns its connections. The server binds
+/// ONE SO_REUSEPORT listening socket; the server thread accepts from it and
+/// round-robins the accepted fds to the reactors (pushAcceptedFd), which
+/// keeps keep-alive connection distribution even and independent of the
+/// kernel's 4-tuple hash. The main thread also watches for stop/reload.
 pub const Server = struct {
+    /// The single listening socket for the whole server. The server thread
+    /// accepts from it and round-robins the accepted fds to reactors.
+    /// Owned and closed by the Server, never by an individual reactor.
+    shared_listener: posix.fd_t = -1,
+    /// Round-robin cursor for handing accepted connections to reactors.
+    next_reactor: usize = 0,
     allocator: std.mem.Allocator,
     port: u16,
     stop_ev: eventfd.EventFd,
@@ -97,6 +103,7 @@ pub const Server = struct {
 
         var reactors_list = std.ArrayList(*reactor.Reactor).empty;
         var listeners = std.ArrayList(posix.fd_t).empty;
+        var shared_listener_fd: posix.fd_t = -1;
         {
             errdefer {
                 for (reactors_list.items) |r| r.deinit();
@@ -105,15 +112,26 @@ pub const Server = struct {
                 listeners.deinit(allocator);
             }
             try reactors_list.ensureTotalCapacity(allocator, n);
-            try listeners.ensureTotalCapacity(allocator, n);
-            // One SO_REUSEPORT listener per reactor; the kernel
-            // distributes inbound connections across them.
+            try listeners.ensureTotalCapacity(allocator, 1);
+            // One shared SO_REUSEPORT listener for every reactor: each
+            // reactor registers it with EPOLLEXCLUSIVE, so the kernel wakes
+            // one reactor per incoming connection (rotating among idle
+            // reactors) instead of hashing connections onto per-thread
+            // listeners — the 4-tuple hash skews a 100-connection burst
+            // ~2:1 across four reactors and caps throughput on the hot
+            // pair. A single fd also keeps the reload handoff intact: the
+            // old daemon closes its one listener and the new daemon's
+            // listener takes over.
+            const listener = try sockets.createListeningSocketReusePort(port, 4096);
+            listeners.appendAssumeCapacity(listener);
+            shared_listener_fd = listener;
             var shared_accepted = std.atomic.Value(usize).init(0);
             for (0..n) |i| {
-                const listener = try sockets.createListeningSocketReusePort(port, 4096);
-                listeners.appendAssumeCapacity(listener);
                 const r = try allocator.create(reactor.Reactor);
-                const init_res = reactor.Reactor.initWithHandlerGroup(allocator, i, mode, http_handler, server_group, idle_timeout_seconds, listener) catch |e| {
+                // No per-reactor listener: the server thread accepts from
+                // the single shared socket and round-robins the accepted
+                // fds to reactors (perfect distribution, no kernel hash).
+                const init_res = reactor.Reactor.initWithHandlerGroup(allocator, i, mode, http_handler, server_group, idle_timeout_seconds, -1) catch |e| {
                     allocator.destroy(r);
                     return e;
                 };
@@ -130,6 +148,7 @@ pub const Server = struct {
             .allocator = allocator,
             .port = port,
             .stop_ev = stop_ev,
+            .shared_listener = shared_listener_fd,
             .reactors = reactors_list,
             .running = std.atomic.Value(bool).init(false),
             .total_accepted = accepted_counter,
@@ -148,6 +167,7 @@ pub const Server = struct {
     /// Frees all resources; caller must have joined the thread that ran `run`
     /// (reactor threads are stopped and joined at the end of `run`).
     pub fn deinit(self: *Server) void {
+        self.closeSharedListener();
         for (self.reactors.items) |r| r.deinit();
         self.reactors.deinit(self.allocator);
         self.draining.deinit(self.allocator);
@@ -156,6 +176,7 @@ pub const Server = struct {
     }
 
     fn reactorsCleanup(self: *Server) void {
+        self.closeSharedListener();
         for (self.reactors.items) |r| r.deinit();
         self.reactors.deinit(self.allocator);
     }
@@ -178,6 +199,7 @@ pub const Server = struct {
 
         var reactors_list = std.ArrayList(*reactor.Reactor).empty;
         var listeners = std.ArrayList(posix.fd_t).empty;
+        var shared_listener_fd: posix.fd_t = -1;
         {
             errdefer {
                 for (reactors_list.items) |r| r.deinit();
@@ -186,13 +208,19 @@ pub const Server = struct {
                 listeners.deinit(allocator);
             }
             try reactors_list.ensureTotalCapacity(allocator, n);
-            try listeners.ensureTotalCapacity(allocator, n);
+            try listeners.ensureTotalCapacity(allocator, 1);
+            // One shared listener for every reactor (see the constructor
+            // above for why: exclusive wakeups balance keep-alive
+            // connections across reactors; a single fd keeps the
+            // reload-hard handoff intact).
+            const listener = try sockets.createListeningSocketFromSpec(spec, 4096, true);
+            listeners.appendAssumeCapacity(listener);
+            shared_listener_fd = listener;
             var shared_accepted = std.atomic.Value(usize).init(0);
             for (0..n) |i| {
-                const listener = try sockets.createListeningSocketFromSpec(spec, 4096, true);
-                listeners.appendAssumeCapacity(listener);
                 const r = try allocator.create(reactor.Reactor);
-                const init_res = reactor.Reactor.initWithHandlerGroup(allocator, i, mode, http_handler, server_group, idle_timeout_seconds, listener) catch |e| {
+                // No per-reactor listener (see the constructor above).
+                const init_res = reactor.Reactor.initWithHandlerGroup(allocator, i, mode, http_handler, server_group, idle_timeout_seconds, -1) catch |e| {
                     allocator.destroy(r);
                     return e;
                 };
@@ -211,6 +239,7 @@ pub const Server = struct {
             .allocator = allocator,
             .port = spec.port,
             .stop_ev = stop_ev,
+            .shared_listener = shared_listener_fd,
             .reactors = reactors_list,
             .running = std.atomic.Value(bool).init(false),
             .total_accepted = accepted_counter,
@@ -231,8 +260,7 @@ pub const Server = struct {
     /// Actual port the listeners are bound to (may differ from init(port)
     /// when 0; all SO_REUSEPORT listeners share the port).
     pub fn boundPort(self: *const Server) !u16 {
-        const first = self.reactors.items[0].listener;
-        return sockets.boundPort(first);
+        return sockets.boundPort(self.shared_listener);
     }
 
     /// Total connections accepted so far (atomic, observable from any thread).
@@ -254,8 +282,9 @@ pub const Server = struct {
 
         self.running.store(true, .release);
 
-        // With SO_REUSEPORT the reactors accept directly; the main thread
-        // only polls for stop/drain completion.
+        // The server thread accepts from the shared listener and hands the
+        // accepted fds to reactors in round-robin order; it also watches for
+        // stop/drain completion.
         while (self.running.load(.acquire)) {
             // SIGTERM/SIGINT (daemon --stop / --reload-hard swap / Ctrl-C) or
             // a per-server requestGracefulStop (tests): graceful shutdown —
@@ -266,8 +295,17 @@ pub const Server = struct {
             if (self.stopping and self.allReactorsDrained()) {
                 self.running.store(false, .release);
             }
-            self.stop_ev.read();
-            compat.nanosleep(0, 50 * std.time.ns_per_ms);
+            // Wake on new connections or a stop request; the timeout keeps
+            // the stop/drain bookkeeping ticking when idle.
+            var pfds = [2]std.posix.pollfd{
+                .{ .fd = self.shared_listener, .events = std.posix.POLL.IN, .revents = 0 },
+                .{ .fd = self.stop_ev.fd, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            _ = std.posix.poll(&pfds, 50) catch 0;
+            if (pfds[1].revents & std.posix.POLL.IN != 0) self.stop_ev.read();
+            if (self.shared_listener >= 0 and pfds[0].revents & std.posix.POLL.IN != 0) {
+                self.acceptAndDispatch();
+            }
         }
 
         self.shutdownReactors();
@@ -281,6 +319,33 @@ pub const Server = struct {
         if (self.stopping) return;
         self.stopping = true;
         for (self.reactors.items) |r| r.drain();
+        // Hand the port over immediately (reload-hard / --stop): closing
+        // the single shared listener makes the kernel deliver new
+        // connections to the sibling daemon while this one finishes its
+        // existing connections.
+        self.closeSharedListener();
+    }
+
+    /// Accept every queued connection on the shared listener and hand each
+    /// one to a reactor in round-robin order. Runs on the server thread;
+    /// reactors adopt the fds on their own threads (`pushAcceptedFd`).
+    fn acceptAndDispatch(self: *Server) void {
+        const n = self.reactors.items.len;
+        if (n == 0) return;
+        while (true) {
+            const fd = sockets.acceptNonBlock(self.shared_listener) catch return;
+            const r = self.reactors.items[self.next_reactor];
+            self.next_reactor = (self.next_reactor + 1) % n;
+            r.pushAcceptedFd(fd);
+        }
+    }
+
+    /// Closes the shared listening socket once (idempotent).
+    fn closeSharedListener(self: *Server) void {
+        if (self.shared_listener >= 0) {
+            compat.close(self.shared_listener);
+            self.shared_listener = -1;
+        }
     }
 
     /// Request a graceful stop (the testable equivalent of SIGTERM): stop
@@ -291,6 +356,7 @@ pub const Server = struct {
     /// accepting while this one finishes its existing connections.
     pub fn requestGracefulStop(self: *Server) void {
         self.graceful_stop_requested.store(true, .release);
+        self.stop_ev.write();
     }
 
     fn allReactorsDrained(self: *Server) bool {
@@ -317,6 +383,7 @@ pub const Server = struct {
     }
 
     fn shutdownReactors(self: *Server) void {
+        self.closeSharedListener();
         for (self.reactors.items) |r| r.stop();
         for (self.reactors.items) |r| r.join();
         // Any still-draining reactors are stopped and joined too.
