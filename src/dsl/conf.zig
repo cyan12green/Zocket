@@ -1939,7 +1939,13 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             var ntoks: usize = 0;
             while (lx.peek() != ';') {
                 if (ntoks >= toks.len) lx.fail("error_page: too many arguments");
-                toks[ntoks] = lx.token() orelse lx.fail("error_page: expected a status code or target");
+                const tk = lx.token() orelse lx.fail("error_page: expected a status code or target");
+                // nginx `error_page 404 = @fallback;` / `= /path;`: a lone
+                // `=` marker says the response carries the target's status.
+                // The attached `=code` form is the target and is kept.
+                const raw = tk.srcOf("error_page: value cannot contain escapes");
+                if (std.mem.eql(u8, raw, "=")) continue;
+                toks[ntoks] = tk;
                 ntoks += 1;
             }
             if (ntoks < 2) lx.fail("error_page: expected at least one status code and a target");
@@ -4653,4 +4659,34 @@ test "conf: proxy_hide_header lands on the route" {
     try testing.expectEqual(@as(usize, 2), cfg.routes[0].proxy_hide.len);
     try testing.expectEqualStrings("X-Powered-By", cfg.routes[0].proxy_hide[0]);
     try testing.expectEqualStrings("Server", cfg.routes[0].proxy_hide[1]);
+}
+
+test "conf: error_page accepts the nginx = marker before a target" {
+    const cfg = parse(
+        \\server {
+        \\    location /api/ {
+        \\        rewrite proxy;
+        \\        proxy_pass 127.0.0.1:9000;
+        \\        error_page 502 503 = @fallback;
+        \\    }
+        \\    location @fallback {
+        \\        return 503 "down\n";
+        \\    }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 2), cfg.routes[0].error_pages.len);
+    try testing.expectEqual(@as(u16, 502), cfg.routes[0].error_pages[0].status);
+    try testing.expectEqual(@as(u16, 503), cfg.routes[0].error_pages[1].status);
+    try testing.expectEqualStrings("@fallback", cfg.routes[0].error_pages[0].target);
+    // Plain-URI form with the marker too.
+    const cfg2 = parse(
+        \\server {
+        \\    location / {
+        \\        content static;
+        \\        root testdata;
+        \\        error_page 404 = /fallback.html;
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("/fallback.html", cfg2.routes[0].error_pages[0].target);
 }

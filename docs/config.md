@@ -137,6 +137,40 @@ Zone sizing (in `limits` section): `proxy_cache_max_bytes` (32 MiB),
 | `etag` | `etag on\|off;` | on | Off suppresses `ETag` emission (conditional `Last-Modified` matching still applies). |
 | `gunzip` | `gunzip on\|off;` | off | Inflate `Content-Encoding: gzip` bodies for clients that don't accept gzip (memory bodies only; corrupt payloads pass through visibly). |
 
+### Response body filters: gzip, sub_filter, precompressed
+
+Three per-location filters transform the response after the content
+module produced it. All bind themselves when their directive appears
+(no separate binding line needed).
+
+| Directive | Syntax | Description |
+|---|---|---|
+| `gzip` | `gzip on\|off;` | Compress text bodies (skips tiny, already-encoded or incompressible bodies; `Content-Encoding: gzip`). |
+| `sub_filter` | `sub_filter match replacement;` + `sub_filter_once on\|off;` | Literal body substitution while streaming the response out (first occurrence unless `sub_filter_once off`; text bodies only). |
+| `precompressed` | `precompressed gz\|br\|zstd;` (repeatable) | Serve the sibling `.gz`/`.br`/`.zst` file when the client accepts that encoding — best-first `br → zstd → gzip`; no runtime compression. |
+| `gunzip` | `gunzip on\|off;` | Inflate `Content-Encoding: gzip` bodies for clients that don't accept gzip. |
+
+```conf
+server {
+    location /app/ {
+        rewrite proxy;
+        proxy_pass 127.0.0.1:9000;
+        sub_filter "http://backend.internal" "https://public.example";
+        sub_filter_once off;      # replace every occurrence
+        gzip on;
+    }
+
+    location /assets/ {
+        root /srv/assets;
+        precompressed br;         # serve a.css.br for Accept-Encoding: br
+        precompressed zstd;
+        precompressed gz;         # fall back to a.css.gz
+    }
+}
+```
+
+See `examples/03-gzip.conf` and `examples/13-filters.conf`.
+
 ### Internal redirects: try_files & error_page
 
 Both build on the same primitive: a handler sets an internal-redirect
@@ -148,6 +182,49 @@ spinning).
 |---|---|---|---|
 | `try_files` | `try_files $uri $uri/ /fallback;` or `try_files $uri =404;` or `try_files $uri @app;` | — | Probe each candidate against `root` in order; redirect to the first that exists. `$uri` is the request target, `$uri/` appends `index`. The last entry is the fallback: a URI redirects to it, `=code` answers that status in place, `@name` redirects to a named location. |
 | `error_page` | `error_page 404 500 /50x.html;`, `error_page 503 =200;`, or `error_page 502 = @fallback;` | — | After the walk, when the outgoing status matches, redirect to the URI (methods other than GET/HEAD become GET), redirect to a named location (`@name`, method preserved), or rewrite the status in place (`=code`). Matches the status the request is heading out with — including 404 when no module claimed it. |
+
+### Internal file serving: accel (`X-Accel-Redirect`)
+
+`accel` implements nginx's **`X-Accel-Redirect`** contract — the standard
+way an application (or proxied backend) hands a download back to the web
+server:
+
+1. The client asks for a protected resource, e.g. `GET /download/42`.
+2. The backend authenticates/authorizes and answers `200` with
+   `X-Accel-Redirect: /files/42.zip` **instead of** a body.
+3. The front server drops the backend's answer, strips the header and
+   re-walks the new URI internally (the same 8-hop redirect loop as
+   `try_files`/`error_page`). The client only ever sees a normal file
+   response.
+
+The point: access control stays in the app, while the expensive bytes are
+served by the front server (sendfile, static cache, range support). Pair
+it with `internal;` on the file location so the path cannot be fetched
+directly (`internal` locations are invisible to client requests and only
+reachable through internal redirects):
+
+```conf
+server {
+    location /files/ {
+        internal;                  # direct hits 404; only redirects land here
+        content static;
+        root /srv/downloads;
+    }
+
+    location /download/ {
+        rewrite proxy;
+        proxy_pass 127.0.0.1:9000; # the app authenticates and replies with
+                                   # X-Accel-Redirect: /files/42.zip
+        accel on;                  # honor it (log phase, GET/HEAD only)
+    }
+}
+```
+
+Only `GET`/`HEAD` targets redirect — unsafe methods keep the backend's
+response untouched. A backend may also use `X-Accel-Redirect` without a
+proxy (any module can set it; the `add_header` directive on a `return`
+route is the usual test hook). See `examples/12-locations.conf`.
+
 
 ### Access control & real client IP
 
@@ -269,7 +346,7 @@ The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
 | `auth_jwt_key_file` | — | PEM certificate whose P-256 key verifies ES256 JWTs (wins over the secret; `alg` confusion fails closed). JWKS rotation deferred. |
 | `auth_jwt_leeway` | 0 | Expiry leeway seconds for clock skew. |
 
-### ACME auto-HTTPS (issuance core)
+### ACME auto-HTTPS (issuance + renewal)
 
 ```conf
 acme {
@@ -279,7 +356,7 @@ acme {
     domain example.com;
     domain www.example.com;
 }
-location /.well-known/acme-challenge/ { acme_challenge; }
+location /.well-known/acme-challenge/ { content acme_challenge; }
 ```
 
 Full issuance + renewal (`src/acme/client.zig`): the server runs one ACME
@@ -330,6 +407,32 @@ upstreams follow the proxy resolver path next).
 | `tls { ... }` in `server {}` | — | Per-vhost TLS override (same directives as the global block; `cert` + `key` required together). The listener picks the certificate by ClientHello SNI at handshake time: exact `server_name` beats `*.suffix` wildcard beats default; a matched vhost without a cert falls back to the first server that has one. `--validate` checks every override. |
 | `tls { client_ca file; verify_client on\|off; }` | off | mTLS: send CertificateRequest and verify the client chain against the PEM bundle (leaf directly or via presented intermediates) + CertificateVerify signature under the session scheme. `verify_client on` without `client_ca` fails startup closed. |
 | `tls { ktls on\|off; }` | off | kTLS TX offload when the kernel supports it (probe-gated; inert elsewhere). Foundation shipped (layouts, probe, key export); per-connection cutover + sendfile-under-TLS next. |
+
+Per-vhost certificates (SNI): give each `server {}` its own `tls {}` block
+and the listener picks the certificate from the ClientHello's SNI — exact
+`server_name` first, then `*.suffix` wildcards, then the default server.
+A matched vhost without credentials falls back to the first server that
+has them, so mixed HTTP/HTTPS deployments keep working:
+
+```conf
+tls { cert /etc/zocket/default.pem; key /etc/zocket/default.key; }
+
+server {
+    listen 443;
+    server_name a.example.com;
+    tls { cert /etc/zocket/a.pem; key /etc/zocket/a.key; }
+    location / { content static; root /var/www/a; }
+}
+
+server {
+    listen 443;
+    server_name b.example.com;
+    tls { cert /etc/zocket/b.pem; key /etc/zocket/b.key; }
+    location / { content static; root /var/www/b; }
+}
+```
+
+See `examples/15-sni-vhosts.conf`.
 
 ### Response headers
 
@@ -484,6 +587,73 @@ Repeat `server_name` for multiple names on one block. Each `listen` port is
 served only by the blocks listening on it; `--port` overrides every block
 (single group, Host selection across all blocks).
 
+### Named locations, internal files and silent drops
+
+```conf
+server {
+    # try_files falls back to a named location (front controller style).
+    location / {
+        root /srv/app/public;
+        try_files $uri @app;
+    }
+    location @app {
+        rewrite proxy;
+        proxy_pass 127.0.0.1:9000;
+    }
+
+    # Only reachable through internal redirects (try_files / error_page /
+    # X-Accel-Redirect); clients get 404 here.
+    location /private/ {
+        internal;
+        content static;
+        root /srv/app/private;
+    }
+
+    # error_page can target a named location too (method preserved).
+    location /api/ {
+        rewrite proxy;
+        proxy_pass 127.0.0.1:9001;
+        error_page 502 503 = @fallback;
+    }
+    location @fallback { return 503 "maintenance"; }
+
+    # nginx-style silent drop: no response bytes, connection closed.
+    location /bot-trap { return 444; }
+}
+```
+
+### Proxy extras: URI rewriting, hidden headers, TLS upstreams
+
+```conf
+server {
+    # Matching the /api/ prefix, forwarding as /v1/... with the query kept.
+    location /api/ {
+        rewrite proxy;
+        proxy_pass https://backend.internal:8443/v1/;
+        proxy_hide_header X-Powered-By;   # strip before the client sees it
+        proxy_set_header X-Forwarded-Host "$host";
+    }
+}
+```
+
+### ACME + SNI in one deployment
+
+```conf
+tls { cert /var/lib/zocket/default.pem; key /var/lib/zocket/default.key; }
+acme {
+    directory https://acme-v02.api.letsencrypt.org/directory;
+    contact mailto:ops@example.com;      # optional
+    account_key /var/lib/zocket/acct.pem; # optional; default <cert>.acct.pem
+    domain example.com;
+    domain www.example.com;
+}
+server {
+    listen 443;
+    location /.well-known/acme-challenge/ { content acme_challenge; }
+    location / { content static; root /var/www/site; }
+}
+```
+
 ## Examples directory
 
 Detailed, commented configs for each feature live in `examples/`:
@@ -501,6 +671,10 @@ Detailed, commented configs for each feature live in `examples/`:
 | `examples/09-tls.conf` | TLS 1.3 with ECDSA certificates |
 | `examples/10-vhosts.conf` | Virtual hosts, server_name, host_select |
 | `examples/11-full.conf` | All features combined |
+| `examples/12-locations.conf` | Named locations, `internal`, `return 444`, try_files fallback |
+| `examples/13-filters.conf` | gzip, `sub_filter`, precompressed twins, gunzip |
+| `examples/14-acme.conf` | ACME auto-HTTPS issuance + renewal |
+| `examples/15-sni-vhosts.conf` | Per-vhost certificates with SNI selection |
 
 Run any example:
 
