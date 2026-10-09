@@ -124,97 +124,118 @@ pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_nam
 fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router.Upstream, pick: usize, started_ns: u64, offer_sticky: bool) anyerror!Action {
     ensureHealthChecker(route);
     const up = &upstreams[pick];
-    var fd = acquirePooled(pick, started_ns, keepaliveIdleNs(route));
-    if (fd < 0) {
-        fd = connectUpstream(up, connectTimeoutMs(route)) catch {
-            markFailure(pick, route, started_ns);
-            return badGateway(ctx);
-        };
-        setRecvTimeout(fd, readTimeoutS(route));
-    }
     // Serialize fully NOW (arena-backed) so a parked transaction never
     // touches the parser again.
     const request = buildUpstreamRequest(ctx, up) catch {
-        posix_close(fd);
-        active[pick] -|= 1;
         markFailure(pick, route, started_ns);
         return badGateway(ctx);
     };
 
-    // HYBRID: try the whole round-trip inline. Fast origins finish right
-    // here at sync-driver cost; only real blocks park.
-    var sent: usize = 0;
-    while (sent < request.len) {
-        const n = compat.write(fd, request[sent..]) catch |e| switch (e) {
-            error.WouldBlock => {
-                return parkRemainder(ctx, route, .{
-                    .fd = fd,
-                    .backend_idx = pick,
-                    .route = route,
-                    .request = request,
-                    .sent = sent,
-                    .awaiting_out = true,
-                    .offer_sticky = offer_sticky,
-                    .sticky_name = route.sticky_cookie orelse "",
-                    .started_ns = started_ns,
-                }, null);
-            },
-            else => {
-                posix_close(fd);
-                active[pick] -|= 1;
+    // A pooled keepalive connection may have been closed by the upstream
+    // while it sat idle (upstream keep-alives are often shorter than the
+    // pool window). Like nginx's upstream keepalive, the first failure on
+    // a POOLED connection is retried once on a fresh connection: the
+    // client never sees the stale-connection 502 and the passive health
+    // counter is not tripped.
+    var attempt: u8 = 0;
+    attempts: while (true) : (attempt += 1) {
+        var pooled = false;
+        var fd = acquirePooled(pick, started_ns, keepaliveIdleNs(route));
+        if (fd >= 0) {
+            pooled = true;
+        } else {
+            fd = connectUpstream(up, connectTimeoutMs(route)) catch {
                 markFailure(pick, route, started_ns);
                 return badGateway(ctx);
-            },
-        };
-        sent += n;
-    }
-
-    var reader = UpstreamReader{};
-    reader.alloc = ctx.req.arena.asAllocator();
-    while (true) {
-        if (reader.tryParse()) |res| {
-            try adoptUpstream(ctx, res, offer_sticky, route.sticky_cookie orelse "", pick);
-            upstreamSuccess(pick, fd, nowNs(), route);
-            return .handled; // normal serialization follows; NO event hop
-        } else |e| switch (e) {
-            error.Incomplete => {},
-            else => {
-                posix_close(fd);
-                active[pick] -|= 1;
-                markFailure(pick, route, started_ns);
-                return badGateway(ctx);
-            },
+            };
+            setRecvTimeout(fd, readTimeoutS(route));
         }
-        const got = reader.fill(fd) catch |fe| switch (fe) {
-            error.WouldBlock => {
-                const hr = ctx.sharedAlloc(@sizeOf(UpstreamReader)) orelse return error.OutOfMemory;
-                const hr_t: *UpstreamReader = @ptrCast(@alignCast(hr));
-                hr_t.* = reader;
-                return parkRemainder(ctx, route, .{
-                    .fd = fd,
-                    .backend_idx = pick,
-                    .route = route,
-                    .request = request,
-                    .sent = sent,
-                    .awaiting_out = false,
-                    .offer_sticky = offer_sticky,
-                    .sticky_name = route.sticky_cookie orelse "",
-                    .started_ns = started_ns,
-                    .reader_ptr = hr_t,
-                }, hr_t);
-            },
-            else => {
+        // Pooled-connection failures never count against the backend:
+        // try the next pooled fd / a fresh connection (bounded attempts).
+        const stale_retry = pooled and attempt < 8;
+
+        // HYBRID: try the whole round-trip inline. Fast origins finish right
+        // here at sync-driver cost; only real blocks park.
+        var sent: usize = 0;
+        while (sent < request.len) {
+            const n = compat.write(fd, request[sent..]) catch |e| switch (e) {
+                error.WouldBlock => {
+                    return parkRemainder(ctx, route, .{
+                        .fd = fd,
+                        .backend_idx = pick,
+                        .route = route,
+                        .request = request,
+                        .sent = sent,
+                        .awaiting_out = true,
+                        .offer_sticky = offer_sticky,
+                        .sticky_name = route.sticky_cookie orelse "",
+                        .started_ns = started_ns,
+                    }, null);
+                },
+                else => {
+                    posix_close(fd);
+                    active[pick] -|= 1;
+                    if (stale_retry) continue :attempts;
+                    markFailure(pick, route, started_ns);
+                    return badGateway(ctx);
+                },
+            };
+            sent += n;
+        }
+
+        var reader = UpstreamReader{};
+        reader.alloc = ctx.req.arena.asAllocator();
+        while (true) {
+            if (reader.tryParse()) |res| {
+                try adoptUpstream(ctx, res, offer_sticky, route.sticky_cookie orelse "", pick);
+                upstreamSuccess(pick, fd, nowNs(), route);
+                return .handled; // normal serialization follows; NO event hop
+            } else |e| switch (e) {
+                error.Incomplete => {},
+                else => {
+                    posix_close(fd);
+                    active[pick] -|= 1;
+                    if (stale_retry) continue :attempts;
+                    markFailure(pick, route, started_ns);
+                    return badGateway(ctx);
+                },
+            }
+            const got = reader.fill(fd) catch |fe| switch (fe) {
+                error.WouldBlock => {
+                    const hr = ctx.sharedAlloc(@sizeOf(UpstreamReader)) orelse return error.OutOfMemory;
+                    const hr_t: *UpstreamReader = @ptrCast(@alignCast(hr));
+                    hr_t.* = reader;
+                    return parkRemainder(ctx, route, .{
+                        .fd = fd,
+                        .backend_idx = pick,
+                        .route = route,
+                        .request = request,
+                        .sent = sent,
+                        .awaiting_out = false,
+                        .offer_sticky = offer_sticky,
+                        .sticky_name = route.sticky_cookie orelse "",
+                        .started_ns = started_ns,
+                        .reader_ptr = hr_t,
+                    }, hr_t);
+                },
+                else => {
+                    posix_close(fd);
+                    active[pick] -|= 1;
+                    if (stale_retry) continue :attempts;
+                    markFailure(pick, route, started_ns);
+                    return badGateway(ctx);
+                },
+            };
+            if (got == 0) {
+                // EOF before a complete response: the pooled connection was
+                // closed while idle (or the upstream truncated). Retry once
+                // on a fresh connection when it came from the pool.
                 posix_close(fd);
                 active[pick] -|= 1;
+                if (stale_retry) continue :attempts;
                 markFailure(pick, route, started_ns);
                 return badGateway(ctx);
-            },
-        };
-        if (got == 0) {
-            posix_close(fd);
-            active[pick] -|= 1;
-            markFailure(pick, route, started_ns);
-            return badGateway(ctx);
+            }
         }
     }
 }
@@ -927,13 +948,15 @@ fn pickBackend(route: *const registry.Route, upstreams: []const router.Upstream,
 
 fn backendUsable(route: *const registry.Route, idx: usize, now_ns: u64) bool {
     const slot = healthSlot(route, idx) orelse return false;
-    if (!slot.alive.load(.acquire)) return false; // only the checker revives
-    if (slot.fails.load(.monotonic) < route.max_fails) return true;
-    if (route.health_check_path != null) return false; // wait for rise
-    // No active checker: honor the passive retry window.
+    if (slot.fails.load(.monotonic) < route.max_fails) return slot.alive.load(.acquire);
+    if (route.health_check_path != null) return slot.alive.load(.acquire); // rise from the checker
+    // No active checker: a tripped route waits out the passive retry window
+    // and then retries (nginx max_fails/fail_timeout). Nothing else can
+    // revive it, so a permanent lock would blackhole the route forever.
     const last = slot.last_fail_ns.load(.monotonic);
     if (now_ns >= last +% @as(u64, route.fail_timeout_seconds) * std.time.ns_per_s) {
         slot.fails.store(0, .monotonic);
+        slot.alive.store(true, .release);
         return true;
     }
     return false;
@@ -1143,6 +1166,10 @@ fn acquirePooled(idx: usize, now_ns: u64, idle_ns: u64) posix_fd {
             entries[len.* - 1] = .{};
         }
         len.* -= 1;
+        // Note: no per-acquire stale probe here — a probe costs a syscall
+        // on every pooled request. Staleness is handled by the retry in
+        // `parkAt` (a failed pooled attempt is retired on a fresh
+        // connection and never counted against the backend).
         return fd;
     }
     return -1;

@@ -22,7 +22,6 @@ cd "$NGINX_SRC"
     --prefix="$OUT" \
     --with-cc-opt="-O3" \
     --without-http_rewrite_module \
-    --with-http_gzip_module \
     --with-http_gzip_static_module \
     --with-http_sub_module \
     --add-module="$ECHO_MOD" >/dev/null
