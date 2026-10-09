@@ -20,7 +20,7 @@ Checklist for the docs/bench pass (updated as items land).
 
 ## Example configs (`examples/`)
 - [x] `12-locations.conf` — named locations, `internal`, `return 444`, `try_files @app` (compiles)
-- [ ] `13-proxy-extras.conf` — `proxy_pass` URI tail, `proxy_hide_header`, upstream TLS keepalive, chunked/large bodies
+- [x] Proxy extras shipped as `11-full.conf` + the config.md "Proxy extras" example (`13-filters.conf` is the filters example)
 - [x] `14-acme.conf` — ACME auto-HTTPS + renewal (compiles)
 - [x] `15-sni-vhosts.conf` — per-vhost certificates with SNI selection (compiles)
 - [x] Extend `11-full.conf` with the new directives (compiles)
