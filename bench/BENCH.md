@@ -114,7 +114,7 @@ or set `ENVOY_BIN=` to include them). 8 workload cells.
 ![Unified](graphs/unified_web.png)
 
 | Cell | Zocket | nginx | Ratio |
-|---|---|---:|---:|---:|
+|---|---|---:|---:|
 | h1_echo | 420,798 | 230,884 | 1.82x |
 | static_small | 311,590 | 168,204 | 1.85x |
 | static_large | 22,056 | 20,551 | 1.07x |
