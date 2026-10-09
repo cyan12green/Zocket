@@ -221,9 +221,11 @@ server {
 ```
 
 Only `GET`/`HEAD` targets redirect — unsafe methods keep the backend's
-response untouched. A backend may also use `X-Accel-Redirect` without a
-proxy (any module can set it; the `add_header` directive on a `return`
-route is the usual test hook). See `examples/12-locations.conf`.
+response untouched. The header must exist before the log phase: the
+canonical producer is a proxied upstream (`examples/12-locations.conf`
+uses a `return` route with `add_header X-Accel-Redirect …` as that
+upstream). A route cannot consume headers from its own `return`
+template — those are applied after the module walk.
 
 
 ### Access control & real client IP
