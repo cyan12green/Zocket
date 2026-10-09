@@ -34,9 +34,13 @@ ACME → full feature tours).
 
 ## Benchmarks
 
-Zocket leads every measured workload — HTTP echo up to 2.8x nginx, static
-up to 2.2x, module features up to 2.1x, unified cells up to 2.7x, HTTP/2
-and HTTP/1.1 over TLS 1.03–1.15x. Full methodology and tables:
+Zocket leads almost every measured workload — HTTP echo up to 1.7x nginx,
+static up to 2.0x, auth/caching/compression features 1.1–1.9x, HTTP/2 and
+HTTP/1.1 over TLS 1.03–1.15x. Upstream-body cells (raw proxy, gzip,
+proxy_hide_header) improved from 0.30–0.67x to 0.77–0.89x in the latest
+nginx-parity series (inline parked transactions, tag dispatch, keepalive
+event-loop reaping) and now beat nginx against a quiet origin
+(up to 1.3x); full methodology, tables and the remaining gap:
 [`bench/BENCH.md`](bench/BENCH.md).
 
 ![Zocket vs nginx — HTTP/1.1](bench/graphs/readme_http.png)
