@@ -579,7 +579,9 @@ pub const Reactor = struct {
             self.advanceTimers();
             self.enforceRequestTimeouts();
             self.kickThrottled();
+            const loop_t0 = upstreamNowNs();
             const n = self.ep.wait(&events, 100) catch continue;
+            _ = loop_t0;
             // Refresh the cached Date after the wait: a request that just
             // woke the loop is handled with a fresh second (stale by the µs
             // of batch processing), instead of up to a second + the wait
@@ -600,7 +602,9 @@ pub const Reactor = struct {
                     // transaction) without any fd->session lookup.
                     self.handleUpstreamEvent(@intCast(d & ~up_tag));
                 } else {
+                    const disp_t0 = upstreamNowNs();
                     self.handleEvent(ev.events, @intCast(d));
+                    _ = disp_t0;
                 }
             }
         }
