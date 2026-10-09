@@ -16,7 +16,9 @@ python3 bench/graphs.py --run --reps 8 --duration 8s
 zig build -Doptimize=ReleaseFast
 bash bench/compare-servers.sh --matrix              # echo sweep
 bash bench/compare-servers.sh --static "1024 1048576"  # file serving
-bash bench/modules-bench.sh                         # feature-level
+bash bench/modules-bench.sh                         # feature-levelbash bench/modules-bench.sh                         # feature-level
+# (build-nginx.sh now includes gzip + sub_filter; the feature cells need
+#  bench/static/{f8k,sub.txt} and the fixture origin bench/modules-origin.conf)
 bash bench/unified.sh                               # unified web/file/LB
 
 # Render graphs from stored results (all PNGs below)
