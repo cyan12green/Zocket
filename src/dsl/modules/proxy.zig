@@ -145,7 +145,6 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
             pooled = true;
         } else {
             fd = connectUpstream(up, connectTimeoutMs(route)) catch {
-                std.debug.print("FAILSRC connect {s}\n", .{route.path});
                 markFailure(pick, route, started_ns);
                 return badGateway(ctx);
             };
@@ -176,7 +175,6 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
                     }, null);
                 },
                 else => {
-                    std.debug.print("FAILSRC write {s}\n", .{route.path});
                     posix_close(fd);
                     active[pick] -|= 1;
                     if (stale_retry) continue :attempts;
@@ -197,7 +195,6 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
             } else |e| switch (e) {
                 error.Incomplete => {},
                 else => {
-                    std.debug.print("FAILSRC parse {s}\n", .{route.path});
                     posix_close(fd);
                     active[pick] -|= 1;
                     if (stale_retry) continue :attempts;
