@@ -2985,10 +2985,25 @@ const TlsOrigin = struct {
     listener: posix_fd,
     port: u16,
     response: []const u8,
+    /// Responses served per connection before the origin closes it
+    /// (maxInt = keep-alive forever).
+    max_requests: usize = std.math.maxInt(usize),
+    /// Close the connection after reading the request head without
+    /// answering: a transport failure after a completed handshake.
+    close_after_request: bool = false,
     stop_flag: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 
+    const Opts = struct {
+        max_requests: usize = std.math.maxInt(usize),
+        close_after_request: bool = false,
+    };
+
     fn start(response: []const u8) !*TlsOrigin {
+        return startOpts(response, .{});
+    }
+
+    fn startOpts(response: []const u8, opts: Opts) !*TlsOrigin {
         const self = try testing.allocator.create(TlsOrigin);
         const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
         var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
@@ -3004,6 +3019,8 @@ const TlsOrigin = struct {
             .listener = lfd,
             .port = (@as(u16, bound[2]) << 8) | bound[3],
             .response = response,
+            .max_requests = opts.max_requests,
+            .close_after_request = opts.close_after_request,
         };
         self.thread = try std.Thread.spawn(.{}, runFn, .{self});
         return self;
@@ -3021,12 +3038,12 @@ const TlsOrigin = struct {
             const cfd = linux.accept4(self.listener, null, null, 0);
             if (linux.errno(cfd) != .SUCCESS) break;
             const fd: posix_fd = @intCast(cfd);
-            serveOne(fd, &creds, self.response);
+            serveOne(self, fd, &creds);
             compat.close(fd);
         }
     }
 
-    fn serveOne(fd: posix_fd, creds: *const @import("../../tls/cert.zig").Credentials, response: []const u8) void {
+    fn serveOne(self: *TlsOrigin, fd: posix_fd, creds: *const @import("../../tls/cert.zig").Credentials) void {
         const tls_conn = @import("../../tls/conn.zig");
         var conn = tls_conn.TlsConn.init(creds);
         defer conn.deinit();
@@ -3034,6 +3051,7 @@ const TlsOrigin = struct {
         var out_buf: [16 * 1024]u8 = undefined;
         var plain: [16 * 1024]u8 = undefined;
         var plain_used: usize = 0;
+        var served: usize = 0;
         while (true) {
             var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
             const ready = std.posix.poll(&pfds, 5000) catch {
@@ -3061,12 +3079,15 @@ const TlsOrigin = struct {
             if (p == 0) continue;
             plain_used += p;
             if (std.mem.indexOf(u8, plain[0..plain_used], "\r\n\r\n") == null) continue;
+            if (self.close_after_request) return;
             switch (conn.inner) {
-                inline else => |*s| s.write(response) catch {
+                inline else => |*s| s.write(self.response) catch {
                     return;
                 },
             }
             flushOut(fd, &conn, &out_buf);
+            served += 1;
+            if (served >= self.max_requests) return;
             // Keep-alive: serve further requests on this connection until
             // the peer closes (lets pooled client sessions actually reuse).
             plain_used = 0;
@@ -3793,6 +3814,851 @@ test "proxy_hide_header strips upstream headers before the client" {
     // Hidden (case-insensitive); everything else survives.
     try testing.expect(respHeader(&resp, "x-powered-by") == null);
     try testing.expect(respHderEq(respHeader(&resp, "x-keep"), "yes"));
+}
+
+// ---- parked (async) upstream path ----
+
+/// Ignore SIGPIPE for the current test (writing to a closed socketpair peer
+/// raises it) and return the previous action for restoration.
+fn ignoreSigpipe() posix.Sigaction {
+    var ign = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    var old: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.PIPE, &ign, &old);
+    return old;
+}
+
+test "proxy parked path: a silent origin parks and takeParked resolves" {
+    // The origin accepts and reads but never answers: parkAt drains the
+    // request write and parks on the WouldBlock fill.
+    const srv = try FakeUpstream.start("", 4);
+    defer srv.stop();
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", srv.port)};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .sticky_cookie = "zsid",
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/parked";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    ctx.async_supported = true;
+    try testing.expect(takeParked(&ctx) == null);
+    try testing.expectEqual(Action.async, try park(&ctx));
+    const plan = takeParked(&ctx).?;
+    try testing.expectEqual(@as(usize, 0), plan.backend_idx);
+    try testing.expect(plan.route == &route);
+    try testing.expectEqual(plan.request.len, plan.sent);
+    try testing.expect(std.mem.startsWith(u8, plan.request, "GET /parked HTTP/1.1\r\n"));
+    try testing.expect(plan.reader_ptr != null);
+    try testing.expect(!plan.awaiting_out);
+    try testing.expect(!plan.pooled);
+    try testing.expectEqualStrings("zsid", plan.sticky_name);
+    // Struct-default construction (the field defaults are part of the API).
+    const blank = ParkedPlan{
+        .fd = -1,
+        .backend_idx = 0,
+        .route = &route,
+        .request = "",
+        .offer_sticky = false,
+        .sticky_name = "",
+        .started_ns = 0,
+    };
+    try testing.expect(!blank.pooled);
+    // The reactor owns the fd from here; a unit test just drops it.
+    posix_close(plan.fd);
+    drainPool(0);
+}
+
+test "proxy parked path: a pooled connection completes inline" {
+    const srv = try FakeUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Up: 1\r\n\r\nhello", 4);
+    defer srv.stop();
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", srv.port)};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    // Blocking pooled fd: the inline read is deterministic (no WouldBlock race).
+    const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try compat.connect(seed, &ups[0].sockaddr, 16);
+    setRecvTimeout(seed, default_read_timeout_s);
+    releasePooled(0, seed, nowNs(), pool_default_max);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/inline";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    ctx.async_supported = true;
+    try testing.expectEqual(Action.handled, try park(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("hello", resp.body);
+    try testing.expectEqualStrings("1", respHeader(&resp, "x-up").?);
+    drainPool(0);
+}
+
+test "adoptUpstream offers the sticky tag" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    const res = UpstreamReader.Parsed{
+        .status = 200,
+        .headers = &.{.{ .name = "X-Up", .value = "1" }},
+        .body = "ok",
+    };
+    try adoptUpstream(&ctx, res, true, "zsid", 2);
+    // The tag is formatted into adoptUpstream's stack scratch (the reactor
+    // serializes before its frame unwinds), so only its shape is checked.
+    const tag = respHeader(&resp, "set-cookie").?;
+    try testing.expectEqual(@as(usize, "zsid=s2; Path=/".len), tag.len);
+    try testing.expectEqualStrings("ok", resp.body);
+    try testing.expectEqualStrings("1", respHeader(&resp, "x-up").?);
+}
+
+test "proxy parked path: a stale pooled fd retries on a fresh connection" {
+    const srv = try FakeUpstream.start("", 4);
+    defer srv.stop();
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", srv.port)};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    // SHUT_WR on the peer: our write succeeds, the read reports EOF — the
+    // upstream-closed-idle-connection shape.
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer compat.close(pair[1]);
+    try testing.expect(std.os.linux.errno(std.os.linux.shutdown(pair[1], 1)) == .SUCCESS);
+    releasePooled(0, pair[0], nowNs(), pool_default_max);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/stale";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    ctx.async_supported = true;
+    try testing.expectEqual(Action.async, try park(&ctx));
+    const plan = takeParked(&ctx).?;
+    try testing.expect(!plan.pooled); // the retry came from a fresh dial
+    posix_close(plan.fd);
+    drainPool(0);
+}
+
+test "proxy parked path: a blocked write parks awaiting_out" {
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", 1)}; // never dialed: the pooled fd wins
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    // A pre-filled nonblocking socketpair: parkAt's request write EAGAINs
+    // before anything was sent, so the transaction parks on the write side.
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    var snd: c_int = 1024;
+    std.posix.setsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&snd)) catch {};
+    var junk: [4096]u8 = @splat('x');
+    var guard: usize = 0;
+    while (guard < 8192) : (guard += 1) {
+        _ = compat.write(pair[0], &junk) catch break;
+    }
+    releasePooled(0, pair[0], nowNs(), pool_default_max);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/blocked";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    ctx.async_supported = true;
+    try testing.expectEqual(Action.async, try park(&ctx));
+    const plan = takeParked(&ctx).?;
+    try testing.expect(plan.awaiting_out);
+    try testing.expect(plan.pooled);
+    try testing.expectEqual(@as(usize, 0), plan.sent);
+    posix_close(pair[0]);
+    compat.close(pair[1]);
+    drainPool(0);
+}
+
+test "proxy parked path: a write failure on a stale pooled fd retries once" {
+    const old = ignoreSigpipe();
+    defer posix.sigaction(posix.SIG.PIPE, &old, null);
+    const srv = try FakeUpstream.start("", 4);
+    defer srv.stop();
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", srv.port)};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    compat.close(pair[1]); // peer gone: the request write gets EPIPE
+    releasePooled(0, pair[0], nowNs(), pool_default_max);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/epipe";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    ctx.async_supported = true;
+    try testing.expectEqual(Action.async, try park(&ctx));
+    const plan = takeParked(&ctx).?;
+    try testing.expect(!plan.pooled); // retried onto a fresh connection
+    posix_close(plan.fd);
+    drainPool(0);
+}
+
+test "proxy parked path: a malformed pooled response retries and parks" {
+    const srv = try FakeUpstream.start("", 4);
+    defer srv.stop();
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", srv.port)};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    // The malformed response is already buffered when parkAt parses it.
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer compat.close(pair[1]);
+    _ = try compat.write(pair[1], "HTTP/1.1 xx\r\n\r\n");
+    releasePooled(0, pair[0], nowNs(), pool_default_max);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/bad-parse";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    ctx.async_supported = true;
+    try testing.expectEqual(Action.async, try park(&ctx));
+    posix_close(takeParked(&ctx).?.fd);
+    drainPool(0);
+}
+
+test "proxy parked path: a sticky TLS backend uses the sync driver" {
+    const port = try deadBackendPort();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", port).?,
+        .tls = true,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .sticky_cookie = "zsid",
+        .proxy_ssl_verify = false,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    _ = req.addHeaderParsed("Cookie", "zsid=s0") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    ctx.async_supported = true;
+    try testing.expectEqual(Action.handled, try park(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+// ---- pool / LB / backend state ----
+
+test "reapPooledFd drops a pooled fd and ignores unknown ones" {
+    const idx = 6;
+    drainPool(idx);
+    var pairs: [3][2]posix_fd = undefined;
+    for (&pairs) |*p| {
+        p.* = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+        releasePooled(idx, p[0], nowNs(), pool_default_max);
+    }
+    defer {
+        for (&pairs) |*p| compat.close(p[1]);
+    }
+    reapPooledFd(pairs[1][0]); // middle entry: swap-remove + close
+    try testing.expectEqual(@as(u32, 2), pool_lens[idx]);
+    try testing.expectError(error.NotOpenForWriting, compat.write(pairs[1][0], "x"));
+    reapPooledFd(-4242); // not pooled: full scan, no change
+    try testing.expectEqual(@as(u32, 2), pool_lens[idx]);
+    drainPool(idx);
+}
+
+test "pickBackend covers least_connections, random and ip_hash" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.client_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 9 };
+    const ups = [_]router.Upstream{
+        .{ .host = "127.0.0.1", .port = 1 },
+        .{ .host = "127.0.0.1", .port = 2 },
+        .{ .host = "127.0.0.1", .port = 3 },
+    };
+    {
+        // least_connections prefers the backend with the fewest in-flight slots.
+        const route = registry.Route{ .path = "/lb-lc", .balance = .least_connections, .max_fails = 1, .upstreams = &ups };
+        testResetRoute(&route);
+        active[0] = 4;
+        active[1] = 0;
+        active[2] = 2;
+        defer {
+            for (&active) |*a| a.* = 0;
+        }
+        try testing.expectEqual(@as(usize, 1), (try pickBackend(&route, route.upstreams, &ctx, nowNs())).?);
+        for (0..3) |i| markFailure(i, &route, nowNs());
+        try testing.expect((try pickBackend(&route, route.upstreams, &ctx, nowNs())) == null);
+    }
+    {
+        const route = registry.Route{ .path = "/lb-random", .balance = .random, .max_fails = 1, .upstreams = &ups };
+        testResetRoute(&route);
+        try testing.expect((try pickBackend(&route, route.upstreams, &ctx, nowNs())).? < ups.len);
+        for (0..3) |i| markFailure(i, &route, nowNs());
+        try testing.expect((try pickBackend(&route, route.upstreams, &ctx, nowNs())) == null);
+    }
+    {
+        const route = registry.Route{ .path = "/lb-iphash", .balance = .ip_hash, .max_fails = 1, .upstreams = &ups };
+        testResetRoute(&route);
+        try testing.expect((try pickBackend(&route, route.upstreams, &ctx, nowNs())).? < ups.len);
+    }
+    {
+        // consistent_hash probes past a failed backend.
+        const route = registry.Route{ .path = "/lb-chash", .balance = .consistent_hash, .max_fails = 1, .upstreams = &ups };
+        testResetRoute(&route);
+        markFailure(0, &route, nowNs());
+        try testing.expect((try pickBackend(&route, route.upstreams, &ctx, nowNs())).? != 0);
+    }
+}
+
+test "backendUsable revives a tripped backend after the fail window" {
+    const route = registry.Route{
+        .path = "/revive",
+        .max_fails = 1,
+        .fail_timeout_seconds = 1,
+        .upstreams = &hc_test_upstreams,
+    };
+    testResetRoute(&route);
+    markFailure(0, &route, 1000);
+    try testing.expect(!backendUsable(&route, 0, 1000));
+    try testing.expect(backendUsable(&route, 0, 1000 + std.time.ns_per_s)); // window elapsed
+    try testing.expect(backendUsable(&route, 0, 1000 + 2 * std.time.ns_per_s));
+}
+
+test "run answers 502 when every backend is unusable" {
+    const route = registry.Route{
+        .path = "/all-down",
+        .balance = .round_robin,
+        .max_fails = 1,
+        .upstreams = &hc_test_upstreams,
+    };
+    testResetRoute(&route);
+    markFailure(0, &route, nowNs());
+    markFailure(1, &route, nowNs());
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+test "upstream bookkeeping helpers and reconnectUpstream" {
+    const srv = try FakeUpstream.start("", 1);
+    defer srv.stop();
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", srv.port)};
+    const route = registry.Route{ .path = "/helpers", .max_fails = 10, .upstreams = &ups };
+    testResetRoute(&route);
+    const fd = try reconnectUpstream(&route, 0);
+    posix_close(fd);
+    upstreamFail(0, &route, nowNs());
+    upstreamAbandoned(0);
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer compat.close(pair[1]);
+    upstreamSuccess(0, pair[0], nowNs(), &route);
+    drainPool(0);
+}
+
+test "releasePooled re-tags fds through a live epoll" {
+    const idx = 6;
+    drainPool(idx);
+    var ep = try epoll_mod.Epoll.create();
+    defer ep.close();
+    setPoolEpoll(&ep);
+    defer setPoolEpoll(null);
+    // Unregistered fd: MOD fails and the ADD fallback runs.
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer compat.close(pair[1]);
+    releasePooled(idx, pair[0], nowNs(), 1);
+    // Pool full: the oldest entry is closed and the shift path re-tags again.
+    const pair2 = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer compat.close(pair2[1]);
+    releasePooled(idx, pair2[0], nowNs(), 1);
+    try testing.expectEqual(@as(u32, 1), pool_lens[idx]);
+    drainPool(idx);
+}
+
+// ---- upstream request building / response reader ----
+
+test "proxy_set_header overrides are hashed and replace client headers" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    _ = req.addHeaderParsed("X-Test", "client") catch unreachable;
+    _ = req.addHeaderParsed("X-Keep", "yes") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    const ups = [_]router.Upstream{mkUp("127.0.0.1", 9999)};
+    const overrides = [_]vars.ProxyHeader{
+        // name_hash 0: the builder falls back to hashing the name itself.
+        .{ .name = "X-Test", .value = &.{.{ .literal = "override" }} },
+        .{ .name = "X-Other", .value = &.{.{ .literal = "other" }}, .name_hash = http_parser.header_hasher.hash("X-Other") },
+    };
+    const route = registry.Route{ .path = "/", .proxy_headers = &overrides, .upstreams = &ups };
+    ctx.route = &route;
+    const wire = try buildUpstreamRequest(&ctx, &ups[0]);
+    try testing.expect(std.mem.indexOf(u8, wire, "X-Test: override\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "X-Test: client\r\n") == null);
+    try testing.expect(std.mem.indexOf(u8, wire, "X-Keep: yes\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "X-Other: other\r\n") != null);
+}
+
+test "fmtIp formats IPv4-mapped and full IPv6 addresses" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("192.168.1.7", fmtIp(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 7 }, &buf));
+    // Every digit-width branch: >= 100, >= 10, single.
+    try testing.expectEqualStrings("255.100.10.1", fmtIp(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 255, 100, 10, 1 }, &buf));
+    try testing.expectEqualStrings("[2001:db8:0:0:0:0:0:1]", fmtIp(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, &buf));
+}
+
+test "upstream reader restores parse state on a malformed header line" {
+    var tbuf: [16 * 1024]u8 = undefined;
+    var r = UpstreamReader.initBuf(&tbuf);
+    const wire = "HTTP/1.1 200 OK\r\nBrokenHeader\r\n\r\n";
+    @memcpy(r.buf[0..wire.len], wire);
+    r.used = wire.len;
+    try testing.expectError(error.BadUpstreamResponse, r.tryParse());
+    // errdefer rewind: a retry re-parses from the same point.
+    try testing.expectEqual(@as(usize, 0), r.pos);
+    try testing.expectEqual(@as(usize, 0), r.header_count);
+    try testing.expectEqual(@as(u16, 0), r.status);
+}
+
+test "upstream reader compacts a split body and decodes chunk boundaries" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var tbuf: [16 * 1024]u8 = undefined;
+    // Split Content-Length body: the incomplete tail is compacted, then the
+    // rest arrives and parses.
+    {
+        var r = UpstreamReader.initBuf(&tbuf);
+        r.alloc = arena_state.allocator();
+        const head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc";
+        @memcpy(r.buf[0..head.len], head);
+        r.used = head.len;
+        try testing.expectError(error.Incomplete, r.tryParse());
+        try testing.expectEqual(@as(usize, 0), r.pos); // compacted to the front
+        const tail = "defghij";
+        @memcpy(r.buf[r.used..][0..tail.len], tail);
+        r.used += tail.len;
+        try testing.expectEqualStrings("abcdefghij", (try r.tryParse()).body);
+    }
+    // Chunked: split between the data chunk and its CRLF, then inside the
+    // trailer section.
+    {
+        var r = UpstreamReader.initBuf(&tbuf);
+        r.alloc = arena_state.allocator();
+        const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello";
+        @memcpy(r.buf[0..head.len], head);
+        r.used = head.len;
+        try testing.expectError(error.Incomplete, r.tryParse());
+        const mid = "\r\n0\r\nX-Tra";
+        @memcpy(r.buf[r.used..][0..mid.len], mid);
+        r.used += mid.len;
+        try testing.expectError(error.Incomplete, r.tryParse());
+        // Completes the trailer line and its terminating blank line.
+        const tail = "\r\n\r\n";
+        @memcpy(r.buf[r.used..][0..tail.len], tail);
+        r.used += tail.len;
+        try testing.expectEqualStrings("hello", (try r.tryParse()).body);
+    }
+}
+
+// ---- forward-path failure modes ----
+
+test "attemptForward: send failure answers 502" {
+    const old = ignoreSigpipe();
+    defer posix.sigaction(posix.SIG.PIPE, &old, null);
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", 1)};
+    const route = registry.Route{ .path = "/send-fail", .balance = .round_robin, .max_fails = 10, .upstreams = &ups };
+    testResetRoute(&route);
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    compat.close(pair[1]); // the request write gets EPIPE
+    releasePooled(0, pair[0], nowNs(), pool_default_max);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+test "attemptForward: read failure answers 502" {
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", 1)};
+    const route = registry.Route{ .path = "/read-fail", .balance = .round_robin, .max_fails = 10, .upstreams = &ups };
+    testResetRoute(&route);
+    // SHUT_WR: the send succeeds, the response read reports EOF.
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer compat.close(pair[1]);
+    try testing.expect(std.os.linux.errno(std.os.linux.shutdown(pair[1], 1)) == .SUCCESS);
+    releasePooled(0, pair[0], nowNs(), pool_default_max);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+test "attemptForward: first-byte timeout answers 502" {
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", 1)};
+    const route = registry.Route{
+        .path = "/read-timeout",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_read_timeout_s = 1,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer compat.close(pair[1]); // silent peer: waitReadable times out
+    releasePooled(0, pair[0], nowNs(), pool_default_max);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+test "sendUpstreamRequest: a full socket waits out the send timeout" {
+    var ups = [_]router.Upstream{mkUp("127.0.0.1", 1)};
+    const route = registry.Route{
+        .path = "/send-timeout",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_send_timeout_s = 1,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    // A pre-filled nonblocking socketpair: the request write EAGAINs, the
+    // OUT poll never fires (peer never reads) and the send timeout trips.
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    defer compat.close(pair[1]);
+    var snd: c_int = 1024;
+    std.posix.setsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&snd)) catch {};
+    var junk: [4096]u8 = @splat('x');
+    var guard: usize = 0;
+    while (guard < 8192) : (guard += 1) {
+        _ = compat.write(pair[0], &junk) catch break;
+    }
+    releasePooled(0, pair[0], nowNs(), pool_default_max);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+// ---- TLS forward paths ----
+
+test "proxy TLS: transport failure after the handshake answers 502" {
+    const origin = try TlsOrigin.startOpts("", .{ .close_after_request = true });
+    defer origin.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = origin.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", origin.port).?,
+        .tls = true,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_ssl_verify = false,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/gone";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+test "proxy TLS: a silent origin times out the record read" {
+    // Handshake completes, the request is read, but no answer ever comes:
+    // the record-layer poll times out and maps to a transport failure.
+    const origin = try TlsOrigin.start("");
+    defer origin.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = origin.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", origin.port).?,
+        .tls = true,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_ssl_verify = false,
+        .proxy_read_timeout_s = 1,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/silent";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.bad_gateway, resp.status);
+}
+
+test "proxy TLS: a stale pooled session retries on a fresh one" {
+    // One response per connection: the origin closes after answering, so the
+    // session parked in the TLS pool is stale on the next request.
+    const origin = try TlsOrigin.startOpts("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntls-hello", .{ .max_requests = 1 });
+    defer origin.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = origin.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", origin.port).?,
+        .tls = true,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .proxy_ssl_verify = false,
+        .proxy_keepalive_max = 4,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    const once = struct {
+        fn go(rt: *const registry.Route) !void {
+            var req = registry.Request.init(testing.allocator);
+            defer req.deinit();
+            req.method = .get;
+            req.target = "/secure";
+            var resp = registry.Response.init(.ok);
+            var ctx = Context{ .req = &req, .resp = &resp };
+            ctx.route = rt;
+            try testing.expectEqual(Action.handled, try run(&ctx));
+            try testing.expectEqualStrings("tls-hello", resp.body);
+        }
+    }.go;
+    try once(&route);
+    try once(&route);
+    // The stale session was retried, not reused: two handshakes.
+    try testing.expectEqual(@as(u64, 2), tls_handshake_count);
+    drainTlsPool(0); // let the origin's keep-alive poll see the close
+}
+
+test "proxy TLS: sticky sessions offer the backend tag" {
+    const origin = try TlsOrigin.start("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntls-hello");
+    defer origin.stop();
+    var ups = [_]router.Upstream{.{
+        .host = "127.0.0.1",
+        .port = origin.port,
+        .sockaddr = router.Upstream.makeSockaddr("127.0.0.1", origin.port).?,
+        .tls = true,
+    }};
+    const route = registry.Route{
+        .path = "/",
+        .balance = .round_robin,
+        .max_fails = 10,
+        .sticky_cookie = "zsid",
+        .proxy_ssl_verify = false,
+        .upstreams = &ups,
+    };
+    testResetRoute(&route);
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/secure";
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.route = &route;
+    try testing.expectEqual(Action.handled, try run(&ctx));
+    try testing.expectEqual(registry.Status.ok, resp.status);
+    try testing.expectEqualStrings("zsid=s0; Path=/", respHeader(&resp, "set-cookie").?);
+    drainTlsPool(0);
+}
+
+// ---- TLS pool / record-layer internals ----
+
+fn fakeTlsPooled() !*TlsPooled {
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    compat.close(pair[1]);
+    const ps = try std.heap.page_allocator.create(TlsPooled);
+    ps.* = .{ .sock = undefined, .handshaked = false, .last_used_ns = 0 };
+    ps.sock.fd = pair[0];
+    return ps;
+}
+
+test "TLS pool release fills free slots and reaps stale sessions" {
+    const idx = 6;
+    drainTlsPool(idx);
+    const a = try fakeTlsPooled();
+    const b = try fakeTlsPooled();
+    releaseTlsPooled(idx, a, 0, 4); // stale: last_used 0
+    releaseTlsPooled(idx, b, nowNs(), 4); // second free slot (occupied-slot scan)
+    try testing.expect(tls_pool[idx][0] == a and tls_pool[idx][1] == b);
+    // Acquire pops the stale first slot (destroyed inline) and returns b.
+    const got = acquireTlsPooled(idx, nowNs(), std.time.ns_per_s).?;
+    try testing.expect(got == b);
+    releaseTlsPooled(idx, got, nowNs(), 4);
+    // Full pool: a further release destroys instead of growing.
+    const c = try fakeTlsPooled();
+    releaseTlsPooled(idx, c, nowNs(), 0);
+    drainTlsPool(idx);
+}
+
+test "tls sock iface: timeouts, EOF and write failures map to transport errors" {
+    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sock = TlsUpstream{
+        .fd = pair[0],
+        .read_ms = 20,
+        .write_ms = 20,
+        .reader_iface = .{ .vtable = &tls_reader_vtable, .buffer = rbuf[0..], .seek = 0, .end = 0 },
+        .writer_iface = .{ .vtable = &tls_writer_vtable, .buffer = wbuf[0..], .end = 0 },
+        .client = undefined,
+    };
+    var out: [16]u8 = undefined;
+    var w: std.Io.Writer = .{ .vtable = &.{ .drain = std.Io.Writer.fixedDrain }, .buffer = out[0..], .end = 0 };
+    // Silent peer: the poll timeout maps to ReadFailed.
+    try testing.expectError(error.ReadFailed, sock.reader_iface.vtable.stream(&sock.reader_iface, &w, .limited(out.len)));
+    // Peer closes: clean EOF maps to EndOfStream, not ReadFailed.
+    compat.close(pair[1]);
+    try testing.expectError(error.EndOfStream, sock.reader_iface.vtable.stream(&sock.reader_iface, &w, .limited(out.len)));
+    // Closed fd: the record write fails.
+    compat.close(pair[0]);
+    try testing.expectError(error.WriteFailed, tlsRawWrite(&sock, "x"));
+}
+
+test "trustedBundle caches bundles and resolves relative paths" {
+    const testdata = @import("../../tls/testdata.zig");
+    const path = "/tmp/zocket-bundle-cache-test.pem";
+    compat.deleteFile(path) catch {};
+    try compat.writeFile(path, testdata.cert_pem);
+    defer compat.deleteFile(path) catch {};
+    const first = trustedBundle(path);
+    try testing.expect(first != null);
+    try testing.expect(trustedBundle(path) == first); // cached by path
+    // Relative path: resolved from the process cwd (the project root).
+    try testing.expect(trustedBundle("src/testdata/tls/server-cert.pem") != null);
+}
+
+test "health prober thread sweeps and exits when idle" {
+    const route = registry.Route{
+        .path = "/hc-thread",
+        .health_check_path = "/hz",
+        .health_check_interval_s = 1000000,
+        .upstreams = &hc_test_upstreams,
+    };
+    // Clear stale registrations from earlier tests: their stack frames are
+    // gone, and the prober must never dereference them.
+    hc_mutex.lock();
+    hc_routes.items.len = 0;
+    hc_mutex.unlock();
+    // Let any prior prober observe the empty list and exit before spawning.
+    var spins: usize = 0;
+    while (spins < 500) : (spins += 1) {
+        hc_mutex.lock();
+        const running = hc_thread_started;
+        hc_mutex.unlock();
+        if (!running) break;
+        compat.nanosleep(0, 10 * std.time.ns_per_ms);
+    }
+    ensureHealthChecker(&route);
+    defer unregisterHealthRoute(&route);
+    hc_mutex.lock();
+    const spawned = hc_thread_started;
+    hc_mutex.unlock();
+    try testing.expect(spawned);
+    // Unregister: the prober observes the empty list and exits on its own.
+    unregisterHealthRoute(&route);
+    var exited = false;
+    spins = 0;
+    while (spins < 500) : (spins += 1) {
+        hc_mutex.lock();
+        const running = hc_thread_started;
+        hc_mutex.unlock();
+        if (!running) {
+            exited = true;
+            break;
+        }
+        compat.nanosleep(0, 10 * std.time.ns_per_ms);
+    }
+    try testing.expect(exited);
+    testResetRoute(&route);
 }
 
 fn respHeader(resp: *const registry.Response, comptime name: []const u8) ?[]const u8 {
