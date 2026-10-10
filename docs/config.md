@@ -350,8 +350,8 @@ The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
 | `cors_max_age` | 0 | Preflight `Access-Control-Max-Age` seconds (0 = omitted). |
 | `secure_link_secret` | — | HMAC-SHA256 secret for expiring URLs; requests need `?e=<unix>&s=<hex(secret, path\|e)>`, else 403. Binds `secure_link`. |
 | `auth_jwt_secret` | — | HS256 shared secret for `Authorization: Bearer` JWTs (signature + `exp` enforced); failures 401 + `WWW-Authenticate: Bearer`. Binds `auth_jwt`. |
-| `auth_jwt_key_file` | — | PEM certificate whose P-256 key verifies ES256 JWTs (wins over the secret; `alg` confusion fails closed). JWKS rotation deferred. |
-| `auth_jwt_jwks_file` | `auth_jwt_jwks_file path;` | — | JWKS JSON store (EC P-256 keys with `kid`); the file is re-read when its mtime moves (live rotation); a token's `kid` selects the key. Fail closed on parse/read errors. |
+| `auth_jwt_key_file` | — | PEM certificate whose P-256 key verifies ES256 JWTs (wins over the secret; `alg` confusion fails closed). |
+| `auth_jwt_jwks_file` | — | JWKS JSON store (EC P-256 keys with `kid`); the file is re-read when its mtime moves (live rotation); a token's `kid` selects the key. Fail closed on parse/read errors. |
 | `auth_jwt_leeway` | 0 | Expiry leeway seconds for clock skew. |
 
 ### ACME auto-HTTPS (issuance + renewal)

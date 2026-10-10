@@ -1348,7 +1348,7 @@ Current standing (c=100, interleaved): 1 KB static 1.66x ours, POST /echo
    sometimes parity). The GET residue is per-request user-space (pipeline
    dispatch + timer + stats + parse) that is already at ~350 ns/request.
 
-## Final: Zocket now leads every workload (12-rep interleaved A/B)
+## Final nginx comparison round (12-rep interleaved A/B)
 
 With the nginx-shaped responses (cached Date + Server) and all previous
 work, the last measured gap (GET / empty) is closed:

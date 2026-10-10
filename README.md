@@ -1,72 +1,131 @@
 # Zocket
 
-High-performance HTTP/TCP server in Zig. Multi-reactor epoll transport,
-HTTP/1.1 + HTTP/2 (h2spec-verified) + native TLS 1.3, WebSocket upgrade,
-nginx-style comptime config, and a 10-phase module pipeline. Beats nginx
-on every measured workload.
+A high-performance HTTP/1.1 and HTTP/2 server written in Zig, configured with
+an nginx-style configuration language that is compiled at build time.
+
+Zocket is a single static binary with no runtime dependencies: multi-reactor
+epoll transport, native TLS 1.3, HTTP/2 (h2spec-verified), WebSocket upgrade,
+a ten-phase module pipeline, reverse proxying, caching, rate limiting and
+built-in ACME certificate management.
+
+```sh
+zig build -Dconfig=config.example.conf run
+```
 
 ## Features
 
-- **Multi-reactor transport** — one shared SO_REUSEPORT listener with round-robin accept dispatch into per-core epoll loops, connection pooling, optional io_uring
-- **HTTP/2 + TLS 1.3** — h2c prior-knowledge, HPACK, flow control, `Expect: 100-continue` interim responses; native Zig TLS (no OpenSSL), ECDSA, ALPN, session tickets, per-vhost certificates selected by SNI, OCSP stapling, mTLS client verification
-- **Comptime config** — nginx-flavored `.conf` compiled entirely at build time; invalid configs are compile errors, not runtime failures
-- **10-phase module pipeline** — handlers, filters, upstreams; comptime dispatch specialisation; prefix/exact/regex routing plus named (`location @name`) and `internal` locations with `try_files`/`error_page`/`X-Accel-Redirect` internal redirects
-- **Modules** — static files + sendfile + ranges, reverse proxy (round-robin / least-conn / ip_hash / consistent_hash / least_time, TLS upstreams with keepalive pooling, chunked + arbitrarily large upstream bodies, URI-tail rewriting, `proxy_hide_header`), sticky sessions, response cache, gzip + precompressed `.gz`/`.br`/`.zstd` serving, `sub_filter` body rewriting, X-Accel-Redirect, conditional GET, auth_basic, auth_request, Basic/CORS/JWT (HS256 + ES256) auth, rate limiting, header manipulation, `return 444` silent drops, access/error logs, stub_status, Prometheus metrics
-- **Virtual hosts** — multiple `server {}` blocks with `server_name` (exact + wildcard), per-port multireactor threads, comptime Host matching
-- **IPv6** — dual-stack listeners (`listen [::]:8080;`), IPv4-mapped IPv6 for v4 clients, `IPV6_V6ONLY` control
-- **Connection limits** — `max_connections` global ceiling, `server_limit_conn` per-IP cap
-- **ACME auto-HTTPS** — built-in ACME v2 issuance + renewal daemon (http-01, ES256 JWS, CSR via native DER writer), no external certbot required
-- **Operations** — daemon mode (`--start/--stop/--status`), zero-downtime config reload (`--reload-hard`), graceful shutdown
+**Transport**
+- One shared `SO_REUSEPORT` listener with round-robin accept dispatch into
+  per-core epoll loops; optional io_uring backend (`--uring`)
+- Connection pooling, per-request timeouts (slowloris defense), idle timeout
+  via a timer wheel
+- IPv4/IPv6 dual-stack listeners, `max_connections` global and per-IP
+  connection ceilings
+
+**Protocols**
+- HTTP/1.1: incremental parser, keep-alive, pipelining, chunked transfer
+  encoding, `Expect: 100-continue`
+- HTTP/2 (h2c prior-knowledge and ALPN `h2`): HPACK, stream multiplexing,
+  flow control, CONTINUATION, trailers
+- Native TLS 1.3 (`src/tls/`, no OpenSSL): ECDSA P-256/P-384, X25519, ALPN,
+  stateless session tickets and PSK resumption, SNI certificate selection,
+  OCSP stapling, mTLS client verification
+- WebSocket upgrade (RFC 6455) with an in-reactor byte-pipe mode
+- PROXY protocol v1/v2 inbound headers and a TLS SNI-aware L4 stream proxy
+  (`stream { server { ... } }`)
+
+**Configuration**
+- nginx-flavored `.conf` language parsed and validated entirely at build time
+  (`-Dconfig=<file>`); invalid configurations are compile errors
+- Route trie, dispatch specialisation, response templates and upstream
+  addresses all live in `.rodata` — there is no runtime config parse
+- `--reload-hard` performs a zero-downtime swap; daemon control via
+  `--start` / `--stop` / `--status`
+
+**Modules** (ten-phase pipeline, config-driven bindings)
+- Static files: `sendfile`, byte ranges, conditional GETs, autoindex, a
+  revalidating fd/content cache, comptime-embedded assets
+- Reverse proxy: round-robin, least-conn, ip_hash, consistent_hash and
+  least_time balancing, sticky sessions, upstream TLS with keep-alive
+  pooling, retries and passive health checks, response caching
+- Compression: `gzip`, precompressed `.gz` / `.br` / `.zstd` twins,
+  `sub_filter` response rewriting, `gunzip`
+- Access control: `auth_basic` (comptime htpasswd), `auth_request`,
+  Basic/CORS/JWT (HS256 + ES256, JWKS rotation) authentication, IP access
+  lists (`allow`/`deny`) and real-IP restoration (`set_real_ip_from`)
+- Traffic: `limit_req` / `limit_conn`, `return 444` silent drops, traffic
+  mirroring, header manipulation, `try_files` / `error_page` /
+  `X-Accel-Redirect` internal redirects
+- Observability: access logs (including JSON format), error logs,
+  `stub_status`, Prometheus metrics
+- ACME v2 auto-HTTPS: issuance and renewal daemon (http-01), no certbot
+  required
 
 ## Quick start
 
 ```sh
-zig build run                                      # default HTTP server, port 8080
-zig build run -- --port 9000                       # custom port
-zig build run -- --threads 4                       # reactor thread count
-zig build -Dconfig=config.example.conf run         # comptime-embedded config
-zig build run -- --help                            # all flags (daemon, echo, uring, etc.)
+zig build run                                  # HTTP server on :8080
+zig build run -- --port 9000                   # custom port
+zig build run -- --threads 4                   # reactor thread count
+zig build -Dconfig=config.example.conf run     # compiled-in configuration
+zig build run -- --help                        # all flags
 ```
 
-See [`docs/config.md`](docs/config.md) for the full config reference and
-[`examples/`](examples/) for runnable, commented configs (basics → TLS/SNI →
-ACME → full feature tours).
+Configuration is embedded at compile time:
+
+```sh
+zig build -Dconfig=config.example.conf run -- --validate   # print the route table
+zig build -Dconfig=config.example.conf -Doptimize=ReleaseFast
+```
+
+See [`docs/config.md`](docs/config.md) for the full configuration reference
+and [`examples/`](examples/) for runnable, commented configurations.
 
 ## Benchmarks
 
-Zocket now leads the raw reverse-proxy cell as well: 183,807 vs 163,835
-req/s (1.12x) in the official CPU-pinned feature benchmark (6 interleaved
-samples, 100 connections), with every proxied-body cell at parity or ahead
-(gzip 1.05x, accel 1.05x, `proxy_hide_header` 1.03x) after the upstream
-path got a single shared listener with round-robin accept dispatch, real
-event-loop keepalive reaping, and the parked-transaction rework (inline
-session transaction, epoll tag dispatch, stale-pool retry). Other measured
-workloads: HTTP echo up to 1.7x nginx, static up to 2.0x,
-auth/caching/compression features 1.1–1.9x, HTTP/2 and HTTP/1.1 over TLS
-1.03–1.15x. Full methodology, tables and sample spread:
-[`bench/BENCH.md`](bench/BENCH.md).
+Measured against nginx on the same hardware, with interleaved repetitions and
+CPU pinning; medians only. Summary of the current results (full methodology,
+tables and raw data in [`bench/BENCH.md`](bench/BENCH.md)):
+
+| Workload | Zocket vs nginx |
+|---|---|
+| HTTP echo (1 KB – 64 KB, c=10–1000) | 1.14x – 2.81x |
+| Static files (1 KB / 1 MB) | 1.16x – 2.17x |
+| Module features (headers, auth, gzip, cache, accel, …) | parity – 1.06x |
+| Reverse proxy (single origin) | 1.02x – 1.12x |
+| HTTP/2 over TLS (h2load) | 1.03x – 1.07x |
+| HTTP/1.1 over TLS | 1.15x |
+| Unified suite (web/file/LB) | 0.88x – 1.49x |
 
 ![Zocket vs nginx — HTTP/1.1](bench/graphs/readme_http.png)
 
 ## Development
 
 ```sh
-zig build test                                     # 861 tests
-zig build h2test                                   # HTTP/2 conformance (curl + h2spec)
-bash bench/compare-servers.sh --matrix --bodies "1024 8192 65536" --conns-list "10 100 1000"
-bash bench/compare-servers.sh --static "1024 1048576"
-bash bench/modules-bench.sh                        # module features vs nginx
-bash bench/unified.sh                              # 8-cell web/file/LB suite
-bash bench/h2-bench.sh                             # HTTP/2 over TLS (h2load)
+zig build test             # 1,055 tests
+zig build h2test           # HTTP/2 end-to-end + h2spec conformance
+zig build cov              # line/block coverage report
+bash bench/modules-bench.sh   # module features vs nginx
+bash bench/unified.sh         # unified web/file/load-balancer suite
+python3 bench/graphs.py --run # full benchmark suite + graphs
 ```
 
-## Docs
+Requires the Zig snapshot pinned in `build.zig.zon`. Development conventions,
+module-authoring recipes and the repository layout are documented in
+[`AGENTS.md`](AGENTS.md) and [`docs/LAYOUT.md`](docs/LAYOUT.md); see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) before sending a change.
 
-- [`docs/config.md`](docs/config.md) — config language reference
+The codebase is developed with agentic tooling (DeepSeek V4 Flash via
+OpenCode) under human review.
+
+## Documentation
+
+- [`docs/config.md`](docs/config.md) — configuration language reference
+- [`docs/LAYOUT.md`](docs/LAYOUT.md) — source layout and architecture
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — roadmap and open items
-- [`docs/milestones.md`](docs/milestones.md) — delivery history
+- [`docs/milestones.md`](docs/milestones.md) — milestone history
 - [`bench/BENCH.md`](bench/BENCH.md) — benchmark methodology and results
 
-## AI Disclosure
+## License
 
-This project uses agentic development (DeepSeek V4 Flash via OpenCode).
+[MIT](LICENSE.md)
