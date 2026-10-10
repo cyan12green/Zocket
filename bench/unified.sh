@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Unified benchmark harness — webserver, fileserver and load-balancer cells
-# against nginx / HAProxy / Envoy / Zocket (see bench/UNIFIED.md).
+# against nginx / HAProxy / Envoy / Zocket (see bench/BENCH.md).
 #
 #   bench/unified.sh [--quick] [--reps N]
 #
