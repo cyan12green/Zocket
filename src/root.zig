@@ -71,7 +71,6 @@ pub const dsl = struct {
         pub const error_log = @import("dsl/modules/error_log.zig");
         pub const stub_status = @import("dsl/modules/stub_status.zig");
         pub const mirror = @import("dsl/modules/mirror.zig");
-        pub const metrics = @import("dsl/modules/metrics.zig");
     };
 };
 
@@ -157,7 +156,6 @@ comptime {
     _ = @import("dsl/modules/error_log.zig");
     _ = @import("dsl/modules/stub_status.zig");
     _ = @import("dsl/modules/mirror.zig");
-    _ = @import("dsl/modules/metrics.zig");
     _ = @import("runtime/config.zig");
     _ = @import("runtime/server.zig");
     _ = @import("tls/pem.zig");

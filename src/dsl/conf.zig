@@ -168,6 +168,8 @@ const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
 const H_proxy_hide_header = keyHash("proxy_hide_header");
 const H_access_log = keyHash("access_log");
+const H_prometheus = keyHash("prometheus");
+const H_status_json = keyHash("status_json");
 const H_json = keyHash("json");
 const H_mirror = keyHash("mirror");
 const H_error_page = keyHash("error_page");
@@ -1471,6 +1473,17 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             _ = b.upstreams.create(parseUpstream(lx, "upstream", ep.host, ep.port, ep.tls));
             spec.upstreams_len += 1;
             b.cost += 8;
+        },
+        H_prometheus => {
+            // Bare observability directive: `location /metrics { prometheus; }`.
+            ensureModuleBound(b, spec, .content, "prometheus");
+            lx.expectTerminator("prometheus");
+            b.cost += 4;
+        },
+        H_status_json => {
+            ensureModuleBound(b, spec, .content, "status_json");
+            lx.expectTerminator("status_json");
+            b.cost += 4;
         },
         H_mirror => {
             const t = lx.value(b, "mirror");
@@ -3777,6 +3790,24 @@ test "conf: mirror and json access log parse and bind" {
     }
     try testing.expect(saw_access);
     try testing.expect(saw_mirror);
+}
+
+test "conf: bare observability directives bind the content modules" {
+    const cfg = parse(
+        \\server {
+        \\    location /metrics { prometheus; }
+        \\    location /status { status_json; }
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 2), cfg.routes.len);
+    for (cfg.routes, 0..) |r, i| {
+        const want = if (i == 0) "prometheus" else "status_json";
+        var saw = false;
+        for (r.modules) |b| {
+            if (std.mem.eql(u8, b.module, want)) saw = true;
+        }
+        try testing.expect(saw);
+    }
 }
 
 test "conf: host_select off disables Host routing" {

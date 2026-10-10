@@ -61,7 +61,10 @@ top-level directives + `server {}` blocks holding `location {}` blocks. No
 | `preaccess conditional_get` | — | preaccess | If-Modified-Since → 304 |
 | `post_access cache_headers` | — | post_access | Cache-Control, ETag |
 | `log gzip` | — | log | gzip compression |
-| `log access_log` | — | log | Access logging |
+| `log access_log` | `access_log format\|json\|off;` | log | Access logging (auto-bound by the directive; `json` is a built-in escaped JSON line format) |
+| `rewrite mirror` | `mirror addr:port;` | rewrite | Fire-and-forget request duplication to a shadow backend (auto-bound by `mirror`) |
+| `content prometheus` | `prometheus;` | content | Prometheus exposition (`/metrics`) |
+| `content status_json` | `status_json;` | content | Counters as JSON (`/status`) |
 | `access auth_basic` | — | access | Basic auth (htpasswd) |
 | `access auth_request` | — | access | Subrequest auth |
 | `access limit_req` | — | access | Rate limiting |
@@ -332,7 +335,8 @@ The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
 | Directive | Syntax | Default | Description |
 |---|---|---|---|
 | `log_format` | `log_format name value;` | combined | Named log format (max 16). Use `log_format json '{"time":"$date","req":"$request","status":$status}';` for JSON lines (values via `jsonEscape` semantics: quotes/backslashes/controls escaped). |
-| `access_log` | `access_log format\|off;` | combined | Per-route log format. |
+| `access_log` | `access_log format\|json\|off;` | combined | Per-route log format; `json` emits the built-in escaped JSON line (`ts`, `remote_addr`, `request`, `status`, `bytes`, `referer`, `user_agent`); `off` silences even when the module is bound. |
+| `mirror` | `mirror addr:port;` | off | Fire-and-forget duplicate of every request to a shadow backend (bounded 10 ms connect wait, response never read). The shadow never joins load balancing. |
 
 ### Auth bundle: CORS, secure_link, JWT-lite
 
