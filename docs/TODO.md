@@ -35,4 +35,4 @@ Checklist for the docs/bench pass (updated as items land).
 - [x] Re-ran unified (front config fixed; front keepalive 64). Matrix/static unaffected by the proxy changes (no upstream bodies)
 
 ## Process
-- [ ] Commit + push after each bullet group; keep this file's checkboxes current
+- [x] Commit + push after each bullet group; keep this file's checkboxes current (all landed; delivery record in `docs/milestones.md`)
