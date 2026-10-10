@@ -187,7 +187,7 @@ pub const HttpTransport = struct {
             addr_count = 1;
             port_off = port;
         } else {
-            const srv = resolver.Servers{};
+            const srv = resolver.currentServers();
             const res = resolver.resolveBlocking(host, srv, 53) catch return error.AcmeDirectoryFailed;
             if (res.count == 0) return error.AcmeDirectoryFailed;
             var i: usize = 0;
@@ -1023,4 +1023,343 @@ test "certRemainingSeconds reports the fixture certificate's lifetime" {
     try testing.expect(remaining > renew_before_seconds);
     // Missing file -> null (issue now).
     try testing.expect(certRemainingSeconds(allocator, ".zig-cache/tmp/does-not-exist.pem") == null);
+}
+
+// ---- Parsers and helpers -------------------------------------------------
+
+test "jsonString skips unquoted keys and unterminated values" {
+    // Bare key at offset 0 is not a JSON key.
+    try testing.expect(jsonString("status:\"x\"", "status") == null);
+    // Opening quote with no closing quote.
+    try testing.expect(jsonString("{\"status\":\"valid", "status") == null);
+    // A non-string value for the key is skipped; a later real one wins.
+    try testing.expectEqualStrings("ok", jsonString("{\"status\":3,\"status\":\"ok\"}", "status").?);
+}
+
+test "jsonStringArray handles missing keys and malformed arrays" {
+    const allocator = testing.allocator;
+    const key = "\"authorizations\"";
+    try testing.expect((try jsonStringArray(allocator, "{}", key)) == null);
+    // Key present but no '[' follows.
+    try testing.expect((try jsonStringArray(allocator, "{\"authorizations\":3}", key)) == null);
+    // Unterminated string inside the array.
+    try testing.expect((try jsonStringArray(allocator, "{\"authorizations\":[\"abc}", key)) == null);
+    // Allocation failure while building the result list.
+    var failing = testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, jsonStringArray(failing.allocator(), "{\"authorizations\":[\"a\"]}", key));
+}
+
+test "headerValue returns null for absent and colonless lines" {
+    try testing.expect(headerValue("HTTP/1.1 200 OK\r\nA: b\r\n", "Missing") == null);
+    try testing.expect(headerValue("HTTP/1.1 200 OK\r\nMalformed\r\n", "Malformed") == null);
+}
+
+test "parseHttpResponse rejects malformed responses" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.AcmeBadResponse, parseHttpResponse(allocator, "HTTP/1.1 200 OK\r\nno separator"));
+    try testing.expectError(error.AcmeBadResponse, parseHttpResponse(allocator, "garbage\r\n\r\n"));
+    try testing.expectError(error.AcmeBadResponse, parseHttpResponse(allocator, "HTTP/1.1\r\n\r\n"));
+    try testing.expectError(error.AcmeBadResponse, parseHttpResponse(allocator, "HTTP/1.1 abc OK\r\n\r\n"));
+}
+
+test "parseHttpResponse frees the head when the body allocation fails" {
+    const allocator = testing.allocator;
+    var failing = testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try testing.expectError(error.OutOfMemory, parseHttpResponse(failing.allocator(), "HTTP/1.1 200 OK\r\n\r\nhi"));
+    var failing2 = testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    try testing.expectError(error.OutOfMemory, parseHttpResponse(failing2.allocator(), "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n"));
+}
+
+test "chunked decoding tolerates extensions and truncation" {
+    const allocator = testing.allocator;
+    var r = try parseHttpResponse(allocator, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=x\r\nabc\r\n0\r\n\r\n");
+    defer r.deinit(allocator);
+    try testing.expectEqualStrings("abc", r.body);
+    // A bad chunk size stops decoding without failing the response.
+    var t = try parseHttpResponse(allocator, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc");
+    defer t.deinit(allocator);
+    try testing.expectEqualStrings("", t.body);
+}
+
+test "parseIp4 accepts dotted quads and rejects malformed hosts" {
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, parseIp4("127.0.0.1").?);
+    try testing.expect(parseIp4("1.2.3") == null);
+    try testing.expect(parseIp4("1.2.3.4.5") == null);
+    try testing.expect(parseIp4("1.2.3.256") == null);
+    try testing.expect(parseIp4("example.test") == null);
+}
+
+test "indexOfIgnoreCase matches case-insensitively" {
+    try testing.expectEqual(@as(?usize, 2), indexOfIgnoreCase("xxCHUNKEDyy", "chunked"));
+    try testing.expect(indexOfIgnoreCase("short", "muchlonger") == null);
+    try testing.expect(indexOfIgnoreCase("abc", "z") == null);
+}
+
+test "copyInto truncates to the destination length" {
+    var dst: [4]u8 = @splat(0);
+    try testing.expectEqual(@as(usize, 4), copyInto(&dst, "abcdef"));
+    try testing.expectEqualStrings("abcd", &dst);
+    try testing.expectEqual(@as(usize, 2), copyInto(&dst, "xy"));
+    try testing.expectEqualStrings("xy", dst[0..2]);
+}
+
+test "http-01 extraction picks the url and token" {
+    const body = "{\"challenges\":[{\"type\":\"dns-01\",\"url\":\"u0\"},{\"type\":\"http-01\",\"url\":\"u1\",\"token\":\"t1\"}]}";
+    try testing.expectEqualStrings("u1", findHttp01Url(body).?);
+    try testing.expectEqualStrings("t1", findHttp01Token(body).?);
+    try testing.expect(findHttp01Url("{\"challenges\":[]}") == null);
+    try testing.expect(findHttp01Token("{\"challenges\":[]}") == null);
+}
+
+test "parseSec1Scalar extracts the scalar from SEC1 DER" {
+    const allocator = testing.allocator;
+    const kp = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(0x66)));
+    const secret = kp.secret_key.toBytes();
+    const der_bytes = try der.sec1PrivateKey(allocator, &secret);
+    defer allocator.free(der_bytes);
+    const scalar = parseSec1Scalar(der_bytes) orelse return error.TestUnexpected;
+    try testing.expectEqualSlices(u8, &secret, &scalar);
+    // No `04 20` marker, and a buffer too short to hold one.
+    try testing.expect(parseSec1Scalar(&.{ 0x04, 0x1f }) == null);
+    try testing.expect(parseSec1Scalar(&.{}) == null);
+}
+
+test "request rejects malformed URLs and maps read errors" {
+    var t = HttpTransport.init(testing.allocator);
+    defer t.deinit();
+    try testing.expectError(error.AcmeBadResponse, t.request("GET", "ftp://x/y", null, null));
+    try testing.expectError(error.AcmeBadResponse, t.request("GET", "http://no-path", null, null));
+    try testing.expectError(error.AcmeBadResponse, t.request("GET", "http://x:notaport/y", null, null));
+    try testing.expectError(error.AcmeDirectoryFailed, t.request("GET", "http://127.0.0.1:1/x", null, null));
+    // A read on an invalid fd surfaces as a directory failure, not a panic.
+    try testing.expectError(error.AcmeDirectoryFailed, t.readResponse(-1));
+}
+
+test "request resolves hostname URLs through the system resolver" {
+    // request() hands resolveBlocking the system nameservers
+    // (resolver.currentServers(): the `resolver` directive, else
+    // /etc/resolv.conf). A hostname that cannot resolve still surfaces as a
+    // directory failure, not a panic; with no configured nameserver at all
+    // the resolver fails fast with NoServers.
+    var t = HttpTransport.init(testing.allocator);
+    defer t.deinit();
+    try testing.expectError(error.AcmeDirectoryFailed, t.request("GET", "http://acme.invalid/directory", null, null));
+}
+
+/// Scripted ACME transport for the `runOnce` failure-path tests: hands out
+/// the queued replies in order, then an empty 200. URLs are ignored.
+const ScriptTransport = struct {
+    allocator: std.mem.Allocator,
+    replies: []const Reply,
+    next: usize = 0,
+
+    const Reply = struct {
+        status: u16 = 200,
+        body: []const u8 = "{}",
+        nonce: ?[]const u8 = "nonce",
+        location: ?[]const u8 = null,
+    };
+
+    fn request(self: *ScriptTransport, method: []const u8, url: []const u8, content_type: ?[]const u8, body: ?[]const u8) !Response {
+        _ = method;
+        _ = url;
+        _ = content_type;
+        _ = body;
+        const r = if (self.next < self.replies.len) self.replies[self.next] else Reply{};
+        self.next += 1;
+        return .{
+            .status = r.status,
+            .body = try self.allocator.dupe(u8, r.body),
+            .nonce = r.nonce,
+            .location = r.location,
+            .head = try self.allocator.dupe(u8, ""),
+        };
+    }
+};
+
+const script_dir = "{\"newNonce\":\"n\",\"newAccount\":\"a\",\"newOrder\":\"o\"}";
+const script_order = "{\"authorizations\":[\"http://ca.test/authz/1\"],\"finalize\":\"http://ca.test/finalize/1\"}";
+const script_authz = "{\"challenges\":[{\"type\":\"http-01\",\"url\":\"http://ca.test/chal/1\",\"token\":\"tok\"}]}";
+/// Directory + nonce + account replies (account Location set).
+const script_acct = [_]ScriptTransport.Reply{
+    .{ .body = script_dir },
+    .{},
+    .{ .location = "http://ca.test/acct/1" },
+};
+/// Everything through a successful challenge poll.
+const script_issued = script_acct ++ [_]ScriptTransport.Reply{
+    .{ .body = script_order },
+    .{ .body = script_authz },
+    .{},
+    .{ .body = "{\"status\":\"valid\"}" },
+};
+
+/// Run `runOnce` against the scripted replies with throwaway output paths.
+fn runScripted(allocator: std.mem.Allocator, replies: []const ScriptTransport.Reply) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var acct_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var cert_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const acct = try std.fmt.bufPrint(&acct_buf, ".zig-cache/tmp/{s}/acct.pem", .{tmp.sub_path});
+    const cert = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
+    const key = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
+    var transport = ScriptTransport{ .allocator = allocator, .replies = replies };
+    const domains = [_][]const u8{"example.test"};
+    try runOnce(allocator, .{
+        .directory = "http://ca.test/directory",
+        .domains = &domains,
+        .account_key_path = acct,
+        .cert_path = cert,
+        .key_path = key,
+    }, &transport, null);
+}
+
+test "runOnce rejects empty configurations" {
+    const allocator = testing.allocator;
+    const domains = [_][]const u8{"example.test"};
+    var transport = ScriptTransport{ .allocator = allocator, .replies = &.{} };
+    try testing.expectError(error.AcmeConfigInvalid, runOnce(allocator, .{
+        .directory = "",
+        .domains = &domains,
+        .account_key_path = "unused.pem",
+        .cert_path = "unused.crt",
+        .key_path = "unused.key",
+    }, &transport, null));
+    try testing.expectError(error.AcmeConfigInvalid, runOnce(allocator, .{
+        .directory = "http://ca.test/directory",
+        .domains = &[_][]const u8{},
+        .account_key_path = "unused.pem",
+        .cert_path = "unused.crt",
+        .key_path = "unused.key",
+    }, &transport, null));
+}
+
+test "runOnce reports directory, nonce and account failures" {
+    const allocator = testing.allocator;
+    try testing.expectError(error.AcmeDirectoryFailed, runScripted(allocator, &.{.{ .status = 500 }}));
+    try testing.expectError(error.AcmeDirectoryFailed, runScripted(allocator, &.{.{ .body = "{}" }}));
+    try testing.expectError(error.AcmeDirectoryFailed, runScripted(allocator, &.{.{ .body = "{\"newNonce\":\"n\"}" }}));
+    try testing.expectError(error.AcmeDirectoryFailed, runScripted(allocator, &.{.{ .body = "{\"newNonce\":\"n\",\"newAccount\":\"a\"}" }}));
+    // Nonce response without a Replay-Nonce header.
+    try testing.expectError(error.AcmeDirectoryFailed, runScripted(allocator, &.{ .{ .body = script_dir }, .{ .nonce = null } }));
+    // Account HTTP error / missing Location (the third reply is the account).
+    try testing.expectError(error.AcmeAccountFailed, runScripted(allocator, &.{ .{ .body = script_dir }, .{}, .{ .status = 400 } }));
+    try testing.expectError(error.AcmeAccountFailed, runScripted(allocator, &.{ .{ .body = script_dir }, .{}, .{} }));
+}
+
+test "runOnce reports order failures" {
+    const allocator = testing.allocator;
+    const bad_status = script_acct ++ [_]ScriptTransport.Reply{.{ .status = 400 }};
+    try testing.expectError(error.AcmeOrderFailed, runScripted(allocator, &bad_status));
+    const no_finalize = script_acct ++ [_]ScriptTransport.Reply{.{ .body = "{\"authorizations\":[\"http://ca.test/authz/1\"]}" }};
+    try testing.expectError(error.AcmeOrderFailed, runScripted(allocator, &no_finalize));
+    const no_authz = script_acct ++ [_]ScriptTransport.Reply{.{ .body = "{\"finalize\":\"http://ca.test/finalize/1\"}" }};
+    try testing.expectError(error.AcmeOrderFailed, runScripted(allocator, &no_authz));
+}
+
+test "runOnce reports challenge failures" {
+    const allocator = testing.allocator;
+    const order_ok = script_acct ++ [_]ScriptTransport.Reply{.{ .body = script_order }};
+    const authz_err = order_ok ++ [_]ScriptTransport.Reply{.{ .status = 400 }};
+    try testing.expectError(error.AcmeChallengeFailed, runScripted(allocator, &authz_err));
+    const authz_no_chal = order_ok ++ [_]ScriptTransport.Reply{.{ .body = "{\"challenges\":[]}" }};
+    try testing.expectError(error.AcmeChallengeFailed, runScripted(allocator, &authz_no_chal));
+    const chal_err = order_ok ++ [_]ScriptTransport.Reply{ .{ .body = script_authz }, .{ .status = 400 } };
+    try testing.expectError(error.AcmeChallengeFailed, runScripted(allocator, &chal_err));
+    const poll_invalid = order_ok ++ [_]ScriptTransport.Reply{
+        .{ .body = script_authz },
+        .{},
+        .{ .body = "{\"status\":\"invalid\"}" },
+    };
+    try testing.expectError(error.AcmeChallengeFailed, runScripted(allocator, &poll_invalid));
+}
+
+test "runOnce reports finalize, order-poll and download failures" {
+    const allocator = testing.allocator;
+    const fin_err = script_issued ++ [_]ScriptTransport.Reply{.{ .status = 400 }};
+    try testing.expectError(error.AcmeFinalizeFailed, runScripted(allocator, &fin_err));
+    const order_invalid = script_issued ++ [_]ScriptTransport.Reply{
+        .{ .body = "{\"status\":\"processing\"}" },
+        .{ .body = "{\"status\":\"invalid\"}" },
+    };
+    try testing.expectError(error.AcmeFinalizeFailed, runScripted(allocator, &order_invalid));
+    // The finalize reply carries the certificate URL, skipping the poll.
+    const dl_err = script_issued ++ [_]ScriptTransport.Reply{
+        .{ .body = "{\"status\":\"valid\",\"certificate\":\"http://ca.test/cert/1\"}" },
+        .{ .status = 400 },
+    };
+    try testing.expectError(error.AcmeDownloadFailed, runScripted(allocator, &dl_err));
+}
+
+/// Loopback listener that accepts up to `n` connections and closes each
+/// immediately — enough to drive the https request path into a TLS handshake
+/// failure without a real TLS peer. Polls with a timeout so a failure to
+/// connect can never hang the suite.
+const ClosingListener = struct {
+    fd: std.posix.fd_t,
+    port: u16,
+    thread: std.Thread,
+
+    fn run(fd: std.posix.fd_t, n: usize) void {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&pfds, 5000) catch break;
+            if (ready == 0) break;
+            const cfd = std.os.linux.accept4(fd, null, null, 0);
+            if (std.os.linux.errno(cfd) != .SUCCESS) break;
+            compat.close(@intCast(cfd));
+        }
+    }
+
+    fn start(n: usize) !ClosingListener {
+        const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        errdefer compat.close(lfd);
+        var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+        addr[0] = 2;
+        addr[4] = 127;
+        addr[7] = 1;
+        try compat.bind(lfd, @ptrCast(&addr), 16);
+        try compat.listen(lfd, 4);
+        var slen: std.posix.socklen_t = 16;
+        var bound: [16]u8 align(@alignOf(u16)) = undefined;
+        try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+        return .{
+            .fd = lfd,
+            .port = (@as(u16, bound[2]) << 8) | bound[3],
+            .thread = try std.Thread.spawn(.{}, run, .{ lfd, n }),
+        };
+    }
+
+    fn stop(self: *ClosingListener) void {
+        self.thread.join();
+        compat.close(self.fd);
+    }
+
+    fn url(self: *ClosingListener, buf: []u8, path: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "https://127.0.0.1:{d}{s}", .{ self.port, path }) catch "";
+    }
+};
+
+test "https requests load the system bundle and report handshake failure" {
+    const allocator = testing.allocator;
+    var srv = try ClosingListener.start(2);
+    defer srv.stop();
+    var url_buf: [64]u8 = undefined;
+
+    // Trust-bundle allocation failure: the connected fd is closed and the
+    // request fails cleanly before any TLS setup.
+    var failing = testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var poor = HttpTransport.init(failing.allocator());
+    defer poor.deinit();
+    try testing.expectError(error.AcmeDirectoryFailed, poor.request("GET", srv.url(&url_buf, "/directory"), null, null));
+
+    // Normal transport: systemCa loads (and caches) the roots, then the
+    // handshake fails because the peer closes without speaking TLS.
+    var t = HttpTransport.init(allocator);
+    defer t.deinit();
+    try testing.expectError(error.AcmeDirectoryFailed, t.request("GET", srv.url(&url_buf, "/directory"), null, null));
+    try testing.expect(t.ca_loaded);
+    try testing.expect(t.systemCa() == t.ca);
 }

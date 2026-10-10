@@ -72,10 +72,7 @@ pub fn verifyCompact(allocator: std.mem.Allocator, pub_sec1: []const u8, compact
     const plen = dec.calcSizeForSlice(pay) catch return error.BadJws;
     const payload = try allocator.alloc(u8, plen);
     errdefer allocator.free(payload);
-    dec.decode(payload, pay) catch {
-        allocator.free(payload);
-        return error.BadJws;
-    };
+    dec.decode(payload, pay) catch return error.BadJws;
     return payload;
 }
 
@@ -147,4 +144,54 @@ test "jwk thumbprint matches a Python-hashlib cross-check" {
     @memcpy(sec1[33..65], &y);
     const tp = try thumbprint(&sec1);
     try testing.expectEqualStrings("QRr9UDIXDxAm-JAlBeO1YPt4DeQt1n9Q4GdAC2D1PZo", &tp);
+}
+
+test "verifyCompact rejects malformed compact serializations" {
+    const allocator = testing.allocator;
+    const seed = @as([32]u8, @splat(@as(u8, 0x77)));
+    const kp = try Ecdsa.KeyPair.fromSecretKey(try Ecdsa.SecretKey.fromBytes(seed));
+    const pub_sec1 = kp.public_key.toUncompressedSec1();
+    // Too few or too many dot-separated parts.
+    try testing.expectError(error.BadJws, verifyCompact(allocator, &pub_sec1, "only.two"));
+    try testing.expectError(error.BadJws, verifyCompact(allocator, &pub_sec1, "a.b.c.d"));
+    // Signature that does not decode to a 64-byte raw R||S.
+    try testing.expectError(error.BadJws, verifyCompact(allocator, &pub_sec1, "a.b.QUJD"));
+    // Invalid SEC1 public key.
+    try testing.expectError(error.BadJws, verifyCompact(allocator, &.{}, "a.b.QUJD"));
+}
+
+test "verifyCompact rejects an undecodable payload" {
+    // The decode-failure path frees the payload exactly once (the errdefer);
+    // testing.allocator proves it by checking for leaks and double frees.
+    const allocator = testing.allocator;
+    const seed = @as([32]u8, @splat(@as(u8, 0x33)));
+    const kp = try Ecdsa.KeyPair.fromSecretKey(try Ecdsa.SecretKey.fromBytes(seed));
+    const pub_sec1 = kp.public_key.toUncompressedSec1();
+    const prot = try b64urlEncode(allocator, "{\"alg\":\"ES256\"}");
+    defer allocator.free(prot);
+    // Four invalid base64url characters: the length check passes, only the
+    // character decoder rejects them.
+    const compact = try signCompact(allocator, &seed, prot, "****");
+    defer allocator.free(compact);
+    try testing.expectError(error.BadJws, verifyCompact(allocator, &pub_sec1, compact));
+}
+
+test "thumbprint rejects a malformed SEC1 key" {
+    try testing.expectError(error.BadKey, thumbprint(&.{0x04}));
+    var sec1: [65]u8 = @splat(0x11);
+    sec1[0] = 0x03; // not the uncompressed-point marker
+    try testing.expectError(error.BadKey, thumbprint(&sec1));
+}
+
+test "signCompact propagates allocation failure" {
+    const allocator = testing.allocator;
+    const seed = @as([32]u8, @splat(@as(u8, 0x55)));
+    var fail: usize = 0;
+    while (fail < 24) : (fail += 1) {
+        var f = testing.FailingAllocator.init(allocator, .{ .fail_index = fail });
+        const a = f.allocator();
+        if (signCompact(a, &seed, "prot", "pay")) |compact| {
+            a.free(compact);
+        } else |e| try testing.expectEqual(error.OutOfMemory, e);
+    }
 }

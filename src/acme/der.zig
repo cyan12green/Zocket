@@ -365,3 +365,95 @@ test "csr builds, signs and verifies" {
     try testing.expect(std.mem.indexOf(u8, csr, "example.com") != null);
     try testing.expect(std.mem.indexOf(u8, csr, "www.example.com") != null);
 }
+
+test "writer int pads values whose top bit is set" {
+    const allocator = testing.allocator;
+    var w = Writer.init(allocator);
+    defer w.deinit();
+    try w.int(0x7f);
+    try w.int(0x80);
+    try w.int(0x8000);
+    try w.int(0);
+    try testing.expectEqualSlices(u8, &.{
+        0x02, 0x01, 0x7f, // 127 fits one byte
+        0x02, 0x02, 0x00, 0x80, // 0x80 needs the DER zero pad
+        0x02, 0x03, 0x00, 0x80, 0x00, // same for 0x8000
+        0x02, 0x01, 0x00, // zero is a single byte
+    }, w.buf.items);
+}
+
+test "writer helpers emit the expected TLVs and long-form lengths" {
+    const allocator = testing.allocator;
+    var w = Writer.init(allocator);
+    defer w.deinit();
+    try w.seq("ab");
+    try w.set("c");
+    try w.oid(&oid_prime256v1);
+    try w.utf8String("hi");
+    try w.contextPrimitive(2, "x");
+    try w.contextConstructed(0, "y");
+    try w.nullValue();
+    try w.boolean(true);
+    try w.boolean(false);
+    try w.bitString("z", 3);
+    try w.octetString("ok");
+    const expect = [_]u8{
+        0x30, 0x02, 'a',  'b',
+        0x31, 0x01, 'c',
+        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07,
+        0x0C, 0x02, 'h',  'i',
+        0x82, 0x01, 'x',
+        0xA0, 0x01, 'y',
+        0x05, 0x00,
+        0x01, 0x01, 0xFF,
+        0x01, 0x01, 0x00,
+        0x03, 0x02, 0x03, 'z',
+        0x04, 0x02, 'o',  'k',
+    };
+    try testing.expectEqualSlices(u8, &expect, w.buf.items);
+    // A body past 127 bytes switches the length field to long form.
+    const long: [128]u8 = @splat(0xAB);
+    try w.octetString(&long);
+    try testing.expectEqual(@as(u8, 0x04), w.buf.items[expect.len]);
+    try testing.expectEqual(@as(u8, 0x81), w.buf.items[expect.len + 1]);
+    try testing.expectEqual(@as(u8, 128), w.buf.items[expect.len + 2]);
+    try testing.expectEqual(expect.len + 3 + long.len, w.buf.items.len);
+}
+
+test "csr builder rejects empty domains and malformed public keys" {
+    const allocator = testing.allocator;
+    var pub_sec1: [65]u8 = @splat(0x04);
+    try testing.expectError(error.DerTooLarge, buildCsr(allocator, &[_][]const u8{}, &pub_sec1));
+    try testing.expectError(error.DerTooLarge, buildCsr(allocator, &[_][]const u8{"example.test"}, pub_sec1[0..64]));
+}
+
+test "der writers propagate allocation failure" {
+    const allocator = testing.allocator;
+    const kp = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(0x44)));
+    const pub_sec1 = kp.public_key.toUncompressedSec1();
+    const secret = kp.secret_key.toBytes();
+    const domains = [_][]const u8{ "a.test", "b.test" };
+    var fail: usize = 0;
+    while (fail < 96) : (fail += 1) {
+        {
+            var f = testing.FailingAllocator.init(allocator, .{ .fail_index = fail });
+            const a = f.allocator();
+            if (buildCsr(a, &domains, &pub_sec1)) |built| a.free(built.csr) else |e| try testing.expectEqual(error.OutOfMemory, e);
+        }
+        {
+            var f = testing.FailingAllocator.init(allocator, .{ .fail_index = fail });
+            const a = f.allocator();
+            if (finishCsr(a, "tbs", "sig")) |csr| a.free(csr) else |e| try testing.expectEqual(error.OutOfMemory, e);
+        }
+        {
+            var f = testing.FailingAllocator.init(allocator, .{ .fail_index = fail });
+            const a = f.allocator();
+            if (pemEncode(a, "TEST", "der-bytes")) |pem| a.free(pem) else |e| try testing.expectEqual(error.OutOfMemory, e);
+        }
+        {
+            var f = testing.FailingAllocator.init(allocator, .{ .fail_index = fail });
+            const a = f.allocator();
+            if (sec1PrivateKey(a, &secret)) |der_bytes| a.free(der_bytes) else |e| try testing.expectEqual(error.OutOfMemory, e);
+        }
+    }
+}
