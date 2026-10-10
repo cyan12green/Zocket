@@ -7,7 +7,7 @@ on every measured workload.
 
 ## Features
 
-- **Multi-reactor transport** — one SO_REUSEPORT listener + epoll loop per core, lock-free dispatch, connection pooling, optional io_uring
+- **Multi-reactor transport** — one shared SO_REUSEPORT listener with round-robin accept dispatch into per-core epoll loops, connection pooling, optional io_uring
 - **HTTP/2 + TLS 1.3** — h2c prior-knowledge, HPACK, flow control, `Expect: 100-continue` interim responses; native Zig TLS (no OpenSSL), ECDSA, ALPN, session tickets, per-vhost certificates selected by SNI, OCSP stapling, mTLS client verification
 - **Comptime config** — nginx-flavored `.conf` compiled entirely at build time; invalid configs are compile errors, not runtime failures
 - **10-phase module pipeline** — handlers, filters, upstreams; comptime dispatch specialisation; prefix/exact/regex routing plus named (`location @name`) and `internal` locations with `try_files`/`error_page`/`X-Accel-Redirect` internal redirects

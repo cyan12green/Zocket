@@ -87,7 +87,7 @@ byte-budgeted LRU stores; nothing grows under load):
 - DONE Runtime zone-size knobs: `limits.proxy_cache_max_bytes` /
   `proxy_cache_max_entries` size the response zone at startup; the LruStore
   is runtime-sized with a chained hash directory (O(1) HIT lookups).
-- OPEN Module framework v2 (this file): Stage 1 in progress; Stage 2 (async upstreams) follows.
+- DONE Module framework v2 (this file): Stage 1 (handler/filter split + lifecycle/state-slot/directive-schema contracts) and Stage 2 (async upstreams) both shipped; items 6-8 remain designed-not-built on top of the seam.
 - BLOCKED ON VENDORING Brotli + zstd compression: std.zig has no encoders
   for either (zstd is decompress-only); needs a vendored codec decision
   (C dependency vs pure-Zig port) before pickup.
@@ -231,7 +231,13 @@ Tracked items (design notes recorded here; build later):
   cache_headers, proxy_cache_store. 321 tests. Directive-schema arm
   validation is partial (names published + uniqueness checks; generic
   param validation deferred).
-- **Stage 2** FUNCTIONALLY DONE, perf gate OPEN (branch module-v2-stage2):
+- **Stage 2** DONE and merged (was branch module-v2-stage2); the perf
+  gate is MET as of the 2026-10-10 proxy work (official suite raw proxy
+  1.02x-1.12x nginx, 864 tests green). Historical notes below;
+  the old bimodality/environment interaction is resolved (root causes:
+  client-abort drops counted as backend failures, an armed EPOLLOUT that
+  was never disarmed, a dangling pool-epoll hook, and unpinned CPU
+  placement on the P/E-core box):
   `Action` is a tagged union with `.async`; the reactor registers upstream
   fds (LT IN|OUT at park, IN after send) and drives proxy's
   send->read->adopt state machine; buffer-ownership fix copies adopted
@@ -399,13 +405,20 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   response-body substitution (single + `once` semantics), `proxy_redirect`
   Location rewriting, X-Accel-Redirect internal file redirect. All shipped
   2026-10.
-- D2.1 proxy upstream-path performance (NEXT): the feature benchmark
-  shows every cell that proxies an upstream response body trails nginx
-  (raw proxy 0.45x, hide 0.45x, gzip 0.54x, accel 0.67x, sub_filter
-  0.91x, unified lb_rr 0.41x); local/request-side cells all lead
-  (1.15x-2.06x). Raising `proxy_keepalive` to 64 took the raw cell from
-  0.30x to 0.45x; the remaining ~2x gap is the per-request upstream path
-  (park/continuation overhead + syscall mix) — target: parity, then lead.
+- D2.1 proxy upstream-path performance ✅ DONE (verified 2026-10-10):
+  the official feature suite now shows the raw proxy cell LEADING nginx
+  in both runs — 183,807 vs 163,835 req/s (1.12x) and 183,490 vs 179,217
+  (1.02x), zero Zocket errors, with Zocket's medians stable to 0.2%
+  across runs; proxied-body cells followed (accel 1.06x, sub_filter
+  1.02x, hide/gzip 1.01x). What closed the gap: the nginx-parity series
+  (parked transaction inline on the session, epoll tag dispatch,
+  stale-pool retry, client-abort accounting, OUT disarm, level-triggered
+  reads), then the shared-listener acceptor with round-robin fd handoff
+  (`acceptAndDispatch`/`pushAcceptedFd`), pooled-fd re-tagging via
+  `epoll_ctl(MOD)` with real event-loop close reaping, and the
+  `setPoolEpoll` dangling-hook fix. Remaining: the multi-origin
+  `lb_rr` cell is at parity within machine spread (0.90x/0.98x/1.000x)
+  with a worse p99 tail (3.5 ms vs 2.0 ms).
 - D1.10 `proxy_hide_header` ✅ SHIPPED 2026-10: route-scoped upstream
   response-header filtering (repeatable, case-insensitive, both adopt
   paths).
