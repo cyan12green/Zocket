@@ -45,6 +45,13 @@ pub const Limits = struct {
     /// When active connections reach this limit, new accepts are closed
     /// immediately. 0 = unlimited. nginx: worker_connections.
     max_connections: usize = 0,
+    /// In-flight request cap PER REACTOR (worker): at most this many
+    /// requests may be parsed-but-unanswered at any instant, including time
+    /// parked on an upstream. Further requests are shed immediately with
+    /// 503 + close (Envoy circuit-breaker semantics; nginx bounds this via
+    /// worker_connections). 0 = unlimited. Comptime config: the value is
+    /// validated at build time against `connection_pool_max`.
+    max_requests: usize = 0,
     /// Per-IP concurrent-connection cap enforced at the server level
     /// (across all routes). 0 = unlimited. nginx: limit_conn ... N at the
     /// server/http scope.
@@ -71,6 +78,7 @@ test "limits compile to the documented defaults" {
     try testing.expectEqual(@as(usize, 16384), l.static_content_cache_max);
     try testing.expectEqual(@as(usize, 1024), l.connection_pool_max);
     try testing.expectEqual(@as(usize, 0), l.max_connections);
+    try testing.expectEqual(@as(usize, 0), l.max_requests);
     try testing.expectEqual(@as(u32, 0), l.server_limit_conn);
 }
 

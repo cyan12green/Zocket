@@ -310,6 +310,7 @@ The `ipv6only=on` flag sets `IPV6_V6ONLY` on the socket.
 | `send_buffer_size` | `send_buffer_size size;` | 16k | Per-connection send buffer. |
 | `connection_pool_max` | `connection_pool_max number;` | 1024 | Max pooled connections per reactor. |
 | `max_connections` | `max_connections number;` | 0 | Global ceiling on concurrent connections. 0 = unlimited. New accepts are rejected when active connections reach this limit. |
+| `max_requests` | `max_requests number;` | 0 | In-flight request cap **per reactor (worker)**: at most this many requests parsed-but-unanswered at any instant, including time parked on an upstream. Further requests are shed immediately with 503 + close (Envoy circuit-breaker semantics). Comptime-checked against `connection_pool_max` (may not exceed it). 0 = unlimited. |
 | `server_limit_conn` | `server_limit_conn number;` | 0 | Per-IP concurrent-connection cap at the server level (across all routes). 0 = unlimited. |
 | `proxy_cache_max_bytes` | `proxy_cache_max_bytes size;` | 32m | mmap zone size for response cache entries. |
 | `proxy_cache_max_entries` | `proxy_cache_max_entries number;` | 256 | Max distinct URL cache slots. |

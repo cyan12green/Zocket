@@ -188,6 +188,9 @@ const HttpSession = struct {
     /// connection object.
     up_tx: UpTx = undefined,
     up_active: bool = false,
+    /// This session has a request counted against `limits.max_requests`
+    /// (incremented at request entry, released on completion/teardown).
+    req_counted: bool = false,
 
 };
 
@@ -280,6 +283,9 @@ pub const Reactor = struct {
     limits: limits_mod.Limits = .{},
     date_len: usize = 0,
     date_sec: u64 = 0,
+    /// Requests parsed-but-unanswered on this reactor right now
+    /// (`limits.max_requests` cap; single-threaded access).
+    in_flight: usize = 0,
     /// Per-reactor listener when set, this
     /// reactor accepts connections directly from the kernel; -1 otherwise.
     listener: posix.fd_t = -1,
@@ -1894,6 +1900,12 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         self.dropConnection(conn);
         if (self.http_sessions.fetchRemove(fd)) |kv| {
             var sess = kv.value;
+            // A torn-down connection may hold a counted request (abort or
+            // error close): release the `max_requests` slot exactly once.
+            if (sess.req_counted) {
+                sess.req_counted = false;
+                self.in_flight -|= 1;
+            }
             if (sess.file_fd >= 0 and !sess.file_fd_cached) compat.close(sess.file_fd);
             if (sess.resp.body_owned) self.allocator.free(sess.resp.body);
             if (self.stats) |s| {
@@ -2085,6 +2097,11 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
 
         session.writing = false;
         session.throttled = false;
+        // Request complete: release its `max_requests` slot.
+        if (session.req_counted) {
+            session.req_counted = false;
+            self.in_flight -|= 1;
+        }
         if (self.stats) |s| {
             if (session.stat_state == .writing) {
                 session.stat_state = .waiting;
@@ -2125,6 +2142,20 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     fn handleHttpRequest(self: *Reactor, fd: posix.fd_t, tls_mode: bool) bool {
         const conn = self.connections.get(fd) orelse return false;
         const session = self.http_sessions.getPtr(fd) orelse return false;
+        // In-flight request cap (`limits.max_requests`, per reactor/worker):
+        // shed new work with 503 once this reactor already holds that many
+        // requests. The count runs from parse to the fully-flushed response
+        // (including time parked on an upstream), so it bounds concurrent
+        // upstream fan-out and per-request memory. Comptime config; the
+        // counter is a plain field because one reactor thread owns it.
+        if (self.limits.max_requests != 0 and self.in_flight >= self.limits.max_requests) {
+            self.respondAndClose(fd, .service_unavailable);
+            return false;
+        }
+        if (!session.req_counted) {
+            session.req_counted = true;
+            self.in_flight += 1;
+        }
         const close0 = !session.req.keep_alive;
         session.resp = http_response.Response.init(.ok);
         // Resolve per-request server from Host header when a server group
@@ -2983,6 +3014,12 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         }
         if (self.http_sessions.fetchRemove(fd)) |kv| {
             var sess = kv.value;
+            // A torn-down connection may hold a counted request (abort or
+            // error close): release the `max_requests` slot exactly once.
+            if (sess.req_counted) {
+                sess.req_counted = false;
+                self.in_flight -|= 1;
+            }
             if (sess.file_fd >= 0 and !sess.file_fd_cached) compat.close(sess.file_fd);
             if (sess.resp.body_owned) self.allocator.free(sess.resp.body);
             if (self.stats) |s| {
@@ -3477,6 +3514,57 @@ test "reactor HTTP handles pipelined requests in one write" {
     try testing.expectEqualStrings(want_a, buf[0..n1]);
     const n2 = try readUntil(pair[0], &buf, want_b.len, 3000);
     try testing.expectEqualStrings(want_b, buf[0..n2]);
+}
+
+test "reactor max_requests sheds with 503 at the cap and releases the slot" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.limits.max_requests = 1;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    // At the cap: the next request is shed immediately with 503 + close and
+    // is never counted.
+    {
+        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer compat.close(pair[0]);
+        try sockets.setNonBlock(pair[0]);
+        try sockets.setNonBlock(pair[1]);
+        const conn = try connection.Connection.create(allocator, pair[1]);
+        r.attach(conn);
+        r.in_flight = 1; // one request already in flight on this reactor
+        try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        var buf: [512]u8 = undefined;
+        const n = try readUntil(pair[0], &buf, 64, 3000);
+        try testing.expect(std.mem.indexOf(u8, buf[0..n], "503 Service Unavailable") != null);
+        try testing.expectEqual(@as(usize, 1), r.in_flight);
+    }
+    // Below the cap: a normal request completes and releases its slot.
+    {
+        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer compat.close(pair[0]);
+        try sockets.setNonBlock(pair[0]);
+        try sockets.setNonBlock(pair[1]);
+        const conn = try connection.Connection.create(allocator, pair[1]);
+        r.attach(conn);
+        r.in_flight = 0;
+        try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        var buf: [512]u8 = undefined;
+        // Empty-body echo takes the minimal fast path (no Date/Server).
+        const want = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        const n = try readUntil(pair[0], &buf, want.len, 3000);
+        try testing.expectEqualStrings(want, buf[0..n]);
+        // The release happens on the reactor thread just before the next
+        // loop turn; allow it a moment to land.
+        var spins: usize = 0;
+        while (r.in_flight != 0 and spins < 200) : (spins += 1) {
+            compat.nanosleep(0, std.time.ns_per_ms);
+        }
+        try testing.expectEqual(@as(usize, 0), r.in_flight);
+    }
 }
 
 test "reactor HTTP error paths respond and close" {

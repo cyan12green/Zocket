@@ -75,6 +75,7 @@ const H_static_cache_valid = keyHash("static_cache_valid");
 const H_static_content_cache_max = keyHash("static_content_cache_max");
 const H_connection_pool_max = keyHash("connection_pool_max");
 const H_max_connections = keyHash("max_connections");
+const H_max_requests = keyHash("max_requests");
 const H_server_limit_conn = keyHash("server_limit_conn");
 const H_proxy_cache_max_bytes = keyHash("proxy_cache_max_bytes");
 const H_proxy_cache_max_entries = keyHash("proxy_cache_max_entries");
@@ -1161,6 +1162,10 @@ fn parseGlobalDirective(lx: *Lexer, b: *Builder, comptime name: []const u8) bool
         },
         H_max_connections => {
             b.limits.max_connections = lx.number(name, usize);
+            lx.expectTerminator(name);
+        },
+        H_max_requests => {
+            b.limits.max_requests = lx.number(name, usize);
             lx.expectTerminator(name);
         },
         H_server_limit_conn => {
@@ -3688,6 +3693,7 @@ test "conf: timeout, zone and pool limits parse" {
         \\static_content_cache_max 32k;
         \\max_chunked_body 128k;
         \\max_connections 4096;
+        \\max_requests 128;
         \\server_limit_conn 100;
         \\server {
         \\    location / {
@@ -3703,6 +3709,7 @@ test "conf: timeout, zone and pool limits parse" {
     try testing.expectEqual(@as(usize, 32 * 1024), cfg.limits.static_content_cache_max);
     try testing.expectEqual(@as(usize, 128 * 1024), cfg.limits.max_chunked_body);
     try testing.expectEqual(@as(usize, 4096), cfg.limits.max_connections);
+    try testing.expectEqual(@as(usize, 128), cfg.limits.max_requests);
     try testing.expectEqual(@as(u32, 100), cfg.limits.server_limit_conn);
 }
 

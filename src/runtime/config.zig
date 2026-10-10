@@ -156,6 +156,14 @@ pub const Config = struct {
     /// branch quota.
     pub inline fn comptimeValidate(comptime cfg: Config, comptime Registry: type) void {
         @setEvalBranchQuota(1_000_000);
+        // Cross-field limit invariants, checked at build time (hard reload
+        // recompiles, so a bad combination never reaches a running daemon).
+        if (cfg.limits.max_requests != 0 and cfg.limits.connection_pool_max != 0 and
+            cfg.limits.max_requests > cfg.limits.connection_pool_max)
+        {
+            @compileError("limits.max_requests cannot exceed limits.connection_pool_max " ++
+                "(each in-flight request is served on a connection slot)");
+        }
         for (cfg.routes) |*r| {
             for (r.modules) |b| {
                 if (!Registry.isRegistered(b.module)) {
