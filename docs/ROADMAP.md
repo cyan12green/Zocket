@@ -307,6 +307,33 @@ Remaining opportunities, ranked (impact = hot-path CPU):
 ---
 ---
 
+## Coverage gate (90% lines) — open
+
+`zig build cov` (zig-cov, exact SanitizerCoverage). Baseline after the
+2026-10 parser/response/vars test batch: **65.4% lines (21.2k/32.3k),
+41.1% blocks**; the gate is 90% lines. The gap is spread thin — the top
+files by missing lines (2026-10):
+
+| File | Missing lines |
+|---|---:|
+| `net/reactor.zig` | 1,759 |
+| `dsl/modules/proxy.zig` | 1,046 |
+| `http2/session.zig` | 758 |
+| `http/parser.zig` | 413 |
+| `tls/session.zig` | 399 |
+| `runtime/server.zig` | 387 |
+| `compat.zig` | 355 |
+| `dsl/conf.zig` | 340 |
+| `acme/client.zig` | 285 |
+| `dsl/modules/static.zig` | 281 |
+
+The reactor/proxy/h2 gaps are integration-shaped (parked paths, error
+branches, teardown) and need harness-driven tests (socketpairs, mock
+origins, timing) rather than more unit cases; the smaller files
+(compat, static, shmem, vars) are mostly unit-testable. Suggested order:
+compat/sockets/shmem (mechanical), static+precompressed (fixtures),
+parser/conf leftovers, then reactor/proxy/h2 harness tests.
+
 ## Dependent milestones (blocked on Zig snapshot)
 
 DM1/DM2 (comptime JSON config validation, comptime config as primary
