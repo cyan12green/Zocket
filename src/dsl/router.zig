@@ -286,6 +286,14 @@ pub const Route = struct {
     /// reads this cookie for a previously-assigned backend tag and answers
     /// new clients with a Set-Cookie binding them to their backend.
     sticky_cookie: ?[]const u8 = null,
+    /// `mirror addr:port;`: fire-and-forget duplication of every request to
+    /// a shadow backend (the mirrored response is never read).
+    mirror: ?Upstream = null,
+    /// `access_log off;`: the access_log module stays silent even when bound.
+    log_off: bool = false,
+    /// `access_log json;`: emit one JSON object per request instead of a
+    /// named log_format.
+    log_json: bool = false,
     /// Index into Config.log_formats; null = none (off). The access_log
     /// module reads it; defaults to index 0 (the `combined` default) when
     /// the route binds `log access_log;` and no `access_log` directive is

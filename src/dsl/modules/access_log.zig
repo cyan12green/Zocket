@@ -26,10 +26,85 @@ pub const combined_format = "$ip - - [$date] \"$request\" $status $bytes \"$refe
 /// when the route declares no `access_log` directive).
 pub const combined_frags = vars.parseComplexValue(combined_format, &.{});
 
+/// Built-in JSON form: one object per request with the standard fields.
+/// Values are escaped (quotes/backslashes/control bytes); `status` and
+/// `bytes` stay bare JSON numbers.
+const jfrags = struct {
+    const date = vars.parseComplexValue("$date", &.{});
+    const ip = vars.parseComplexValue("$ip", &.{});
+    const request = vars.parseComplexValue("$request", &.{});
+    const status = vars.parseComplexValue("$status", &.{});
+    const bytes = vars.parseComplexValue("$bytes", &.{});
+    const referer = vars.parseComplexValue("$referer", &.{});
+    const user_agent = vars.parseComplexValue("$user_agent", &.{});
+};
+
+/// Sink wrapper that JSON-escapes every appended chunk (chunk boundaries do
+/// not matter for per-byte escaping).
+fn JsonEsc(comptime Ptr: type) type {
+    return struct {
+        inner: Ptr,
+        pub fn appendAll(self: *@This(), bytes: []const u8) !void {
+            for (bytes) |c| {
+                switch (c) {
+                    '"' => try self.inner.appendAll("\\\""),
+                    '\\' => try self.inner.appendAll("\\\\"),
+                    '\n' => try self.inner.appendAll("\\n"),
+                    '\r' => try self.inner.appendAll("\\r"),
+                    '\t' => try self.inner.appendAll("\\t"),
+                    0...8, 11, 12, 14...0x1f => {
+                        var buf: [6]u8 = undefined;
+                        _ = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch {};
+                        try self.inner.appendAll(buf[0..6]);
+                    },
+                    else => try self.inner.appendAll(&[_]u8{c}),
+                }
+            }
+        }
+    };
+}
+
+fn renderJson(ctx: *Context, sink: anytype) !void {
+    var esc = JsonEsc(@TypeOf(sink)){ .inner = sink };
+    try sink.appendAll("{\"ts\":\"");
+    try vars.renderComplex(ctx, jfrags.date, &esc);
+    try sink.appendAll("\",\"remote_addr\":\"");
+    try vars.renderComplex(ctx, jfrags.ip, &esc);
+    try sink.appendAll("\",\"request\":\"");
+    try vars.renderComplex(ctx, jfrags.request, &esc);
+    try sink.appendAll("\",\"status\":");
+    try vars.renderComplex(ctx, jfrags.status, &esc);
+    try sink.appendAll(",\"bytes\":");
+    try vars.renderComplex(ctx, jfrags.bytes, &esc);
+    try sink.appendAll(",\"referer\":\"");
+    try vars.renderComplex(ctx, jfrags.referer, &esc);
+    try sink.appendAll("\",\"user_agent\":\"");
+    try vars.renderComplex(ctx, jfrags.user_agent, &esc);
+    try sink.appendAll("\"}");
+}
+
 fn run(ctx: *Context) anyerror!Action {
     const allocator = ctx.allocator orelse return .pass;
     var line = std.ArrayList(u8).empty;
     defer line.deinit(allocator);
+
+    // JSON mode (`access_log json;`) and `off` are decided before the
+    // named-format lookup.
+    if (ctx.route) |route| {
+        if (route.log_off) return .pass;
+        if (route.log_json) {
+            var stack_buf: [1024]u8 = undefined;
+            var stack_sink = vars.StackSink{ .buf = &stack_buf };
+            if (renderJson(ctx, &stack_sink)) |_| {
+                std.log.info("{s}", .{stack_buf[0..stack_sink.len]});
+            } else |_| {
+                var sink = vars.ArrayListSink{ .list = &line, .allocator = allocator };
+                try renderJson(ctx, &sink);
+                std.log.info("{s}", .{line.items});
+            }
+            return .pass;
+        }
+    }
 
     // The route's log_format index selects a named format; `off` (null)
     // disables logging. Default: the combined format (index 0 semantics).
@@ -60,6 +135,30 @@ fn run(ctx: *Context) anyerror!Action {
 }
 
 const testing = std.testing;
+
+test "json access log escapes quotes and control bytes" {
+    const allocator = testing.allocator;
+    var req = registry.Request.init(allocator);
+    defer req.deinit();
+    req.method = .get;
+    req.target = "/a\"b";
+    try req.addHeaderParsed("User-Agent", "Mozilla/5.0 \"quoted\"\n");
+    var resp = registry.Response.init(.ok);
+    resp.status = .ok;
+    var ctx = Context{ .req = &req, .resp = &resp, .allocator = allocator };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    var sink = vars.ArrayListSink{ .list = &out, .allocator = allocator };
+    try renderJson(&ctx, &sink);
+
+    try testing.expect(std.mem.startsWith(u8, out.items, "{\"ts\":\""));
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"remote_addr\":") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "/a\\\"b") != null); // escaped quote in the URI
+    try testing.expect(std.mem.indexOf(u8, out.items, "\\\"quoted\\\"") != null); // escaped UA quotes
+    try testing.expect(std.mem.indexOf(u8, out.items, "\\n") != null); // escaped newline
+    try testing.expect(std.mem.endsWith(u8, out.items, "\"}") or std.mem.endsWith(u8, out.items, "}"));
+}
 
 test "combined format parses into fragments covering the standard fields" {
     var saw_ip = false;

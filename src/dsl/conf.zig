@@ -168,6 +168,8 @@ const H_fail_timeout = keyHash("fail_timeout");
 const H_proxy_set_header = keyHash("proxy_set_header");
 const H_proxy_hide_header = keyHash("proxy_hide_header");
 const H_access_log = keyHash("access_log");
+const H_json = keyHash("json");
+const H_mirror = keyHash("mirror");
 const H_error_page = keyHash("error_page");
 const H_try_files = keyHash("try_files");
 const H_off = keyHash("off");
@@ -334,6 +336,13 @@ const LocationSpec = struct {
     /// `access_log <name>|off` → the log_format name (null = off). The
     /// index into Config.log_formats is resolved in `build`.
     log_format: ?Str = null,
+    /// `access_log off;` (silences a bound access_log module).
+    log_off: bool = false,
+    /// `access_log json;` (built-in JSON line format).
+    log_json: bool = false,
+    /// `mirror addr:port;` — one shadow upstream in the shared pool.
+    mirror_start: usize = 0,
+    mirror_len: usize = 0,
     /// `return` status code (0 = none).
     return_status: u16 = 0,
     return_body: ?Str = null,
@@ -1463,6 +1472,17 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             spec.upstreams_len += 1;
             b.cost += 8;
         },
+        H_mirror => {
+            const t = lx.value(b, "mirror");
+            const s = resolve(t, b.strings.items[0..]);
+            lx.expectTerminator("mirror");
+            const ep = splitEndpoint(lx, "mirror", s);
+            if (spec.mirror_len == 0) spec.mirror_start = b.upstreams.len;
+            _ = b.upstreams.create(parseUpstream(lx, "mirror", ep.host, ep.port, ep.tls));
+            spec.mirror_len += 1;
+            ensureModuleBound(b, spec, .rewrite, "mirror");
+            b.cost += 8;
+        },
         H_balance => {
             const t = lx.token() orelse lx.fail("balance: expected a strategy");
             const s = t.srcOf("balance: value cannot contain escapes");
@@ -1928,9 +1948,21 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             b.cost += 8;
         },
         H_access_log => {
-            const t = lx.token() orelse lx.fail("access_log: expected a format name or off");
+            const t = lx.token() orelse lx.fail("access_log: expected a format name, json or off");
             const s = t.srcOf("access_log: value cannot contain escapes");
-            spec.log_format = if (keyHash(s) == H_off) null else t;
+            if (keyHash(s) == H_off) {
+                spec.log_off = true;
+                spec.log_format = null;
+            } else if (keyHash(s) == H_json) {
+                // Built-in JSON line format; binds the module like a named
+                // format does (directive-presence activation).
+                spec.log_json = true;
+                spec.log_format = null;
+                ensureModuleBound(b, spec, .log, "access_log");
+            } else {
+                spec.log_format = t;
+                ensureModuleBound(b, spec, .log, "access_log");
+            }
             lx.expectTerminator("access_log");
             b.cost += 8;
         },
@@ -2870,6 +2902,11 @@ fn build(b: *const Builder) Config {
                 .chunked = spec.chunked,
                 .tcp_nopush = spec.tcp_nopush,
                 .log_format = logFormatIndex(spec.log_format, log_table.items[0..log_table.len], strings),
+                .log_off = spec.log_off,
+                .log_json = spec.log_json,
+                // The mirror lives in the shared upstream pool, outside the
+                // route's LB range (it must not join load balancing).
+                .mirror = if (spec.mirror_len > 0) upstreams[spec.mirror_start] else null,
             };
             // Validate: verification without a bundle can never succeed —
             // fail the build instead of handshaking doomed every request.
@@ -3715,6 +3752,31 @@ test "conf: timeout, zone and pool limits parse" {
     try testing.expectEqual(@as(usize, 4096), cfg.limits.max_connections);
     try testing.expectEqual(@as(usize, 128), cfg.limits.max_requests);
     try testing.expectEqual(@as(u32, 100), cfg.limits.server_limit_conn);
+}
+
+test "conf: mirror and json access log parse and bind" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        access_log json;
+        \\        mirror 127.0.0.1:9001;
+        \\    }
+        \\}
+    );
+    try testing.expect(cfg.routes[0].log_json);
+    try testing.expectEqual(@as(?usize, null), cfg.routes[0].log_format);
+    const m = cfg.routes[0].mirror orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("127.0.0.1", m.host);
+    try testing.expectEqual(@as(u16, 9001), m.port);
+    var saw_access = false;
+    var saw_mirror = false;
+    for (cfg.routes[0].modules) |b| {
+        if (std.mem.eql(u8, b.module, "access_log")) saw_access = true;
+        if (std.mem.eql(u8, b.module, "mirror")) saw_mirror = true;
+    }
+    try testing.expect(saw_access);
+    try testing.expect(saw_mirror);
 }
 
 test "conf: host_select off disables Host routing" {

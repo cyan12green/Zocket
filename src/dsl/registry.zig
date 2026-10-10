@@ -290,7 +290,10 @@ pub const Context = struct {
 
 /// Upper bound for registered modules; asserted against the registry at
 /// comptime in root-level tests.
-pub const max_module_states = 32;
+/// Per-request named state slots (`ctx.setState/getState`), one per module
+/// index. Bumped whenever the registry grows past the current bound (the
+/// comptime assertion in `root.zig` enforces the invariant).
+pub const max_module_states = 40;
 
 /// Shared connection/request counters: updated atomically by
 /// the reactors, rendered by the stub_status module. Defined here so the
@@ -466,6 +469,8 @@ pub const default_registry = Registry(.{
     @import("modules/access_log.zig").access_log,
     @import("modules/error_log.zig").error_log,
     @import("modules/stub_status.zig").stub_status,
+    @import("modules/mirror.zig").mirror,
+    @import("modules/metrics.zig").metrics,
     @import("modules/headers.zig").headers,
     @import("modules/auth_basic.zig").auth_basic,
     @import("modules/limit.zig").limit_req,
