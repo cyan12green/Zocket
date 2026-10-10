@@ -3292,6 +3292,21 @@ fn testDateLine(buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Zocket/" ++ version_mod.version ++ "\r\n", .{date}) catch unreachable;
 }
 
+/// Build one raw HTTP/2 frame (9-byte header + payload) into `buf`.
+fn h2Frame(buf: []u8, ftype: http2_frames.FrameType, flags: u8, stream_id: u31, payload: []const u8) []const u8 {
+    var hdr: [9]u8 = undefined;
+    var fh = http2_frames.FrameHeader{
+        .length = @intCast(payload.len),
+        .type = ftype,
+        .flag_bits = flags,
+        .stream_id = stream_id,
+    };
+    fh.encode(&hdr);
+    @memcpy(buf[0..9], &hdr);
+    @memcpy(buf[9..][0..payload.len], payload);
+    return buf[0 .. 9 + payload.len];
+}
+
 /// Build one masked client-to-server websocket frame (RFC 6455 §5.3): the
 /// client MUST mask; the key is fixed here so tests are deterministic.
 fn wsMaskedFrame(buf: []u8, opcode: websocket_mod.Opcode, payload: []const u8) []const u8 {
@@ -3422,6 +3437,87 @@ test "reactor upgrades to websocket and echoes frames after the 101" {
     const n4 = try readUntil(pair[0], &buf, 2, 3000);
     try testing.expectEqualSlices(u8, &[_]u8{ 0x88, 0x00 }, buf[0..n4]);
     try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+}
+
+test "reactor websocket drops pongs and rejects continuation and bad frames" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const handshake = "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    const want_101_len = "HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "\r\n";
+
+    // Connection 1: an incomplete frame waits for the rest; pongs are
+    // dropped; a continuation frame is rejected with a close.
+    {
+        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer compat.close(pair[0]);
+        try sockets.setNonBlock(pair[0]);
+        try sockets.setNonBlock(pair[1]);
+        const conn = try connection.Connection.create(allocator, pair[1]);
+        r.attach(conn);
+
+        try writeAll(pair[0], handshake);
+        var buf: [512]u8 = undefined;
+        _ = try readUntil(pair[0], &buf, want_101_len.len, 3000);
+
+        // First byte only: the decoder must not consume or answer yet.
+        var wire: [64]u8 = undefined;
+        const text = wsMaskedFrame(&wire, .text, "half");
+        try writeAll(pair[0], text[0..1]);
+        try testing.expectError(error.Timeout, readUntil(pair[0], &buf, 1, 400));
+        // Complete the frame: the buffered header byte is still there.
+        try writeAll(pair[0], text[1..]);
+        const n = try readUntil(pair[0], &buf, 6, 3000);
+        try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x04 } ++ "half".*, buf[0..n]);
+
+        // Unsolicited pong: dropped, no reply.
+        try writeAll(pair[0], wsMaskedFrame(&wire, .pong, "p"));
+        try testing.expectError(error.Timeout, readUntil(pair[0], &buf, 1, 400));
+
+        // Continuation frame: fragmented messages are rejected outright.
+        try writeAll(pair[0], wsMaskedFrame(&wire, .continuation, "x"));
+        try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+    }
+    // Connection 2: a reserved opcode is a protocol error -> close.
+    {
+        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer compat.close(pair[0]);
+        try sockets.setNonBlock(pair[0]);
+        try sockets.setNonBlock(pair[1]);
+        const conn = try connection.Connection.create(allocator, pair[1]);
+        r.attach(conn);
+
+        try writeAll(pair[0], handshake);
+        var buf: [512]u8 = undefined;
+        _ = try readUntil(pair[0], &buf, want_101_len.len, 3000);
+        var wire: [64]u8 = undefined;
+        try writeAll(pair[0], wsMaskedFrame(&wire, @enumFromInt(3), "z"));
+        try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+    }
+    // Connection 3: RSV bits set (no extension negotiated) -> malformed.
+    {
+        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer compat.close(pair[0]);
+        try sockets.setNonBlock(pair[0]);
+        try sockets.setNonBlock(pair[1]);
+        const conn = try connection.Connection.create(allocator, pair[1]);
+        r.attach(conn);
+
+        try writeAll(pair[0], handshake);
+        var buf: [512]u8 = undefined;
+        _ = try readUntil(pair[0], &buf, want_101_len.len, 3000);
+        try writeAll(pair[0], &[_]u8{ 0xC1, 0x80, 0x00, 0x00, 0x00, 0x00 });
+        try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+    }
 }
 
 test "reactor leaves non-RFC upgrade requests as plain HTTP" {
@@ -3652,6 +3748,92 @@ test "reactor HTTP error paths respond and close" {
     }
 }
 
+test "reactor HTTP 413 for a chunked body over the cap" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    // The parser caps the accumulated chunked body (413), independent of the
+    // receive buffer.
+    r.limits.max_chunked_body = 8;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "10\r\n0123456789abcdef\r\n0\r\n\r\n");
+    const want = "HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\nContent-Length: 17\r\n\r\nPayload Too Large";
+    var buf: [512]u8 = undefined;
+    const n = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n]);
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+}
+
+test "reactor HTTP 431 for an oversized header line" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    // A single header line past the configured cap is 431 (distinct from the
+    // buffer-full path: the request fits, the line does not).
+    r.limits.max_line_bytes = 32;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n");
+    const want = "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 31\r\n\r\nRequest Header Fields Too Large";
+    var buf: [512]u8 = undefined;
+    const n = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n]);
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+}
+
+test "reactor treats a TLS-looking prefix without credentials as plain HTTP" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Handshake record type 22, version 3.1, handshake type 1 — the TLS
+    // sniff triggers, but no credentials are configured, so the bytes fall
+    // through to the HTTP parser and are answered as a normal error.
+    try writeAll(pair[0], &[_]u8{ 0x16, 0x03, 0x01, 0x00, 0x2a, 0x01 });
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    const want = "HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 15\r\n\r\nNot Implemented";
+    var buf: [512]u8 = undefined;
+    const n = try readUntil(pair[0], &buf, want.len, 3000);
+    try testing.expectEqualStrings(want, buf[0..n]);
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+}
+
 test "reactor HTTP oversized body hits the buffer cap, yields 431 and closes" {
     std.testing.log_level = .err;
     const allocator = testing.allocator;
@@ -3802,6 +3984,51 @@ test "reactor runs a conf-config pipeline with default 404 fallback" {
     r.join();
 }
 
+test "reactor selects the vhost from the Host header through a server group" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    const group = runtime_server.ServerGroup.comptimeInit(comptime runtime_server.Config.fromConfComptime(
+        \\server {
+        \\    server_name a.test;
+        \\    location / { return 200 "A"; }
+        \\}
+        \\server {
+        \\    server_name b.test;
+        \\    location / { return 200 "B"; }
+        \\}
+    ));
+
+    var r = try Reactor.initWithHandlerGroup(allocator, 0, .http, null, &group, 60, -1);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Host a.test -> the first server's route.
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: a.test\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    const res_a = try readHeadBody(pair[0], &buf);
+    try testing.expectEqualStrings("A", buf[res_a.head_len..][0..res_a.body_len]);
+
+    // Host b.test -> the second server's route (same connection).
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: b.test\r\n\r\n");
+    const res_b = try readHeadBody(pair[0], &buf);
+    try testing.expectEqualStrings("B", buf[res_b.head_len..][0..res_b.body_len]);
+
+    // Unknown Host -> the default (first) server.
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: unknown.test\r\n\r\n");
+    const res_c = try readHeadBody(pair[0], &buf);
+    try testing.expectEqualStrings("A", buf[res_c.head_len..][0..res_c.body_len]);
+}
+
 test "reactor HEAD responds with head only and correct Content-Length" {
     std.testing.log_level = .err;
     const allocator = testing.allocator;
@@ -3895,6 +4122,14 @@ test "reactor serves a comptime template route from pre-serialised bytes" {
     try testing.expectEqualStrings(want, buf[0..n3]);
     const n4 = try readUntil(pair[0], &buf, want.len, 3000);
     try testing.expectEqualStrings(want, buf[0..n4]);
+
+    // HEAD takes the same fast path: head only, Content-Length preserved.
+    try writeAll(pair[0], "HEAD /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    const want_head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
+    const n5 = try readUntil(pair[0], &buf, want_head.len, 3000);
+    try testing.expectEqualStrings(want_head, buf[0..n5]);
+    // The would-be body must not follow the head.
+    try testing.expectError(error.Timeout, readUntil(pair[0], &buf, 1, 500));
 
     r.stop();
     r.join();
@@ -3990,6 +4225,110 @@ test "reactor serves a chunked response when the route opts in" {
 
     r.stop();
     r.join();
+}
+
+test "reactor detects the h2c preface and speaks HTTP/2" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // Client preface + empty SETTINGS. The server answers with its own
+    // SETTINGS and a SETTINGS ACK (both queued in one flush).
+    var wire: [64]u8 = undefined;
+    var msg: [64]u8 = undefined;
+    @memcpy(msg[0..24], http2_session.Session.preface);
+    const settings = h2Frame(&wire, .settings, 0, 0, &.{});
+    @memcpy(msg[24..][0..settings.len], settings);
+    try writeAll(pair[0], msg[0 .. 24 + settings.len]);
+
+    var buf: [128]u8 = undefined;
+    _ = try readUntil(pair[0], &buf, 15 + 9, 3000);
+    const srv_settings = http2_frames.parseHeader(buf[0..9]).?;
+    try testing.expectEqual(http2_frames.FrameType.settings, srv_settings.type);
+    try testing.expectEqual(@as(u24, 6), srv_settings.length);
+    try testing.expectEqual(@as(u31, 0), srv_settings.stream_id);
+    // Advertised MAX_CONCURRENT_STREAMS (id 3) is the protocol default.
+    try testing.expectEqual(@as(u8, 0), buf[9]);
+    try testing.expectEqual(@as(u8, 3), buf[10]);
+    try testing.expectEqual(@as(u32, 100), std.mem.readInt(u32, buf[11..15], .big));
+    const ack = http2_frames.parseHeader(buf[15..24]).?;
+    try testing.expectEqual(http2_frames.FrameType.settings, ack.type);
+    try testing.expectEqual(@as(u8, 1), ack.flag_bits);
+    try testing.expectEqual(@as(u24, 0), ack.length);
+
+    // PING -> PING ACK with the payload preserved.
+    const ping = h2Frame(&wire, .ping, 0, 0, "pingpong");
+    try writeAll(pair[0], ping);
+    const n2 = try readUntil(pair[0], &buf, 17, 3000);
+    try testing.expectEqual(@as(usize, 17), n2);
+    const pong = http2_frames.parseHeader(buf[0..9]).?;
+    try testing.expectEqual(http2_frames.FrameType.ping, pong.type);
+    try testing.expectEqual(@as(u8, 1), pong.flag_bits);
+    try testing.expectEqualStrings("pingpong", buf[9..17]);
+
+    // GOAWAY from the client: the server finishes and closes.
+    const goaway_payload: [8]u8 = @splat(0);
+    const goaway = h2Frame(&wire, .goaway, 0, 0, &goaway_payload);
+    try writeAll(pair[0], goaway);
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
+}
+
+test "reactor sends GOAWAY and closes on an h2 connection error" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // A SETTINGS frame on a non-zero stream is a connection error: the
+    // server must GOAWAY (PROTOCOL_ERROR) and close.
+    var wire: [64]u8 = undefined;
+    var msg: [64]u8 = undefined;
+    @memcpy(msg[0..24], http2_session.Session.preface);
+    const bad = h2Frame(&wire, .settings, 0, 1, &.{});
+    @memcpy(msg[24..][0..bad.len], bad);
+    try writeAll(pair[0], msg[0 .. 24 + bad.len]);
+
+    var buf: [128]u8 = undefined;
+    _ = try readUntil(pair[0], &buf, 9, 3000);
+    const hdr = http2_frames.parseHeader(buf[0..9]).?;
+    try testing.expectEqual(http2_frames.FrameType.goaway, hdr.type);
+    try testing.expectEqual(@as(u31, 0), hdr.stream_id);
+    try testing.expect(hdr.length >= 8);
+    _ = try readUntil(pair[0], buf[9..], hdr.length, 3000);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[9..13], .big)); // last stream
+    try testing.expectEqual(@as(u32, 0x1), std.mem.readInt(u32, buf[13..17], .big)); // PROTOCOL_ERROR
+    try testing.expectEqualStrings("ProtocolError", buf[17..][0 .. hdr.length - 8]);
+    // The SETTINGS frame accumulated before the error is flushed after the
+    // GOAWAY (the ACK never got queued: the bad frame failed validation),
+    // then the connection closes.
+    _ = try readUntil(pair[0], &buf, 15, 3000);
+    const late_settings = http2_frames.parseHeader(buf[0..9]).?;
+    try testing.expectEqual(http2_frames.FrameType.settings, late_settings.type);
+    try testing.expectEqual(@as(u24, 6), late_settings.length);
+    try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 2000));
 }
 // wheel's tick granularity is 100 ms, so deadlines land within ~100 ms of the
 // nominal second (the loop re-advances the wheel before every epoll_wait,
@@ -4189,6 +4528,311 @@ test "upstream driver sends parked request and adopts response" {
     try testing.expect(saw_ct and saw_mid);
 }
 
+/// Shared setup for the direct-drive parked tests: a client session under
+/// `cpair[1]` with a live request arena and a registered connection, plus a
+/// route anchored for the driver. Mirrors "upstream driver sends parked
+/// request and adopts response".
+fn parkTestSession(r: *Reactor, cpair: [2]posix.fd_t, route: *const dsl_registry.Route) !*HttpSession {
+    const sess_local = HttpSession{
+        .parser = http_parser.Parser.init(testing.allocator),
+        .req = http_parser.Request.init(testing.allocator),
+    };
+    try r.http_sessions.put(cpair[1], sess_local);
+    const sess = r.http_sessions.getPtr(cpair[1]).?;
+    sess.req.arena = @import("../http/arena.zig").Arena.init(testing.allocator);
+    sess.route_ptr_for_test = route;
+    try r.connections.put(cpair[1], try connection.Connection.create(testing.allocator, cpair[1]));
+    return sess;
+}
+
+fn parkTestTeardown(r: *Reactor, cpair: [2]posix.fd_t) void {
+    if (r.http_sessions.getPtr(cpair[1])) |s2| {
+        s2.parser.deinit();
+        s2.req.deinit();
+    }
+    _ = r.http_sessions.remove(cpair[1]);
+}
+
+test "upstream driver fails a transaction past its deadline with 502" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+
+    var route = dsl_registry.Route{ .path = "/", .match = .prefix };
+    // Reset before creating any fd: a stale pooled fd number from an earlier
+    // test must not be closed after this test's fds reuse it.
+    proxy_mod.testResetRoute(&route);
+
+    const up = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(up[0]);
+    try sockets.setNonBlock(up[0]);
+    try sockets.setNonBlock(up[1]);
+
+    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(cpair[0]);
+    try sockets.setNonBlock(cpair[0]);
+
+    const sess = try parkTestSession(&r, cpair, &route);
+    defer parkTestTeardown(&r, cpair);
+
+    var rt_buf: [16 * 1024]u8 = undefined;
+    sess.up_tx = .{
+        .fd = up[0],
+        .backend_idx = 0,
+        .route = &route,
+        .state = .reading,
+        .request = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n",
+        .reader = proxy_mod.UpstreamReader.initBuf(&rt_buf),
+        .offer_sticky = false,
+        .sticky_name = "",
+        .started_ns = upstreamNowNs() -% 6 * std.time.ns_per_s,
+    };
+    sess.up_active = true;
+    r.handleUpstreamEvent(cpair[1]);
+
+    // Deadline exceeded: the transaction failed with a 502 and the upstream
+    // fd was closed.
+    try testing.expect(!sess.up_active);
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(up[0], linux.F.GETFD, 0)));
+    var buf: [512]u8 = undefined;
+    const res = try readHeadBody(cpair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 502 Bad Gateway"));
+    try testing.expectEqualStrings("Bad Gateway", buf[res.head_len..][0..res.body_len]);
+}
+
+test "upstream driver stamps the sticky cookie on the adopted response" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+
+    var route = dsl_registry.Route{ .path = "/", .match = .prefix };
+    proxy_mod.testResetRoute(&route);
+    // Runs last (after the fds close): drains the fd upstreamSuccess pools.
+    defer proxy_mod.testResetRoute(&route);
+
+    const up = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(up[0]);
+    try sockets.setNonBlock(up[0]);
+    try sockets.setNonBlock(up[1]);
+
+    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(cpair[0]);
+    try sockets.setNonBlock(cpair[0]);
+
+    const sess = try parkTestSession(&r, cpair, &route);
+    defer parkTestTeardown(&r, cpair);
+
+    var rt_buf: [16 * 1024]u8 = undefined;
+    sess.up_tx = .{
+        .fd = up[0],
+        .backend_idx = 0,
+        .route = &route,
+        .state = .sending,
+        .request = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n",
+        .reader = proxy_mod.UpstreamReader.initBuf(&rt_buf),
+        .offer_sticky = true,
+        .sticky_name = "srv",
+        .started_ns = upstreamNowNs(),
+    };
+    sess.up_active = true;
+    _ = try compat.write(up[1], "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+    r.handleUpstreamEvent(cpair[1]);
+
+    var buf: [512]u8 = undefined;
+    const res = try readHeadBody(cpair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
+    try testing.expect(std.mem.indexOf(u8, buf[0..res.head_len], "Set-Cookie: srv=s0; Path=/") != null);
+    try testing.expectEqualStrings("hi", buf[res.head_len..][0..res.body_len]);
+}
+
+test "upstream driver resumes a partially sent request after EAGAIN" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+
+    var route = dsl_registry.Route{ .path = "/", .match = .prefix };
+    proxy_mod.testResetRoute(&route);
+
+    const up = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(up[0]);
+    try sockets.setNonBlock(up[0]);
+    try sockets.setNonBlock(up[1]);
+
+    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(cpair[0]);
+    try sockets.setNonBlock(cpair[0]);
+
+    const sess = try parkTestSession(&r, cpair, &route);
+    defer parkTestTeardown(&r, cpair);
+
+    // The upstream fd must be registered for the writability re-arm to
+    // succeed (the production path registers it in parkUpstream).
+    try r.ep.add(up[0], epoll.Events.In | epoll.Events.Out, @intCast(@as(u64, @intCast(cpair[1])) | up_tag));
+
+    // Bigger than the socketpair buffer, and the origin side is not read:
+    // the send loop must yield on EAGAIN and resume exactly where it stopped.
+    const big = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(big);
+    @memset(big, 'q');
+
+    var rt_buf: [16 * 1024]u8 = undefined;
+    sess.up_tx = .{
+        .fd = up[0],
+        .backend_idx = 0,
+        .route = &route,
+        .state = .sending,
+        .request = big,
+        .reader = proxy_mod.UpstreamReader.initBuf(&rt_buf),
+        .offer_sticky = false,
+        .sticky_name = "",
+        .started_ns = upstreamNowNs(),
+    };
+    sess.up_active = true;
+
+    r.handleUpstreamEvent(cpair[1]);
+    try testing.expect(sess.up_tx.awaiting_out);
+    try testing.expect(sess.up_tx.sent > 0 and sess.up_tx.sent < big.len);
+    try testing.expectEqual(UpTxState.sending, sess.up_tx.state);
+
+    var drain_buf: [64 * 1024]u8 = undefined;
+    var rounds: usize = 0;
+    while (sess.up_tx.state == .sending and rounds < 64) : (rounds += 1) {
+        // Make room on the origin side.
+        while (true) {
+            const got = posix.read(up[1], &drain_buf) catch break;
+            if (got == 0) break;
+        }
+        r.handleUpstreamEvent(cpair[1]);
+    }
+    try testing.expectEqual(UpTxState.reading, sess.up_tx.state);
+    try testing.expect(!sess.up_tx.awaiting_out);
+    try testing.expectEqual(big.len, sess.up_tx.sent);
+    // No response staged: pumpOnce yielded on WouldBlock and the
+    // transaction is still parked.
+    try testing.expect(sess.up_active);
+}
+
+test "upstream driver retries a pooled transaction on a fresh connection" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+
+    const router_mod = @import("../dsl/router.zig");
+    var ups = [_]router_mod.Upstream{.{
+        .host = "127.0.0.1",
+        .port = 0,
+        .sockaddr = undefined,
+    }};
+    var route = dsl_registry.Route{ .path = "/", .match = .prefix, .upstreams = &ups };
+    // Clear stale backend state before creating any fd.
+    proxy_mod.testResetRoute(&route);
+    // Runs last: drains the fd the completed retry pools.
+    defer proxy_mod.testResetRoute(&route);
+
+    const up = try TestUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    defer up.stop();
+    ups[0].port = up.port;
+    ups[0].sockaddr = router_mod.Upstream.makeSockaddr("127.0.0.1", up.port).?;
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+
+    // A pooled fd whose peer is already gone: the first write fails with
+    // EPIPE and triggers the one-shot fresh-connection retry.
+    const dead = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    compat.close(dead[1]);
+    try sockets.setNonBlock(dead[0]);
+
+    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(cpair[0]);
+    try sockets.setNonBlock(cpair[0]);
+
+    const sess = try parkTestSession(&r, cpair, &route);
+    defer parkTestTeardown(&r, cpair);
+
+    var rt_buf: [16 * 1024]u8 = undefined;
+    sess.up_tx = .{
+        .fd = dead[0],
+        .backend_idx = 0,
+        .route = &route,
+        .state = .sending,
+        .request = "GET /retry HTTP/1.1\r\nHost: t\r\n\r\n",
+        .reader = proxy_mod.UpstreamReader.initBuf(&rt_buf),
+        .offer_sticky = false,
+        .sticky_name = "",
+        .started_ns = upstreamNowNs(),
+        .pooled = true,
+    };
+    sess.up_active = true;
+
+    r.handleUpstreamEvent(cpair[1]);
+    // The retry armed a fresh fd and stayed parked. (The fd number may be
+    // reused by the fresh connect, so only the transaction state proves it.)
+    try testing.expect(sess.up_active);
+    try testing.expect(sess.up_tx.retried);
+    try testing.expectEqual(UpTxState.reading, sess.up_tx.state);
+
+    // Wait for the origin's response, then adopt it (the response may
+    // arrive split, so drive until the transaction completes).
+    var spins: usize = 0;
+    while (sess.up_active and spins < 3000) : (spins += 1) {
+        var pfds = [_]posix.pollfd{.{ .fd = sess.up_tx.fd, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&pfds, 50) catch 0;
+        if (ready > 0) r.handleUpstreamEvent(cpair[1]);
+    }
+    try testing.expect(!sess.up_active);
+
+    var buf: [512]u8 = undefined;
+    const res = try readHeadBody(cpair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
+    try testing.expectEqualStrings("ok", buf[res.head_len..][0..res.body_len]);
+}
+
+test "reactor dropUpstream closes the upstream fd on client teardown" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+
+    var route = dsl_registry.Route{ .path = "/", .match = .prefix };
+    proxy_mod.testResetRoute(&route);
+
+    const up = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(up[1]);
+    try sockets.setNonBlock(up[0]);
+    try sockets.setNonBlock(up[1]);
+
+    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(cpair[0]);
+
+    const sess = try parkTestSession(&r, cpair, &route);
+    defer parkTestTeardown(&r, cpair);
+
+    var rt_buf: [16 * 1024]u8 = undefined;
+    sess.up_tx = .{
+        .fd = up[0],
+        .backend_idx = 0,
+        .route = &route,
+        .state = .reading,
+        .request = "GET /x HTTP/1.1\r\nHost: t\r\n\r\n",
+        .reader = proxy_mod.UpstreamReader.initBuf(&rt_buf),
+        .offer_sticky = false,
+        .sticky_name = "",
+        .started_ns = upstreamNowNs(),
+    };
+    sess.up_active = true;
+
+    // Client teardown mid-transaction: the upstream fd is released, not
+    // pooled, and the session disappears.
+    r.removeConnection(cpair[1]);
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(up[0], linux.F.GETFD, 0)));
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(cpair[1], linux.F.GETFD, 0)));
+    try testing.expectEqual(@as(usize, 0), r.countConnections());
+    try testing.expect(r.http_sessions.getPtr(cpair[1]) == null);
+}
+
 test "max_connections: active counter tracks registered connections" {
     std.testing.log_level = .err;
     const allocator = testing.allocator;
@@ -4234,6 +4878,139 @@ test "max_connections: accept path rejects when active >= limit" {
     try testing.expectEqual(@as(usize, 42), r.limits.max_connections);
     r.limits.max_connections = 0;
     try testing.expectEqual(@as(usize, 0), r.limits.max_connections);
+}
+
+test "max_connections: adoptAcceptedFd closes the fd at the ceiling" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.limits.max_connections = 1;
+    var stats = runtime_server.ServerStats{};
+    r.stats = &stats;
+    stats.active.store(1, .monotonic);
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    r.adoptAcceptedFd(pair[1]);
+    // At the ceiling the accepted fd is closed without registering.
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(pair[1], linux.F.GETFD, 0)));
+    try testing.expectEqual(@as(usize, 0), r.countConnections());
+    try testing.expectEqual(@as(usize, 0), r.registered.load(.monotonic));
+}
+
+test "reactor accepts on its own listener and drains gracefully" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+
+    // Private non-blocking listener owned by the reactor (the accept loop
+    // drains the backlog, so a blocking listener would stall it).
+    const lfd = try sockets.createListeningSocket(0, 8);
+    var slen: posix.socklen_t = 16;
+    var bound: [16]u8 align(@alignOf(u16)) = undefined;
+    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+    const port = (@as(u16, bound[2]) << 8) | bound[3];
+
+    var r = try Reactor.initWithHandlerListener(allocator, 0, .http, null, 60, lfd);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const cfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    var cfd_open = true;
+    defer if (cfd_open) compat.close(cfd);
+    try sockets.setNonBlock(cfd);
+    var caddr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    caddr[0] = 2;
+    caddr[2] = @intCast(port >> 8);
+    caddr[3] = @intCast(port & 0xff);
+    caddr[4] = 127;
+    caddr[7] = 1;
+    compat.connect(cfd, @ptrCast(&caddr), 16) catch |e| switch (e) {
+        error.WouldBlock => {}, // EINPROGRESS: wait for the handshake below
+        else => return e,
+    };
+    var pfds = [_]posix.pollfd{.{ .fd = cfd, .events = posix.POLL.OUT, .revents = 0 }};
+    try testing.expect((posix.poll(&pfds, 3000) catch 0) > 0);
+
+    try writeAll(cfd, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    var ok_buf: [160]u8 = undefined;
+    const ok = httpOkEmpty(&ok_buf);
+    const n = try readUntil(cfd, &buf, ok.len, 3000);
+    try testing.expectEqualStrings(ok, buf[0..n]);
+    try testing.expectEqual(@as(usize, 1), r.countConnections());
+
+    // Graceful drain: the private listener is closed (listener = -1) and the
+    // loop exits once the connection is gone.
+    r.drain();
+    compat.close(cfd);
+    cfd_open = false;
+    var spins: usize = 0;
+    while (!r.isDrained() and spins < 5000) : (spins += 1) {
+        compat.nanosleep(0, 1 * std.time.ns_per_ms);
+    }
+    try testing.expect(r.isDrained());
+    try testing.expectEqual(@as(posix.fd_t, -1), r.listener);
+    r.stop();
+    r.join();
+}
+
+test "reactor adopts a pushed accepted fd and refuses pushes while draining" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    r.pushAcceptedFd(pair[1]);
+
+    try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    var ok_buf: [160]u8 = undefined;
+    const ok = httpOkEmpty(&ok_buf);
+    const n = try readUntil(pair[0], &buf, ok.len, 3000);
+    try testing.expectEqualStrings(ok, buf[0..n]);
+
+    // While draining, a pushed fd is closed immediately.
+    r.drain();
+    const pair2 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair2[0]);
+    try sockets.setNonBlock(pair2[1]);
+    r.pushAcceptedFd(pair2[1]);
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(pair2[1], linux.F.GETFD, 0)));
+
+    r.stop();
+    r.join();
+}
+
+test "reactor rejects attach while draining" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    r.drain();
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn); // draining: closed and destroyed immediately
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(pair[1], linux.F.GETFD, 0)));
+    try testing.expectEqual(@as(usize, 0), r.countConnections());
+    r.stop();
+    r.join();
 }
 
 test "server_limit_conn: per-IP concurrent cap enforced via attach" {
@@ -4858,6 +5635,120 @@ test "reactor parked proxy honors X-Accel-Redirect to a template route" {
     try testing.expectEqualStrings("internal-ok", buf[res.head_len..][0..res.body_len]);
 }
 
+test "reactor parked accel redirect serves a static file via sendfile" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    const up = try TestUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Accel-Redirect: /file/slow.bin\r\n\r\n");
+    defer up.stop();
+
+    const router_mod = @import("../dsl/router.zig");
+    var ups = [_]router_mod.Upstream{.{
+        .host = "127.0.0.1",
+        .port = up.port,
+        .sockaddr = router_mod.Upstream.makeSockaddr("127.0.0.1", up.port).?,
+    }};
+    const bindings = [_]router_mod.ModuleBinding{
+        .{ .phase = .rewrite, .module = "proxy" },
+        .{ .phase = .log, .module = "accel" },
+    };
+    const static_bindings = [_]router_mod.ModuleBinding{.{ .phase = .content, .module = "static" }};
+    const routes = [_]router_mod.Route{
+        .{
+            .path = "/accel",
+            .match = .exact,
+            .modules = &bindings,
+            .upstreams = &ups,
+            .accel_enabled = true,
+        },
+        .{
+            .path = "/file",
+            .match = .prefix,
+            .modules = &static_bindings,
+            .root = "testdata",
+        },
+    };
+    var srv = runtime_server.Server.init(.{ .routes = &routes });
+    proxy_mod.testResetRoute(&routes[0]);
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.handler = &srv;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // The redirect lands on a 20 KiB static file: the adopted response takes
+    // the sendfile path (body_from_file) and the file fd ownership handoff.
+    try writeAll(pair[0], "GET /accel HTTP/1.1\r\nHost: test\r\n\r\n");
+    var buf: [32 * 1024]u8 = undefined;
+    const res = try readHeadBody(pair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
+    try testing.expectEqual(@as(usize, 20 * 1024), res.body_len);
+    // Byte-exact against the fixture pattern.
+    const body = buf[res.head_len..][0..res.body_len];
+    var i: usize = 0;
+    for (body) |b| {
+        try testing.expectEqual(@as(u8, @intCast(i % 256)), b);
+        i += 1;
+    }
+}
+
+test "reactor parked accel redirect to an unknown target yields 404" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    const up = try TestUpstream.start("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Accel-Redirect: /nowhere\r\n\r\n");
+    defer up.stop();
+
+    const router_mod = @import("../dsl/router.zig");
+    var ups = [_]router_mod.Upstream{.{
+        .host = "127.0.0.1",
+        .port = up.port,
+        .sockaddr = router_mod.Upstream.makeSockaddr("127.0.0.1", up.port).?,
+    }};
+    const bindings = [_]router_mod.ModuleBinding{
+        .{ .phase = .rewrite, .module = "proxy" },
+        .{ .phase = .log, .module = "accel" },
+    };
+    const routes = [_]router_mod.Route{.{
+        .path = "/accel",
+        .match = .exact,
+        .modules = &bindings,
+        .upstreams = &ups,
+        .accel_enabled = true,
+    }};
+    var srv = runtime_server.Server.init(.{ .routes = &routes });
+    proxy_mod.testResetRoute(&routes[0]);
+
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    r.handler = &srv;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // The internal redirect target matches no route: the parked tail
+    // replaces the response with the default 404.
+    try writeAll(pair[0], "GET /accel HTTP/1.1\r\nHost: test\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    const res = try readHeadBody(pair[0], &buf);
+    try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 404 Not Found"));
+    try testing.expectEqualStrings("Not Found", buf[res.head_len..][0..res.body_len]);
+}
+
 test "reactor parked proxy applies proxy_hide_header and proxy_redirect" {
     std.testing.log_level = .err;
     const allocator = testing.allocator;
@@ -4968,4 +5859,66 @@ test "reactor parked 502 runs error_page to a named location" {
     const res = try readHeadBody(pair[0], &buf);
     try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
     try testing.expectEqualStrings("fallback-ok", buf[res.head_len..][0..res.body_len]);
+}
+
+// ---- io_uring backend (opt-in via `force_epoll = false`; --uring) ----
+//
+// The ring path submits one read per connection at registration and drives
+// reads/writes through completions instead of epoll events. These tests cover
+// one transaction per connection (the ring's read resubmission is exercised
+// by the registration path); they skip when io_uring is unavailable.
+
+test "reactor ring backend echoes a connection" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    force_epoll = false;
+    defer force_epoll = true;
+    var r = try Reactor.init(allocator, 0, .echo);
+    defer r.deinit();
+    if (r.io_mode != .ring) return error.SkipZigTest;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    try writeAll(pair[0], "hello ring echo");
+    var buf: [64]u8 = undefined;
+    const n = try readUntil(pair[0], &buf, "hello ring echo".len, 5000);
+    try testing.expectEqualStrings("hello ring echo", buf[0..n]);
+}
+
+test "reactor ring backend serves an HTTP transaction" {
+    std.testing.log_level = .err;
+    const allocator = testing.allocator;
+    force_epoll = false;
+    defer force_epoll = true;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+    if (r.io_mode != .ring) return error.SkipZigTest;
+    try r.start();
+    defer r.join();
+    defer r.stop();
+
+    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer compat.close(pair[0]);
+    try sockets.setNonBlock(pair[0]);
+    try sockets.setNonBlock(pair[1]);
+    const conn = try connection.Connection.create(allocator, pair[1]);
+    r.attach(conn);
+
+    // One request per connection: the ring read is submitted at registration,
+    // the response goes out via a ring writev completion.
+    try writeAll(pair[0], "GET /ring HTTP/1.1\r\nHost: x\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    var ok_buf: [160]u8 = undefined;
+    const ok = httpOkEmpty(&ok_buf);
+    const n = try readUntil(pair[0], &buf, ok.len, 5000);
+    try testing.expectEqualStrings(ok, buf[0..n]);
+    try testing.expectEqual(@as(usize, 1), r.countConnections());
 }
