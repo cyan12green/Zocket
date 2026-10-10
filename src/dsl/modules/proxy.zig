@@ -1420,24 +1420,25 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
     // Forwarded client headers.
     for (0..ctx.req.headerCount()) |i| {
         const h = ctx.req.headerAt(i);
-        const hh = http_parser.header_hasher.hash(h.name);
-        const skip = switch (hh) {
-            http_parser.header_hasher.hash("host"),
-            http_parser.header_hasher.hash("connection"),
-            http_parser.header_hasher.hash("content-length"),
-            http_parser.header_hasher.hash("transfer-encoding"),
-            => true,
+        // DFA tag from parse time: hop-by-hop filtering is four integer
+        // compares and costs no hashing at all.
+        const skip = switch (ctx.req.headerTagAt(i)) {
+            .host, .connection, .content_length, .transfer_encoding => true,
             else => false,
         };
         if (skip) continue;
-        var overridden = false;
-        for (override_hashes[0..override_count]) |oh| {
-            if (oh == hh) {
-                overridden = true;
-                break;
+        if (override_count > 0) {
+            // Only hash when the route actually overrides names.
+            const hh = http_parser.header_hasher.hash(h.name);
+            var overridden = false;
+            for (override_hashes[0..override_count]) |oh| {
+                if (oh == hh) {
+                    overridden = true;
+                    break;
+                }
             }
+            if (overridden) continue;
         }
-        if (overridden) continue;
         // "name: value\r\n"
         total += h.name.len + 2 + h.value.len + 2;
     }
@@ -1492,24 +1493,22 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
     // Forwarded client headers.
     for (0..ctx.req.headerCount()) |i| {
         const h = ctx.req.headerAt(i);
-        const hh = http_parser.header_hasher.hash(h.name);
-        const skip = switch (hh) {
-            http_parser.header_hasher.hash("host"),
-            http_parser.header_hasher.hash("connection"),
-            http_parser.header_hasher.hash("content-length"),
-            http_parser.header_hasher.hash("transfer-encoding"),
-            => true,
+        const skip = switch (ctx.req.headerTagAt(i)) {
+            .host, .connection, .content_length, .transfer_encoding => true,
             else => false,
         };
         if (skip) continue;
-        var overridden = false;
-        for (override_hashes[0..override_count]) |oh| {
-            if (oh == hh) {
-                overridden = true;
-                break;
+        if (override_count > 0) {
+            const hh = http_parser.header_hasher.hash(h.name);
+            var overridden = false;
+            for (override_hashes[0..override_count]) |oh| {
+                if (oh == hh) {
+                    overridden = true;
+                    break;
+                }
             }
+            if (overridden) continue;
         }
-        if (overridden) continue;
         write(buf, &pos, h.name);
         write(buf, &pos, ": ");
         write(buf, &pos, h.value);

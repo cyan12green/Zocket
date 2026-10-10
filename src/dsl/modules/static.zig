@@ -50,11 +50,21 @@ fn serveEmbedded(ctx: *Context, route: *const registry.Route) !Action {
     resp.setHeader("Cache-Control", "public, max-age=31536000");
     resp.setHeader("Accept-Ranges", "bytes");
 
-    // Stable entity tag from the content itself.
-    var etag_buf: [32]u8 = undefined;
-    const etag = std.fmt.bufPrint(&etag_buf, "\"{x}\"", .{contentHash(bytes)}) catch "";
-    resp.setHeaderFmt("ETag", "{s}", .{etag});
-    ctx.etag = etag;
+    // Stable entity tag from the content itself. Config-built routes carry
+    // the comptime-rendered tag; hand-built routes (tests) fall back to the
+    // runtime hash.
+    if (route.embed_etag.len > 0) {
+        resp.setHeader("ETag", route.embed_etag);
+        ctx.etag = route.embed_etag;
+    } else {
+        // Hand-built route: render and copy into the request arena (the
+        // header/ctx slices outlive this frame).
+        var etag_buf: [32]u8 = undefined;
+        const rendered = std.fmt.bufPrint(&etag_buf, "\"{x}\"", .{contentHash(bytes)}) catch "";
+        const etag = ctx.req.arena.asAllocator().dupe(u8, rendered) catch rendered;
+        resp.setHeader("ETag", etag);
+        ctx.etag = etag;
+    }
     return .handled;
 }
 

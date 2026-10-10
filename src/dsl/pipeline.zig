@@ -297,6 +297,17 @@ pub fn assignDispatch(comptime Registry: type, comptime routes: []const router.R
     return comptime assignDispatchImpl(Registry, routes);
 }
 
+/// FNV-1a over the embedded bytes, rendered as a quoted hex ETag at
+/// comptime (used by embedded static routes).
+fn embedEtag(bytes: []const u8) []const u8 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (bytes) |b| {
+        h ^= b;
+        h *%= 0x100000001b3;
+    }
+    return std.fmt.comptimePrint("\"{x}\"", .{h});
+}
+
 fn assignDispatchImpl(comptime Registry: type, comptime routes: []const router.Route) [routes.len]router.Route {
     var out: [routes.len]router.Route = undefined;
     inline for (routes, 0..) |r, i| {
@@ -307,6 +318,10 @@ fn assignDispatchImpl(comptime Registry: type, comptime routes: []const router.R
         // (the `embeds` module lives at the root for @embedFile).
         if (r.embed) |embed_path| {
             out[i].embed_bytes = @import("embeds").embed(embed_path);
+            // Embedded content never changes: hash once at comptime and bake
+            // the ETag string next to the bytes (the serve path then skips
+            // an O(filesize) hash + hex format per request).
+            out[i].embed_etag = comptime embedEtag(out[i].embed_bytes);
         }
         // Fixed-response templates serialised at compile time.
         if (r.response) |t| {

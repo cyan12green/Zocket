@@ -88,6 +88,10 @@ pub const Route = struct {
     autoindex: bool = false,
     embed: ?[]const u8 = null,
     embed_bytes: []const u8 = &.{},
+    /// Pre-rendered ETag (`"hex"`) for `embed_bytes`, computed at comptime in
+    /// the dispatch table build. Empty for hand-built routes (runtime
+    /// fallback).
+    embed_etag: []const u8 = &.{},
     /// Fixed-response template: a route with `response` (and
     /// no modules) is served from the pre-serialised `response_bytes` — no
     /// pipeline, no response builder. Routes with modules keep the pipeline;

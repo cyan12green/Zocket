@@ -313,6 +313,13 @@ pub const Request = struct {
         };
     }
 
+    /// DFA tag of the i-th header name (classified at parse time). Hot paths
+    /// that special-case known names compare this integer instead of
+    /// re-hashing the wire bytes.
+    pub fn headerTagAt(self: *const Request, i: usize) HeaderTag {
+        return self.slots[i].tag;
+    }
+
     /// Public entry point for non-HTTP/1 callers (the HTTP/2 session):
     /// add a decoded header (name/value already validated, typically
     /// HPACK-decompressed). Behaves identically to the wire parser's header
@@ -762,9 +769,10 @@ fn finalizeKeepAlive(req: *Request) void {
     var close = false;
     var keep = false;
     for (0..req.headerCount()) |i| {
+        // The DFA classified the name at parse time: one integer compare per
+        // slot instead of re-hashing every wire name.
+        if (req.headerTagAt(i) != .connection) continue;
         const h = req.headerAt(i);
-        // Hash compare for the name, then for each comma token.
-        if (header_hasher.hash(h.name) != comptime header_hasher.hash("connection")) continue;
         var tokens = mem.tokenizeAny(u8, h.value, ",");
         while (tokens.next()) |t| {
             const tok = mem.trim(u8, t, " \t");

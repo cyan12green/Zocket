@@ -39,8 +39,14 @@ const table = [_]Table{
 /// MIME type for a file extension (without the leading dot, lower-case), or
 /// the octet-stream default when the extension is unknown or absent.
 pub fn mimeForExtension(ext: []const u8) []const u8 {
+    if (ext.len == 0) return "application/octet-stream";
+    const first = ext[0];
+    // First-byte prefilter: the comptime-only first byte compare rejects all
+    // but a handful of the ~26 candidates before any content check, and the
+    // compiler folds the chain into a jump table over `first`. At most 2-3
+    // candidates ever reach `mem.eql`.
     inline for (table) |entry| {
-        if (std.mem.eql(u8, ext, entry.ext)) return entry.mime;
+        if (entry.ext[0] == first and std.mem.eql(u8, ext, entry.ext)) return entry.mime;
     }
     return "application/octet-stream";
 }
