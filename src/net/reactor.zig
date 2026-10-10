@@ -1428,13 +1428,15 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         // so copy names AND values (plus body) into the request arena.
         const arena_a = session.req.arena.asAllocator();
         for (res.headers) |h| {
-            const skip = switch (http_parser.header_hasher.hash(h.name)) {
-                http_parser.header_hasher.hash("connection"),
-                http_parser.header_hasher.hash("content-length"),
-                http_parser.header_hasher.hash("transfer-encoding"),
+            // Parse-time DFA tags from the upstream reader: integer
+            // compares instead of hashing every response header name.
+            const skip = switch (h.tag) {
+                .connection,
+                .content_length,
+                .transfer_encoding,
                 // nginx's default proxy_hide_header set (Date/Server).
-                http_parser.header_hasher.hash("date"),
-                http_parser.header_hasher.hash("server"),
+                .date,
+                .server,
                 => true,
                 else => false,
             };

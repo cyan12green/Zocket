@@ -123,6 +123,10 @@ pub const HeaderTag = enum(u16) {
     upgrade,
     sec_websocket_key,
     expect,
+    // Response-side names: the upstream adopt paths hide the origin's
+    // Date/Server duplicates (nginx's default proxy_hide_header set).
+    date,
+    server,
 
     /// Tag for a comptime-known header name (compile-time constant used in
     /// `Request.header` lookups). Unknown names yield `.unknown`.
@@ -130,6 +134,13 @@ pub const HeaderTag = enum(u16) {
         return @enumFromInt(header_dfa.classify(name));
     }
 };
+
+/// Runtime classification of a wire header name against the same DFA the
+/// request parser uses (one table lookup per byte; case-insensitive).
+/// `.unknown` for names outside the known set.
+pub fn classifyTag(name: []const u8) HeaderTag {
+    return @enumFromInt(header_dfa.classify(name));
+}
 
 /// The comptime-built classification DFA over the known header-name set.
 /// One transition-table lookup per byte; terminal state is the exact tag.
@@ -151,6 +162,8 @@ pub const header_dfa = header_dfa_mod.build(&.{
     .{ .name = "upgrade", .tag = @intFromEnum(HeaderTag.upgrade) },
     .{ .name = "sec-websocket-key", .tag = @intFromEnum(HeaderTag.sec_websocket_key) },
     .{ .name = "expect", .tag = @intFromEnum(HeaderTag.expect) },
+    .{ .name = "date", .tag = @intFromEnum(HeaderTag.date) },
+    .{ .name = "server", .tag = @intFromEnum(HeaderTag.server) },
 });
 
 comptime {

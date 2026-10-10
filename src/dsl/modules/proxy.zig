@@ -104,14 +104,16 @@ pub fn adoptUpstream(ctx: *Context, res: anytype, offer_sticky: bool, sticky_nam
     const arena_a = ctx.req.arena.asAllocator();
     const route = ctx.route;
     for (res.headers) |h| {
-        const skip = switch (http_parser.header_hasher.hash(h.name)) {
-            http_parser.header_hasher.hash("connection") => !ws101,
-            http_parser.header_hasher.hash("content-length"),
-            http_parser.header_hasher.hash("transfer-encoding"),
+        // Parse-time DFA tags: hop-by-hop filtering and the default
+        // Date/Server hides are integer compares (no name hashing).
+        const skip = switch (h.tag) {
+            .connection => !ws101,
+            .content_length,
+            .transfer_encoding,
             // nginx's default proxy_hide_header set: the front supplies its
             // own Date/Server; leaking the origin's duplicates them.
-            http_parser.header_hasher.hash("date"),
-            http_parser.header_hasher.hash("server"),
+            .date,
+            .server,
             => true,
             else => false,
         };
@@ -678,10 +680,9 @@ fn attemptForward(
     for (r.headers) |h| {
         // Skip hop-by-hop headers the reactor controls (except Connection
         // on a proxied 101, which is end-to-end).
-        const skip = switch (http_parser.header_hasher.hash(h.name)) {
-            http_parser.header_hasher.hash("connection") => !ws101,
-            http_parser.header_hasher.hash("content-length") => true,
-            http_parser.header_hasher.hash("transfer-encoding") => true,
+        const skip = switch (h.tag) {
+            .connection => !ws101,
+            .content_length, .transfer_encoding => true,
             else => false,
         };
         if (skip or headerHidden(route, h.name)) continue;
@@ -802,10 +803,9 @@ fn attemptForwardTls(
         const ws101 = isWs101(ctx, r.status);
         const arena_a = ctx.req.arena.asAllocator();
         for (r.headers) |h| {
-            const skip = switch (http_parser.header_hasher.hash(h.name)) {
-                http_parser.header_hasher.hash("connection") => !ws101,
-                http_parser.header_hasher.hash("content-length") => true,
-                http_parser.header_hasher.hash("transfer-encoding") => true,
+            const skip = switch (h.tag) {
+                .connection => !ws101,
+                .content_length, .transfer_encoding => true,
                 else => false,
             };
             if (skip) continue;
@@ -1599,7 +1599,14 @@ fn fmtIp(ip: [16]u8, buf: []u8) []const u8 {
 // ---- upstream response reading ----
 
 const max_upstream_headers = 16;
-const UpstreamHeader = struct { name: []const u8, value: []const u8 };
+const UpstreamHeader = struct {
+    name: []const u8,
+    value: []const u8,
+    /// DFA tag of the name, classified once at parse time: the adopt paths
+    /// and this module's header scans compare integers. `.unknown` for
+    /// custom names (X-Accel-Redirect, X-Powered-By, ...).
+    tag: http_parser.HeaderTag = .unknown,
+};
 
 /// Cap for allocator-backed upstream bodies (matching the server's own
 /// response-size sanity limits; larger responses are a 502).
@@ -1692,9 +1699,12 @@ pub const UpstreamReader = struct {
                 if (line.len == 0) break;
                 const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadUpstreamResponse;
                 if (self.header_count >= max_upstream_headers) return error.BadUpstreamResponse;
+                const hname = std.mem.trim(u8, line[0..colon], " \t");
+                const hval = std.mem.trim(u8, line[colon + 1 ..], " \t");
                 self.headers[self.header_count] = .{
-                    .name = std.mem.trim(u8, line[0..colon], " \t"),
-                    .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
+                    .name = hname,
+                    .value = hval,
+                    .tag = http_parser.classifyTag(hname),
                 };
                 self.header_count += 1;
             }
@@ -1702,10 +1712,9 @@ pub const UpstreamReader = struct {
             var content_length: usize = 0;
             var chunked = false;
             for (self.headers[0..self.header_count]) |h| {
-                const hh = http_parser.header_hasher.hash(h.name);
-                if (hh == comptime http_parser.header_hasher.hash("content-length")) {
+                if (h.tag == .content_length) {
                     content_length = std.fmt.parseInt(usize, h.value, 10) catch return error.BadUpstreamResponse;
-                } else if (hh == comptime http_parser.header_hasher.hash("transfer-encoding")) {
+                } else if (h.tag == .transfer_encoding) {
                     if (containsToken(h.value, "chunked")) chunked = true;
                 }
             }
