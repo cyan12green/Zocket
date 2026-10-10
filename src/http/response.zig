@@ -1040,3 +1040,112 @@ test "response holds nginx-sized header sets past the old 8 cap" {
     try testing.expect(head.len > 0);
     try testing.expect(std.mem.indexOf(u8, head, "X-Extra: 1\r\n") != null);
 }
+
+// ---- Boundary coverage: every status, exact-fit buffers, part caps ----
+
+test "every Status value serializes with its own reason phrase" {
+    const allocator = testing.allocator;
+    inline for (std.enums.values(Status)) |s| {
+        const resp = Response.init(s);
+        const out = try serialize(allocator, &resp);
+        defer allocator.free(out);
+        try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 "));
+        try testing.expect(std.mem.indexOf(u8, out, s.reasonPhrase()) != null);
+        try testing.expectEqual(out.len, resp.wireSize());
+    }
+    // Phrases the hand-written table tests previously skipped.
+    try testing.expectEqualStrings("No Content", Status.no_content.reasonPhrase());
+    try testing.expectEqualStrings("No Response", Status.no_response.reasonPhrase());
+    try testing.expectEqualStrings("Too Many Requests", Status.too_many_requests.reasonPhrase());
+}
+
+test "reasonPhraseForCode maps 429 and 444" {
+    try testing.expectEqualStrings("Too Many Requests", reasonPhraseForCode(429));
+    try testing.expectEqualStrings("No Response", reasonPhraseForCode(444));
+}
+
+test "Connection close serializes with Content-Length 0 on an empty body" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.no_content);
+    resp.setHeader("Connection", "close");
+    const out = try serialize(allocator, &resp);
+    defer allocator.free(out);
+    try testing.expectEqualStrings(
+        "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        out,
+    );
+    try testing.expectEqual(out.len, resp.wireSize());
+}
+
+test "writeChunkedHeadToBuffer fits an exactly sized buffer and rejects one byte less" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.ok);
+    resp.setHeader("Content-Type", "text/plain");
+    resp.setBody("hello");
+
+    const growable = try buffer_mod.Buffer.init(allocator);
+    defer growable.deinit(allocator);
+    var tail: [8]u8 = undefined;
+    const probe = try resp.writeChunkedHeadToBuffer(growable, resp.body.len, &tail);
+    const want = try allocator.dupe(u8, growable.peek()[0..probe.head_len]);
+    defer allocator.free(want);
+
+    const exact = try buffer_mod.Buffer.initFixed(allocator, probe.head_len);
+    defer exact.deinit(allocator);
+    const framing = try resp.writeChunkedHeadToBuffer(exact, resp.body.len, &tail);
+    try testing.expectEqual(probe.head_len, framing.head_len);
+    try testing.expectEqualStrings(want, exact.peek());
+    try testing.expectEqualStrings("\r\n0\r\n\r\n", framing.tail);
+
+    // One byte short: fails cleanly with nothing written.
+    const short = try buffer_mod.Buffer.initFixed(allocator, probe.head_len - 1);
+    defer short.deinit(allocator);
+    try testing.expectError(error.BufferFull, resp.writeChunkedHeadToBuffer(short, resp.body.len, &tail));
+    try testing.expectEqual(@as(usize, 0), short.availableRead());
+}
+
+test "writevParts fills every part at the header cap" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.ok);
+    var i: usize = 0;
+    while (i < max_resp_headers) : (i += 1) {
+        resp.setHeader("X-Extra", "v");
+    }
+    resp.setBody("body");
+
+    var parts: [max_writev_parts]posix.iovec_const = undefined;
+    const n = resp.writevParts(&parts);
+    // 5 status parts + 4 per header + 3 Content-Length parts + body.
+    try testing.expectEqual(max_writev_parts, n);
+
+    const buf = try buffer_mod.Buffer.init(allocator);
+    defer buf.deinit(allocator);
+    try resp.writeToBuffer(buf);
+    var joined: [1024]u8 = undefined;
+    try testing.expectEqualStrings(buf.peek(), copyParts(parts[0..n], &joined));
+}
+
+test "writevHeadParts carries an explicit sendfile Content-Length" {
+    var resp = Response.init(.partial_content);
+    resp.setHeader("Content-Range", "bytes 0-4095/8192");
+    var parts: [max_writev_parts]posix.iovec_const = undefined;
+    const n = resp.writevHeadParts(&parts, 4096, &.{});
+    var joined: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4095/8192\r\nContent-Length: 4096\r\n\r\n",
+        copyParts(parts[0..n], &joined),
+    );
+}
+
+test "setHeaderFmt fills the scratch exactly then drops further headers" {
+    var resp = Response.init(.ok);
+    const exact: [96]u8 = @splat(@as(u8, 'm'));
+    resp.setHeaderFmt("X-Full", "{s}", .{exact[0..]});
+    try testing.expectEqual(@as(usize, 1), resp.header_count);
+    try testing.expectEqual(@as(usize, 96), resp.scratch_used);
+    try testing.expectEqualStrings(&exact, resp.headers[0].value);
+    // No scratch left: the next formatted header is silently dropped.
+    resp.setHeaderFmt("X-Overflow", "x", .{});
+    try testing.expectEqual(@as(usize, 1), resp.header_count);
+    try testing.expectEqual(@as(usize, 96), resp.scratch_used);
+}

@@ -1603,3 +1603,274 @@ test "expect 100-continue sets the continue flag when a body is pending" {
     try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
     try testing.expect(!parser.takeContinue());
 }
+
+// ---- Boundary, accessor and allocation-failure coverage ----
+
+test "Method.fromString maps every known method case-insensitively" {
+    try testing.expectEqual(Method.get, Method.fromString("GET").?);
+    try testing.expectEqual(Method.get, Method.fromString("gEt").?);
+    try testing.expectEqual(Method.head, Method.fromString("HEAD").?);
+    try testing.expectEqual(Method.post, Method.fromString("POST").?);
+    try testing.expectEqual(Method.put, Method.fromString("PUT").?);
+    try testing.expectEqual(Method.delete, Method.fromString("DELETE").?);
+    try testing.expectEqual(Method.options, Method.fromString("OPTIONS").?);
+    try testing.expectEqual(Method.patch, Method.fromString("PATCH").?);
+    try testing.expectEqual(@as(?Method, null), Method.fromString("BREW"));
+}
+
+test "stray empty lines before the request line are skipped" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "\r\n\nGET /skip HTTP/1.1\r\nHost: x\r\n\r\n");
+    defer buf.deinit(allocator);
+
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("/skip", req.target);
+    try testing.expectEqualStrings("x", req.header("host").?);
+}
+
+test "request line accepts tabs and rejects a missing version token" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET\t/tab\tHTTP/1.1\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("/tab", req.target);
+
+    const bad = try fill(allocator, "GET /\r\n\r\n");
+    defer bad.deinit(allocator);
+    var req2 = Request.init(allocator);
+    defer req2.deinit();
+    var parser2 = Parser.init(allocator);
+    defer parser2.deinit();
+    try testing.expectEqual(Outcome.bad_request, parser2.parse(bad, &req2));
+}
+
+test "numeric version overflow yields 501" {
+    const allocator = testing.allocator;
+    const bad = [_][]const u8{
+        "GET / HTTP/99999999999999999999.1\r\n\r\n",
+        "GET / HTTP/1.999999999\r\n\r\n",
+    };
+    for (bad) |wire| {
+        const buf = try fill(allocator, wire);
+        defer buf.deinit(allocator);
+        var req = Request.init(allocator);
+        defer req.deinit();
+        var parser = Parser.init(allocator);
+        defer parser.deinit();
+        try testing.expectEqual(Outcome.unsupported, parser.parse(buf, &req));
+    }
+}
+
+test "percent decoding keeps + and accepts both hex cases" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET /a+b%2Bc%2Fd HTTP/1.1\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("/a+b%2Bc%2Fd", req.target);
+    try testing.expectEqualStrings("/a+b+c/d", req.decoded_target);
+}
+
+test "partial line over the configured line cap yields 431" {
+    const allocator = testing.allocator;
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.initWithLimits(allocator, 16, 1024);
+    defer parser.deinit();
+
+    // No newline anywhere: the accumulated partial line alone exceeds the cap.
+    const buf = try fill(allocator, "GET /a-long-target-without-newline");
+    defer buf.deinit(allocator);
+    try testing.expectEqual(Outcome.header_too_large, parser.parse(buf, &req));
+}
+
+test "chunked body over the configured accumulation cap yields 413" {
+    const allocator = testing.allocator;
+
+    // A single announced chunk over the cap (pre-payload check).
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.initWithLimits(allocator, max_line_bytes, 8);
+    defer parser.deinit();
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n");
+    defer buf.deinit(allocator);
+    try testing.expectEqual(Outcome.payload_too_large, parser.parse(buf, &req));
+
+    // Two chunks each under the cap, but the accumulated body crosses it.
+    var req2 = Request.init(allocator);
+    defer req2.deinit();
+    var parser2 = Parser.initWithLimits(allocator, max_line_bytes, 8);
+    defer parser2.deinit();
+    const buf2 = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n4\r\n");
+    defer buf2.deinit(allocator);
+    try testing.expectEqual(Outcome.payload_too_large, parser2.parse(buf2, &req2));
+}
+
+test "chunk size integer overflow yields 400" {
+    const allocator = testing.allocator;
+    // 16 f's = maxInt(usize); the 17th digit overflows the size accumulator.
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffff\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.bad_request, parser.parse(buf, &req));
+}
+
+test "chunk terminator bytes are consumed leniently" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello!!3\r\nabc\r\n0\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("helloabc", req.body);
+}
+
+test "parsed header accessors expose tags and arrival order" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET / HTTP/1.1\r\nX-Custom: one\r\nHost: h\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqual(@as(usize, 2), req.headerCount());
+    try testing.expectEqual(HeaderTag.unknown, req.headerTagAt(0));
+    try testing.expectEqual(HeaderTag.host, req.headerTagAt(1));
+    try testing.expectEqualStrings("X-Custom", req.headerAt(0).name);
+    try testing.expectEqualStrings("one", req.headerAt(0).value);
+    try testing.expectEqualStrings("h", req.headerAt(1).value);
+}
+
+test "addHeaderParsed: DFA tags, trimming and the header cap" {
+    const allocator = testing.allocator;
+    var req = Request.initWithLimits(allocator, 2, (limits_mod.Limits{}).max_body_spool);
+    defer req.deinit();
+    try req.addHeaderParsed("HoSt", "  example.com  ");
+    try req.addHeaderParsed("x-a", "1");
+    try testing.expectEqual(HeaderTag.host, req.headerTagAt(0));
+    try testing.expectEqual(HeaderTag.unknown, req.headerTagAt(1));
+    try testing.expectEqualStrings("HoSt", req.headerAt(0).name);
+    try testing.expectEqualStrings("example.com", req.headerAt(0).value);
+    try testing.expectError(error.HeaderCountExceeded, req.addHeaderParsed("x-b", "2"));
+}
+
+test "addHeaderParsed rejects empty names and duplicate Content-Length" {
+    const allocator = testing.allocator;
+    var req = Request.init(allocator);
+    defer req.deinit();
+    try testing.expectError(error.Malformed, req.addHeaderParsed(" \t ", "v"));
+
+    // A malformed CL is rejected and (until reset) blocks a valid retry.
+    try testing.expectError(error.Malformed, req.addHeaderParsed("Content-Length", "nope"));
+    req.reset();
+    try req.addHeaderParsed("Content-Length", "5");
+    try testing.expectEqual(@as(usize, 5), req.content_length);
+    try testing.expectError(error.Malformed, req.addHeaderParsed("content-length", "6"));
+    req.reset();
+    try req.addHeaderParsed("Content-Length", "7");
+    try testing.expectEqual(@as(usize, 7), req.content_length);
+
+    // Transfer-Encoding side effect through the same entry point.
+    try req.addHeaderParsed("Transfer-Encoding", "gzip, chunked");
+    try testing.expect(req.transfer_chunked);
+}
+
+test "keep-alive: HTTP/1.2 defaults on, token conflicts per version" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { wire: []const u8, keep: bool }{
+        .{ .wire = "GET / HTTP/1.2\r\n\r\n", .keep = true }, // minor >= 1 defaults keep-alive
+        .{ .wire = "GET / HTTP/1.1\r\nConnection: close, keep-alive\r\n\r\n", .keep = false }, // close wins on 1.1
+        .{ .wire = "GET / HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n", .keep = true }, // keep token wins on 1.0
+        .{ .wire = "GET / HTTP/1.1\r\nConnection: ,,\r\n\r\n", .keep = true }, // empty token list
+    };
+    for (cases) |c| {
+        const buf = try fill(allocator, c.wire);
+        defer buf.deinit(allocator);
+        var req = Request.init(allocator);
+        defer req.deinit();
+        var parser = Parser.init(allocator);
+        defer parser.deinit();
+        try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+        try testing.expectEqual(c.keep, req.keep_alive);
+    }
+}
+
+test "expect 100-continue with a chunked body signals before the chunks" {
+    const allocator = testing.allocator;
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    const buf = try fill(allocator, "POST /up HTTP/1.1\r\nHost: x\r\nExpect:   100-Continue \r\nTransfer-Encoding: chunked\r\n\r\n");
+    defer buf.deinit(allocator);
+    try testing.expectEqual(Outcome.incomplete, parser.parse(buf, &req));
+    try testing.expect(parser.takeContinue());
+    _ = buf.writeSlice("2\r\nhi\r\n0\r\n\r\n");
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("hi", req.body);
+    try testing.expect(!parser.takeContinue()); // reset cleared the pending flag
+}
+
+test "line-buffer allocation failure surfaces out_of_memory" {
+    const allocator = testing.allocator;
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(failing.allocator());
+    defer parser.deinit();
+    const buf = try fill(allocator, "GET / HTTP/1.1\r\n\r\n");
+    defer buf.deinit(allocator);
+    try testing.expectEqual(Outcome.out_of_memory, parser.parse(buf, &req));
+}
+
+test "arena spill failure surfaces out_of_memory for targets and headers" {
+    const allocator = testing.allocator;
+
+    // Request target: the embedded region is full, so the target allocation
+    // has to spill and the heap allocation fails.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var req = Request.init(allocator);
+    defer req.deinit();
+    req.arena = arena_mod.Arena.init(failing.allocator());
+    _ = req.arena.alloc(arena_mod.default_size) orelse return error.SkipZigTest;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    const buf = try fill(allocator, "GET /spill HTTP/1.1\r\n\r\n");
+    defer buf.deinit(allocator);
+    try testing.expectEqual(Outcome.out_of_memory, parser.parse(buf, &req));
+
+    // Header value: leave embedded room for the target and name so the value
+    // allocation is the one that spills.
+    var failing2 = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var req2 = Request.init(allocator);
+    defer req2.deinit();
+    req2.arena = arena_mod.Arena.init(failing2.allocator());
+    _ = req2.arena.alloc(arena_mod.default_size - 64) orelse return error.SkipZigTest;
+    var parser2 = Parser.init(allocator);
+    defer parser2.deinit();
+    const big_value: [100]u8 = @splat(@as(u8, 'x'));
+    var wire_buf: [256]u8 = undefined;
+    const wire = std.fmt.bufPrint(&wire_buf, "GET /x HTTP/1.1\r\nX-Big: {s}\r\n\r\n", .{big_value[0..]}) catch unreachable;
+    const buf2 = try fill(allocator, wire);
+    defer buf2.deinit(allocator);
+    try testing.expectEqual(Outcome.out_of_memory, parser2.parse(buf2, &req2));
+}

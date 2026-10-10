@@ -1212,3 +1212,133 @@ test "evalMap out-of-range index and cyclic maps bottom out" {
     var ctx2 = Context{ .req = &req, .resp = &resp, .maps = &defs };
     try testing.expectEqualStrings("", evalMap(&ctx2, 0).?);
 }
+
+// ---- Boundary coverage: braced generics, clocks, maps and sinks ----
+
+test "parseComplexValue braced generic names keep the hash fallbacks" {
+    const frags = parseComplexValue("${arg_q}${cookie_SID}${http_x_ext}", &.{});
+    try testing.expectEqual(@as(usize, 3), frags.len);
+    try testing.expectEqual(comptime hashFn("q"), frags[0].arg);
+    try testing.expectEqual(comptime hashLower("SID"), frags[1].cookie);
+    try testing.expectEqual(comptime http_parser.header_hasher.hash("x-ext"), frags[2].http_header);
+}
+
+test "isBuiltinName matches every VarId and rejects others" {
+    inline for (std.enums.values(VarId)) |id| {
+        try testing.expect(isBuiltinName(@tagName(id)));
+    }
+    try testing.expect(!isBuiltinName("nope"));
+    try testing.expect(!isBuiltinName("HOST")); // exact names only
+}
+
+test "iso8601Date formats the epoch exactly" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("1970-01-01T00:00:00+00:00", iso8601Date(0, &buf));
+    try testing.expectEqualStrings("1970-01-02T00:00:00+00:00", iso8601Date(86400, &buf));
+}
+
+test "getBuiltin request_time is zero when the clock never started" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    ctx.started = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+    var scratch = GetterScratch{};
+    try testing.expectEqualStrings("0", getBuiltin(&ctx, .request_time, &scratch));
+}
+
+test "getHttpHeaderTag resolves known tags and misses to empty" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.addHeaderParsed("host", "h.example") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqualStrings("h.example", getHttpHeaderTag(&ctx, .host));
+    try testing.expectEqualStrings("", getHttpHeaderTag(&ctx, .accept));
+}
+
+test "getArg accepts a query string without the leading question mark" {
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    req.query_string = "a=2";
+    try testing.expectEqualStrings("2", getArg(&ctx, comptime hashFn("a")));
+    req.query_string = "";
+    try testing.expectEqualStrings("", getArg(&ctx, comptime hashFn("a")));
+}
+
+test "StackSink fills exactly and errors without partial writes" {
+    var buf: [5]u8 = undefined;
+    var sink = StackSink{ .buf = &buf };
+    try sink.appendAll("abc");
+    try sink.appendAll("");
+    try testing.expectError(error.NoSpaceLeft, sink.appendAll("def"));
+    try testing.expectEqual(@as(usize, 3), sink.len); // nothing was written
+    try sink.appendAll("de");
+    try testing.expectEqual(@as(usize, 5), sink.len);
+    try testing.expectEqualStrings("abcde", buf[0..5]);
+}
+
+test "evalMap regex_ci, default and out-of-table indexes" {
+    const src = comptime parseComplexValue("$http_x_mode", &.{});
+    const v_fast = comptime parseComplexValue("quick", &.{});
+    const v_default = comptime parseComplexValue("unknown", &.{});
+    const entries = [_]MapEntry{
+        .{ .kind = .regex_ci, .pattern = regex_mod.compileRegex("^fast"), .value = v_fast },
+    };
+    const defs = [_]MapDef{.{ .name = "mode", .source = src, .default = v_default, .entries = &entries }};
+    var resp = registry.Response.init(.ok);
+
+    // No entry matches -> default.
+    var req_default = registry.Request.init(testing.allocator);
+    defer req_default.deinit();
+    req_default.addHeaderParsed("x-mode", "slow") catch unreachable;
+    var ctx_default = Context{ .req = &req_default, .resp = &resp, .maps = &defs };
+    try testing.expectEqualStrings("unknown", evalMap(&ctx_default, 0).?);
+    try testing.expect(evalMap(&ctx_default, 1) == null); // beyond the table
+    try testing.expect(evalMap(&ctx_default, max_maps) == null); // beyond the cap
+
+    // Lowercase pattern matches a mixed-case source case-insensitively.
+    var req_ci = registry.Request.init(testing.allocator);
+    defer req_ci.deinit();
+    req_ci.addHeaderParsed("x-mode", "FaSt-and-Furious") catch unreachable;
+    var ctx_ci = Context{ .req = &req_ci, .resp = &resp, .maps = &defs };
+    try testing.expectEqualStrings("quick", evalMap(&ctx_ci, 0).?);
+}
+
+test "renderComplex and renderComplexArena render map fragments" {
+    const src = comptime parseComplexValue("$http_x_kind", &.{});
+    const v_a = comptime parseComplexValue("alpha", &.{});
+    const v_def = comptime parseComplexValue("beta", &.{});
+    const entries = [_]MapEntry{.{ .kind = .literal, .key = "a", .value = v_a }};
+    const defs = [_]MapDef{.{ .name = "kind", .source = src, .default = v_def, .entries = &entries }};
+    const frags = [_]Frag{ .{ .literal = "k=" }, .{ .map = 0 } };
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.addHeaderParsed("x-kind", "a") catch unreachable;
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp, .maps = &defs };
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(testing.allocator);
+    var sink = ArrayListSink{ .list = &out, .allocator = testing.allocator };
+    try renderComplex(&ctx, &frags, &sink);
+    try testing.expectEqualStrings("k=alpha", out.items);
+
+    const rendered = renderComplexArena(&ctx, &frags, &req.arena).?;
+    try testing.expectEqualStrings("k=alpha", rendered);
+}
+
+test "renderComplexArena renders user slots empty without a route" {
+    const set_frags = comptime parseComplexValue("hi", &.{});
+    const route_set = SetVar{ .name = "greet", .slot = 0, .value = set_frags };
+    const frags = comptime parseComplexValue("v=$greet!", &.{route_set});
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = registry.Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp }; // route = null
+    const rendered = renderComplexArena(&ctx, frags, &req.arena).?;
+    try testing.expectEqualStrings("v=!", rendered);
+}
