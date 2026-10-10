@@ -1874,3 +1874,371 @@ test "arena spill failure surfaces out_of_memory for targets and headers" {
     defer buf2.deinit(allocator);
     try testing.expectEqual(Outcome.out_of_memory, parser2.parse(buf2, &req2));
 }
+
+// ---- Out-of-line calls to the parse helpers ----
+// The hot paths inline these helpers, so their branch blocks are attributed
+// to the callers. `@call(.never_inline, ...)` emits a standalone copy whose
+// own blocks make every branch visible to coverage, and the arguments are
+// built in runtime buffers so nothing folds at comptime.
+
+test "header hasher out of line: runtime bytes fold case and match known hashes" {
+    var buf: [16]u8 = undefined;
+    @memcpy(buf[0..4], "HoSt");
+    try testing.expectEqual(
+        comptime header_hasher.hash("host"),
+        @call(.never_inline, header_hasher.hash, .{buf[0..4]}),
+    );
+    @memcpy(buf[0..14], "content-length");
+    const h = @call(.never_inline, header_hasher.hash, .{buf[0..14]});
+    try testing.expectEqual(comptime header_hasher.hash("content-length"), h);
+    try testing.expect(header_hasher.isKnownHash(h));
+    @memcpy(buf[0..8], "x-custom");
+    try testing.expect(!header_hasher.isKnownHash(@call(.never_inline, header_hasher.hash, .{buf[0..8]})));
+}
+
+test "valueHasChunked out of line: parameters, mixed case, misses and empty tokens" {
+    var buf: [24]u8 = undefined;
+    @memcpy(buf[0..7], "chunked");
+    try testing.expect(@call(.never_inline, valueHasChunked, .{buf[0..7]}));
+    @memcpy(buf[0..15], "gzip, ChUnKeD;x");
+    try testing.expect(@call(.never_inline, valueHasChunked, .{buf[0..15]}));
+    @memcpy(buf[0..8], "identity");
+    try testing.expect(!@call(.never_inline, valueHasChunked, .{buf[0..8]}));
+    @memcpy(buf[0..5], ", , ,");
+    try testing.expect(!@call(.never_inline, valueHasChunked, .{buf[0..5]}));
+}
+
+test "percentDecode out of line: plain bytes, escapes and malformed input" {
+    var src: [8]u8 = undefined;
+    var dst: [8]u8 = undefined;
+    @memcpy(src[0..7], "a%2Bb+c");
+    const decoded = @call(.never_inline, percentDecode, .{ src[0..7], &dst }) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("a+b+c", decoded);
+    @memcpy(src[0..3], "%2B");
+    try testing.expectEqualStrings("+", @call(.never_inline, percentDecode, .{ src[0..3], &dst }).?);
+    @memcpy(src[0..2], "%2");
+    try testing.expect(@call(.never_inline, percentDecode, .{ src[0..2], &dst }) == null);
+}
+
+test "parseMethod and parseVersion out of line: unknown and malformed tokens" {
+    var buf: [16]u8 = undefined;
+    @memcpy(buf[0..5], "pAtCh");
+    try testing.expectEqual(Method.patch, @call(.never_inline, parseMethod, .{buf[0..5]}));
+    @memcpy(buf[0..4], "BREW");
+    try testing.expectEqual(Method.unknown, @call(.never_inline, parseMethod, .{buf[0..4]}));
+    @memcpy(buf[0..8], "HTTP/1.0");
+    try testing.expectEqual(@as(u8, 1), @call(.never_inline, parseVersion, .{buf[0..8]}).?.major);
+    @memcpy(buf[0..5], "HTTP/");
+    try testing.expect(@call(.never_inline, parseVersion, .{buf[0..5]}) == null);
+    @memcpy(buf[0..7], "HTTP/1.");
+    try testing.expect(@call(.never_inline, parseVersion, .{buf[0..7]}) == null);
+}
+
+test "parseChunkSize out of line: extension, whitespace, empty and bad digit" {
+    var buf: [24]u8 = undefined;
+    @memcpy(buf[0..8], "1a;ext=1");
+    try testing.expectEqual(@as(usize, 26), @call(.never_inline, parseChunkSize, .{buf[0..8]}));
+    @memcpy(buf[0..4], "10 x");
+    try testing.expectEqual(@as(usize, 16), @call(.never_inline, parseChunkSize, .{buf[0..4]}));
+    try testing.expectError(error.BadChunkSize, @call(.never_inline, parseChunkSize, .{buf[0..0]}));
+    @memcpy(buf[0..4], "nope");
+    try testing.expectError(error.BadChunkSize, @call(.never_inline, parseChunkSize, .{buf[0..4]}));
+}
+
+test "Request.header out of line: known tag and unknown-name fallback scan" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET / HTTP/1.1\r\nHost: h\r\nX-Custom: c\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("h", @call(.never_inline, Request.header, .{ &req, "host" }).?);
+    try testing.expectEqualStrings("c", @call(.never_inline, Request.header, .{ &req, "x-custom" }).?);
+    try testing.expect(@call(.never_inline, Request.header, .{ &req, "missing" }) == null);
+}
+
+test "Parser.parse out of line: colon-less header lines are 400" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET / HTTP/1.1\r\nBadHeaderNoColon\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.bad_request, @call(.never_inline, Parser.parse, .{ &parser, buf, &req }));
+
+    // An error leaves the parser mid-request; reset it before the next wire.
+    parser.reset();
+    req.reset();
+    buf.compact();
+    _ = buf.writeSlice("GET / HTTP/1.1\r\nHost: x\r\nX-Also-No-Colon\r\n\r\n");
+    try testing.expectEqual(Outcome.bad_request, @call(.never_inline, Parser.parse, .{ &parser, buf, &req }));
+}
+
+test "finalizeKeepAlive direct: token conflicts and the 1.1 default" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { conn: ?[]const u8, version: Version, keep: bool }{
+        .{ .conn = null, .version = .{ .major = 1, .minor = 1 }, .keep = true },
+        .{ .conn = "close", .version = .{ .major = 1, .minor = 1 }, .keep = false },
+        .{ .conn = "keep-alive, upgrade", .version = .{ .major = 1, .minor = 0 }, .keep = true },
+        .{ .conn = "CLOSE, keep-alive", .version = .{ .major = 1, .minor = 0 }, .keep = true },
+        .{ .conn = "close", .version = .{ .major = 1, .minor = 0 }, .keep = false },
+    };
+    for (cases) |c| {
+        var req = Request.init(allocator);
+        defer req.deinit();
+        req.version = c.version;
+        if (c.conn) |v| try req.addHeaderParsed("Connection", v);
+        finalizeKeepAlive(&req);
+        try testing.expectEqual(c.keep, req.keep_alive);
+    }
+}
+
+test "addHeaderParsed out of line: TE side effect and CL reset" {
+    const allocator = testing.allocator;
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var te_buf: [16]u8 = undefined;
+    @memcpy(te_buf[0..12], "gzip,chunked");
+    try req.addHeaderParsed("Transfer-Encoding", te_buf[0..12]);
+    try testing.expect(req.transfer_chunked);
+    try req.addHeaderParsed("Content-Length", "12");
+    try testing.expectEqual(@as(usize, 12), req.content_length);
+    try testing.expectEqual(@as(usize, 2), req.headerCount());
+    try testing.expectEqual(HeaderTag.transfer_encoding, req.headerTagAt(0));
+    try testing.expectEqual(HeaderTag.content_length, req.headerTagAt(1));
+}
+
+// ---- Limit boundaries and line-shape edge cases ----
+
+test "request line cap boundary: exactly the limit passes, one byte over yields 431" {
+    const allocator = testing.allocator;
+    const a18: [18]u8 = @splat(@as(u8, 'a'));
+    var wire_buf: [128]u8 = undefined;
+    // "GET " + "/" + 18 a's + " HTTP/1.1" = 32 bytes, exactly the cap.
+    const ok_wire = std.fmt.bufPrint(&wire_buf, "GET /{s} HTTP/1.1\r\n\r\n", .{a18[0..]}) catch unreachable;
+    const buf = try fill(allocator, ok_wire);
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.initWithLimits(allocator, 32, 1024);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+
+    const a19: [19]u8 = @splat(@as(u8, 'a'));
+    var over_buf: [128]u8 = undefined;
+    const over_wire = std.fmt.bufPrint(&over_buf, "GET /{s} HTTP/1.1\r\n\r\n", .{a19[0..]}) catch unreachable;
+    req.reset();
+    buf.compact();
+    _ = buf.writeSlice(over_wire);
+    try testing.expectEqual(Outcome.header_too_large, parser.parse(buf, &req));
+}
+
+test "header count boundary: exactly the cap passes, one more yields 431" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET / HTTP/1.1\r\nX-A: 1\r\nX-B: 2\r\nX-C: 3\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.initWithLimits(allocator, 3, (limits_mod.Limits{}).max_body_spool);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqual(@as(usize, 3), req.headerCount());
+
+    req.reset();
+    buf.compact();
+    _ = buf.writeSlice("GET / HTTP/1.1\r\nX-A: 1\r\nX-B: 2\r\nX-C: 3\r\nX-D: 4\r\n\r\n");
+    try testing.expectEqual(Outcome.header_too_large, parser.parse(buf, &req));
+}
+
+test "zero-slot request rejects every header" {
+    const allocator = testing.allocator;
+    var req = Request.initWithLimits(allocator, 0, (limits_mod.Limits{}).max_body_spool);
+    defer req.deinit();
+    try testing.expectEqual(@as(usize, 0), req.slots.len);
+    try testing.expectError(error.HeaderCountExceeded, req.addHeaderParsed("X-A", "1"));
+
+    const buf = try fill(allocator, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    defer buf.deinit(allocator);
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.header_too_large, parser.parse(buf, &req));
+}
+
+test "chunked body exactly at the accumulation cap is accepted" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n0\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.initWithLimits(allocator, max_line_bytes, 8);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("12345678", req.body);
+}
+
+test "chunked trailers: multiple lines are dropped" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\nX-T1: a\r\nX-T2: b\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("ab", req.body);
+    try testing.expectEqual(@as(?[]const u8, null), req.header("x-t1"));
+}
+
+test "chunked framing requires CRLF after the payload" {
+    // chunk_crlf consumes two bytes unconditionally, so a bare-LF chunk
+    // terminator eats the first byte of the next size line and the request
+    // is rejected (fail-closed, but not the leniency readLine applies to
+    // request and header lines).
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "POST / HTTP/1.1\nTransfer-Encoding: chunked\n\n3\nabc\n0\n\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.bad_request, parser.parse(buf, &req));
+}
+
+test "keep-alive: Upgrade token alone does not enable keep-alive on 1.0" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET / HTTP/1.0\r\nConnection: Upgrade\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(!req.keep_alive);
+
+    req.reset();
+    buf.compact();
+    _ = buf.writeSlice("GET / HTTP/1.0\r\nConnection: Keep-Alive, Upgrade\r\n\r\n");
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(req.keep_alive);
+
+    req.reset();
+    buf.compact();
+    _ = buf.writeSlice("GET / HTTP/1.1\r\nConnection: upgrade\r\n\r\n");
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(req.keep_alive);
+}
+
+test "request line tolerates runs of whitespace" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET   /spaced   HTTP/1.1\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("/spaced", req.target);
+}
+
+test "query-only target decodes to an empty path" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET ?q=1 HTTP/1.1\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("?q=1", req.target);
+    try testing.expectEqualStrings("", req.decoded_target);
+    try testing.expectEqualStrings("?q=1", req.query_string);
+}
+
+test "HTTP/1.99 minor version is accepted" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET / HTTP/1.99\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqual(@as(u8, 99), req.version.minor);
+    try testing.expect(req.keep_alive);
+}
+
+test "header value keeps interior whitespace and stops at the first colon" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET / HTTP/1.1\r\nX-Ws:  a  b  \r\nX-Time: 12:34\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("a  b", req.header("x-ws").?);
+    try testing.expectEqualStrings("12:34", req.header("x-time").?);
+}
+
+test "header name is trimmed around the colon and empty values are allowed" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET / HTTP/1.1\r\nX-A \t: 1\r\nX-Empty:\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("1", req.header("x-a").?);
+    try testing.expectEqualStrings("", req.header("x-empty").?);
+    try testing.expectEqualStrings("X-A", req.headerAt(0).name);
+}
+
+test "duplicate Transfer-Encoding headers: any chunked token wins" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expect(req.transfer_chunked);
+    try testing.expectEqual(@as(usize, 2), req.headerCount());
+}
+
+test "chunk size with a leading plus is rejected" {
+    // parseChunkSize's doc comment mentions a leading '+', but the code only
+    // accepts hex digits (RFC 9112 chunk-size = 1*HEXDIG): current = 400.
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n+5\r\nhello\r\n0\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.bad_request, parser.parse(buf, &req));
+}
+
+test "three pipelined requests parse in order" {
+    const allocator = testing.allocator;
+    const buf = try fill(allocator, "GET /1 HTTP/1.1\r\n\r\nGET /2 HTTP/1.1\r\n\r\nGET /3 HTTP/1.1\r\n\r\n");
+    defer buf.deinit(allocator);
+    var req = Request.init(allocator);
+    defer req.deinit();
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("/1", req.target);
+    req.reset();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("/2", req.target);
+    req.reset();
+    try testing.expectEqual(Outcome.complete, parser.parse(buf, &req));
+    try testing.expectEqualStrings("/3", req.target);
+    try testing.expectEqual(@as(usize, 0), buf.availableRead());
+}
