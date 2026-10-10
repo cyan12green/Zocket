@@ -492,8 +492,9 @@ the comparison benchmarks must show Zocket ahead (iterate until green).
   default; cert-less vhost falls back to a server with creds;
   `--validate` checks every override). Upstream TLS keepalive pooling
   (per-backend, idle-reaped, reconnect-on-stale) also shipped 2026-10.
-- D2 auth/resilience: JWT ES256 ✅ + `jwks_file` deferred (TLS ECDSA
-  verify reuse done; JWKS rotation still deferred),
+- D2 auth/resilience: JWT ES256 ✅ + `jwks_file` ✅ SHIPPED 2026-10-10
+  (`auth_jwt_jwks_file`: EC P-256 JWKS JSON store, kid selection, live
+  rotation on mtime change, fail-closed parsing),
   `proxy_next_upstream` status retry (`http_502|http_503|...`), upstream
   TLS keepalive pooling (pool keyed by host/port/tls) + parked-path TLS.
 - D3 ACME issuance loop ✅ SHIPPED 2026-10: full v2 exchange in

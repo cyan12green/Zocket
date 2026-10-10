@@ -134,17 +134,25 @@ fn forbidden(ctx: *Context) Action {
 
 fn runAuthJwt(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
+    const configured = route.auth_jwt_secret != null or route.auth_jwt_key_file != null or route.auth_jwt_jwks_file != null;
     const auth = ctx.req.header("authorization") orelse {
-        if (route.auth_jwt_secret == null and route.auth_jwt_key_file == null) return .pass;
+        if (!configured) return .pass;
         return jwtUnauthorized(ctx);
     };
     const trimmed = std.mem.trim(u8, auth, " \t");
     if (trimmed.len < 8 or !std.ascii.eqlIgnoreCase(trimmed[0..6], "Bearer") or trimmed[6] != ' ') {
-        if (route.auth_jwt_secret == null and route.auth_jwt_key_file == null) return .pass;
+        if (!configured) return .pass;
         return jwtUnauthorized(ctx);
     }
     const token = std.mem.trim(u8, trimmed[7..], " \t");
-    // ES256 wins when a key file is configured (asymmetric first).
+    // JWKS wins when configured (multi-key, kid-addressed), then a PEM key
+    // file, then the shared HS256 secret.
+    if (route.auth_jwt_jwks_file) |jf| {
+        if (!verifyJwtJwks(jf, token, nowSeconds(ctx), route.auth_jwt_leeway_s)) {
+            return jwtUnauthorized(ctx);
+        }
+        return .pass;
+    }
     if (route.auth_jwt_key_file) |kf| {
         const pubkey_bytes = jwtPubkey(kf) orelse return jwtUnauthorized(ctx);
         if (!verifyJwtEs256(&pubkey_bytes, token, nowSeconds(ctx), route.auth_jwt_leeway_s)) {
@@ -157,6 +165,135 @@ fn runAuthJwt(ctx: *Context) anyerror!Action {
         return jwtUnauthorized(ctx);
     }
     return .pass;
+}
+
+// ---- JWKS (JSON Web Key Set) with rotation ----
+
+/// JWKS store: up to `max_jwks_files` files, each with up to
+/// `max_jwks_keys` EC P-256 keys parsed from their JSON (kty EC, crv
+/// P-256, x/y base64url, optional kid). The file is re-read whenever its
+/// mtime nanoseconds move, so rotating keys is a file write away; a
+/// matching `kid` selects the key (a token without `kid` tries all
+/// configured keys). Fail closed on any parse/read error.
+const max_jwks_files = 2;
+const max_jwks_keys = 8;
+const JwksKey = struct {
+    kid: [64]u8 = undefined,
+    kid_len: usize = 0,
+    sec1: [65]u8 = undefined,
+};
+const JwksFile = struct {
+    path: []const u8 = "",
+    mtime_ns: i128 = -1,
+    key_count: usize = 0,
+    keys: [max_jwks_keys]JwksKey = undefined,
+};
+var jwks_mutex = compat.Mutex{};
+var jwks_files: [max_jwks_files]JwksFile = @splat(.{});
+
+/// Extract a JSON string field value (no escapes: JWKS fields are
+/// base64url/identifiers).
+fn jsonStr(obj: []const u8, comptime field: []const u8) ?[]const u8 {
+    const needle = comptime "\"" ++ field ++ "\"";
+    const at = std.mem.indexOf(u8, obj, needle) orelse return null;
+    var i = at + needle.len;
+    while (i < obj.len and (obj[i] == ' ' or obj[i] == ':')) : (i += 1) {}
+    if (i >= obj.len or obj[i] != '"') return null;
+    i += 1;
+    const end = std.mem.indexOfScalarPos(u8, obj, i, '"') orelse return null;
+    return obj[i..end];
+}
+
+/// Refresh (if stale) and return the cache slot for `path`. Caller holds
+/// `jwks_mutex`.
+fn jwksSlot(path: []const u8) *JwksFile {
+    for (&jwks_files) |*f| {
+        if (std.mem.eql(u8, f.path, path)) return f;
+    }
+    var slot: *JwksFile = &jwks_files[0];
+    for (&jwks_files) |*f| {
+        if (f.path.len == 0) {
+            slot = f;
+            break;
+        }
+    }
+    slot.* = .{ .path = path };
+    return slot;
+}
+
+/// Reload the JWKS file into its slot when needed. Caller holds the lock.
+fn jwksRefresh(path: []const u8) *JwksFile {
+    const f = jwksSlot(path);
+    const st = compat.statFile(path) catch {
+        f.key_count = 0;
+        return f;
+    };
+    if (f.mtime_ns == st.mtime.nanoseconds and f.key_count > 0) return f;
+    f.mtime_ns = st.mtime.nanoseconds;
+    f.key_count = 0;
+    const bytes = compat.readFileAlloc(std.heap.page_allocator, path, 1 << 20) catch return f;
+    defer std.heap.page_allocator.free(bytes);
+    var rest = bytes;
+    while (std.mem.indexOfScalar(u8, rest, '{')) |brace| {
+        const end = std.mem.indexOfScalarPos(u8, rest, brace, '}') orelse break;
+        const obj = rest[brace..end];
+        rest = rest[end..];
+        const kty = jsonStr(obj, "kty") orelse continue;
+        if (!std.mem.eql(u8, kty, "EC")) continue;
+        const crv = jsonStr(obj, "crv") orelse continue;
+        if (!std.mem.eql(u8, crv, "P-256")) continue;
+        const x = jsonStr(obj, "x") orelse continue;
+        const y = jsonStr(obj, "y") orelse continue;
+        if (f.key_count >= max_jwks_keys) break;
+        const key = &f.keys[f.key_count];
+        key.sec1[0] = 0x04;
+        std.base64.url_safe_no_pad.Decoder.decode(key.sec1[1..33], x) catch continue;
+        std.base64.url_safe_no_pad.Decoder.decode(key.sec1[33..65], y) catch continue;
+        if (jsonStr(obj, "kid")) |kid| {
+            const n = @min(kid.len, key.kid.len);
+            @memcpy(key.kid[0..n], kid[0..n]);
+            key.kid_len = n;
+        } else {
+            key.kid_len = 0;
+        }
+        f.key_count += 1;
+    }
+    return f;
+}
+
+/// The token header's `kid` (base64url-decoded JSON), copied into `buf`.
+fn jwtHeaderKid(token: []const u8, buf: []u8) ?[]const u8 {
+    const h = std.mem.sliceTo(token, '.');
+    if (h.len == 0) return null;
+    const hlen = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(h) catch return null;
+    if (hlen > 256) return null;
+    var hbuf: [256]u8 = undefined;
+    std.base64.url_safe_no_pad.Decoder.decode(hbuf[0..hlen], h) catch return null;
+    const kid = jsonStr(hbuf[0..hlen], "kid") orelse return null;
+    if (kid.len > buf.len) return null;
+    @memcpy(buf[0..kid.len], kid);
+    return buf[0..kid.len];
+}
+
+/// Verify an ES256 token against a JWKS file (kid-selected; all keys when
+/// the token carries no kid). Pure aside from the store lock.
+pub fn verifyJwtJwks(path: []const u8, token: []const u8, now_s: i64, leeway_s: u32) bool {
+    jwks_mutex.lock();
+    defer jwks_mutex.unlock();
+    const f = jwksRefresh(path);
+    if (f.key_count == 0) return false;
+    var kid_buf: [64]u8 = undefined;
+    const kid = jwtHeaderKid(token, &kid_buf);
+    var i: usize = 0;
+    while (i < f.key_count) : (i += 1) {
+        const key = &f.keys[i];
+        if (kid) |k| {
+            // kid present: require the matching key (rotation-safe).
+            if (key.kid_len == 0 or !std.mem.eql(u8, k, key.kid[0..key.kid_len])) continue;
+        }
+        if (verifyJwtEs256(&key.sec1, token, now_s, leeway_s)) return true;
+    }
+    return false;
 }
 
 /// Process-wide SEC1 pubkey cache keyed by PEM path (4 slots; DER lives
@@ -464,6 +601,62 @@ test "jwt es256 verifies with the fixture pair, rejects confusion" {
     @memcpy(bad_tok[0..token.len], token);
     bad_tok[token.len - 3] ^= 0x01;
     try testing.expect(!verifyJwtEs256(&leaf, bad_tok[0..token.len], 1_000, 60));
+}
+
+test "jwks verifies by kid and rotates when the file changes" {
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const testdata = @import("../../tls/testdata.zig");
+    const cert_mod = @import("../../tls/cert.zig");
+    const creds = try cert_mod.loadCredentials(testing.allocator, testdata.client_cert_pem, testdata.client_key_pem);
+    defer testing.allocator.free(creds.cert_der);
+    // SEC1 point from the fixture leaf.
+    const leaf = blk: {
+        const pem_mod = @import("../../tls/pem.zig");
+        var lb: [4096]u8 = undefined;
+        const ll = (try pem_mod.decodeFirst(testdata.client_cert_pem, "CERTIFICATE", &lb)) orelse return error.TestUnexpected;
+        const parsed = try std.crypto.Certificate.parse(.{ .buffer = lb[0..ll], .index = 0 });
+        var sec1: [65]u8 = undefined;
+        @memcpy(&sec1, parsed.pubKey());
+        break :blk sec1;
+    };
+    var xbuf: [128]u8 = undefined;
+    const xs = std.base64.url_safe_no_pad.Encoder.encode(&xbuf, leaf[1..33]);
+    var ybuf: [128]u8 = undefined;
+    const ys = std.base64.url_safe_no_pad.Encoder.encode(&ybuf, leaf[33..65]);
+
+    var jwks_buf: [1024]u8 = undefined;
+    const jwks = std.fmt.bufPrint(&jwks_buf, "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"k1\",\"x\":\"{s}\",\"y\":\"{s}\"}}]}}", .{ xs, ys }) catch unreachable;
+    const path = "/tmp/zocket-jwks-rotate-test.json";
+    compat.deleteFile(path) catch {};
+    try compat.writeFile(path, jwks);
+    defer compat.deleteFile(path) catch {};
+
+    // Token with kid k1, signed by the fixture key.
+    const h = "eyJhbGciOiJFUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0"; // {"alg":"ES256","kid":"k1","typ":"JWT"}
+    const pl = "eyJleHAiOjk5OTk5OTk5OTl9";
+    var msg: [256]u8 = undefined;
+    const m = std.fmt.bufPrint(&msg, "{s}.{s}", .{ h, pl }) catch unreachable;
+    const sk = try Ecdsa.SecretKey.fromBytes(creds.key.secret_key[0..Ecdsa.SecretKey.encoded_length].*);
+    const kp = try Ecdsa.KeyPair.fromSecretKey(sk);
+    const sig = kp.sign(m, null) catch unreachable;
+    const raw = sig.toBytes();
+    var sig_b64: [128]u8 = undefined;
+    const sig_s = std.base64.url_safe_no_pad.Encoder.encode(&sig_b64, &raw);
+    var tok: [512]u8 = undefined;
+    const token = std.fmt.bufPrint(&tok, "{s}.{s}.{s}", .{ h, pl, sig_s }) catch unreachable;
+
+    try testing.expect(verifyJwtJwks(path, token, 1_000, 60));
+    // Garbage JWKS fails closed.
+    try compat.writeFile(path, "not json");
+    try testing.expect(!verifyJwtJwks(path, token, 1_000, 60));
+    // Restore, then rotate: same file, new kid -> the old token no longer
+    // matches (mtime moves to a new nanosecond).
+    try compat.writeFile(path, jwks);
+    try testing.expect(verifyJwtJwks(path, token, 1_000, 60));
+    var jwks2_buf: [1024]u8 = undefined;
+    const jwks2 = std.fmt.bufPrint(&jwks2_buf, "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"k2\",\"x\":\"{s}\",\"y\":\"{s}\"}}]}}", .{ xs, ys }) catch unreachable;
+    try compat.writeFile(path, jwks2);
+    try testing.expect(!verifyJwtJwks(path, token, 1_000, 60));
 }
 
 test "jwt es256 handler gates on the key file" {

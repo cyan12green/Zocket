@@ -294,6 +294,9 @@ pub const Route = struct {
     /// `access_log json;`: emit one JSON object per request instead of a
     /// named log_format.
     log_json: bool = false,
+    /// `auth_jwt_jwks_file path;`: JWKS JSON store (EC P-256 keys with
+    /// kid), re-read when the file's mtime moves.
+    auth_jwt_jwks_file: ?[]const u8 = null,
     /// Index into Config.log_formats; null = none (off). The access_log
     /// module reads it; defaults to index 0 (the `combined` default) when
     /// the route binds `log access_log;` and no `access_log` directive is

@@ -128,6 +128,7 @@ const H_secure_link_secret = keyHash("secure_link_secret");
 const H_auth_jwt_secret = keyHash("auth_jwt_secret");
 const H_auth_jwt_leeway = keyHash("auth_jwt_leeway");
 const H_auth_jwt_key_file = keyHash("auth_jwt_key_file");
+const H_auth_jwt_jwks_file = keyHash("auth_jwt_jwks_file");
 const H_proxy_ws = keyHash("proxy_ws");
 const H_proxy_cache = keyHash("proxy_cache");
 const H_client_header_timeout = keyHash("client_header_timeout");
@@ -386,6 +387,7 @@ const LocationSpec = struct {
     auth_jwt_secret: ?Str = null,
     auth_jwt_leeway: u32 = 0,
     auth_jwt_key_file: ?Str = null,
+    auth_jwt_jwks_file: ?Str = null,
     /// `proxy_ws on|off;` (WebSocket upgrade forwarding).
     proxy_ws: bool = false,
     /// `sticky_cookie name;` (cookie-based backend affinity)
@@ -1734,6 +1736,12 @@ fn parseLocationDirective(lx: *Lexer, b: *Builder, spec: *LocationSpec, comptime
             ensureModuleBound(b, spec, .access, "auth_jwt");
             b.cost += 8;
         },
+        H_auth_jwt_jwks_file => {
+            spec.auth_jwt_jwks_file = lx.value(b, "auth_jwt_jwks_file");
+            lx.expectTerminator("auth_jwt_jwks_file");
+            ensureModuleBound(b, spec, .access, "auth_jwt");
+            b.cost += 4;
+        },
         H_auth_jwt_key_file => {
             spec.auth_jwt_key_file = lx.value(b, "auth_jwt_key_file");
             lx.expectTerminator("auth_jwt_key_file");
@@ -2872,6 +2880,7 @@ fn build(b: *const Builder) Config {
                 .auth_jwt_secret = if (spec.auth_jwt_secret) |s| resolve(s, strings) else null,
                 .auth_jwt_leeway_s = spec.auth_jwt_leeway,
                 .auth_jwt_key_file = if (spec.auth_jwt_key_file) |s| resolve(s, strings) else null,
+                .auth_jwt_jwks_file = if (spec.auth_jwt_jwks_file) |s| resolve(s, strings) else null,
                 .proxy_ws = spec.proxy_ws,
                 .proxy_cache_enabled = spec.cache_enabled,
                 .cache_ttl_seconds = spec.cache_ttl,
@@ -4605,6 +4614,23 @@ test "conf: accel on binds the log module" {
         \\}
     );
     try testing.expect(cfg.routes[0].accel_enabled);
+}
+
+test "conf: auth_jwt_jwks_file binds the jwt module" {
+    const cfg = parse(
+        \\server {
+        \\    location / {
+        \\        content echo;
+        \\        auth_jwt_jwks_file keys/jwks.json;
+        \\    }
+        \\}
+    );
+    try testing.expectEqualStrings("keys/jwks.json", cfg.routes[0].auth_jwt_jwks_file.?);
+    var saw = false;
+    for (cfg.routes[0].modules) |b| {
+        if (std.mem.eql(u8, b.module, "auth_jwt")) saw = true;
+    }
+    try testing.expect(saw);
 }
 
 test "conf: auth_jwt_key_file binds the jwt module" {
