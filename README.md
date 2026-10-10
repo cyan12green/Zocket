@@ -102,7 +102,7 @@ tables and raw data in [`bench/BENCH.md`](bench/BENCH.md)):
 ## Development
 
 ```sh
-zig build test             # 1,055 tests
+zig build test             # 1,054 tests
 zig build h2test           # HTTP/2 end-to-end + h2spec conformance
 zig build cov              # line/block coverage report
 bash bench/modules-bench.sh   # module features vs nginx

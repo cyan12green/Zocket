@@ -27,7 +27,7 @@ forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 | B1 | Modules batch: headers, `auth_basic`, `auth_request`, `limit_req`/`limit_conn`, precompressed serving, `proxy_cache`, LB random/consistent_hash/least_time with cookie sticky sessions; framework additions: shared request memory, bounded shmem zones, per-request timeouts. |
 | B2 | Reload-surviving zones and vhost readiness audit: memfd-backed named shmem zones handed through the daemon state file, `MmapKeyedTable`, `ZoneRegistry`, lifecycle init from inherited fds, per-server stats, `ModuleError` status mapping, capability flags, memfd body spooling. |
 | B3 | Multi-server vhost pipeline: `server_name` (exact + `*.domain` wildcard), multiple `server {}` blocks with per-block listen ports, `host_select`, comptime `ServerSelectFn`, `ServerGroup` with per-request Host resolution. |
-| P18 | Zig 0.16 → 0.18 port and verification hardening: the removed std surface was shimmed (now `src/sys.zig`); all gates green on 0.18; coverage tooling (`zig build cov`, zig-cov with a local expansion patch, per-area `src/cov_*.zig` drivers) with a ≥90% line gate. |
+| P18 | Zig 0.16 → 0.18 port and verification hardening: the removed std surface was shimmed (now `src/sys.zig`); all gates green on 0.18; coverage tooling (`zig build cov`, zig-cov with a local expansion patch, per-area `src/cov_*.zig` drivers) with a ≥90% line gate, met at 90.6% (32,293/35,655 lines, 42.0% blocks) with 1,054/1,054 tests green. |
 | M19 | HTTP/3 + QUIC (planned). |
 
 Dependency milestones DM1 (comptime JSON config validation) and DM2

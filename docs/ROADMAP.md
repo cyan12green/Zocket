@@ -52,12 +52,13 @@ designed items remain on top of that seam:
 
 ## Coverage
 
-The ≥90% line gate is met (see `bench/.cache/coverage.json`). Remaining
-misses are mostly tool attribution artifacts (defer lines, switch arms) plus
-genuinely untested error branches in the largest files (`net/reactor.zig`,
-`http2/session.zig`, `dsl/modules/proxy.zig`, `http/parser.zig`,
-`sys.zig`). Further test work is optional and should target those error
-branches.
+The ≥90% line gate is met: **90.6% (32,293/35,655 lines, 42.0% blocks)** at
+the last run, with 1,054/1,054 tests green (see `bench/.cache/coverage.json`).
+Remaining misses are mostly tool attribution artifacts (defer lines, switch
+arms) plus genuinely untested error branches in the largest files
+(`net/reactor.zig`, `http2/session.zig`, `dsl/modules/proxy.zig`,
+`http/parser.zig`, `sys.zig`). Further test work is optional and should
+target those error branches.
 
 ## Blocked on an external decision
 

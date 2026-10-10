@@ -91,7 +91,8 @@ for methodology and current results.
   the `--listen=-` IPC protocol, which the test runner only speaks in fuzz
   mode.
 - Gate: project line coverage ≥90% (`bench/.cache/coverage.json` summary; met
-  at 90.6%, 32.3k/35.7k, with 1,055/1,055 tests green).
+  at 90.6% — 32,293/35,655 lines, 42.0% blocks — with 1,054/1,054 tests
+  green).
 - **Local zig-cov patch**: upstream's block→line expansion drops lines that
   follow a `try`/error branch (the error block sits between the executed code
   and statements that have no coverage point of their own — upstream's own
