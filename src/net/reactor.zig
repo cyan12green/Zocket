@@ -2148,16 +2148,22 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         // (including time parked on an upstream), so it bounds concurrent
         // upstream fan-out and per-request memory. Comptime config; the
         // counter is a plain field because one reactor thread owns it.
-        if (self.limits.max_requests != 0 and self.in_flight >= self.limits.max_requests) {
-            self.respondAndClose(fd, .service_unavailable);
-            return false;
-        }
-        if (!session.req_counted) {
+        const shed = self.limits.max_requests != 0 and self.in_flight >= self.limits.max_requests;
+        // Shed requests get a 503 but keep the connection (when the client
+        // asked for keep-alive): the request body is already consumed by
+        // the parser, so a retry on the same socket costs no reconnect —
+        // otherwise sustained shedding turns into a connect storm on the
+        // same cores that are already saturated.
+        if (!shed and !session.req_counted) {
             session.req_counted = true;
             self.in_flight += 1;
         }
         const close0 = !session.req.keep_alive;
-        session.resp = http_response.Response.init(.ok);
+        session.resp = if (shed) blk: {
+            var resp = http_response.Response.init(.service_unavailable);
+            resp.setBody(http_response.Status.service_unavailable.reasonPhrase());
+            break :blk resp;
+        } else http_response.Response.init(.ok);
         // Resolve per-request server from Host header when a server group
         // is configured.
         if (session.req.header("host")) |host| {
@@ -2185,7 +2191,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             },
         };
 
-        if (!tls_mode) {
+        if (!tls_mode and !shed) {
             // Fast path: module-less response-template routes are
             // written straight from their pre-serialised bytes (status line +
             // template headers + Connection + Content-Length + body),
@@ -2216,7 +2222,8 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             }
         }
 
-        const request_outcome = blk: {
+        var request_outcome: dsl_pipeline.Outcome = .not_handled;
+        if (!shed) request_outcome = blk: {
             if (!ctx.async_supported) {
                 // Synchronous drivers (ring/TLS fronts): modules use the
                 // blocking path; no parking possible.
@@ -2245,7 +2252,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 },
             };
         };
-        if (request_outcome == .not_handled) {
+        if (request_outcome == .not_handled and !shed) {
             // No module claimed the request (no route matched, a
             // short-circuit, or no module attached): default 404.
             session.resp = http_response.Response.init(.not_found);
@@ -3540,6 +3547,8 @@ test "reactor max_requests sheds with 503 at the cap and releases the slot" {
         var buf: [512]u8 = undefined;
         const n = try readUntil(pair[0], &buf, 64, 3000);
         try testing.expect(std.mem.indexOf(u8, buf[0..n], "503 Service Unavailable") != null);
+        // Keep-alive shed: no Connection: close on the response.
+        try testing.expect(std.mem.indexOf(u8, buf[0..n], "Connection: close") == null);
         try testing.expectEqual(@as(usize, 1), r.in_flight);
     }
     // Below the cap: a normal request completes and releases its slot.
