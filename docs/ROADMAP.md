@@ -256,6 +256,50 @@ Tracked items (design notes recorded here; build later):
   designed-not-built on top of this seam.
 
 ---
+
+## Comptime audit (2026-10-10)
+
+A full-tree survey for runtime work over compile-time-known data. The
+heavy wins are already banked (header DFA, route trie + dispatch
+specialisation, conf parsing/validation, pre-serialised response
+templates, HPACK static/Huffman tables, comptime embeds). This pass
+shipped the remaining hot-path items in `85be096`: parse-time tags in
+`finalizeKeepAlive` and the upstream request builder (no per-header
+re-hashing; hashing only when a route overrides names), a first-byte
+prefilter in the MIME lookup, and a comptime-rendered ETag for embedded
+files (removes an O(filesize) hash per request).
+
+Measured: ~1% CPU/req (15.93 -> 15.71 us steady-state, interleaved
+before/after binaries); throughput unchanged within the box's +-3% noise
+floor. The proxied path's dominant cost is the syscall/wakeup chain, not
+runtime table work, so further comptime conversions are CPU headroom,
+not benchmark movement.
+
+Remaining opportunities, ranked (impact = hot-path CPU):
+
+1. Classify upstream response header names at parse (add a tag to
+   `UpstreamHeader`); the four adopt sites and the response-side filters
+   (gzip/accel/sub_filter/hide) then compare integers instead of hashing
+   and scanning case-insensitively per header per response.
+2. HTTP/2: `hpack.encodeField` value-indexed static-table map (no
+   61-entry scan per header) and a single hash switch for pseudo-header
+   classification in the session (currently an `eql` chain).
+3. `static_cache`: 64-bit path hash prefilter before the 16-entry scan.
+4. `vars`: map `$http_<name>` fragments to DFA tags at comptime instead
+   of re-hashing request headers per render (access-log path).
+5. `proxy_set_header` override name hashes precomputed at conf build
+   (comptime data) instead of per request.
+6. Single-pass upstream request builder (upper-bound arena buffer with a
+   two-pass fallback) to drop the whole sizing pass.
+7. `precompressed`: per-route codec bitmask at comptime instead of
+   per-request token matching.
+8. Regex routes: literal-prefix/first-byte prefilter after a prefix match.
+9. Response head: pre-render the per-second Date+Server block next to the
+   cached date and splice it instead of per-header writes.
+10. `access_log`: format into a stack buffer instead of
+    ArrayList + `std.log.info` machinery per line.
+
+---
 ---
 
 ## Dependent milestones (blocked on Zig snapshot)
