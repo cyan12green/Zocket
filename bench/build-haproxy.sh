@@ -3,11 +3,14 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/bench/.cache/haproxy-build"
-VER="3.0.9"
+VER="3.0.29"
+# Upstream lays out sources by MINOR series (download/3.0/src/...), not by
+# the full version; the old full-version path 404s for every release.
+SER="${VER%.*}"
 mkdir -p "$ROOT/bench/.cache" "$OUT/sbin"
 cd "$ROOT/bench/.cache"
 [ -d haproxy-$VER ] || {
-    curl -sL -o haproxy.tgz "https://www.haproxy.org/download/$VER/src/haproxy-$VER.tar.gz" &&
+    curl -sL -o haproxy.tgz "https://www.haproxy.org/download/$SER/src/haproxy-$VER.tar.gz" &&
         tar xzf haproxy.tgz
 }
 cd haproxy-$VER
