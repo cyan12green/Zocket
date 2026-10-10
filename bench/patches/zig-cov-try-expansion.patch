@@ -1,0 +1,110 @@
+diff --git a/src/dwarf/resolver.zig b/src/dwarf/resolver.zig
+index 6f02c5d..06aeb19 100644
+--- a/src/dwarf/resolver.zig
++++ b/src/dwarf/resolver.zig
+@@ -329,21 +329,98 @@ fn expandBlocks(
+         if (idx < list.items.len and list.items[idx].addr == e.addr) list.items[idx].executed = true;
+     }
+ 
++    // Owner of an address: the last block starting at or before it.
++    const ownerOf = struct {
++        fn f(blocks: []const Block, addr: u64) ?usize {
++            const idx = std.sort.upperBound(Block, blocks, addr, struct {
++                fn order(ctx: u64, item: Block) std.math.Order {
++                    return std.math.order(ctx, item.addr);
++                }
++            }.order);
++            if (idx == 0) return null; // before the first instrumented block
++            return idx - 1;
++        }
++    }.f;
++
++    // Every line with an executed owner. The second pass reasons from this:
++    // a line is only ever *known* covered when some block that ran owns a row
++    // on it, or when the second pass proves it the same way.
++    var covered_lines = std.StringHashMap(std.AutoHashMap(u32, void)).init(allocator);
++    defer {
++        var lit = covered_lines.valueIterator();
++        while (lit.next()) |set| set.deinit();
++        covered_lines.deinit();
++    }
++
++    for (coverable, coverable_keys) |row, key| {
++        const list = by_obj.get(key.obj) orelse continue;
++        const owner = ownerOf(list.items, key.addr) orelse continue;
++        if (!list.items[owner].executed) continue;
++        const gop = try covered_lines.getOrPut(row.file);
++        if (!gop.found_existing) gop.value_ptr.* = std.AutoHashMap(u32, void).init(allocator);
++        try gop.value_ptr.put(row.line, {});
++    }
++
++    // Second pass, in address order: an unexecuted owner still covers a row
++    // when a covered row of the *same file* already appeared inside that
++    // block's span, on a line at or before this one. This is the
++    // `try`/error-branch shape — the error path sits between the executed code
++    // and the statements after the `try`, which often have no point of their
++    // own — so the error block *not* running is itself evidence that those
++    // statements did run. Never-executed code (a never-called function, a body
++    // before any coverage, dead code after a `return`) stays a miss, because
++    // no covered row of its file precedes it inside its own block.
++    const order = try allocator.alloc(usize, coverable.len);
++    defer allocator.free(order);
++    for (order, 0..) |*slot, i| slot.* = i;
++    std.mem.sort(usize, order, coverable_keys, struct {
++        fn lt(keys: []const AddrKey, a: usize, b: usize) bool {
++            if (keys[a].obj != keys[b].obj) return keys[a].obj < keys[b].obj;
++            return keys[a].addr < keys[b].addr;
++        }
++    }.lt);
++
++    // (object, file) -> the last row of that file seen in address order whose
++    // line is covered.
++    const Entry = struct { addr: u64, line: u32 };
++    var last_covered = std.AutoHashMap(usize, std.StringHashMap(Entry)).init(allocator);
++    defer {
++        var lit = last_covered.valueIterator();
++        while (lit.next()) |m| m.deinit();
++        last_covered.deinit();
++    }
++
+     var out: std.ArrayList(ResolvedLocation) = .empty;
+     errdefer {
+         for (out.items) |loc| allocator.free(loc.file);
+         out.deinit(allocator);
+     }
+ 
+-    for (coverable, coverable_keys) |row, key| {
++    for (order) |i| {
++        const row = coverable[i];
++        const key = coverable_keys[i];
+         const list = by_obj.get(key.obj) orelse continue;
+-        const idx = std.sort.upperBound(Block, list.items, key.addr, struct {
+-            fn order(ctx: u64, item: Block) std.math.Order {
+-                return std.math.order(ctx, item.addr);
++        const owner = ownerOf(list.items, key.addr) orelse continue;
++
++        var covered = list.items[owner].executed;
++        if (!covered) {
++            if (last_covered.getPtr(key.obj)) |by_file| {
++                if (by_file.getPtr(row.file)) |e| {
++                    if (e.addr >= list.items[owner].addr and e.line <= row.line) covered = true;
++                }
+             }
+-        }.order);
+-        if (idx == 0) continue; // before the first instrumented block
+-        if (!list.items[idx - 1].executed) continue;
++        }
++
++        const gop = try covered_lines.getOrPut(row.file);
++        if (!gop.found_existing) gop.value_ptr.* = std.AutoHashMap(u32, void).init(allocator);
++        if (covered) try gop.value_ptr.put(row.line, {});
++        if (!gop.value_ptr.contains(row.line)) continue;
++
++        const gop_obj = try last_covered.getOrPut(key.obj);
++        if (!gop_obj.found_existing) gop_obj.value_ptr.* = std.StringHashMap(Entry).init(allocator);
++        try gop_obj.value_ptr.put(row.file, .{ .addr = key.addr, .line = row.line });
++
++        if (!covered) continue;
+         try out.append(allocator, .{
+             .file = try allocator.dupe(u8, row.file),
+             .line = row.line,
