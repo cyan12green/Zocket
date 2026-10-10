@@ -53,6 +53,15 @@ pub const Session = struct {
     pending_hpack_block: std.ArrayList(u8) = .empty,
     /// Set when the connection should be torn down (GOAWAY sent/received).
     closing: bool = false,
+    /// Advertised + enforced concurrent-stream ceiling (RFC 9113 §6.5.2 /
+    /// §5.1.2). Defaults to `max_concurrent_streams`; the reactor lowers it
+    /// to `limits.max_requests` when that cap is configured.
+    max_streams: u32 = max_concurrent_streams,
+    /// Pre-encoded (date, server) HPACK block, rebuilt when the date string
+    /// changes (once per second): both fields are static-table-only encoded,
+    /// so the bytes are session-independent and can be spliced per response.
+    meta_block: std.ArrayList(u8) = .empty,
+    meta_date: []const u8 = "",
 
     pub const default_window: u32 = 65535;
     pub const max_concurrent_streams: u32 = 100;
@@ -154,6 +163,7 @@ pub const Session = struct {
         for (self.request_pool.items) |*r| r.deinit();
         self.request_pool.deinit(self.allocator);
         self.block_scratch.deinit(self.allocator);
+        self.meta_block.deinit(self.allocator);
     }
 
     fn destroyStream(self: *Session, st: *Stream) void {
@@ -205,7 +215,7 @@ pub const Session = struct {
         // Advertise: default initial window (65535), default max frame size
         // (16384), max concurrent streams 100.
         try frames.writeSettings(send, self.allocator, &.{
-            .{ .id = 3, .value = max_concurrent_streams },
+            .{ .id = 3, .value = self.max_streams },
         });
     }
 
@@ -419,7 +429,7 @@ pub const Session = struct {
         }
         // Enforce the advertised concurrent-stream limit (RFC 9113 §5.1.2):
         // new streams beyond it are refused (RST_STREAM REFUSED_STREAM).
-        if (self.streams.count() >= max_concurrent_streams) {
+        if (self.streams.count() >= self.max_streams) {
             self.streamError(hdr.stream_id, send);
             return;
         }
@@ -632,7 +642,8 @@ pub const Session = struct {
                 self.streamError(stream_id, send);
                 return;
             }
-            if (std.mem.eql(u8, f.name, ":method")) {
+            const nh = hdrHash(f.name);
+            if (nh == comptime hdrHash(":method")) {
                 if (pseudo_seen[0]) {
                     self.streamError(stream_id, send);
                     return;
@@ -646,7 +657,7 @@ pub const Session = struct {
                 };
                 req.method = m;
                 method_set = true;
-            } else if (std.mem.eql(u8, f.name, ":path")) {
+            } else if (nh == comptime hdrHash(":path")) {
                 if (pseudo_seen[3]) {
                     self.streamError(stream_id, send);
                     return;
@@ -667,21 +678,21 @@ pub const Session = struct {
                     req.decoded_target = f.value;
                 }
                 path_set = true;
-            } else if (std.mem.eql(u8, f.name, ":scheme")) {
+            } else if (nh == comptime hdrHash(":scheme")) {
                 if (pseudo_seen[1]) {
                     self.streamError(stream_id, send);
                     return;
                 }
                 pseudo_seen[1] = true;
                 scheme_set = true;
-            } else if (std.mem.eql(u8, f.name, ":authority")) {
+            } else if (nh == comptime hdrHash(":authority")) {
                 if (pseudo_seen[2]) {
                     self.streamError(stream_id, send);
                     return;
                 }
                 pseudo_seen[2] = true;
                 authority = f.value;
-            } else if (std.mem.eql(u8, f.name, "content-length")) {
+            } else if (nh == comptime hdrHash("content-length")) {
                 content_length = std.fmt.parseInt(usize, f.value, 10) catch {
                     self.streamError(stream_id, send);
                     return;
@@ -821,17 +832,25 @@ pub const Session = struct {
         var status_buf: [8]u8 = undefined;
         const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{@intFromEnum(resp.status)}) catch "500";
         try hpack.encodeField(block, self.allocator, ":status", status_str);
-        // Date + Server (nginx-parity, both free).
-        try hpack.encodeField(block, self.allocator, "date", handler.date_header);
-        try hpack.encodeField(block, self.allocator, "server", handler.version_string);
-        // Response headers (skip connection-specific ones, and content-length
-        // is implicit in the DATA framing).
+        // Date + Server are constant for a whole second: encode them once
+        // per second and splice the bytes (static-table encoding is
+        // session-independent, so this is valid for every response).
+        if (!std.mem.eql(u8, self.meta_date, handler.date_header)) {
+            self.meta_block.clearRetainingCapacity();
+            try hpack.encodeField(&self.meta_block, self.allocator, "date", handler.date_header);
+            try hpack.encodeField(&self.meta_block, self.allocator, "server", handler.version_string);
+            self.meta_date = handler.date_header;
+        }
+        try block.appendSlice(self.allocator, self.meta_block.items);
+        // Response headers (skip connection-specific ones and content-length,
+        // which is implicit in the DATA framing) — integer hash compares.
         for (resp.headers[0..resp.header_count]) |h| {
-            if (std.mem.eql(u8, h.name, "connection") or
-                std.mem.eql(u8, h.name, "keep-alive") or
-                std.mem.eql(u8, h.name, "transfer-encoding"))
+            const nh = hdrHash(h.name);
+            if (nh == hdrHash("connection") or
+                nh == hdrHash("keep-alive") or
+                nh == hdrHash("transfer-encoding") or
+                nh == hdrHash("content-length"))
                 continue;
-            if (std.mem.eql(u8, h.name, "content-length")) continue;
             try hpack.encodeField(block, self.allocator, h.name, h.value);
         }
         // Body: buffered or read from the file (sendfile under h2 is

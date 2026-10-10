@@ -57,6 +57,17 @@ const default_http_handler = runtime_server.Server.default();
 /// (fds are small positive ints, so bit 30 is safely out of their range).
 const up_tag: u64 = 1 << 30;
 
+/// `limits.max_requests` maps to the h2 per-connection concurrent-stream
+/// ceiling when configured (0 keeps the protocol default of 100): the
+/// worker-wide in-flight cap cannot be enforced per stream without
+/// cross-session accounting, so the advertised/enforced limit is the
+/// session-level analog.
+fn applyH2StreamCap(h2s: *http2_session.Session, max_requests: usize) void {
+    if (max_requests == 0) return;
+    const cap: u32 = @intCast(@min(max_requests, @as(usize, std.math.maxInt(u32))));
+    if (cap != 0 and cap < h2s.max_streams) h2s.max_streams = cap;
+}
+
 /// Connection protocol handled by a reactor.
 pub const Mode = enum {
     /// Raw byte echo.
@@ -1179,6 +1190,7 @@ pub const Reactor = struct {
                 const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
                 if (recv_slice.len >= 24 and http2_session.Session.looksLikeHttp2Preface(recv_slice[0..24])) {
                     session.h2 = http2_session.Session.init(self.allocator);
+                    applyH2StreamCap(&(session.h2.?), self.limits.max_requests);
                     if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
                 }
             }
@@ -2513,6 +2525,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         // Route to the h2 session when ALPN negotiated it.
         if (sess.h2 == null and std.mem.eql(u8, tc.alpn(), "h2")) {
             sess.h2 = http2_session.Session.init(self.allocator);
+            applyH2StreamCap(&(sess.h2.?), self.limits.max_requests);
             if (self.stats) |s| _ = s.requests.fetchAdd(1, .monotonic);
         }
 
@@ -3523,6 +3536,23 @@ test "reactor HTTP handles pipelined requests in one write" {
     try testing.expectEqualStrings(want_a, buf[0..n1]);
     const n2 = try readUntil(pair[0], &buf, want_b.len, 3000);
     try testing.expectEqualStrings(want_b, buf[0..n2]);
+}
+
+test "limits.max_requests lowers the h2 concurrent-stream ceiling" {
+    const httpx = struct {
+        const h2 = @import("../http2/session.zig");
+    };
+    var s = httpx.h2.Session.init(testing.allocator);
+    defer s.deinit();
+    // Unconfigured: the protocol default stays.
+    applyH2StreamCap(&s, 0);
+    try testing.expectEqual(@as(u32, 100), s.max_streams);
+    // Configured: the session advertises/enforces the configured cap.
+    applyH2StreamCap(&s, 25);
+    try testing.expectEqual(@as(u32, 25), s.max_streams);
+    // A cap above the default does not raise it.
+    applyH2StreamCap(&s, 500);
+    try testing.expectEqual(@as(u32, 25), s.max_streams);
 }
 
 test "reactor max_requests sheds with 503 at the cap and releases the slot" {
