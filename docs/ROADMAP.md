@@ -91,9 +91,14 @@ byte-budgeted LRU stores; nothing grows under load):
 - BLOCKED ON VENDORING Brotli + zstd compression: std.zig has no encoders
   for either (zstd is decompress-only); needs a vendored codec decision
   (C dependency vs pure-Zig port) before pickup.
-- Traffic mirroring (nginx `mirror`).
-- Prometheus `/metrics` endpoint and structured JSON access logs.
-- OpenTelemetry trace spans.
+- DONE Traffic mirroring (nginx `mirror`) ✅ SHIPPED 2026-10: `mirror
+  addr:port;` duplicates every request to a shadow backend; the copy is
+  fire-and-forget (bounded connect wait, response never read), the shadow
+  never joins load balancing.
+- DONE Prometheus `/metrics` endpoint and structured JSON access logs ✅
+  SHIPPED 2026-10: `prometheus;` / `status_json;` bind the content
+  modules; `access_log json;` emits a built-in escaped JSON line.
+- OPEN OpenTelemetry trace spans.
 - DONE Connection limits: `max_connections` (global ceiling) + `server_limit_conn` (per-IP cap) with shmem-backed counters.
 - DONE HTTP parser hardening: CL.TE/TE.CL smuggling rejection, duplicate Content-Length detection (RFC 9112 §3.3.3).
 - DONE IPv6 listeners (dual-stack): `listen [::]:8080;` syntax, `sockaddr_in6`, IPv4-mapped IPv6 for v4 peers, 16-byte `peer_ip` throughout.
