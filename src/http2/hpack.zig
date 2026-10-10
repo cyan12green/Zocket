@@ -1097,3 +1097,62 @@ test "HPACK: static name index misses unknown names" {
     try testing.expect(staticNameIndex(":method") != null);
     try testing.expect(staticNameIndex("content-length") != null);
 }
+
+test "HPACK: runtime names use the hash index; long values use the integer loop" {
+    var d = Decoder.init(testing.allocator);
+    defer d.deinit();
+    var sink = std.ArrayList(u8).empty;
+    defer sink.deinit(testing.allocator);
+    var fields = std.ArrayList(Field).empty;
+    defer fields.deinit(testing.allocator);
+
+    // A runtime-built name defeats comptime folding of nameHash and
+    // staticNameIndex (content-length is static index 28, so the literal
+    // index needs the multi-byte integer prefix).
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{s}{s}", .{ "content", "-length" });
+    try encodeField(&sink, testing.allocator, name, "42");
+    try testing.expectEqual(@as(u8, 0x0f), sink.items[0]);
+    try d.decode(testing.allocator, sink.items, &fields);
+    try testing.expectEqualStrings("content-length", fields.items[0].name);
+    try testing.expectEqualStrings("42", fields.items[0].value);
+    freeFields(testing.allocator, &fields);
+    fields.clearRetainingCapacity();
+
+    // 300 bytes needs a >=128 continuation in the 7-bit-prefix length.
+    sink.clearRetainingCapacity();
+    const long_value = @as([300]u8, @splat(@as(u8, 'v')));
+    try encodeField(&sink, testing.allocator, name, &long_value);
+    try d.decode(testing.allocator, sink.items, &fields);
+    try testing.expectEqualStrings(&long_value, fields.items[0].value);
+    freeFields(testing.allocator, &fields);
+}
+
+test "HPACK: dynamic-table insert failures free partial entries" {
+    // Value copy fails after the name copy: the name errdefer frees it.
+    {
+        var fail = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+        var d = Decoder.init(fail.allocator());
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var fields = std.ArrayList(Field).empty;
+        defer fields.deinit(arena.allocator());
+        try testing.expectError(error.OutOfMemory, d.decode(arena.allocator(), &.{ 0x40, 0x01, 'a', 0x01, '1' }, &fields));
+        try testing.expectEqual(@as(usize, 0), d.dyn.entries.items.len);
+        d.deinit();
+        try testing.expectEqual(fail.allocated_bytes, fail.freed_bytes);
+    }
+    // The list insert fails after both copies: both errdefers free.
+    {
+        var fail = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+        var d = Decoder.init(fail.allocator());
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var fields = std.ArrayList(Field).empty;
+        defer fields.deinit(arena.allocator());
+        try testing.expectError(error.OutOfMemory, d.decode(arena.allocator(), &.{ 0x40, 0x01, 'b', 0x01, '2' }, &fields));
+        try testing.expectEqual(@as(usize, 0), d.dyn.entries.items.len);
+        d.deinit();
+        try testing.expectEqual(fail.allocated_bytes, fail.freed_bytes);
+    }
+}

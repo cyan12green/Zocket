@@ -393,3 +393,47 @@ test "frame: writeHeaders without END_STREAM omits the flag" {
     try writeHeaders(&buf, testing.allocator, 5, &.{0x82}, true, 16384);
     try testing.expectEqual(@as(usize, 10), buf.items.len);
 }
+
+test "frame: max length and stream id round-trip" {
+    const h = FrameHeader{ .length = 0xffffff, .type = .goaway, .flag_bits = 0xff, .stream_id = 0x7fffffff };
+    var buf: [9]u8 = undefined;
+    h.encode(&buf);
+    const back = parseHeader(&buf).?;
+    try testing.expectEqual(@as(u24, 0xffffff), back.length);
+    try testing.expectEqual(@as(u31, 0x7fffffff), back.stream_id);
+    try testing.expectEqual(@as(u8, 0xff), back.flag_bits);
+}
+
+test "frame: exact chunk boundaries and high-bit payload values" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    // A block exactly max_frame wide is one HEADERS frame, no CONTINUATION.
+    const exact = @as([16]u8, @splat(@as(u8, 0x82)));
+    try writeHeaders(&buf, testing.allocator, 7, &exact, false, 16);
+    try testing.expectEqual(@as(usize, 9 + 16), buf.items.len);
+    // One byte more spills a 1-byte CONTINUATION with END_HEADERS.
+    buf.clearRetainingCapacity();
+    const over = @as([17]u8, @splat(@as(u8, 0x82)));
+    try writeHeaders(&buf, testing.allocator, 7, &over, true, 16);
+    try testing.expectEqual(@as(usize, 2 * 9 + 17), buf.items.len);
+    const c = parseHeader(buf.items[9 + 16 ..][0..9]).?;
+    try testing.expectEqual(FrameType.continuation, c.type);
+    try testing.expectEqual(@as(u24, 1), c.length);
+    try testing.expectEqual(flags.end_headers, c.flag_bits);
+
+    // Encoders carry all-ones payload fields byte-exactly.
+    buf.clearRetainingCapacity();
+    try writeSettings(&buf, testing.allocator, &.{.{ .id = 0xffff, .value = 0xffffffff }});
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, buf.items[9..]);
+    buf.clearRetainingCapacity();
+    try writeRstStream(&buf, testing.allocator, 0x7fffffff, 0xffffffff);
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, buf.items[9..]);
+    buf.clearRetainingCapacity();
+    try writeWindowUpdate(&buf, testing.allocator, 0x7fffffff, 0);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, buf.items[9..]);
+
+    // GOAWAY without debug data still carries the 8-byte body.
+    buf.clearRetainingCapacity();
+    try writeGoaway(&buf, testing.allocator, 0, 0, "");
+    try testing.expectEqual(@as(usize, 9 + 8), buf.items.len);
+}

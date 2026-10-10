@@ -2165,3 +2165,347 @@ test "session: return 444 resets the stream instead of answering" {
     try testing.expect(saw_rst);
     try testing.expect(!saw_headers);
 }
+
+test "session: SETTINGS window delta adjusts open streams and clamps" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+
+    // Open stream 1 without END_STREAM: its send window tracks the peer's
+    // INITIAL_WINDOW_SIZE.
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(u32, 65535), s.streams.getPtr(1).?.send_window);
+
+    // Shrink to zero: the negative delta clamps at 0.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 6, .settings, 0, 0, &.{ 0x00, 0x04, 0, 0, 0, 0 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(u32, 0), s.streams.getPtr(1).?.send_window);
+    try testing.expectEqual(@as(u32, 0), s.peer_initial_window);
+
+    // Grow again: the positive delta applies verbatim.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 6, .settings, 0, 0, &.{ 0x00, 0x04, 0, 0, 0, 100 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(u32, 100), s.streams.getPtr(1).?.send_window);
+
+    // A delta past 2^31-1 clamps at the ceiling.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 6, .settings, 0, 0, &.{ 0x00, 0x04, 0x7f, 0xff, 0xff, 0xff });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(u32, 0x7fffffff), s.streams.getPtr(1).?.send_window);
+    try testing.expectEqual(@as(u32, 0x7fffffff), s.peer_initial_window);
+
+    // HEADER_TABLE_SIZE resizes the decoder table; MAX_CONCURRENT_STREAMS
+    // (id 3) is accepted and ignored.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 12, .settings, 0, 0, &.{ 0x00, 0x01, 0, 0, 0, 0, 0x00, 0x03, 0, 0, 0, 7 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(usize, 0), s.hpack_dec.dyn.max_size);
+}
+
+test "session: connection WINDOW_UPDATE drains buffered response bodies" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+
+    // Shut the connection window and stage a pending body, then open it with
+    // a connection-level WINDOW_UPDATE: the per-stream loop flushes it.
+    s.conn_send_window = 0;
+    try s.streams.getPtr(1).?.pending_response.appendSlice(testing.allocator, "hello");
+    fr.clearRetainingCapacity();
+    send.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .window_update, 0, 0, &.{ 0, 0, 0, 5 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(usize, 0), s.streams.getPtr(1).?.pending_response.items.len);
+    try testing.expectEqual(@as(u32, 0), s.conn_send_window);
+
+    // The DATA frame carries the whole body with END_STREAM.
+    var off: usize = 0;
+    var found = false;
+    while (off + 9 <= send.items.len) {
+        const fh = frames.parseHeader(send.items[off..]).?;
+        if (fh.type == .data and fh.stream_id == 1) {
+            found = true;
+            try testing.expect(fh.flag_bits & frames.flags.end_stream != 0);
+            try testing.expectEqualSlices(u8, "hello", send.items[off + 9 .. off + 9 + fh.length]);
+        }
+        off += 9 + fh.length;
+    }
+    try testing.expect(found);
+}
+
+test "session: DATA on a reset stream answers STREAM_CLOSED" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+
+    // The client resets the open stream: it stays in the table, closed.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 4, .rst_stream, 0, 1, &.{ 0, 0, 0, 8 });
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expect(s.streams.getPtr(1).?.reset);
+
+    fr.clearRetainingCapacity();
+    send.clearRetainingCapacity();
+    try h2tFrame(&fr, 2, .data, 0, 1, "hi");
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(?u32, 0x5), h2tRstCode(send.items, 1));
+}
+
+test "session: query strings split target and decoded target" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try hpack.encodeField(&hb, testing.allocator, ":method", "POST");
+    try hpack.encodeField(&hb, testing.allocator, ":scheme", "http");
+    try hpack.encodeField(&hb, testing.allocator, ":path", "/a?b=c");
+    try hpack.encodeField(&hb, testing.allocator, "content-length", "5");
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+    // A short body against content-length 5 is a stream error; the stream
+    // (and its parsed request) survives for inspection.
+    fr.clearRetainingCapacity();
+    try h2tFrame(&fr, 2, .data, frames.flags.end_stream, 1, "hi");
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(?u32, 0x1), h2tRstCode(send.items, 1));
+    const req = s.streams.getPtr(1).?.request.?;
+    try testing.expectEqualStrings("/a?b=c", req.target);
+    try testing.expectEqualStrings("/a", req.decoded_target);
+    try testing.expectEqualStrings("?b=c", req.query_string);
+}
+
+test "session: malformed HPACK blocks reset the stream" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    // Index 0 is never valid, a truncated integer runs out of bytes, and an
+    // all-ones Huffman string exceeds the padding allowance. All three are
+    // stream errors (RST_STREAM), not connection errors.
+    const bad_blocks = [_][]const u8{
+        &.{0x80},
+        &.{0xff},
+        &.{ 0x00, 0x81, 0xff, 0x81, 0xff },
+    };
+    for (bad_blocks) |blk| {
+        var s = h2tSession();
+        defer s.deinit();
+        var send = std.ArrayList(u8).empty;
+        defer send.deinit(testing.allocator);
+        var fr = std.ArrayList(u8).empty;
+        defer fr.deinit(testing.allocator);
+        try h2tFrame(&fr, blk.len, .headers, frames.flags.end_headers, 1, blk);
+        try testing.expectError(error.StreamError, s.process(fr.items, &send, &handler));
+    }
+}
+
+test "session: header-count limit resets the stream" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try hpack.encodeField(&hb, testing.allocator, ":method", "GET");
+    try hpack.encodeField(&hb, testing.allocator, ":scheme", "http");
+    try hpack.encodeField(&hb, testing.allocator, ":path", "/");
+    var name_buf: [16]u8 = undefined;
+    for (0..33) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "x-{d}", .{i});
+        try hpack.encodeField(&hb, testing.allocator, name, "v");
+    }
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(?u32, 0x1), h2tRstCode(send.items, 1));
+}
+
+test "session: concurrent-stream cap refuses new streams" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    s.max_streams = 1;
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(usize, 1), s.streams.count());
+
+    // The second stream is over the cap: streamError sends PROTOCOL_ERROR
+    // (the handler's comment says REFUSED_STREAM; both are RFC-legal), and
+    // the highest opened stream id is unchanged.
+    fr.clearRetainingCapacity();
+    send.clearRetainingCapacity();
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers, 3, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+    try testing.expectEqual(@as(?u32, 0x1), h2tRstCode(send.items, 3));
+    try testing.expectEqual(@as(u31, 1), s.max_stream_id);
+}
+
+test "session: allocator-owned bodies are freed and the meta block rebuilds" {
+    const srv = server_mod.Server.default();
+    var handler = h2tHandler(&srv);
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    try s.streams.put(1, .{});
+
+    var resp = response_mod.Response.init(.ok);
+    const owned = try testing.allocator.dupe(u8, "owned-body");
+    resp.body = owned;
+    resp.body_owned = true;
+    try s.frameResponse(1, &resp, false, &send, &handler);
+    try testing.expect(!resp.body_owned);
+    try testing.expect(h2tHasFrame(send.items, .data, 1));
+
+    // A different date forces the cached (date, server) block to rebuild.
+    send.clearRetainingCapacity();
+    handler.date_header = "Sun, 16 Aug 2026 00:00:00 GMT";
+    var resp2 = response_mod.Response.init(.ok);
+    try s.frameResponse(1, &resp2, true, &send, &handler);
+    try testing.expect(h2tHasFrame(send.items, .headers, 1));
+}
+
+test "session: unmatched routes answer 404" {
+    const cfg = @import("../runtime/config.zig").Config.fromConfComptime(
+        \\server {
+        \\    location /only { content echo; }
+        \\}
+    );
+    var srv = server_mod.Server.init(cfg);
+    var handler = Session.Handler{
+        .server = &srv,
+        .allocator = testing.allocator,
+        .limits = &h2t_limits,
+        .date_header = "Sat, 15 Aug 2026 00:00:00 GMT",
+        .version_string = "Zocket/1.0.0",
+    };
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+    const status = try h2tStatus(send.items, 1);
+    defer if (status) |st| testing.allocator.free(st);
+    try testing.expect(status != null);
+    try testing.expectEqualStrings("404", status.?);
+}
+
+test "session: a module error becomes a 500" {
+    const cfg = @import("../runtime/config.zig").Config.fromConfComptime(
+        \\server {
+        \\    location / { content echo; log access_log; }
+        \\}
+    );
+    var srv = server_mod.Server.init(cfg);
+    // The echo response allocates nothing; the first allocation through the
+    // handler allocator is the access log line buffer. Force it to fail.
+    var fail = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var handler = Session.Handler{
+        .server = &srv,
+        .allocator = fail.allocator(),
+        .limits = &h2t_limits,
+        .date_header = "Sat, 15 Aug 2026 00:00:00 GMT",
+        .version_string = "Zocket/1.0.0",
+    };
+    var s = h2tSession();
+    defer s.deinit();
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    var fr = std.ArrayList(u8).empty;
+    defer fr.deinit(testing.allocator);
+    var hb = std.ArrayList(u8).empty;
+    defer hb.deinit(testing.allocator);
+    try h2tGetBlock(&hb, "GET", &.{});
+    // A >1 KiB User-Agent forces the log line past the stack-buffer fast
+    // path into the allocating sink, where the failure lands.
+    const ua = @as([1500]u8, @splat(@as(u8, 'a')));
+    try hpack.encodeField(&hb, testing.allocator, "user-agent", &ua);
+    try h2tFrame(&fr, hb.items.len, .headers, frames.flags.end_headers | frames.flags.end_stream, 1, hb.items);
+    _ = try s.process(fr.items, &send, &handler);
+    const status = try h2tStatus(send.items, 1);
+    defer if (status) |st| testing.allocator.free(st);
+    try testing.expect(status != null);
+    try testing.expectEqualStrings("500", status.?);
+}
+
+test "session: pooled-request append failure frees the request" {
+    var fail = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var s = Session.init(fail.allocator());
+    defer s.deinit();
+    var st = Session.Stream{};
+    st.request = parser.Request.initWithLimits(testing.allocator, 4, (limits_mod.Limits{}).max_body_spool);
+    fail.fail_index = fail.alloc_index; // the request-pool append is next
+    s.destroyStream(&st);
+    try testing.expect(st.request == null);
+    try testing.expectEqual(@as(usize, 0), s.request_pool.items.len);
+    try testing.expect(fail.has_induced_failure);
+}
+
+test "session: a failed flush restores the pending backlog" {
+    var fail = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var s = Session.init(fail.allocator());
+    var send = std.ArrayList(u8).empty;
+    defer send.deinit(testing.allocator);
+    try s.streams.put(1, .{});
+    s.streams.getPtr(1).?.send_window = 65535;
+    s.conn_send_window = 65535;
+    try s.streams.getPtr(1).?.pending_response.appendSlice(fail.allocator(), "hello");
+    fail.fail_index = fail.alloc_index; // the DATA frame header append fails
+    try testing.expectError(error.OutOfMemory, s.flushPendingResponse(1, &send));
+    try testing.expectEqualSlices(u8, "hello", s.streams.getPtr(1).?.pending_response.items);
+    try testing.expectEqual(@as(usize, 0), send.items.len);
+    s.deinit();
+    try testing.expectEqual(fail.allocated_bytes, fail.freed_bytes);
+}
