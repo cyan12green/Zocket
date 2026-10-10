@@ -812,6 +812,39 @@ test "matchFast returns pre-serialised bytes only for module-less template route
     try testing.expectEqual(@as(?router_mod.FastResponse, null), srv.matchFast(&ctx3));
 }
 
+test "matchFast records regex captures for a template route" {
+    const regex_mod = @import("../dsl/regex.zig");
+    const cfg = comptime Config{
+        .routes = &.{
+            .{
+                .path = "^/item/([0-9]+)$",
+                .match = .regex,
+                .pattern_regex = regex_mod.compileRegex("^/item/([0-9]+)$"),
+                .response = .{ .status = 200, .body = "found" },
+            },
+            // A prefix route gives the trie a node; the regex walk only
+            // runs when a trie match succeeded.
+            .{ .path = "/", .match = .prefix },
+        },
+    };
+    const srv = Server.comptimeInit(cfg);
+
+    var req = registry.Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/item/42";
+    req.decoded_target = "/item/42";
+    var resp = registry.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &req, .resp = &resp };
+    const fb = srv.matchFast(&ctx).?;
+    try testing.expectEqualStrings("found", fb.body);
+    // The match caps were copied onto the context: group 0 is the whole
+    // match, group 1 the digits.
+    try testing.expectEqual(@as(u8, 2), ctx.capture_count);
+    try testing.expectEqualStrings("/item/42", ctx.capture_subject);
+    try testing.expectEqualStrings("/item/42", ctx.capture_subject[ctx.captures[0].start..ctx.captures[0].end]);
+    try testing.expectEqualStrings("42", ctx.capture_subject[ctx.captures[1].start..ctx.captures[1].end]);
+}
+
 // ---- Comptime-embedded config as the primary path ----
 
 test "embedded comptime config parses via fromConfEmbedded (root-relative path)" {
@@ -924,6 +957,58 @@ test "embeddedInit resolves static roots at startup (root_real + root_fd)" {
 
     // The copy carries the comptime dispatch fn.
     try testing.expect(srv.cfg.routes[0].dispatch != null);
+}
+
+test "embeddedInit prepares hostname upstreams and frees a partial copy on OOM" {
+    // Success path: the hostname upstream is duped onto the heap (the
+    // resolver rewrites its sockaddr in place) and the root is resolved.
+    const ok_cfg = comptime Config{
+        .routes = &.{
+            .{
+                .path = "/host",
+                .root = "testdata",
+                .upstreams = &.{.{ .host = "backend.internal", .port = 8001, .hostname = "backend.internal" }},
+            },
+        },
+    };
+    var srv = try Server.embeddedInit(testing.allocator, ok_cfg);
+    defer srv.deinitPrepared(testing.allocator);
+    try testing.expect(srv.cfg.routes[0].root_real != null);
+    try testing.expect(srv.cfg.routes[0].root_fd >= 0);
+    try testing.expect(srv.cfg.routes[0].upstreams[0].hostname != null);
+
+    // OOM while preparing the second route: the errdefer must free the
+    // first route's resolved root and duped upstream array (the testing
+    // allocator fails the test on any leak).
+    const fail_cfg = comptime Config{
+        .routes = &.{
+            .{
+                .path = "/host",
+                .root = "testdata",
+                .upstreams = &.{.{ .host = "backend.internal", .port = 8001, .hostname = "backend.internal" }},
+            },
+            .{ .path = "/b", .root = "testdata" },
+        },
+    };
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 3 });
+    try testing.expectError(error.OutOfMemory, Server.embeddedInit(failing.allocator(), fail_cfg));
+    try testing.expect(failing.has_induced_failure);
+}
+
+test "embeddedInitWithTls frees prepared routes when TLS loading fails" {
+    const cfg = comptime Config.fromConfComptime(
+        \\tls {
+        \\    cert "/nonexistent-zocket/cert.pem";
+        \\    key "/nonexistent-zocket/key.pem";
+        \\}
+        \\server {
+        \\    location / { content echo; }
+        \\}
+    );
+    // embeddedInit succeeds first; loadTls fails, so the error path must
+    // release the prepared route copy and the per-server stats (the testing
+    // allocator fails the test on any leak).
+    try testing.expectError(error.FileNotFound, Server.embeddedInitWithTls(testing.allocator, cfg));
 }
 
 test "conf template route applies through the pipeline" {
@@ -1152,6 +1237,30 @@ test "embeddedInitGroupWithTls builds a single-server group without servers" {
     const group = try ServerGroup.embeddedInitGroupWithTls(arena_state.allocator(), cfg);
     try testing.expectEqual(@as(usize, 1), group.servers.len);
     try testing.expect(group.servers_owned);
+}
+
+test "embeddedInitGroupWithTls builds one server per block" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    listen 8080;
+        \\    server_name a.test;
+        \\    location / { content echo; }
+        \\}
+        \\server {
+        \\    listen 8081;
+        \\    server_name b.test;
+        \\    location / { content echo; }
+        \\}
+    );
+    const group = try ServerGroup.embeddedInitGroupWithTls(arena_state.allocator(), cfg);
+    try testing.expect(group.servers_owned);
+    try testing.expectEqual(@as(usize, 2), group.servers.len);
+    try testing.expectEqual(@as(?u16, 8080), group.servers[0].cfg.listen_port);
+    try testing.expectEqual(@as(?u16, 8081), group.servers[1].cfg.listen_port);
+    // Runtime fallback selection honors the per-server names.
+    try testing.expectEqual(&group.servers[1], group.selectServer("b.test", null));
 }
 
 /// A group of virtual-host servers: holds one `Server` per `server {}`
@@ -1561,6 +1670,42 @@ test "loadTls refuses verify_client without a bundle, loads a good one" {
     if (srv.client_ca_bundle) |*b| b.deinit(std.heap.page_allocator);
     srv.tls_creds = null;
     srv.client_ca_bundle = null;
+}
+
+test "loadTls rejects malformed OCSP and client-CA files without leaking" {
+    const testdata = @import("../tls/testdata.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cert_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ocsp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var ca_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cert_path = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
+    const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
+    const ocsp_path = try std.fmt.bufPrint(&ocsp_buf, ".zig-cache/tmp/{s}/ocsp.der", .{tmp.sub_path});
+    const ca_path = try std.fmt.bufPrint(&ca_buf, ".zig-cache/tmp/{s}/ca.pem", .{tmp.sub_path});
+    try compat.writeFile(cert_path, testdata.cert_pem);
+    try compat.writeFile(key_path, testdata.key_pem);
+    try compat.writeFile(ocsp_path, "not a DER OCSP response");
+    // An unterminated PEM block: the bundle loader must reject it.
+    try compat.writeFile(ca_path, "-----BEGIN CERTIFICATE-----\nZm9v\n");
+
+    // Malformed OCSP DER: fail closed, credentials cleared.
+    var bad_ocsp = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .ocsp_file = ocsp_path } });
+    try testing.expectError(error.OcspInvalid, bad_ocsp.loadTls(testing.allocator));
+    try testing.expect(bad_ocsp.tls_creds == null);
+
+    // Bad client CA (relative path branch): MtlsBadBundle, creds cleared.
+    var bad_ca = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .client_ca = ca_path } });
+    try testing.expectError(error.MtlsBadBundle, bad_ca.loadTls(testing.allocator));
+    try testing.expect(bad_ca.tls_creds == null);
+
+    // Absolute path variant takes the addCertsFromFilePathAbsolute branch.
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ca_abs = compat.realpath(ca_path, &abs_buf) catch return error.SkipZigTest;
+    var bad_ca_abs = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .client_ca = ca_abs } });
+    try testing.expectError(error.MtlsBadBundle, bad_ca_abs.loadTls(testing.allocator));
+    try testing.expect(bad_ca_abs.tls_creds == null);
 }
 
 test "selectServerTls picks the SNI vhost, falls back to a server with creds" {

@@ -781,6 +781,35 @@ test "dispatched routes route identically through a trie-backed router" {
     try testing.expectEqual(Outcome.not_handled, res2);
 }
 
+test "runWithRouter copies regex captures into the context" {
+    const regex_mod = @import("regex.zig");
+    const routes = comptime &[_]router.Route{
+        .{
+            .path = "^/api/([0-9]+)$",
+            .match = .regex,
+            .pattern_regex = regex_mod.compileRegex("^/api/([0-9]+)$"),
+            .modules = &.{.{ .phase = .content, .module = "content_claim" }},
+        },
+        .{ .path = "/", .match = .prefix },
+    };
+    const trie = router.buildTrie(routes);
+    const regex_tbl = router.buildRegexTable(routes);
+    var rtr = router.Router{ .routes = routes, .trie = trie, .regex_routes = regex_tbl };
+
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/api/42";
+    req.decoded_target = "/api/42";
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(Outcome.handled, try runWithRouter(PassThroughRegistry, routes, &rtr, &ctx));
+    // The router recorded the regex groups; runWithRouter copied them.
+    try testing.expectEqual(@as(u8, 2), ctx.capture_count);
+    try testing.expectEqualStrings("/api/42", ctx.capture_subject);
+    try testing.expectEqualStrings("/api/42", ctx.capture_subject[ctx.captures[0].start..ctx.captures[0].end]);
+    try testing.expectEqualStrings("42", ctx.capture_subject[ctx.captures[1].start..ctx.captures[1].end]);
+}
+
 test "response_cv renders set user variables lazily with caching" {
     var req = Request.init(testing.allocator);
     defer req.deinit();
@@ -907,6 +936,22 @@ test "module failure maps through central taxonomy" {
     try testing.expectEqual(registry.Status.bad_gateway, ctx.resp.status);
 }
 
+test "loop walk maps a module failure through the error taxonomy" {
+    // The loop-walk path (no dispatch fn) takes the same central mapping:
+    // the failure is not propagated, the response becomes a 502.
+    const routes = comptime &[_]router.Route{.{ .path = "/", .modules = &.{
+        .{ .phase = .content, .module = "fail_mod" },
+    } }};
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/";
+    req.decoded_target = "/";
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(Outcome.handled, try run(FailedRegistry, routes, &ctx));
+    try testing.expectEqual(Status.bad_gateway, ctx.resp.status);
+}
+
 test "route chunked and tcp_nopush flags travel on the response" {
     const routes = comptime &[_]router.Route{.{
         .path = "/",
@@ -940,6 +985,117 @@ test "loop walk falls back to the literal response template" {
     try testing.expectEqual(Outcome.handled, res.outcome);
     try testing.expectEqual(Status.not_found, res.resp.status);
     try testing.expectEqualStrings("template-fallback", res.resp.body);
+}
+
+test "loop walk applies literal template headers and dynamic templates" {
+    // Literal template WITH headers: the header loop of applyTemplate runs.
+    const lit_routes = comptime &[_]router.Route{.{
+        .path = "/lit",
+        .modules = &.{.{ .phase = .content, .module = "content_mod" }},
+        .response = .{
+            .status = 200,
+            .headers = &.{.{ .name = "X-Tpl", .value = "yes" }},
+            .body = "lit",
+        },
+    }};
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/lit";
+    req.decoded_target = "/lit";
+    const res = try runWith(OrderRegistry, lit_routes, &req);
+    try testing.expectEqual(Outcome.handled, res.outcome);
+    // X-Order (the passing content module) plus the template header.
+    try testing.expectEqual(@as(usize, 2), res.resp.header_count);
+    try testing.expectEqualStrings("X-Tpl", res.resp.headers[1].name);
+    try testing.expectEqualStrings("yes", res.resp.headers[1].value);
+    try testing.expectEqualStrings("lit", res.resp.body);
+
+    // Dynamic template: rendered per request through the loop walk.
+    const dyn_routes = comptime &[_]router.Route{.{
+        .path = "/dyn",
+        .modules = &.{.{ .phase = .content, .module = "content_mod" }},
+        .response_cv = .{ .status = 200, .body = vars.parseComplexValue("b=$host", &.{}) },
+    }};
+    var req2 = Request.init(testing.allocator);
+    defer req2.deinit();
+    req2.target = "/dyn";
+    req2.decoded_target = "/dyn";
+    req2.addHeaderParsed("host", "example.com") catch unreachable;
+    const res2 = try runWith(OrderRegistry, dyn_routes, &req2);
+    try testing.expectEqual(Outcome.handled, res2.outcome);
+    try testing.expectEqualStrings("b=example.com", res2.resp.body);
+}
+
+test "runWithRouter applies templates when a dispatch fn returns not_handled" {
+    // A custom dispatch fn (not dispatchForRoute) can decline to claim a
+    // template route; runWithRouter then applies the template fallback.
+    const routes = [_]router.Route{
+        .{
+            .path = "/lit",
+            .dispatch = struct {
+                fn run(ctx: *Context) anyerror!Outcome {
+                    _ = ctx;
+                    return .not_handled;
+                }
+            }.run,
+            .response = .{
+                .status = 200,
+                .headers = &.{.{ .name = "X-L", .value = "1" }},
+                .body = "lit",
+            },
+        },
+        .{
+            .path = "/dyn",
+            .dispatch = struct {
+                fn run(ctx: *Context) anyerror!Outcome {
+                    _ = ctx;
+                    return .not_handled;
+                }
+            }.run,
+            .response_cv = .{ .status = 200, .body = vars.parseComplexValue("b=$host", &.{}) },
+        },
+    };
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    req.target = "/lit";
+    req.decoded_target = "/lit";
+    var resp = Response.init(.ok);
+    var ctx = Context{ .req = &req, .resp = &resp };
+    try testing.expectEqual(Outcome.handled, try runWithRouter(OrderRegistry, &routes, null, &ctx));
+    try testing.expectEqualStrings("lit", resp.body);
+    try testing.expectEqual(@as(usize, 1), resp.header_count);
+    try testing.expectEqualStrings("1", resp.headers[0].value);
+
+    var req2 = Request.init(testing.allocator);
+    defer req2.deinit();
+    req2.target = "/dyn";
+    req2.decoded_target = "/dyn";
+    req2.addHeaderParsed("host", "example.com") catch unreachable;
+    var resp2 = Response.init(.ok);
+    var ctx2 = Context{ .req = &req2, .resp = &resp2 };
+    try testing.expectEqual(Outcome.handled, try runWithRouter(OrderRegistry, &routes, null, &ctx2));
+    try testing.expectEqualStrings("b=example.com", resp2.body);
+}
+
+test "runLogHandlers runs only log-phase handlers on parked responses" {
+    const pages = [_]router.ErrorPage{.{ .status = 502, .target = "=200" }};
+    const route = router.Route{
+        .path = "/",
+        .modules = &.{
+            .{ .phase = .content, .module = "content_mod" }, // skipped
+            .{ .phase = .log, .module = "missing_log_mod" }, // resolve miss -> skip
+            .{ .phase = .log, .module = "error_page" },
+        },
+        .error_pages = &pages,
+    };
+    var req = Request.init(testing.allocator);
+    defer req.deinit();
+    var resp = Response.init(.bad_gateway);
+    var ctx = Context{ .req = &req, .resp = &resp, .route = &route };
+    try runLogHandlers(&route, &ctx);
+    // effective_status seeded from the parked 502; the `=200` form rewrote it.
+    try testing.expectEqual(Status.ok, resp.status);
+    try testing.expectEqual(@as(u16, 200), ctx.effective_status);
 }
 
 test "dispatch walk falls back to literal and dynamic templates" {

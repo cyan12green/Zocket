@@ -1149,3 +1149,47 @@ test "setHeaderFmt fills the scratch exactly then drops further headers" {
     try testing.expectEqual(@as(usize, 1), resp.header_count);
     try testing.expectEqual(@as(usize, 96), resp.scratch_used);
 }
+
+test "header-bearing response serializes identically across every writer" {
+    const allocator = testing.allocator;
+    var resp = Response.init(.not_found);
+    resp.setHeader("X-A", "1");
+    resp.setHeader("Content-Type", "text/plain");
+    resp.setBody("gone");
+
+    const want = try serialize(allocator, &resp);
+    defer allocator.free(want);
+
+    // writeToBuffer: one contiguous pass.
+    const buf = try buffer_mod.Buffer.init(allocator);
+    defer buf.deinit(allocator);
+    try resp.writeToBuffer(buf);
+    try testing.expectEqualStrings(want, buf.peek());
+
+    // Head with an explicit Content-Length (sendfile bodies).
+    const head = try buffer_mod.Buffer.init(allocator);
+    defer head.deinit(allocator);
+    try resp.writeHeadToBufferWithLength(head, resp.body.len);
+    try testing.expectEqualStrings(want[0 .. want.len - resp.body.len], head.peek());
+
+    // writevParts: scattered pieces join to the same bytes.
+    var parts: [max_writev_parts]posix.iovec_const = undefined;
+    var resp2 = resp;
+    const n = resp2.writevParts(&parts);
+    var joined: [256]u8 = undefined;
+    try testing.expectEqualStrings(want, copyParts(parts[0..n], &joined));
+
+    // Chunked head carries the same headers and frames the body as one chunk.
+    const chunk_buf = try buffer_mod.Buffer.init(allocator);
+    defer chunk_buf.deinit(allocator);
+    var tail: [8]u8 = undefined;
+    const framing = try resp.writeChunkedHeadToBuffer(chunk_buf, resp.body.len, &tail);
+    const chunk_head = chunk_buf.peek()[0..framing.head_len];
+    try testing.expect(std.mem.indexOf(u8, chunk_head, "X-A: 1\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, chunk_head, "Content-Type: text/plain\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, chunk_head, "Content-Length") == null);
+    try testing.expectEqualStrings("4\r\n", chunk_head[chunk_head.len - 3 ..]);
+    try testing.expectEqualStrings("\r\n0\r\n\r\n", framing.tail);
+    // Head size accounting matches the bytes written (size line included).
+    try testing.expectEqual(chunk_head.len, resp.chunkedHeadWireSize() + hexDigitCount(resp.body.len) + 2);
+}
