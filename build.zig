@@ -197,6 +197,12 @@ pub fn build(b: *std.Build) void {
     // `zig build cov` once `zig-cov` + `zig-cov-rt.o` are on PATH
     // (see bench/coverage.sh). Without -Dcoverage this is a no-op.
     const coverage = b.option(bool, "coverage", "Enable zig-cov SanitizerCoverage instrumentation") orelse false;
+    // The fuzz/IPC test runner dies mid-suite under instrumentation (tests
+    // after the crash never run, so coverage is truncated to ~37% of the
+    // test corpus). The SanitizerCoverage runtime flushes via atexit and
+    // does not need the runner mode, so the default is the plain runner;
+    // pass -Dcoverage-fuzz=true to restore the IPC runner.
+    const coverage_fuzz = b.option(bool, "coverage-fuzz", "Use the fuzz IPC test runner under -Dcoverage (default false)") orelse false;
     const coverage_rt = b.option([]const u8, "coverage-rt", "Path to zig-cov-rt.o (required with -Dcoverage)") orelse null;
     if (coverage) {
         // NOTE: rt.o goes on the library module ONLY. exe_tests shares
@@ -205,10 +211,10 @@ pub fn build(b: *std.Build) void {
         // symbol). Via the zocket import, exe_tests still gets exactly
         // one copy.
         mod_tests.use_llvm = true;
-        mod_tests.root_module.fuzz = true;
+        if (coverage_fuzz) mod_tests.root_module.fuzz = true;
         mod_tests.root_module.link_libc = true;
         exe_tests.use_llvm = true;
-        exe_tests.root_module.fuzz = true;
+        if (coverage_fuzz) exe_tests.root_module.fuzz = true;
         exe_tests.root_module.link_libc = true;
         if (coverage_rt) |p| {
             // zig-cov passes an absolute rt path; b.path() only
