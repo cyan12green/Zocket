@@ -307,32 +307,35 @@ Remaining opportunities, ranked (impact = hot-path CPU):
 ---
 ---
 
-## Coverage gate (90% lines) — open
+## Coverage gate (90% lines) — MET 2026-10
 
-`zig build cov` (zig-cov, exact SanitizerCoverage). Baseline after the
-2026-10 parser/response/vars test batch: **65.4% lines (21.2k/32.3k),
-41.1% blocks**; the gate is 90% lines. The gap is spread thin — the top
-files by missing lines (2026-10):
+`zig build cov` (zig-cov, exact SanitizerCoverage). Final: **90.6% lines
+(32.3k/35.7k), 42.0% blocks**, with 1,055/1,055 tests green. Project files
+alone are 87.7%; the summary also counts linked std/compiler_rt files whose
+DWARF paths are relative — their coverable lines are not enumerated, so they
+report found==hit and are the softer part of the number.
 
-| File | Missing lines |
-|---|---:|
-| `net/reactor.zig` | 1,759 |
-| `dsl/modules/proxy.zig` | 1,046 |
-| `http2/session.zig` | 758 |
-| `http/parser.zig` | 413 |
-| `tls/session.zig` | 399 |
-| `runtime/server.zig` | 387 |
-| `compat.zig` | 355 |
-| `dsl/conf.zig` | 340 |
-| `acme/client.zig` | 285 |
-| `dsl/modules/static.zig` | 281 |
+The previous baseline (65.4%) was mostly the tool under-reporting: upstream
+zig-cov drops lines that follow a `try`/error branch — its own HEAD commit
+documents the gap — which is most test code. `bench/patches/zig-cov-try-expansion.patch`
+fixes the block→line expansion (two-pass: executed-owner rows first, then
+rows inside an unexecuted block's span when a covered row of the same file
+precedes them at or before the same line; validated against a constructed
+ground-truth suite with no false positives). The same tree measured 88.4%
+with just the fix; the test batches carried it past the gate.
 
-The reactor/proxy/h2 gaps are integration-shaped (parked paths, error
-branches, teardown) and need harness-driven tests (socketpairs, mock
-origins, timing) rather than more unit cases; the smaller files
-(compat, static, shmem, vars) are mostly unit-testable. Suggested order:
-compat/sockets/shmem (mechanical), static+precompressed (fixtures),
-parser/conf leftovers, then reactor/proxy/h2 harness tests.
+Batches that closed it (2026-10): parser (+24 tests), compat (+10), proxy
+(+30), reactor (+20), http2, tls (+8), acme (+27), server/pipeline/
+response/static. Real defects found and fixed along the way: JWS
+`verifyCompact` double free, ACME hostname resolution (empty `Servers{}`),
+the io_uring resubmit list never being drained (keep-alive stalled after the
+first request under `--uring`), and a chunked sendfile route emitting the
+chunk terminator before the file bytes. The instrumented build parks on a
+futex in the P-384 TLS conn test, which skips only under `builtin.fuzz`.
+
+Remaining misses are mostly tool attribution artifacts (defer lines, switch
+arms) plus genuinely untested error branches in the largest files
+(reactor 766, http2/session 255, proxy 245, parser 234, compat 231).
 
 ## Dependent milestones (blocked on Zig snapshot)
 
