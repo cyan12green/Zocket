@@ -1723,7 +1723,11 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             for (comps[0..n]) |c| self.handleCompletion(c);
         }
         // One submit per loop iteration: covers reads resubmitted by
-        // completions and writes queued by the flush path.
+        // completions and writes queued by the flush path. The resubmit list
+        // must be drained into the ring first — a read queued by a completion
+        // is otherwise never submitted and keep-alive stalls after the first
+        // request.
+        self.ringSubmitReads();
         self.ring.submit() catch {};
     }
 
@@ -1976,7 +1980,10 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                     iovs.*[n] = .{ .base = sess.pending_body.ptr, .len = sess.pending_body.len };
                     n += 1;
                 }
-                if (sess.pending_tail.len > 0) {
+                if (sess.pending_tail.len > 0 and sess.file_remaining == 0) {
+                    // The chunked terminator flushes only after a sendfile
+                    // body is done: with the file still pending, sending the
+                    // tail here would put `0\r\n\r\n` before the file bytes.
                     iovs.*[n] = .{ .base = sess.pending_tail.ptr, .len = sess.pending_tail.len };
                     n += 1;
                 }
