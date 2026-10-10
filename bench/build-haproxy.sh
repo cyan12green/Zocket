@@ -11,6 +11,13 @@ cd "$ROOT/bench/.cache"
         tar xzf haproxy.tgz
 }
 cd haproxy-$VER
-make -j"$(nproc)" TARGET=linux-glibc USE_OPENSSL=1 USE_ZLIB=1 USE_PCRE2=1 >/dev/null
+# PCRE2 is optional for the benchmark routes; use it when the dev headers
+# are present and fall back to the built-in matcher otherwise.
+if [ -f /usr/include/pcre2.h ] || pkg-config --exists libpcre2-8 2>/dev/null; then
+    PCRE=USE_PCRE2=1
+else
+    PCRE=USE_PCRE2=
+fi
+make -j"$(nproc)" TARGET=linux-glibc USE_OPENSSL=1 USE_ZLIB=1 "$PCRE" >/dev/null
 cp haproxy "$OUT/sbin/haproxy"
 echo "haproxy built at $OUT/sbin/haproxy"
