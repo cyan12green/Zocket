@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/bench/.cache/haproxy-build"
-VER="3.0.11"
+VER="3.0.9"
 mkdir -p "$ROOT/bench/.cache" "$OUT/sbin"
 cd "$ROOT/bench/.cache"
 [ -d haproxy-$VER ] || {
