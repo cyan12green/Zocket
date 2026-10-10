@@ -1141,3 +1141,277 @@ test "compat: openDir iterates entries" {
     }
     try testing.expect(found_hello);
 }
+
+test "compat: write/writev error mapping and broken pipe" {
+    // Empty slices short-circuit without a syscall.
+    try testing.expectEqual(@as(usize, 0), try write(-1, ""));
+    try testing.expectEqual(@as(usize, 0), try writev(-1, &[_]posix.iovec_const{}));
+
+    // Bad descriptor and read-only files: EBADF -> NotOpenForWriting.
+    const iov = [_]posix.iovec_const{.{ .base = "x".ptr, .len = 1 }};
+    try testing.expectError(error.NotOpenForWriting, write(-1, "x"));
+    try testing.expectError(error.NotOpenForWriting, writev(-1, &iov));
+
+    const path = "/tmp/zocket-compat-write-ro";
+    try writeFile(path, "ro");
+    defer deleteFile(path) catch {};
+    const rfd = try openFile(path);
+    defer close(rfd);
+    try testing.expectError(error.NotOpenForWriting, write(rfd, "x"));
+    try testing.expectError(error.NotOpenForWriting, writev(rfd, &iov));
+
+    // A pipe whose read end is closed reports EPIPE as BrokenPipe. SIGPIPE
+    // would kill the test process, so ignore it for the duration.
+    const fds = try pipe();
+    close(fds[0]);
+    defer close(fds[1]);
+    var ign = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    var old: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.PIPE, &ign, &old);
+    defer posix.sigaction(posix.SIG.PIPE, &old, null);
+    try testing.expectError(error.BrokenPipe, write(fds[1], "x"));
+    try testing.expectError(error.BrokenPipe, writev(fds[1], &iov));
+}
+
+test "compat: socket/bind/listen/connect error mapping" {
+    try testing.expectError(error.AddressFamilyNotSupported, socket(9999, posix.SOCK.STREAM, 0));
+    try testing.expectError(error.ProtocolNotSupported, socket(posix.AF.UNIX, posix.SOCK.STREAM, 6));
+    try testing.expectError(error.SocketTypeNotSupported, socket(posix.AF.INET, 999, 0));
+    try testing.expectError(error.SocketTypeNotSupported, socket(posix.AF.INET, posix.SOCK.STREAM, 999));
+    try testing.expectError(error.Unexpected, socketpair(posix.AF.INET, posix.SOCK.STREAM, 0));
+    if (linux.geteuid() != 0) {
+        // Raw sockets need CAP_NET_RAW; a valid protocol reaches the check.
+        try testing.expectError(error.PermissionDenied, socket(posix.AF.INET, posix.SOCK.RAW, 1));
+    }
+
+    var zero_sa = std.mem.zeroes(posix.sockaddr);
+    try testing.expectError(error.Unexpected, bind(-1, &zero_sa, 0));
+
+    const a = try socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer close(a);
+    var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    addr[0] = 2; // AF_INET
+    addr[4] = 127;
+    addr[7] = 1; // 127.0.0.1, ephemeral port
+    try bind(a, @ptrCast(&addr), 16);
+    var slen: posix.socklen_t = 16;
+    var bound: [16]u8 align(@alignOf(u16)) = undefined;
+    try getsockname(a, @ptrCast(&bound), &slen);
+
+    const b = try socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer close(b);
+    try testing.expectError(error.AddressInUse, bind(b, @ptrCast(&bound), 16));
+
+    var nonlocal: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    nonlocal[0] = 2;
+    nonlocal[4] = 8;
+    nonlocal[5] = 8;
+    nonlocal[6] = 8;
+    nonlocal[7] = 8; // 8.8.8.8 is not a local address
+    try testing.expectError(error.AddressNotAvailable, bind(b, @ptrCast(&nonlocal), 16));
+
+    // listen/connect on non-sockets and bad descriptors.
+    const fds = try pipe();
+    defer close(fds[0]);
+    defer close(fds[1]);
+    try testing.expectError(error.Unexpected, listen(fds[0], 1));
+    try testing.expectError(error.Unexpected, listen(-1, 1));
+    try testing.expectError(error.Unexpected, connect(-1, @ptrCast(&addr), 16));
+}
+
+test "compat: nonblocking connect reports pending" {
+    const fd = try socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    defer close(fd);
+    var blackhole: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
+    blackhole[0] = 2; // AF_INET
+    blackhole[2] = 0;
+    blackhole[3] = 9; // port 9
+    blackhole[4] = 10;
+    blackhole[5] = 255;
+    blackhole[6] = 255;
+    blackhole[7] = 1; // 10.255.255.1:9
+    const first = connect(fd, @ptrCast(&blackhole), 16);
+    if (first) |_| {} else |e| switch (e) {
+        // Still in progress: a second connect reports EALREADY.
+        error.WouldBlock => try testing.expectError(error.ConnectionPending, connect(fd, @ptrCast(&blackhole), 16)),
+        // No route to that address on this host: nothing to assert.
+        error.NetworkUnreachable, error.HostUnreachable, error.ConnectionTimedOut => {},
+        else => return e,
+    }
+}
+
+test "compat: eventfd round-trip and epoll ctl errors" {
+    try testing.expectError(error.Unexpected, eventfd(0, 1 << 20));
+    const efd = try eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+    defer close(efd);
+    var val: u64 = 42;
+    try testing.expectEqual(@as(usize, 8), try write(efd, std.mem.asBytes(&val)));
+    var got: u64 = 0;
+    try testing.expectEqual(@as(usize, 8), try posix.read(efd, std.mem.asBytes(&got)));
+    try testing.expectEqual(@as(u64, 42), got);
+
+    try testing.expectError(error.Unexpected, epoll_create1(0xdead));
+    const ep = try epoll_create1(0);
+    defer close(ep);
+    var ev = linux.epoll_event{ .events = 0x1, .data = .{ .ptr = 0 } };
+    try epoll_ctl(ep, 1, efd, &ev); // ADD
+    try testing.expectError(error.AlreadyPresent, epoll_ctl(ep, 1, efd, &ev)); // ADD again
+    try testing.expectError(error.BadFd, epoll_ctl(ep, 1, -1, &ev));
+    try testing.expectError(error.BadFd, epoll_ctl(-1, 1, efd, &ev));
+    try epoll_ctl(ep, 2, efd, null); // DEL
+}
+
+test "compat: dup2 onto an explicit target and dup errors" {
+    const fds = try pipe();
+    defer close(fds[0]);
+    defer close(fds[1]);
+    const path = "/tmp/zocket-compat-dup2";
+    try writeFile(path, "");
+    defer deleteFile(path) catch {};
+    const target = try openFile(path);
+    try dup2(fds[1], target); // target becomes a copy of the pipe write end
+    try writeAll(target, "via-dup2");
+    close(target);
+    var buf: [8]u8 = undefined;
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = try posix.read(fds[0], buf[got..]);
+        if (n == 0) break;
+        got += n;
+    }
+    try testing.expectEqualStrings("via-dup2", buf[0..got]);
+
+    try testing.expectError(error.Unexpected, dup2(-1, fds[1]));
+    try testing.expectError(error.Unexpected, fcntl(-1, linux.F.GETFD, 0));
+    try testing.expectError(error.Unexpected, dup(-1));
+}
+
+test "compat: pread, ftruncate and lseek edge cases" {
+    var one: [1]u8 = undefined;
+    try testing.expectError(error.NotOpenForReading, pread(-1, &one, 0));
+    try testing.expectError(error.NotOpenForReading, lseek_SET(-1, 0));
+    try testing.expectError(error.Unexpected, ftruncate(-1, 0));
+
+    const fds = try pipe();
+    defer close(fds[0]);
+    defer close(fds[1]);
+    try testing.expectError(error.Unseekable, pread(fds[0], &one, 0));
+    try testing.expectError(error.Unseekable, lseek_SET(fds[0], 0));
+    try testing.expectError(error.Unseekable, ftruncate(fds[0], 0));
+
+    const dir = try openDir("/tmp");
+    defer close(dir.fd);
+    try testing.expectError(error.IsDir, pread(dir.fd, &one, 0));
+
+    const path = "/tmp/zocket-compat-pread";
+    defer deleteFile(path) catch {};
+    const fd = try createFile(path);
+    defer close(fd);
+    try writeAll(fd, "abc");
+    try testing.expectEqual(@as(usize, 0), try pread(fd, &one, 99)); // past EOF
+    try ftruncate(fd, 64);
+    try testing.expectEqual(@as(u64, 64), (try fstat(fd)).size);
+}
+
+test "compat: readlink and symLink error mapping" {
+    var buf: [256]u8 = undefined;
+    try testing.expectError(error.FileNotFound, readlink("/tmp/zocket-compat-rl-missing", &buf));
+
+    const path = "/tmp/zocket-compat-rl";
+    const link = "/tmp/zocket-compat-rl-link";
+    defer deleteFile(path) catch {};
+    defer deleteFile(link) catch {};
+    try writeFile(path, "x");
+    try testing.expectError(error.NotLink, readlink(path, &buf)); // EINVAL
+    try symLink(path, link);
+    try testing.expectEqualStrings(path, try readlink(link, &buf));
+    try testing.expectError(error.Unexpected, symLink(path, link)); // EEXIST
+    try testing.expectError(error.FileNotFound, symLink(path, "/tmp/zocket-compat-rl-missing-dir/x"));
+}
+
+test "compat: file helper error mapping" {
+    const missing = "/tmp/zocket-compat-missing";
+    var buf: [256]u8 = undefined;
+    try testing.expectError(error.FileNotFound, statFile(missing));
+    try testing.expectError(error.FileNotFound, openFile(missing));
+    try testing.expectError(error.FileNotFound, realpath(missing, &buf));
+    try testing.expectError(error.FileNotFound, openDir(missing));
+    try testing.expectError(error.FileNotFound, deleteFile(missing));
+    try testing.expectError(error.FileNotFound, writeFile("/tmp/zocket-compat-missing-dir/x", "x"));
+    try testing.expectError(error.FileNotFound, createFile("/tmp/zocket-compat-missing-dir/x"));
+    try testing.expectError(error.AccessDenied, writeFile("/tmp", "x")); // EISDIR
+    try testing.expectError(error.AccessDenied, createFile("/tmp")); // EISDIR
+
+    // toZ rejects over-long paths before the syscall.
+    var long: [posix.PATH_MAX + 8]u8 = @splat('a');
+    long[0] = '/';
+    try testing.expectError(error.NameTooLong, openFile(&long));
+    try testing.expectError(error.NameTooLong, openDir(&long));
+
+    // A regular file is not a directory.
+    const file = "/tmp/zocket-compat-notdir";
+    defer deleteFile(file) catch {};
+    try writeFile(file, "x");
+    try testing.expectError(error.FileNotFound, openDir(file));
+    try testing.expectError(error.FileNotFound, openFile("/tmp/zocket-compat-notdir/child"));
+
+    // Symlink loop: ELOOP -> FileNotFound.
+    const l1 = "/tmp/zocket-compat-loop1";
+    const l2 = "/tmp/zocket-compat-loop2";
+    defer deleteFile(l1) catch {};
+    defer deleteFile(l2) catch {};
+    try symLink(l2, l1);
+    try symLink(l1, l2);
+    try testing.expectError(error.FileNotFound, statFile(l1));
+    try testing.expectError(error.FileNotFound, openFile(l1));
+
+    // statx on a bad fd is not EBADF-aware here.
+    try testing.expectError(error.Unexpected, fstat(-1));
+
+    // realpath resolves directories too (O_PATH), and a directory fd opens.
+    const rp = try realpath("/tmp", &buf);
+    try testing.expectEqualStrings("/tmp", rp);
+    const dfd = try openFile("/tmp");
+    close(dfd);
+
+    // deleteFile on a directory: EISDIR -> Unexpected.
+    const dpath = "/tmp/zocket-compat-rmdir";
+    deleteFile(dpath) catch {};
+    try testing.expectEqual(@as(usize, 0), linux.mkdir(dpath, 0o755));
+    defer _ = linux.rmdir(dpath);
+    try testing.expectError(error.Unexpected, deleteFile(dpath));
+
+    // readFileAlloc fails closed over the byte cap (and frees its list).
+    try testing.expectError(error.Unexpected, readFileAlloc(testing.allocator, file, 0));
+}
+
+test "compat: Mutex blocks while held" {
+    var m = Mutex{};
+    m.lock();
+    var acquired = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(mu: *Mutex, done: *std.atomic.Value(bool)) void {
+            mu.lock();
+            mu.unlock();
+            done.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{ &m, &acquired });
+    // Hold the lock long enough for the worker to enter the futex wait.
+    nanosleep(0, 5 * std.time.ns_per_ms);
+    m.unlock();
+    t.join();
+    try testing.expect(acquired.load(.acquire));
+}
+
+test "compat: clock_gettime clock ids and nanosleep" {
+    _ = try clock_gettime(posix.CLOCK.MONOTONIC);
+    _ = try clock_gettime(posix.CLOCK.MONOTONIC_RAW);
+    _ = try clock_gettime(posix.CLOCK.BOOTTIME);
+    _ = try clock_gettime(posix.CLOCK.PROCESS_CPUTIME_ID); // unmapped -> REALTIME
+    nanosleep(0, 0);
+}
