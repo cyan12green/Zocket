@@ -167,33 +167,35 @@ Notes:
 
 ## Unified benchmark (web/file/LB)
 
-All servers co-resident: Zocket, nginx (HAProxy/Envoy omitted — not
-built on this machine; build `bench/.cache/haproxy-build/sbin/haproxy`
-or set `ENVOY_BIN=` to include them). 8 workload cells, pinned re-run on
-the final proxy-path source (server on CPUs 0-3, four fixture origins on
-4-7, loader on 8-11; medians of 3 samples).
+All servers co-resident: Zocket, nginx, HAProxy (built from source via
+`bench/build-haproxy.sh`, 3.0.29). Envoy's prebuilt binary is fetched
+(`bench/fetch-envoy.sh`, 1.31.0) but its cell config is still to be
+authored. 8 workload cells, pinned re-run 2026-10-10 (server on CPUs
+0-3, four fixture origins on 4-7, loader on 8-11; medians of 3 samples).
 
 ![Unified](graphs/unified_web.png)
 
-| Cell | Zocket | nginx | Ratio |
-|---|---|---:|---:|---:|
-| h1_echo | 268,838 | 177,847 | 1.51x |
-| static_small | 216,058 | 181,911 | 1.19x |
-| static_large | 15,987 | 15,686 | 1.02x |
-| precompressed | 211,290 | 183,881 | 1.15x |
-| headers_ops | 264,466 | 264,707 | 1.00x |
-| auth_basic | 252,571 | 246,482 | 1.02x |
-| cache_hit | 258,805 | 255,666 | 1.01x |
-| lb_rr | 196,677 | 200,937 | 0.98x |
+| Cell | Zocket | nginx | HAProxy | Zocket/nginx |
+|---|---:|---:|---:|---:|
+| h1_echo | 255,532 | 171,608 | — | 1.49x |
+| static_small | 217,817 | 188,108 | — | 1.16x |
+| static_large | 15,821 | 16,425 | — | 0.96x |
+| precompressed | 214,212 | 187,204 | — | 1.14x |
+| headers_ops | 270,544 | 265,236 | — | 1.02x |
+| auth_basic | 268,353 | 246,745 | — | 1.09x |
+| cache_hit | 266,536 | 259,387 | — | 1.03x |
+| lb_rr | 181,392 | 205,939 | 126,870 | 0.88x |
 
-`lb_rr` proxies through a 4-origin pool. Across three interleaved
-comparisons it sits at parity within the machine's run-to-run spread:
-0.98x in this run (196,677 vs 200,937; Zocket p50 315 µs vs nginx
-403 µs, but Zocket p99 3.5 ms vs 2.0 ms), 0.90x in the previous run
-(187,781 vs 207,535) and 1.000x in a dedicated 6-rep fresh interleaved
-A/B (209,701 vs 209,654). The single-origin raw proxy cell is the
-verified lead (1.12x/1.02x above); the multi-origin cell's residual
-tail is the remaining item.
+`lb_rr` proxies through a 4-origin pool. Across four interleaved
+comparisons it sits within the machine's run-to-run spread: 0.88x in
+this run, 0.98x and 0.90x in the previous two (196,677/187,781 vs
+200,937/207,535) and 1.000x in a dedicated 6-rep fresh interleaved A/B
+(209,701 vs 209,654); Zocket's p50 is consistently lower (338 µs vs nginx
+389 µs here) while its p99 tail (4.4 ms vs 2.1 ms) is the remaining
+item. **Against HAProxy's default proxy path Zocket leads 1.43x**
+(181,392 vs 126,870) and nginx 1.62x — HAProxy's round-robin path is
+markedly slower on this box. The single-origin raw proxy cell is the
+verified Zocket lead (1.12x/1.02x above).
 An earlier
 revision of this table reported `lb_rr 402,308 (2.66x)` for Zocket: those
 runs had `unified.sh` building the front with the wrong config, so every
