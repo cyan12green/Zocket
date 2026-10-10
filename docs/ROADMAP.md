@@ -56,7 +56,7 @@ The ≥90% line gate is met (see `bench/.cache/coverage.json`). Remaining
 misses are mostly tool attribution artifacts (defer lines, switch arms) plus
 genuinely untested error branches in the largest files (`net/reactor.zig`,
 `http2/session.zig`, `dsl/modules/proxy.zig`, `http/parser.zig`,
-`compat.zig`). Further test work is optional and should target those error
+`sys.zig`). Further test work is optional and should target those error
 branches.
 
 ## Blocked on an external decision

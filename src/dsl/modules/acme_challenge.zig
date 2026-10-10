@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const registry = @import("../registry.zig");
-const compat = @import("../../compat.zig");
+const sys = @import("../../sys.zig");
 
 pub const Context = registry.Context;
 pub const Action = registry.Action;
@@ -27,7 +27,7 @@ const Entry = struct {
     used: bool = false,
 };
 
-var table_mutex = compat.Mutex{};
+var table_mutex = sys.Mutex{};
 var table: [max_tokens]Entry = @as([max_tokens]Entry, @splat(Entry{}));
 
 /// Publish a challenge response (renewal loop). False when the table is

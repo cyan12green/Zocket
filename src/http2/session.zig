@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const parser = @import("../http/parser.zig");
 const response_mod = @import("../http/response.zig");
 const hpack = @import("hpack.zig");
@@ -864,7 +864,7 @@ pub const Session = struct {
             file_buf = buf;
             var read_total: usize = 0;
             while (read_total < size) {
-                const n = compat.pread(resp.file_fd, buf[read_total..], resp.file_offset + read_total) catch break;
+                const n = sys.pread(resp.file_fd, buf[read_total..], resp.file_offset + read_total) catch break;
                 if (n == 0) break;
                 read_total += n;
             }
@@ -2003,8 +2003,8 @@ test "session: file-backed responses frame from the fd" {
     var send = std.ArrayList(u8).empty;
     defer send.deinit(testing.allocator);
     try s.streams.put(1, .{});
-    const fd = try compat.openFile("/dev/zero");
-    defer compat.close(fd);
+    const fd = try sys.openFile("/dev/zero");
+    defer sys.close(fd);
     var resp = response_mod.Response.init(.ok);
     resp.body_from_file = true;
     resp.file_fd = fd;

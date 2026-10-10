@@ -378,19 +378,24 @@ pub const Request = struct {
     }
 };
 
-/// True if a Transfer-Encoding value lists `chunked` (comma-separated;
-/// `;`-parameters on a token are tolerated). Token matching is a hash
-/// compare against the comptime `chunked` hash.
-fn valueHasChunked(value: []const u8) bool {
+/// True if a comma-separated header value lists `token` (`;`-parameters on a
+/// token are tolerated). Token matching is a hash compare against the
+/// comptime token hash, so callers pass a literal.
+pub fn valueHasToken(value: []const u8, comptime token: []const u8) bool {
     var tokens = mem.tokenizeAny(u8, value, ",");
     while (tokens.next()) |t| {
         var tok = mem.trim(u8, t, " \t");
         if (mem.indexOfScalar(u8, tok, ';')) |semi| tok = tok[0..semi];
-        if (tok.len > 0 and header_hasher.hash(tok) == comptime header_hasher.hash("chunked")) {
+        if (tok.len > 0 and header_hasher.hash(tok) == comptime header_hasher.hash(token)) {
             return true;
         }
     }
     return false;
+}
+
+/// True if a Transfer-Encoding value lists `chunked`.
+fn valueHasChunked(value: []const u8) bool {
+    return valueHasToken(value, "chunked");
 }
 
 fn parseMethod(tok: []const u8) Method {

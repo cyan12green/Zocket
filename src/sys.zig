@@ -1,20 +1,26 @@
-//! Zig 0.18 compatibility shims.
+//! Linux system layer.
 //!
-//! The 0.18 stdlib removed a large part of `std.posix` (socket syscalls,
-//! `clock_gettime`, `nanosleep`, `close`, `write`, `fcntl`, `epoll_*`,
-//! `eventfd`, `pipe`/`fork`/etc.) and `std.time.Instant`. The survivors live
-//! in `std.os.linux` as raw syscalls returning `usize` (negative errno).
-//! This module re-exposes the 0.16-era signatures the server was written
-//! against, implemented over the raw Linux syscalls with the same error
-//! names the call sites already handle (`WouldBlock`, ...).
+//! Zig 0.18 moved the socket layer, most of `std.posix` (close, write,
+//! fcntl, epoll_*, eventfd, pipe/fork, clock_gettime, nanosleep, ...) and
+//! `std.time.Instant` behind the `std.Io` interface. This server's reactor
+//! is built on raw Linux syscalls (one level-triggered epoll loop per
+//! core) and cannot route its hot path through an io instance, so this
+//! module provides the fd, socket, filesystem and clock primitives it
+//! needs directly over `std.os.linux`, with the error names the call
+//! sites handle (`WouldBlock`, `BrokenPipe`, ...).
 //!
-//! Linux-only by design (the server targets Linux epoll).
+//! Linux-only by design (the server targets Linux epoll). The file
+//! helpers exist because `std.fs` is io-mediated in this snapshot; they
+//! serve startup work (certificates, config-adjacent files) and the
+//! static module's per-request cache misses.
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const fd_t = posix.fd_t;
 
-/// Drop-in replacement for `std.time.Instant` (removed in 0.18):
+// --- Clock -------------------------------------------------------------------
+
+/// Monotonic clock (BOOTTIME), equivalent to the removed `std.time.Instant`:
 /// monotonic BOOTTIME clock, `now()` + `since()` in nanoseconds.
 pub const Instant = struct {
     timestamp: posix.timespec,
@@ -40,7 +46,7 @@ pub const Instant = struct {
     }
 };
 
-/// 0.16 `posix.clock_gettime(clk)` shape: returns the timestamp, no out-param.
+/// `clock_gettime(clk)` returning the timestamp directly (no out-param).
 pub fn clock_gettime(clk_id: posix.CLOCK) Instant.InitError!posix.timespec {
     var ts: posix.timespec = undefined;
     const rc = linux.clock_gettime(switch (clk_id) {
@@ -54,7 +60,7 @@ pub fn clock_gettime(clk_id: posix.CLOCK) Instant.InitError!posix.timespec {
     return ts;
 }
 
-/// 0.16 `posix.nanosleep(seconds, nanoseconds)`: retry on EINTR, ignore rest.
+/// `nanosleep(seconds, nanoseconds)`: retry on EINTR, ignore other errors.
 pub fn nanosleep(seconds: u64, nanoseconds: u64) void {
     var req = posix.timespec{
         .sec = @intCast(seconds),
@@ -69,6 +75,8 @@ pub fn nanosleep(seconds: u64, nanoseconds: u64) void {
         }
     }
 }
+
+// --- File descriptors --------------------------------------------------------
 
 pub fn close(fd: fd_t) void {
     _ = linux.close(fd);
@@ -134,6 +142,8 @@ pub fn writev(fd: fd_t, iovs: []const posix.iovec_const) WriteError!usize {
         }
     }
 }
+
+// --- Sockets -----------------------------------------------------------------
 
 pub const SocketError = error{
     PermissionDenied,
@@ -244,6 +254,8 @@ pub const FcntlError = error{
     Locked,
     Unexpected,
 };
+
+// --- Process and event primitives --------------------------------------------
 
 pub fn fcntl(fd: fd_t, cmd: i32, arg: usize) FcntlError!usize {
     const rc = linux.fcntl(fd, cmd, arg);
@@ -372,6 +384,8 @@ pub fn socketpair(domain: u32, socket_type: u32, protocol: u32) DupError![2]fd_t
     }
 }
 
+// --- Descriptor I/O ----------------------------------------------------------
+
 pub const PReadError = error{
     InputOutput,
     SystemResources,
@@ -484,7 +498,7 @@ pub fn readlink(path: []const u8, out_buffer: []u8) ReadLinkError![]u8 {
     }
 }
 
-/// 0.16 `posix.lseek_SET(fd, offset)` helper.
+/// `lseek(fd, offset, SEEK_SET)` helper.
 pub fn lseek_SET(fd: fd_t, offset: u64) PReadError!void {
     const rc = linux.lseek(fd, @intCast(offset), posix.SEEK.SET);
     switch (linux.errno(rc)) {
@@ -495,10 +509,12 @@ pub fn lseek_SET(fd: fd_t, offset: u64) PReadError!void {
     }
 }
 
-// ---- file helpers (replace the removed std.fs.Dir/File surface) ----
-
 /// Same shape as `std.Io.File.Stat` (size, mtime.nanoseconds, kind), filled
 /// from `statx` so existing field accesses keep working.
+// --- Filesystem ---------------------------------------------------------------
+// The snapshot's `std.fs`/`std.Io.Dir` helpers are io-mediated; these take
+// plain paths/fds for startup work and static-cache misses.
+
 pub const FileStat = std.Io.File.Stat;
 
 pub const StatError = error{
@@ -567,7 +583,7 @@ fn toZ(path: []const u8, buf: *[posix.PATH_MAX:0]u8) StatError![:0]const u8 {
     return buf[0..path.len :0];
 }
 
-/// `std.fs.cwd().statFile(path)` replacement (follows symlinks).
+/// `std.fs.cwd().statFile(path)` equivalent (follows symlinks).
 pub fn statFile(path: []const u8) StatError!FileStat {
     var zbuf: [posix.PATH_MAX:0]u8 = undefined;
     const zpath = try toZ(path, &zbuf);
@@ -577,7 +593,7 @@ pub fn statFile(path: []const u8) StatError!FileStat {
     return statxToFileStat(sx);
 }
 
-/// `File.stat()` replacement for an open fd.
+/// `File.stat()` equivalent for an open fd.
 pub fn fstat(fd: fd_t) StatError!FileStat {
     var sx: linux.Statx = undefined;
     const rc = linux.statx(fd, "", posix.AT.EMPTY_PATH, statx_mask, &sx);
@@ -587,7 +603,7 @@ pub fn fstat(fd: fd_t) StatError!FileStat {
 
 pub const OpenFileError = StatError || error{ NotFile, IsDir };
 
-/// `std.fs.cwd().openFile(path, .{})` replacement: read-only + CLOEXEC.
+/// `std.fs.cwd().openFile(path, .{})` equivalent: read-only + CLOEXEC.
 pub fn openFile(path: []const u8) OpenFileError!fd_t {
     var zbuf: [posix.PATH_MAX:0]u8 = undefined;
     const zpath = toZ(path, &zbuf) catch |e| switch (e) {
@@ -609,7 +625,7 @@ pub fn openFile(path: []const u8) OpenFileError!fd_t {
     }
 }
 
-/// `std.fs.cwd().realpath(path, buf)` replacement: resolve via /proc/self/fd
+/// `std.fs.cwd().realpath(path, buf)` equivalent: resolve via /proc/self/fd
 /// (opens O_PATH, so it works for directories too).
 pub fn realpath(path: []const u8, buf: []u8) StatError![]u8 {
     var zbuf: [posix.PATH_MAX:0]u8 = undefined;
@@ -638,7 +654,7 @@ pub fn realpath(path: []const u8, buf: []u8) StatError![]u8 {
     }
 }
 
-/// Test helper: `std.fs.cwd().writeFile(.{ .sub_path, .data })` replacement.
+/// Test helper: `std.fs.cwd().writeFile(.{ .sub_path, .data })` equivalent.
 pub fn writeFile(path: []const u8, data: []const u8) (StatError || WriteError)!void {
     var zbuf: [posix.PATH_MAX:0]u8 = undefined;
     const zpath = try toZ(path, &zbuf);
@@ -664,7 +680,7 @@ pub fn writeFile(path: []const u8, data: []const u8) (StatError || WriteError)!v
     }
 }
 
-/// `std.fs.cwd().createFile(path, .{})` replacement: RDWR|CREAT|TRUNC.
+/// `std.fs.cwd().createFile(path, .{})` equivalent: RDWR|CREAT|TRUNC.
 pub fn createFile(path: []const u8) StatError!fd_t {
     var zbuf: [posix.PATH_MAX:0]u8 = undefined;
     const zpath = try toZ(path, &zbuf);
@@ -684,7 +700,7 @@ pub fn createFile(path: []const u8) StatError!fd_t {
     }
 }
 
-/// `File.writeAll` replacement.
+/// `File.writeAll` equivalent.
 pub fn writeAll(fd: fd_t, bytes: []const u8) WriteError!void {
     var off: usize = 0;
     while (off < bytes.len) {
@@ -692,7 +708,7 @@ pub fn writeAll(fd: fd_t, bytes: []const u8) WriteError!void {
     }
 }
 
-/// Test helper: `std.fs.cwd().deleteFile(path)` replacement.
+/// Test helper: `std.fs.cwd().deleteFile(path)` equivalent.
 pub fn deleteFile(path: []const u8) StatError!void {
     var zbuf: [posix.PATH_MAX:0]u8 = undefined;
     const zpath = try toZ(path, &zbuf);
@@ -723,7 +739,7 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: 
     return list.toOwnedSlice(allocator);
 }
 
-/// Test helper: `std.fs.cwd().symLink(target, link, .{})` replacement.
+/// Test helper: `std.fs.cwd().symLink(target, link, .{})` equivalent.
 pub fn symLink(target: []const u8, link_path: []const u8) StatError!void {
     var zt: [posix.PATH_MAX:0]u8 = undefined;
     var zl: [posix.PATH_MAX:0]u8 = undefined;
@@ -741,6 +757,8 @@ pub fn symLink(target: []const u8, link_path: []const u8) StatError!void {
 }
 
 /// Minimal directory iterator for autoindex (`std.fs.Dir.iterate`).
+// --- Directory iteration -----------------------------------------------------
+
 pub const DirEntry = struct {
     name: []const u8,
     kind: std.Io.File.Kind,
@@ -807,7 +825,7 @@ pub const Dir = struct {
     }
 };
 
-/// `std.fs.cwd().openDir(path, .{})` replacement for iteration.
+/// `std.fs.cwd().openDir(path, .{})` equivalent for iteration.
 pub fn openDir(path: []const u8) OpenFileError!Dir {
     var zbuf: [posix.PATH_MAX:0]u8 = undefined;
     const zpath = toZ(path, &zbuf) catch |e| switch (e) {
@@ -833,10 +851,10 @@ pub fn openDir(path: []const u8) OpenFileError!Dir {
     }
 }
 
-// ---- sync (replace the removed std.Thread.Mutex) ----
-
 /// Blocking mutex with the old `std.Thread.Mutex` call shape
 /// (`lock()` / `unlock()` / `tryLock()`, no Io needed), futex-backed.
+// --- Synchronization ----------------------------------------------------------
+
 pub const Mutex = struct {
     state: std.atomic.Value(u32) = .{ .raw = 0 },
 
@@ -870,7 +888,9 @@ pub const Mutex = struct {
     }
 };
 
-/// `std.crypto.random.bytes(buf)` replacement (CSPRNG via getrandom).
+/// `std.crypto.random.bytes(buf)` equivalent (CSPRNG via getrandom).
+// --- Entropy -----------------------------------------------------------------
+
 pub fn randomBytes(buf: []u8) void {
     var off: usize = 0;
     while (off < buf.len) {
@@ -896,34 +916,9 @@ pub fn randomBytes(buf: []u8) void {
     }
 }
 
-/// `std.ascii.indexOfIgnoreCase(haystack, needle)` replacement.
-pub fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > haystack.len) return null;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        var ok = true;
-        for (needle, 0..) |nc, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) return i;
-    }
-    return null;
-}
-
-/// Old `std.fs.path.relative(allocator, from, to)` shape over the new
-/// `relativeAlloc` (both inputs are absolute at our call sites, so the
-/// dummy cwd is never consulted).
-pub fn relativePath(allocator: std.mem.Allocator, from: []const u8, to: []const u8) ![]u8 {
-    return std.fs.path.relativeAlloc(allocator, ".", null, from, to);
-}
-
 const testing = std.testing;
 
-test "compat: Instant and clock_gettime move forward" {
+test "sys: Instant and clock_gettime move forward" {
     const t0 = try Instant.now();
     nanosleep(0, 2 * std.time.ns_per_ms);
     const t1 = try Instant.now();
@@ -933,7 +928,7 @@ test "compat: Instant and clock_gettime move forward" {
     try testing.expect(ts.sec > 0);
 }
 
-test "compat: Mutex excludes concurrent increments" {
+test "sys: Mutex excludes concurrent increments" {
     var m = Mutex{};
     try testing.expect(m.tryLock());
     try testing.expect(!m.tryLock());
@@ -957,39 +952,30 @@ test "compat: Mutex excludes concurrent increments" {
     try testing.expectEqual(@as(u32, N * Per), counter);
 }
 
-test "compat: randomBytes fills and indexOfIgnoreCase matches" {
+test "sys: randomBytes fills" {
     var a: [32]u8 = @splat(0);
     randomBytes(&a);
     var empty: [0]u8 = .{};
     randomBytes(&empty); // zero-length is a no-op
-    try testing.expectEqual(@as(?usize, 0), indexOfIgnoreCase("Hello", ""));
-    try testing.expectEqual(@as(?usize, 0), indexOfIgnoreCase("Hello", "he"));
-    try testing.expectEqual(@as(?usize, 2), indexOfIgnoreCase("aBcDe", "CD"));
-    try testing.expectEqual(@as(?usize, null), indexOfIgnoreCase("abc", "abcd"));
-    try testing.expectEqual(@as(?usize, null), indexOfIgnoreCase("abc", "x"));
+    try testing.expect(std.mem.indexOfNone(u8, &a, &[_]u8{0}) != null);
 }
 
-test "compat: relativePath computes a relative path" {
-    const rel = try relativePath(testing.allocator, "/a/b", "/a/c");
-    defer testing.allocator.free(rel);
-    try testing.expectEqualStrings("../c", rel);
-}
-
-test "compat: file helpers round-trip" {
+test "sys: file helpers round-trip" {
     const dir = "/tmp";
-    const path = dir ++ "/zocket-compat-roundtrip.txt";
-    const link = dir ++ "/zocket-compat-roundtrip-link";
+    const path = dir ++ "/zocket-sys-roundtrip.txt";
+    const link = dir ++ "/zocket-sys-roundtrip-link";
     defer deleteFile(path) catch {};
     defer deleteFile(link) catch {};
 
-    try writeFile(path, "hello compat");
+    const payload = "hello sys";
+    try writeFile(path, payload);
     const st = try statFile(path);
     try testing.expectEqual(std.Io.File.Kind.file, st.kind);
-    try testing.expectEqual(@as(u64, 12), st.size);
+    try testing.expectEqual(@as(u64, payload.len), st.size);
 
     const fd = try openFile(path);
     const fst = try fstat(fd);
-    try testing.expectEqual(@as(u64, 12), fst.size);
+    try testing.expectEqual(@as(u64, payload.len), fst.size);
     var head: [5]u8 = undefined;
     try testing.expectEqual(@as(usize, 5), try pread(fd, &head, 0));
     try testing.expectEqualStrings("hello", &head);
@@ -998,7 +984,7 @@ test "compat: file helpers round-trip" {
 
     const got = try readFileAlloc(testing.allocator, path, 1024);
     defer testing.allocator.free(got);
-    try testing.expectEqualStrings("hello compat", got);
+    try testing.expectEqualStrings("hello sys", got);
 
     var rp_buf: [512]u8 = undefined;
     const rp = try realpath(path, &rp_buf);
@@ -1006,7 +992,7 @@ test "compat: file helpers round-trip" {
 
     try symLink(path, link);
     const lst = try statFile(link); // follows the link
-    try testing.expectEqual(@as(u64, 12), lst.size);
+    try testing.expectEqual(@as(u64, payload.len), lst.size);
 
     const cf = try createFile(dir ++ "/created.txt");
     defer deleteFile(dir ++ "/created.txt") catch {};
@@ -1015,8 +1001,8 @@ test "compat: file helpers round-trip" {
     try testing.expectError(error.FileNotFound, statFile(dir ++ "/missing.txt"));
 }
 
-test "compat: truncate and writev gather" {
-    const path = "/tmp/zocket-compat-trunc";
+test "sys: truncate and writev gather" {
+    const path = "/tmp/zocket-sys-trunc";
     defer deleteFile(path) catch {};
     const fd = try createFile(path);
     defer close(fd);
@@ -1043,7 +1029,7 @@ test "compat: truncate and writev gather" {
     try testing.expectEqualStrings("foobarbaz", buf[0..got]);
 }
 
-test "compat: sockets bind/listen/connect/accept" {
+test "sys: sockets bind/listen/connect/accept" {
     const listen_fd = try socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer close(listen_fd);
     var zero_sa = std.mem.zeroes(posix.sockaddr);
@@ -1103,7 +1089,7 @@ test "compat: sockets bind/listen/connect/accept" {
     try testing.expect(refused == error.ConnectionRefused or refused == error.WouldBlock);
 }
 
-test "compat: eventfd, epoll and pipe/dup round-trip" {
+test "sys: eventfd, epoll and pipe/dup round-trip" {
     const efd = try eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
     defer close(efd);
     const ep = try epoll_create1(0);
@@ -1132,7 +1118,7 @@ test "compat: eventfd, epoll and pipe/dup round-trip" {
     try testing.expectEqualStrings("piped", buf[0..got]);
 }
 
-test "compat: openDir iterates entries" {
+test "sys: openDir iterates entries" {
     var dir = try openDir("testdata");
     defer close(dir.fd);
     var found_hello = false;
@@ -1142,7 +1128,7 @@ test "compat: openDir iterates entries" {
     try testing.expect(found_hello);
 }
 
-test "compat: write/writev error mapping and broken pipe" {
+test "sys: write/writev error mapping and broken pipe" {
     // Empty slices short-circuit without a syscall.
     try testing.expectEqual(@as(usize, 0), try write(-1, ""));
     try testing.expectEqual(@as(usize, 0), try writev(-1, &[_]posix.iovec_const{}));
@@ -1152,7 +1138,7 @@ test "compat: write/writev error mapping and broken pipe" {
     try testing.expectError(error.NotOpenForWriting, write(-1, "x"));
     try testing.expectError(error.NotOpenForWriting, writev(-1, &iov));
 
-    const path = "/tmp/zocket-compat-write-ro";
+    const path = "/tmp/zocket-sys-write-ro";
     try writeFile(path, "ro");
     defer deleteFile(path) catch {};
     const rfd = try openFile(path);
@@ -1177,7 +1163,7 @@ test "compat: write/writev error mapping and broken pipe" {
     try testing.expectError(error.BrokenPipe, writev(fds[1], &iov));
 }
 
-test "compat: socket/bind/listen/connect error mapping" {
+test "sys: socket/bind/listen/connect error mapping" {
     try testing.expectError(error.AddressFamilyNotSupported, socket(9999, posix.SOCK.STREAM, 0));
     try testing.expectError(error.ProtocolNotSupported, socket(posix.AF.UNIX, posix.SOCK.STREAM, 6));
     try testing.expectError(error.SocketTypeNotSupported, socket(posix.AF.INET, 999, 0));
@@ -1223,7 +1209,7 @@ test "compat: socket/bind/listen/connect error mapping" {
     try testing.expectError(error.Unexpected, connect(-1, @ptrCast(&addr), 16));
 }
 
-test "compat: nonblocking connect reports pending" {
+test "sys: nonblocking connect reports pending" {
     const fd = try socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
     defer close(fd);
     var blackhole: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
@@ -1244,7 +1230,7 @@ test "compat: nonblocking connect reports pending" {
     }
 }
 
-test "compat: eventfd round-trip and epoll ctl errors" {
+test "sys: eventfd round-trip and epoll ctl errors" {
     try testing.expectError(error.Unexpected, eventfd(0, 1 << 20));
     const efd = try eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
     defer close(efd);
@@ -1265,11 +1251,11 @@ test "compat: eventfd round-trip and epoll ctl errors" {
     try epoll_ctl(ep, 2, efd, null); // DEL
 }
 
-test "compat: dup2 onto an explicit target and dup errors" {
+test "sys: dup2 onto an explicit target and dup errors" {
     const fds = try pipe();
     defer close(fds[0]);
     defer close(fds[1]);
-    const path = "/tmp/zocket-compat-dup2";
+    const path = "/tmp/zocket-sys-dup2";
     try writeFile(path, "");
     defer deleteFile(path) catch {};
     const target = try openFile(path);
@@ -1290,7 +1276,7 @@ test "compat: dup2 onto an explicit target and dup errors" {
     try testing.expectError(error.Unexpected, dup(-1));
 }
 
-test "compat: pread, ftruncate and lseek edge cases" {
+test "sys: pread, ftruncate and lseek edge cases" {
     var one: [1]u8 = undefined;
     try testing.expectError(error.NotOpenForReading, pread(-1, &one, 0));
     try testing.expectError(error.NotOpenForReading, lseek_SET(-1, 0));
@@ -1307,7 +1293,7 @@ test "compat: pread, ftruncate and lseek edge cases" {
     defer close(dir.fd);
     try testing.expectError(error.IsDir, pread(dir.fd, &one, 0));
 
-    const path = "/tmp/zocket-compat-pread";
+    const path = "/tmp/zocket-sys-pread";
     defer deleteFile(path) catch {};
     const fd = try createFile(path);
     defer close(fd);
@@ -1317,12 +1303,12 @@ test "compat: pread, ftruncate and lseek edge cases" {
     try testing.expectEqual(@as(u64, 64), (try fstat(fd)).size);
 }
 
-test "compat: readlink and symLink error mapping" {
+test "sys: readlink and symLink error mapping" {
     var buf: [256]u8 = undefined;
-    try testing.expectError(error.FileNotFound, readlink("/tmp/zocket-compat-rl-missing", &buf));
+    try testing.expectError(error.FileNotFound, readlink("/tmp/zocket-sys-rl-missing", &buf));
 
-    const path = "/tmp/zocket-compat-rl";
-    const link = "/tmp/zocket-compat-rl-link";
+    const path = "/tmp/zocket-sys-rl";
+    const link = "/tmp/zocket-sys-rl-link";
     defer deleteFile(path) catch {};
     defer deleteFile(link) catch {};
     try writeFile(path, "x");
@@ -1330,19 +1316,19 @@ test "compat: readlink and symLink error mapping" {
     try symLink(path, link);
     try testing.expectEqualStrings(path, try readlink(link, &buf));
     try testing.expectError(error.Unexpected, symLink(path, link)); // EEXIST
-    try testing.expectError(error.FileNotFound, symLink(path, "/tmp/zocket-compat-rl-missing-dir/x"));
+    try testing.expectError(error.FileNotFound, symLink(path, "/tmp/zocket-sys-rl-missing-dir/x"));
 }
 
-test "compat: file helper error mapping" {
-    const missing = "/tmp/zocket-compat-missing";
+test "sys: file helper error mapping" {
+    const missing = "/tmp/zocket-sys-missing";
     var buf: [256]u8 = undefined;
     try testing.expectError(error.FileNotFound, statFile(missing));
     try testing.expectError(error.FileNotFound, openFile(missing));
     try testing.expectError(error.FileNotFound, realpath(missing, &buf));
     try testing.expectError(error.FileNotFound, openDir(missing));
     try testing.expectError(error.FileNotFound, deleteFile(missing));
-    try testing.expectError(error.FileNotFound, writeFile("/tmp/zocket-compat-missing-dir/x", "x"));
-    try testing.expectError(error.FileNotFound, createFile("/tmp/zocket-compat-missing-dir/x"));
+    try testing.expectError(error.FileNotFound, writeFile("/tmp/zocket-sys-missing-dir/x", "x"));
+    try testing.expectError(error.FileNotFound, createFile("/tmp/zocket-sys-missing-dir/x"));
     try testing.expectError(error.AccessDenied, writeFile("/tmp", "x")); // EISDIR
     try testing.expectError(error.AccessDenied, createFile("/tmp")); // EISDIR
 
@@ -1353,15 +1339,15 @@ test "compat: file helper error mapping" {
     try testing.expectError(error.NameTooLong, openDir(&long));
 
     // A regular file is not a directory.
-    const file = "/tmp/zocket-compat-notdir";
+    const file = "/tmp/zocket-sys-notdir";
     defer deleteFile(file) catch {};
     try writeFile(file, "x");
     try testing.expectError(error.FileNotFound, openDir(file));
-    try testing.expectError(error.FileNotFound, openFile("/tmp/zocket-compat-notdir/child"));
+    try testing.expectError(error.FileNotFound, openFile("/tmp/zocket-sys-notdir/child"));
 
     // Symlink loop: ELOOP -> FileNotFound.
-    const l1 = "/tmp/zocket-compat-loop1";
-    const l2 = "/tmp/zocket-compat-loop2";
+    const l1 = "/tmp/zocket-sys-loop1";
+    const l2 = "/tmp/zocket-sys-loop2";
     defer deleteFile(l1) catch {};
     defer deleteFile(l2) catch {};
     try symLink(l2, l1);
@@ -1379,7 +1365,7 @@ test "compat: file helper error mapping" {
     close(dfd);
 
     // deleteFile on a directory: EISDIR -> Unexpected.
-    const dpath = "/tmp/zocket-compat-rmdir";
+    const dpath = "/tmp/zocket-sys-rmdir";
     deleteFile(dpath) catch {};
     try testing.expectEqual(@as(usize, 0), linux.mkdir(dpath, 0o755));
     defer _ = linux.rmdir(dpath);
@@ -1389,7 +1375,7 @@ test "compat: file helper error mapping" {
     try testing.expectError(error.Unexpected, readFileAlloc(testing.allocator, file, 0));
 }
 
-test "compat: Mutex blocks while held" {
+test "sys: Mutex blocks while held" {
     var m = Mutex{};
     m.lock();
     var acquired = std.atomic.Value(bool).init(false);
@@ -1408,7 +1394,7 @@ test "compat: Mutex blocks while held" {
     try testing.expect(acquired.load(.acquire));
 }
 
-test "compat: clock_gettime clock ids and nanosleep" {
+test "sys: clock_gettime clock ids and nanosleep" {
     _ = try clock_gettime(posix.CLOCK.MONOTONIC);
     _ = try clock_gettime(posix.CLOCK.MONOTONIC_RAW);
     _ = try clock_gettime(posix.CLOCK.BOOTTIME);

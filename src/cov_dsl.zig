@@ -2,7 +2,7 @@
 // Imports the area's files so their `test` blocks run in a
 // small binary kcov can instrument (the monolith is too big).
 comptime {
-    _ = @import("compat.zig");
+    _ = @import("sys.zig");
     _ = @import("ct_pool.zig");
     _ = @import("dsl/phase.zig");
     _ = @import("dsl/router.zig");

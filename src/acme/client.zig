@@ -9,7 +9,7 @@
 //! transport speaks HTTP/1.1 over TCP, with TLS for https:// URLs.
 
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const jws = @import("jws.zig");
 const der = @import("der.zig");
 const acme_challenge = @import("../dsl/modules/acme_challenge.zig");
@@ -122,7 +122,7 @@ pub const HttpTransport = struct {
     allocator: std.mem.Allocator,
     /// Lazily-loaded system trust bundle for https.
     ca: ?*Certificate.Bundle = null,
-    mutex: compat.Mutex = .{},
+    mutex: sys.Mutex = .{},
     ca_loaded: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) HttpTransport {
@@ -146,7 +146,7 @@ pub const HttpTransport = struct {
         const bundle = self.allocator.create(Certificate.Bundle) catch return null;
         bundle.* = Certificate.Bundle.empty;
         // System roots (Debian/Ubuntu layout; harmless when missing).
-        const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return null;
+        const ts = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch return null;
         const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
         bundle.addCertsFromDirPathAbsolute(self.allocator, io, now, "/etc/ssl/certs") catch {};
         self.ca = bundle;
@@ -199,12 +199,12 @@ pub const HttpTransport = struct {
         var connected: ?std.posix.fd_t = null;
         var i: usize = 0;
         while (i < addr_count) : (i += 1) {
-            const fd = compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch continue;
+            const fd = sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch continue;
             var sa = std.posix.sockaddr{ .family = std.posix.AF.INET, .data = @as([14]u8, @splat(@as(u8, 0))) };
             std.mem.writeInt(u16, sa.data[0..2], port_off, .big);
             @memcpy(sa.data[2..6], &addrs[i]);
-            compat.connect(fd, &sa, 16) catch {
-                compat.close(fd);
+            sys.connect(fd, &sa, 16) catch {
+                sys.close(fd);
                 continue;
             };
             connected = fd;
@@ -214,12 +214,12 @@ pub const HttpTransport = struct {
 
         if (tls) {
             const bundle = self.systemCa() orelse {
-                compat.close(fd);
+                sys.close(fd);
                 return error.AcmeDirectoryFailed;
             };
             return self.tlsRequest(fd, host, method, path, content_type, body, bundle);
         }
-        defer compat.close(fd);
+        defer sys.close(fd);
 
         var req = std.ArrayList(u8).empty;
         defer req.deinit(self.allocator);
@@ -229,7 +229,7 @@ pub const HttpTransport = struct {
         if (body != null) req.print(self.allocator, "Content-Length: {d}\r\n", .{blen}) catch return error.AcmeBadResponse;
         req.appendSlice(self.allocator, "\r\n") catch return error.AcmeBadResponse;
         if (body) |b| req.appendSlice(self.allocator, b) catch return error.AcmeBadResponse;
-        try compat.writeAll(fd, req.items);
+        try sys.writeAll(fd, req.items);
         return self.readResponse(fd);
     }
 
@@ -243,7 +243,7 @@ pub const HttpTransport = struct {
         body: ?[]const u8,
         bundle: *Certificate.Bundle,
     ) !Response {
-        defer compat.close(fd);
+        defer sys.close(fd);
         // The std TLS client needs blocking-ish semantics; this path runs
         // on the ACME worker thread only (one request at a time).
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -255,7 +255,7 @@ pub const HttpTransport = struct {
         var reader = stream.reader(io, &rbuf);
         var writer = stream.writer(io, &wbuf);
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
-        compat.randomBytes(&entropy);
+        sys.randomBytes(&entropy);
         var lock = std.Io.RwLock.init;
         var client = std.crypto.tls.Client.init(&reader.interface, &writer.interface, .{
             .host = .{ .explicit = host },
@@ -264,7 +264,7 @@ pub const HttpTransport = struct {
             .read_buffer = &trbuf,
             .entropy = &entropy,
             .realtime_now = blk: {
-                const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch break :blk .{ .nanoseconds = 0 };
+                const ts = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch break :blk .{ .nanoseconds = 0 };
                 break :blk .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
             },
             .allow_truncation_attacks = true,
@@ -410,7 +410,7 @@ pub fn runOnce(
 
     // 1. Account key: load or generate.
     var secret: [32]u8 = undefined;
-    if (compat.readFileAlloc(allocator, cfg.account_key_path, 1 << 20)) |pem| {
+    if (sys.readFileAlloc(allocator, cfg.account_key_path, 1 << 20)) |pem| {
         defer allocator.free(pem);
         const pem_mod = @import("../tls/pem.zig");
         var buf: [256]u8 = undefined;
@@ -420,7 +420,7 @@ pub fn runOnce(
     } else |_| {
         const kp = try Ecdsa.KeyPair.generateDeterministic(blk: {
             var seed: [32]u8 = undefined;
-            compat.randomBytes(&seed);
+            sys.randomBytes(&seed);
             break :blk seed;
         });
         secret = kp.secret_key.toBytes();
@@ -428,7 +428,7 @@ pub fn runOnce(
         defer allocator.free(key_der);
         const pem = try der.pemEncode(allocator, "EC PRIVATE KEY", key_der);
         defer allocator.free(pem);
-        try compat.writeFile(cfg.account_key_path, pem);
+        try sys.writeFile(cfg.account_key_path, pem);
         {
             var mb: [512]u8 = undefined;
             const m = std.fmt.bufPrint(&mb, "acme: generated account key {s}", .{cfg.account_key_path}) catch "acme: account key";
@@ -532,7 +532,7 @@ pub fn runOnce(
         // Poll the authorization until it leaves pending.
         var attempts: usize = 0;
         while (attempts < 60) : (attempts += 1) {
-            compat.nanosleep(1, 0);
+            sys.nanosleep(1, 0);
             const poll_p = try buildProtected(allocator, nonce, authz_url, kid, &pub_sec1);
             defer allocator.free(poll_p);
             var state = try signedPost(allocator, transport, &secret, poll_p, authz_url, "", null);
@@ -551,7 +551,7 @@ pub fn runOnce(
     // 7. Certificate key + CSR + finalize.
     const cert_kp = try Ecdsa.KeyPair.generateDeterministic(blk: {
         var seed: [32]u8 = undefined;
-        compat.randomBytes(&seed);
+        sys.randomBytes(&seed);
         break :blk seed;
     });
     const cert_pub = cert_kp.public_key.toUncompressedSec1();
@@ -581,7 +581,7 @@ pub fn runOnce(
     defer if (cert_url_owned) |c| allocator.free(c);
     var attempts: usize = 0;
     while (cert_url == null and attempts < 60) : (attempts += 1) {
-        compat.nanosleep(1, 0);
+        sys.nanosleep(1, 0);
         const op = try buildProtected(allocator, nonce, order_url, kid, &pub_sec1);
         defer allocator.free(op);
         var st = try signedPost(allocator, transport, &secret, op, order_url, "", null);
@@ -602,13 +602,13 @@ pub fn runOnce(
     var chain = try signedPost(allocator, transport, &secret, cp, cu, "", null);
     defer chain.deinit(allocator);
     if (chain.status != 200) return error.AcmeDownloadFailed;
-    try compat.writeFile(cfg.cert_path, chain.body);
+    try sys.writeFile(cfg.cert_path, chain.body);
 
     const key_der = try der.sec1PrivateKey(allocator, &cert_kp.secret_key.toBytes());
     defer allocator.free(key_der);
     const key_pem = try der.pemEncode(allocator, "EC PRIVATE KEY", key_der);
     defer allocator.free(key_pem);
-    try compat.writeFile(cfg.key_path, key_pem);
+    try sys.writeFile(cfg.key_path, key_pem);
     {
         var mb: [512]u8 = undefined;
         const m = std.fmt.bufPrint(&mb, "acme: issued for {d} domain(s) -> {s}", .{ cfg.domains.len, cfg.cert_path }) catch "acme: issued";
@@ -743,16 +743,16 @@ pub const FakeCA = struct {
 
     pub fn start(allocator: std.mem.Allocator, cert_pem: []const u8, expect_key_auth: []const u8) !*FakeCA {
         const self = try allocator.create(FakeCA);
-        const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        const lfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
         var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
         addr[0] = 2;
         addr[4] = 127;
         addr[7] = 1;
-        try compat.bind(lfd, @ptrCast(&addr), 16);
-        try compat.listen(lfd, 16);
+        try sys.bind(lfd, @ptrCast(&addr), 16);
+        try sys.listen(lfd, 16);
         var slen: std.posix.socklen_t = 16;
         var bound: [16]u8 align(@alignOf(u16)) = undefined;
-        try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+        try sys.getsockname(lfd, @ptrCast(&bound), &slen);
         self.* = .{
             .listener = lfd,
             .port = (@as(u16, bound[2]) << 8) | bound[3],
@@ -767,7 +767,7 @@ pub const FakeCA = struct {
 
     pub fn stop(self: *FakeCA) void {
         self.stop_flag.store(true, .release);
-        compat.close(self.listener);
+        sys.close(self.listener);
         self.thread.join();
     }
 
@@ -789,7 +789,7 @@ pub const FakeCA = struct {
             if (std.os.linux.errno(cfd) != .SUCCESS) break;
             const fd: std.posix.fd_t = @intCast(cfd);
             self.serveOne(fd);
-            compat.close(fd);
+            sys.close(fd);
         }
     }
 
@@ -901,7 +901,7 @@ pub const FakeCA = struct {
         if (location.len > 0) resp.print(A, "Location: {s}\r\n", .{location}) catch return;
         resp.appendSlice(A, "\r\n") catch return;
         resp.appendSlice(A, payload) catch return;
-        _ = compat.writeAll(fd, resp.items) catch return;
+        _ = sys.writeAll(fd, resp.items) catch return;
     }
 };
 
@@ -947,15 +947,15 @@ test "acme runOnce completes a full issuance against the fake CA" {
     }, &transport, LogFn);
 
     // Downloaded chain landed byte-exact; key parses; challenges cleaned.
-    const chain = try compat.readFileAlloc(allocator, cert_path, 1 << 20);
+    const chain = try sys.readFileAlloc(allocator, cert_path, 1 << 20);
     defer allocator.free(chain);
     try testing.expectEqualStrings(testdata.cert_pem, chain);
-    const cert_key_pem = try compat.readFileAlloc(allocator, certkey_path, 1 << 20);
+    const cert_key_pem = try sys.readFileAlloc(allocator, certkey_path, 1 << 20);
     defer allocator.free(cert_key_pem);
     const creds = try @import("../tls/cert.zig").loadCredentials(allocator, testdata.cert_pem, cert_key_pem);
     defer allocator.free(creds.cert_der);
     // Account key persisted for the next run.
-    const acct_pem = try compat.readFileAlloc(allocator, acct_path, 1 << 20);
+    const acct_pem = try sys.readFileAlloc(allocator, acct_path, 1 << 20);
     defer allocator.free(acct_pem);
     try testing.expect(std.mem.startsWith(u8, acct_pem, "-----BEGIN EC PRIVATE KEY-----"));
     try testing.expect(fake.challenge_ok.load(.acquire));
@@ -970,13 +970,13 @@ pub const check_interval_seconds: u64 = 12 * 60 * 60;
 /// Seconds until the certificate chain at `path` expires; null when the
 /// file is missing or unparseable (treat as "issue now").
 pub fn certRemainingSeconds(allocator: std.mem.Allocator, path: []const u8) ?u64 {
-    const pem = compat.readFileAlloc(allocator, path, 1 << 20) catch return null;
+    const pem = sys.readFileAlloc(allocator, path, 1 << 20) catch return null;
     defer allocator.free(pem);
     const pem_mod = @import("../tls/pem.zig");
     var buf: [8192]u8 = undefined;
     const len = (pem_mod.decodeFirst(pem, "CERTIFICATE", &buf) catch return null) orelse return null;
     const parsed = Certificate.parse(.{ .buffer = buf[0..len], .index = 0 }) catch return null;
-    const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return null;
+    const ts = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch return null;
     const now: u64 = @intCast(ts.sec);
     return if (parsed.validity.not_after > now) parsed.validity.not_after - now else 0;
 }
@@ -1006,7 +1006,7 @@ pub fn runDaemon(
                 log(logFn, m);
             };
         }
-        compat.nanosleep(check_interval_seconds, 0);
+        sys.nanosleep(check_interval_seconds, 0);
     }
 }
 
@@ -1017,7 +1017,7 @@ test "certRemainingSeconds reports the fixture certificate's lifetime" {
     const testdata = @import("../tls/testdata.zig");
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/crt.pem", .{tmp.sub_path});
-    try compat.writeFile(path, testdata.cert_pem);
+    try sys.writeFile(path, testdata.cert_pem);
     const remaining = certRemainingSeconds(allocator, path) orelse return error.TestUnexpected;
     // The fixture is valid for years; anything sane is > 30 days.
     try testing.expect(remaining > renew_before_seconds);
@@ -1309,22 +1309,22 @@ const ClosingListener = struct {
             if (ready == 0) break;
             const cfd = std.os.linux.accept4(fd, null, null, 0);
             if (std.os.linux.errno(cfd) != .SUCCESS) break;
-            compat.close(@intCast(cfd));
+            sys.close(@intCast(cfd));
         }
     }
 
     fn start(n: usize) !ClosingListener {
-        const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-        errdefer compat.close(lfd);
+        const lfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        errdefer sys.close(lfd);
         var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
         addr[0] = 2;
         addr[4] = 127;
         addr[7] = 1;
-        try compat.bind(lfd, @ptrCast(&addr), 16);
-        try compat.listen(lfd, 4);
+        try sys.bind(lfd, @ptrCast(&addr), 16);
+        try sys.listen(lfd, 4);
         var slen: std.posix.socklen_t = 16;
         var bound: [16]u8 align(@alignOf(u16)) = undefined;
-        try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+        try sys.getsockname(lfd, @ptrCast(&bound), &slen);
         return .{
             .fd = lfd,
             .port = (@as(u16, bound[2]) << 8) | bound[3],
@@ -1334,7 +1334,7 @@ const ClosingListener = struct {
 
     fn stop(self: *ClosingListener) void {
         self.thread.join();
-        compat.close(self.fd);
+        sys.close(self.fd);
     }
 
     fn url(self: *ClosingListener, buf: []u8, path: []const u8) []const u8 {

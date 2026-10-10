@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const phase_mod = @import("phase.zig");
 const router = @import("router.zig");
 const http_parser = @import("../http/parser.zig");
@@ -197,7 +197,7 @@ pub const Context = struct {
     /// Map evaluation depth (cyclic-map backstop; see vars.evalMap).
     map_depth: u8 = 0,
     /// Per-request start instant for `$request_time`.
-    started: compat.Instant = undefined,
+    started: sys.Instant = undefined,
     /// Monotonic request timestamp in ns (reactor clock; 0 when unset, e.g.
     /// unit tests set it explicitly). Rate buckets and LB timing read this.
     now_ns: u64 = 0,

@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -54,8 +54,8 @@ pub const ListenSpec = struct {
 };
 
 pub fn setNonBlock(fd: posix.fd_t) !void {
-    const flags = try compat.fcntl(fd, F_GETFL, 0);
-    _ = try compat.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    const flags = try sys.fcntl(fd, F_GETFL, 0);
+    _ = try sys.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 /// Create a non-blocking IPv4 TCP listener bound to 127.0.0.1:port with
@@ -76,8 +76,8 @@ pub fn createListeningSocketReusePort(port: u16, backlog: usize) !posix.fd_t {
 /// default when family is .ipv6.
 pub fn createListeningSocketFromSpec(spec: ListenSpec, backlog: usize, reuse_port: bool) !posix.fd_t {
     const family: u16 = if (spec.family == .ipv6) AF_INET6 else AF_INET;
-    const listener = try compat.socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    errdefer compat.close(listener);
+    const listener = try sys.socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    errdefer sys.close(listener);
     try posix.setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     if (reuse_port) {
         try posix.setsockopt(listener, SOL_SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
@@ -98,7 +98,7 @@ pub fn createListeningSocketFromSpec(spec: ListenSpec, backlog: usize, reuse_por
             .sin6_addr = spec.addr,
             .sin6_scope_id = 0,
         };
-        try compat.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in6));
+        try sys.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in6));
     } else {
         const addr = sockaddr_in{
             .sin_family = AF_INET,
@@ -106,15 +106,15 @@ pub fn createListeningSocketFromSpec(spec: ListenSpec, backlog: usize, reuse_por
             .sin_addr = std.mem.nativeToBig(u32, @as(u32, @intCast(spec.addr[0])) << 24 | @as(u32, @intCast(spec.addr[1])) << 16 | @as(u32, @intCast(spec.addr[2])) << 8 | @as(u32, @intCast(spec.addr[3]))),
             .sin_zero = @as([8]u8, @splat(@as(u8, 0))),
         };
-        try compat.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in));
+        try sys.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in));
     }
-    try compat.listen(listener, @intCast(backlog));
+    try sys.listen(listener, @intCast(backlog));
     return listener;
 }
 
 fn createListeningSocketFlags(port: u16, backlog: usize, reuse_port: bool) !posix.fd_t {
-    const listener = try compat.socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    errdefer compat.close(listener);
+    const listener = try sys.socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    errdefer sys.close(listener);
     try posix.setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     if (reuse_port) {
         try posix.setsockopt(listener, SOL_SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
@@ -129,8 +129,8 @@ fn createListeningSocketFlags(port: u16, backlog: usize, reuse_port: bool) !posi
         .sin_zero = @as([8]u8, @splat(@as(u8, 0))),
     };
 
-    try compat.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in));
-    try compat.listen(listener, @intCast(backlog));
+    try sys.bind(listener, @as(*const posix.sockaddr, @ptrCast(&addr)), @sizeOf(sockaddr_in));
+    try sys.listen(listener, @intCast(backlog));
     return listener;
 }
 
@@ -176,7 +176,7 @@ pub fn boundPort(fd: posix.fd_t) !u16 {
     var buf: [28]u8 align(@alignOf(u16)) = undefined;
     var len: posix.socklen_t = 28;
     const sa_ptr: *posix.sockaddr = @ptrCast(&buf);
-    try compat.getsockname(fd, sa_ptr, &len);
+    try sys.getsockname(fd, sa_ptr, &len);
     const family: u16 = @intCast(@as(u16, sa_ptr.family));
     if (family == AF_INET6) {
         const addr: *const sockaddr_in6 = @ptrCast(@alignCast(&buf));
@@ -367,28 +367,28 @@ test "sockets: fmtIp renders v4-mapped and v6 canonical forms" {
 
 test "sockets: listeners bind ephemeral ports, peers resolve" {
     const fd = try createListeningSocket(0, 8);
-    defer compat.close(fd);
+    defer sys.close(fd);
     const port = try boundPort(fd);
     try testing.expect(port != 0);
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
     // Socketpair peers are not INET: zeroes.
     try testing.expectEqual([16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, peerIp(pair[0]));
 
     // Connected TCP peer resolves to mapped 127.0.0.1.
-    const cfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    defer compat.close(cfd);
+    const cfd = try sys.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer sys.close(cfd);
     var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     addr[0] = 2;
     addr[2] = @intCast(port >> 8);
     addr[3] = @intCast(port & 0xff);
     addr[4] = 127;
     addr[7] = 1;
-    try compat.connect(cfd, @ptrCast(&addr), 16);
+    try sys.connect(cfd, @ptrCast(&addr), 16);
     const afd = try acceptNonBlock(fd);
-    defer compat.close(afd);
+    defer sys.close(afd);
     const peer = peerIp(afd);
     try testing.expect(isIPv4Mapped(peer));
     var pbuf: [64]u8 = undefined;
@@ -400,7 +400,7 @@ test "sockets: listeners bind ephemeral ports, peers resolve" {
     // Socket options apply without error; NODELAY reads back set.
     setTcpNoDelay(cfd);
     var nodelay: [4]u8 = undefined;
-    try compat.getsockopt(cfd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &nodelay);
+    try sys.getsockopt(cfd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &nodelay);
     try testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, &nodelay, .little));
     setTcpCork(cfd);
     clearTcpCork(cfd);

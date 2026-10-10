@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -9,7 +9,7 @@ const linux = std.os.linux;
 /// passes through to the child process on exec.
 pub fn create(name: []const u8, size: usize) !posix.fd_t {
     const fd = try posix.memfd_create(name, 0);
-    try compat.ftruncate(fd, @intCast(size));
+    try sys.ftruncate(fd, @intCast(size));
     return fd;
 }
 
@@ -36,7 +36,7 @@ pub fn inheritAndMap(fd: posix.fd_t, size: usize) ![]align(std.heap.page_size_mi
 test "memfd create and map round-trips" {
     const size = std.heap.page_size_min;
     const fd = try create("test-zone", size);
-    defer compat.close(fd);
+    defer sys.close(fd);
 
     const region = try map(fd, size);
     defer posix.munmap(region);
@@ -54,7 +54,7 @@ test "memfd create and map round-trips" {
 test "memfd inheritAndMap remaps a live fd" {
     const size = std.heap.page_size_min;
     const fd = try create("test-inherit", size);
-    defer compat.close(fd);
+    defer sys.close(fd);
     const first = try map(fd, size);
     defer posix.munmap(first);
     first[0] = 0x5A;
@@ -67,9 +67,9 @@ test "memfd inheritAndMap remaps a live fd" {
 test "memfd regions are independent per fd" {
     const size = std.heap.page_size_min;
     const fd_a = try create("test-iso-a", size);
-    defer compat.close(fd_a);
+    defer sys.close(fd_a);
     const fd_b = try create("test-iso-b", size);
-    defer compat.close(fd_b);
+    defer sys.close(fd_b);
 
     const a = try map(fd_a, size);
     defer posix.munmap(a);

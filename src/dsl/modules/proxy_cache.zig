@@ -20,7 +20,7 @@
 //! GET/HEAD only; requests carrying Authorization bypass entirely.
 
 const std = @import("std");
-const compat = @import("../../compat.zig");
+const sys = @import("../../sys.zig");
 const registry = @import("../registry.zig");
 const shmem = @import("../shmem.zig");
 
@@ -33,7 +33,7 @@ const max_entries = 256;
 
 const default_entries: usize = 256;
 
-var store_mutex: compat.Mutex = .{};
+var store_mutex: sys.Mutex = .{};
 var store: ?shmem.LruStore = null;
 var store_budget: usize = 0;
 var store_entries_cap: usize = 0;

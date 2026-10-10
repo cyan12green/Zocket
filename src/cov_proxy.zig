@@ -4,5 +4,5 @@ comptime {
     _ = @import("dsl/modules/proxy.zig");
     _ = @import("dsl/registry.zig");
     _ = @import("dsl/router.zig");
-    _ = @import("compat.zig");
+    _ = @import("sys.zig");
 }

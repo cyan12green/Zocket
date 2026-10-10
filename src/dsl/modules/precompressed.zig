@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const posix = std.posix;
-const compat = @import("../../compat.zig");
+const sys = @import("../../sys.zig");
 const registry = @import("../registry.zig");
 const mime_mod = @import("../../http/mime.zig");
 
@@ -107,9 +107,9 @@ fn tryTwin(ctx: *Context, root: []const u8, target: []const u8, c: Codec) bool {
     var path_buf: [520]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}{s}", .{ root, target, c.suffix }) catch return false;
 
-    const file = compat.openFile(path) catch return false; // no twin
-    defer compat.close(file);
-    const stat = compat.fstat(file) catch return false;
+    const file = sys.openFile(path) catch return false; // no twin
+    defer sys.close(file);
+    const stat = sys.fstat(file) catch return false;
     if (stat.kind != .file) return false;
     if (stat.size > max_buffered) return false;
 
@@ -154,7 +154,7 @@ test "no accept-encoding or no gz twin passes through" {
 test "serves the gz twin with the original content type" {
     // Fixture: testdata/hello.txt.gz holds a tiny valid gzip of hello.txt.
     try makeTwin("testdata/hello.txt", "testdata/hello.txt.gz");
-    defer compat.deleteFile("testdata/hello.txt.gz") catch {};
+    defer sys.deleteFile("testdata/hello.txt.gz") catch {};
 
     var req = Request.init(testing.allocator);
     defer req.deinit();
@@ -182,11 +182,11 @@ test "serves the gz twin with the original content type" {
 fn makeTwin(src: []const u8, dst: []const u8) !void {
     const gzip_mod = @import("gzip.zig");
     const allocator = testing.allocator;
-    const raw = try compat.readFileAlloc(allocator, src, 1 << 20);
+    const raw = try sys.readFileAlloc(allocator, src, 1 << 20);
     defer allocator.free(raw);
     const compressed = try gzip_mod.gzipCompress(allocator, raw);
     defer allocator.free(compressed);
-    try compat.writeFile(dst, compressed);
+    try sys.writeFile(dst, compressed);
 }
 
 test "passes through without route, root, or a safe target" {
@@ -247,7 +247,7 @@ test "passes through without client gzip support" {
 
 test "uppercase GZIP matches case-insensitively" {
     try makeTwin("testdata/hello.txt", "testdata/hello.txt.gz");
-    defer compat.deleteFile("testdata/hello.txt.gz") catch {};
+    defer sys.deleteFile("testdata/hello.txt.gz") catch {};
 
     var req = Request.init(testing.allocator);
     defer req.deinit();
@@ -263,10 +263,10 @@ test "uppercase GZIP matches case-insensitively" {
 test "br and zstd twins serve with best-first preference" {
     // Fixtures are opaque bytes (no std brotli/zstd encoders exist); the
     // module serves disk bytes verbatim with the right Content-Encoding.
-    try compat.writeFile("testdata/hello.txt.br", "fake-br-payload");
-    defer compat.deleteFile("testdata/hello.txt.br") catch {};
-    try compat.writeFile("testdata/hello.txt.zst", "fake-zst-payload");
-    defer compat.deleteFile("testdata/hello.txt.zst") catch {};
+    try sys.writeFile("testdata/hello.txt.br", "fake-br-payload");
+    defer sys.deleteFile("testdata/hello.txt.br") catch {};
+    try sys.writeFile("testdata/hello.txt.zst", "fake-zst-payload");
+    defer sys.deleteFile("testdata/hello.txt.zst") catch {};
 
     const serve = struct {
         fn go(ae: []const u8, br: bool, zstd: bool, gz: bool) ![]const u8 {
@@ -286,7 +286,7 @@ test "br and zstd twins serve with best-first preference" {
         }
     }.go;
     try makeTwin("testdata/hello.txt", "testdata/hello.txt.gz");
-    defer compat.deleteFile("testdata/hello.txt.gz") catch {};
+    defer sys.deleteFile("testdata/hello.txt.gz") catch {};
     // Best-first: br wins when accepted + enabled, even with gzip listed first.
     try testing.expectEqualStrings("br", try serve("gzip, br", true, false, true));
     try testing.expectEqualStrings("zstd", try serve("gzip, zstd", false, true, true));
@@ -296,8 +296,8 @@ test "br and zstd twins serve with best-first preference" {
 }
 
 test "disabled codecs never serve even when accepted" {
-    try compat.writeFile("testdata/hello.txt.br", "fake-br-payload");
-    defer compat.deleteFile("testdata/hello.txt.br") catch {};
+    try sys.writeFile("testdata/hello.txt.br", "fake-br-payload");
+    defer sys.deleteFile("testdata/hello.txt.br") catch {};
     var req = Request.init(testing.allocator);
     defer req.deinit();
     req.decoded_target = "hello.txt";

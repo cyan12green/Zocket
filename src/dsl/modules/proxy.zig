@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../../compat.zig");
+const sys = @import("../../sys.zig");
 const registry = @import("../registry.zig");
 const sockets = @import("../../net/sockets.zig");
 const epoll_mod = @import("../../net/epoll.zig");
@@ -171,7 +171,7 @@ fn parkAt(ctx: *Context, route: *const registry.Route, upstreams: []const router
         // here at sync-driver cost; only real blocks park.
         var sent: usize = 0;
         while (sent < request.len) {
-            const n = compat.write(fd, request[sent..]) catch |e| switch (e) {
+            const n = sys.write(fd, request[sent..]) catch |e| switch (e) {
                 error.WouldBlock => {
                     return parkRemainder(ctx, route, .{
                         .fd = fd,
@@ -345,7 +345,7 @@ fn keepaliveIdleNs(route: *const registry.Route) u64 {
     return s * std.time.ns_per_s;
 }
 
-threadlocal var epoch: compat.Instant = undefined;
+threadlocal var epoch: sys.Instant = undefined;
 threadlocal var epoch_set = false;
 
 /// Monotonic nanoseconds since this thread's first proxy use (the retry
@@ -357,10 +357,10 @@ pub fn currentNs() u64 {
 
 fn nowNs() u64 {
     if (!epoch_set) {
-        epoch = compat.Instant.now() catch return 0;
+        epoch = sys.Instant.now() catch return 0;
         epoch_set = true;
     }
-    return (compat.Instant.now() catch return 0).since(epoch);
+    return (sys.Instant.now() catch return 0).since(epoch);
 }
 /// Compiled defaults for the proxy_*_timeout directives (0 = default):
 /// connect and send are tight (a half-dead backend must not park a reactor
@@ -425,7 +425,7 @@ fn backendKey(route: *const registry.Route, idx: usize) u64 {
 var probeFn: *const fn (up: *const router.Upstream, path: []const u8, timeout_s: u32) bool = tcpProbe;
 
 /// Registered health-checked routes (process-immortal route pointers).
-var hc_mutex: compat.Mutex = .{};
+var hc_mutex: sys.Mutex = .{};
 var hc_routes: std.ArrayList(*const registry.Route) = .empty;
 var hc_thread_started: bool = false;
 
@@ -737,7 +737,7 @@ fn attemptForwardTls(
         var link_slice: []const u8 = "-";
         if (ps) |s| {
             const lp = std.fmt.bufPrint(&lbuf, "/proc/self/fd/{d}", .{s.sock.fd}) catch "?";
-            link_slice = compat.readlink(lp, &link) catch "?";
+            link_slice = sys.readlink(lp, &link) catch "?";
         }
     }
     var reused = ps != null;
@@ -1136,7 +1136,7 @@ fn ensureHealthChecker(route: *const registry.Route) void {
     t.detach();
 }
 
-var epoch_zero: compat.Instant = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+var epoch_zero: sys.Instant = .{ .timestamp = .{ .sec = 0, .nsec = 0 } };
 
 fn healthThread() void {
     while (true) {
@@ -1147,12 +1147,12 @@ fn healthThread() void {
         // Idle exit: no routes left (tests unregistered theirs) — a later
         // ensureHealthChecker restarts the prober on demand.
         if (empty) return;
-        const t = compat.Instant.now() catch {
-            compat.nanosleep(1, 0);
+        const t = sys.Instant.now() catch {
+            sys.nanosleep(1, 0);
             continue;
         };
         runHealthChecksOnce(t.since(epoch_zero));
-        compat.nanosleep(0, 250 * std.time.ns_per_ms);
+        sys.nanosleep(0, 250 * std.time.ns_per_ms);
     }
 }
 
@@ -1167,17 +1167,17 @@ fn tcpProbe(up: *const router.Upstream, path: []const u8, timeout_s: u32) bool {
     const req = std.fmt.bufPrint(&req_buf, "HEAD {s} HTTP/1.1\r\nHost: zocket-hc\r\nConnection: close\r\n\r\n", .{path}) catch return false;
     var sent: usize = 0;
     while (sent < req.len) {
-        sent += compat.write(fd, req[sent..]) catch return false;
+        sent += sys.write(fd, req[sent..]) catch return false;
     }
     var buf: [128]u8 = undefined;
     var got: usize = 0;
     const timeout_ns: u64 = @as(u64, if (timeout_s == 0) 1 else timeout_s) * std.time.ns_per_s;
-    const deadline = compat.Instant.now() catch return false;
+    const deadline = sys.Instant.now() catch return false;
     while (got < 12) {
         const n = std.posix.read(fd, buf[got..]) catch return false;
         if (n == 0) break;
         got += n;
-        const now = compat.Instant.now() catch return false;
+        const now = sys.Instant.now() catch return false;
         if (now.since(deadline) > timeout_ns) return false;
     }
     if (got < 12) return false;
@@ -1297,10 +1297,10 @@ fn connectUpstream(up: *const router.Upstream, connect_ms: i32) !posix_fd {
     // Non-blocking + CLOEXEC: the connect completes under a bounded poll,
     // and every later read/write on this fd gets EAGAIN handling instead
     // of parking the reactor thread on a slow backend.
-    const fd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
+    const fd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
     errdefer posix_close(fd);
     sockets.setTcpNoDelay(fd);
-    compat.connect(fd, &up.sockaddr, 16) catch |e| switch (e) {
+    sys.connect(fd, &up.sockaddr, 16) catch |e| switch (e) {
         error.WouldBlock => {}, // EINPROGRESS: finish under poll below
         else => return e,
     };
@@ -1308,7 +1308,7 @@ fn connectUpstream(up: *const router.Upstream, connect_ms: i32) !posix_fd {
     const ready = std.posix.poll(&pfds, connect_ms) catch return error.ConnectTimeout;
     if (ready == 0) return error.ConnectTimeout;
     var err_bytes: [4]u8 = undefined;
-    compat.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, &err_bytes) catch return error.ConnectFailed;
+    sys.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, &err_bytes) catch return error.ConnectFailed;
     if (std.mem.readInt(i32, &err_bytes, .little) != 0) return error.ConnectFailed;
     return fd;
 }
@@ -1326,7 +1326,7 @@ fn setRecvTimeout(fd: posix_fd, read_s: u32) void {
 }
 
 fn posix_close(fd: posix_fd) void {
-    compat.close(fd);
+    sys.close(fd);
 }
 
 // ---- upstream request forwarding ----
@@ -1337,7 +1337,7 @@ fn sendUpstreamRequest(fd: posix_fd, ctx: *Context, up: *const router.Upstream, 
     const req = try buildUpstreamRequest(ctx, up);
     var remaining = req;
     while (remaining.len > 0) {
-        const n = compat.write(fd, remaining) catch |e| switch (e) {
+        const n = sys.write(fd, remaining) catch |e| switch (e) {
             error.WouldBlock => {
                 var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
                 const ready = std.posix.poll(&pfds, send_ms) catch return error.UpstreamWriteFailed;
@@ -1949,7 +1949,7 @@ fn tlsIo() std.Io {
 /// Process-wide CA bundle cache keyed by file path (loaded once each;
 /// DER bytes live forever — same convention as server credentials).
 const max_bundles = 4;
-var bundle_mutex = compat.Mutex{};
+var bundle_mutex = sys.Mutex{};
 var bundle_paths: [max_bundles][]const u8 = @as([max_bundles][]const u8, @splat(@as([]const u8, "")));
 var bundle_slots: [max_bundles]Certificate.Bundle = @as([max_bundles]Certificate.Bundle, @splat(Certificate.Bundle.empty));
 var bundle_filled: usize = 0;
@@ -1966,7 +1966,7 @@ fn trustedBundle(path: []const u8) ?*Certificate.Bundle {
     }
     if (bundle_filled >= max_bundles) return null;
     const io = tlsIo();
-    const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return null;
+    const ts = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch return null;
     const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
     var bundle = Certificate.Bundle.empty;
     // Absolute paths (the normal case: /etc/ssl/certs/...) open directly;
@@ -2214,10 +2214,10 @@ fn tlsHandshake(
     };
     const io = tlsIo();
     var entropy: [tls_client.Options.entropy_len]u8 = undefined;
-    compat.randomBytes(&entropy);
+    sys.randomBytes(&entropy);
     // Real wall clock: certificate expiry/host verification needs true
     // time (verify-off handshakes don't care, but always pass it).
-    const ts: std.posix.timespec = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch .{ .sec = 0, .nsec = 0 };
+    const ts: std.posix.timespec = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch .{ .sec = 0, .nsec = 0 };
     const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
     const sni = tlsServerName(route, up);
     const HostOpt = @FieldType(tls_client.Options, "host");
@@ -2495,13 +2495,13 @@ fn intervalNsFor(route: *const registry.Route) u64 {
 }
 
 fn nowForHc() u64 {
-    const t = compat.Instant.now() catch return 0;
+    const t = sys.Instant.now() catch return 0;
     return t.since(epoch_zero);
 }
 
 test "tcpProbe distinguishes a live listener from a dead port" {
     const listener = try sockets.createListeningSocket(18933, 4);
-    defer compat.close(listener);
+    defer sys.close(listener);
     // Accept the probe connection on a side thread (connect-only probe
     // sends nothing and closes).
     const accept_thread = try std.Thread.spawn(.{}, struct {
@@ -2510,7 +2510,7 @@ test "tcpProbe distinguishes a live listener from a dead port" {
             _ = std.posix.poll(&fds, 2000) catch return;
             if (fds[0].revents & std.posix.POLL.IN != 0) {
                 const c = sockets.acceptNonBlock(lfd) catch return;
-                compat.close(c);
+                sys.close(c);
             }
         }
     }.run, .{listener});
@@ -2525,7 +2525,7 @@ test "tcpProbe distinguishes a live listener from a dead port" {
     for (0..4) |_| {
         const tmp_listener = try sockets.createListeningSocket(0, 4);
         const dead_port = try sockets.boundPort(tmp_listener);
-        compat.close(tmp_listener);
+        sys.close(tmp_listener);
         const dead = mkUp("127.0.0.1", dead_port);
         if (!tcpProbe(&dead, "", 1)) {
             dead_ok_checked = true;
@@ -2551,16 +2551,16 @@ const FakeUpstream = struct {
 
     fn start(response: []const u8, max_conns: usize) !*FakeUpstream {
         const self = try testing.allocator.create(FakeUpstream);
-        const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        const lfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
         var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
         addr[0] = 2;
         addr[4] = 127;
         addr[7] = 1;
-        try compat.bind(lfd, @ptrCast(&addr), 16);
-        try compat.listen(lfd, 8);
+        try sys.bind(lfd, @ptrCast(&addr), 16);
+        try sys.listen(lfd, 8);
         var slen: posix.socklen_t = 16;
         var bound: [16]u8 align(@alignOf(u16)) = undefined;
-        try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+        try sys.getsockname(lfd, @ptrCast(&bound), &slen);
         self.* = .{
             .listener = lfd,
             .port = (@as(u16, bound[2]) << 8) | bound[3],
@@ -2605,16 +2605,16 @@ const FakeUpstream = struct {
                 if (!complete) break;
                 self.last_req_len = @min(used, self.last_req.len);
                 @memcpy(self.last_req[0..self.last_req_len], req_buf[0..self.last_req_len]);
-                _ = compat.write(fd, self.response) catch break;
+                _ = sys.write(fd, self.response) catch break;
             }
-            compat.close(fd);
+            sys.close(fd);
             served += 1;
         }
     }
 
     fn stop(self: *FakeUpstream) void {
         self.stop_flag.store(true, .release);
-        compat.close(self.listener); // wakes the poll
+        sys.close(self.listener); // wakes the poll
         self.thread.join();
         testing.allocator.destroy(self);
     }
@@ -2662,8 +2662,8 @@ test "proxy round-trips through the sync forward path with pool reuse" {
     // Seed the pool with a BLOCKING socket: the sync forward path reads
     // exactly once, so a nonblocking fd would race the fake's response
     // (WouldBlock -> 502). Blocking + recv timeout is deterministic.
-    const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    try compat.connect(seed, &ups[0].sockaddr, 16);
+    const seed = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try sys.connect(seed, &ups[0].sockaddr, 16);
     setRecvTimeout(seed, default_read_timeout_s);
     releasePooled(0, seed, nowNs(), pool_default_max);
 
@@ -2700,17 +2700,17 @@ test "proxy connectUpstream dials a live listener" {
 
 test "proxy answers 502 when the upstream refuses" {
     // Reserve-then-close a listener so the port is definitely shut.
-    const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    const lfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     addr[0] = 2;
     addr[4] = 127;
     addr[7] = 1;
-    try compat.bind(lfd, @ptrCast(&addr), 16);
+    try sys.bind(lfd, @ptrCast(&addr), 16);
     var slen: posix.socklen_t = 16;
     var bound: [16]u8 align(@alignOf(u16)) = undefined;
-    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+    try sys.getsockname(lfd, @ptrCast(&bound), &slen);
     const dead_port = (@as(u16, bound[2]) << 8) | bound[3];
-    compat.close(lfd);
+    sys.close(lfd);
 
     var ups = [_]router.Upstream{mkUp("127.0.0.1", dead_port)};
     const route = registry.Route{
@@ -2750,27 +2750,27 @@ test "proxy timeouts resolve explicit seconds over defaults" {
 }
 
 test "proxy setRecvTimeout applies SO_RCVTIMEO read-back" {
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
     setRecvTimeout(pair[0], 7);
     var tv: std.posix.timeval = undefined;
-    try compat.getsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try sys.getsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
     try testing.expectEqual(@as(i64, 7), tv.sec);
 }
 
 /// Reserve a loopback port, then close it: connecting to it refuses fast.
 fn deadBackendPort() !u16 {
-    const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    const lfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     addr[0] = 2;
     addr[4] = 127;
     addr[7] = 1;
-    try compat.bind(lfd, @ptrCast(&addr), 16);
+    try sys.bind(lfd, @ptrCast(&addr), 16);
     var slen: posix.socklen_t = 16;
     var bound: [16]u8 align(@alignOf(u16)) = undefined;
-    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
-    compat.close(lfd);
+    try sys.getsockname(lfd, @ptrCast(&bound), &slen);
+    sys.close(lfd);
     return (@as(u16, bound[2]) << 8) | bound[3];
 }
 
@@ -2813,8 +2813,8 @@ test "proxy_next_upstream on: failover serves from the live backend" {
     };
     testResetRoute(&route);
     // Seed backend 1 with a blocking socket (deterministic read).
-    const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    try compat.connect(seed, &ups[1].sockaddr, 16);
+    const seed = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try sys.connect(seed, &ups[1].sockaddr, 16);
     setRecvTimeout(seed, default_read_timeout_s);
     releasePooled(1, seed, nowNs(), pool_default_max);
 
@@ -2877,23 +2877,23 @@ test "proxy pool reaps idle entries and returns fresh ones" {
     // Backend 7: unused by other tests (they pin idx 0/1).
     const idx = 7;
     drainPool(idx);
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     // Stale entry (last_used = 0): reaped on acquire, pool stays empty.
     releasePooled(idx, pair[0], 0, pool_default_max);
     releasePooled(idx, pair[1], 0, pool_default_max);
     try testing.expectEqual(@as(posix_fd, -1), acquirePooled(idx, nowNs(), 1));
     // Fresh entry: returned as-is.
-    const live = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    const live = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     releasePooled(idx, live[0], nowNs(), pool_default_max);
-    compat.close(live[1]);
+    sys.close(live[1]);
     try testing.expectEqual(live[0], acquirePooled(idx, nowNs(), pool_default_idle_s * std.time.ns_per_s));
-    compat.close(live[0]);
+    sys.close(live[0]);
     // Overflow past max_conns closes instead of growing the pool.
     var i: u32 = 0;
     while (i < pool_default_max + 2) : (i += 1) {
-        const sp = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+        const sp = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
         releasePooled(idx, sp[0], nowNs(), 2);
-        compat.close(sp[1]);
+        sys.close(sp[1]);
     }
     try testing.expectEqual(@as(u32, 2), pool_lens[idx]);
     drainPool(idx);
@@ -2920,8 +2920,8 @@ test "proxy hostname upstream resolves via refresh then forwards" {
     dns_resolver.resolveAndRegister("loopback", &ups[0], srv, stub.port);
     try testing.expectEqual(@as(u16, 2), ups[0].sockaddr.family); // AF_INET now
     // Seed backend 0 with a blocking socket (deterministic read).
-    const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    try compat.connect(seed, &ups[0].sockaddr, 16);
+    const seed = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try sys.connect(seed, &ups[0].sockaddr, 16);
     setRecvTimeout(seed, default_read_timeout_s);
     releasePooled(0, seed, nowNs(), pool_default_max);
 
@@ -3005,16 +3005,16 @@ const TlsOrigin = struct {
 
     fn startOpts(response: []const u8, opts: Opts) !*TlsOrigin {
         const self = try testing.allocator.create(TlsOrigin);
-        const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        const lfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
         var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
         addr[0] = 2;
         addr[4] = 127;
         addr[7] = 1;
-        try compat.bind(lfd, @ptrCast(&addr), 16);
-        try compat.listen(lfd, 8);
+        try sys.bind(lfd, @ptrCast(&addr), 16);
+        try sys.listen(lfd, 8);
         var slen: posix.socklen_t = 16;
         var bound: [16]u8 align(@alignOf(u16)) = undefined;
-        try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+        try sys.getsockname(lfd, @ptrCast(&bound), &slen);
         self.* = .{
             .listener = lfd,
             .port = (@as(u16, bound[2]) << 8) | bound[3],
@@ -3039,7 +3039,7 @@ const TlsOrigin = struct {
             if (linux.errno(cfd) != .SUCCESS) break;
             const fd: posix_fd = @intCast(cfd);
             serveOne(self, fd, &creds);
-            compat.close(fd);
+            sys.close(fd);
         }
     }
 
@@ -3100,7 +3100,7 @@ const TlsOrigin = struct {
                 inline else => |*s| s.takeOut(out_buf),
             };
             if (m == 0) return;
-            _ = compat.write(fd, out_buf[0..m]) catch {
+            _ = sys.write(fd, out_buf[0..m]) catch {
                 return;
             };
         }
@@ -3108,7 +3108,7 @@ const TlsOrigin = struct {
 
     fn stop(self: *TlsOrigin) void {
         self.stop_flag.store(true, .release);
-        compat.close(self.listener);
+        sys.close(self.listener);
         self.thread.join();
         testing.allocator.destroy(self);
     }
@@ -3150,10 +3150,10 @@ test "proxy TLS verify-on trusts the testdata cert via bundle file" {
     const path = "/tmp/zocket-upstream-ca-test.pem";
     {
         const testdata = @import("../../tls/testdata.zig");
-        compat.deleteFile(path) catch {};
-        try compat.writeFile(path, testdata.cert_pem);
+        sys.deleteFile(path) catch {};
+        try sys.writeFile(path, testdata.cert_pem);
     }
-    defer compat.deleteFile(path) catch {};
+    defer sys.deleteFile(path) catch {};
     const origin = try TlsOrigin.start("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\ntls-hello");
     defer origin.stop();
     var ups = [_]router.Upstream{.{
@@ -3187,9 +3187,9 @@ test "proxy TLS verify-on trusts the testdata cert via bundle file" {
 test "proxy TLS iso: sock ifaces round-trip bytes over socketpair" {
     // No TLS involved: proves the poll-bounded vtables move bytes
     // correctly in both directions (the TLS failures are elsewhere).
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
     var sock = TlsUpstream{
@@ -3210,7 +3210,7 @@ test "proxy TLS iso: sock ifaces round-trip bytes over socketpair" {
     try testing.expectEqualStrings(msg, raw[0..n]);
     // Inbound: raw peer write must surface through the iface.
     const back = "peer reply ok";
-    _ = try compat.write(pair[1], back);
+    _ = try sys.write(pair[1], back);
     var out: [64]u8 = undefined;
     try sock.reader_iface.readSliceAll(out[0..back.len]);
     try testing.expectEqualStrings(back, out[0..back.len]);
@@ -3532,9 +3532,9 @@ test "proxy TLS pools live sessions across requests" {
 
 test "tls sock iface poll reads available bytes" {
     // Isolation: does tlsStream see waiting data? (Rules out poll blindness.)
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
     var sock = TlsUpstream{
@@ -3545,7 +3545,7 @@ test "tls sock iface poll reads available bytes" {
         .writer_iface = .{ .vtable = &tls_writer_vtable, .buffer = wbuf[0..], .end = 0 },
         .client = undefined,
     };
-    _ = try compat.write(pair[1], "hello-poll");
+    _ = try sys.write(pair[1], "hello-poll");
     var out: [64]u8 = undefined;
     // Drive stream() directly through a temp writer over `out`.
     var w: std.Io.Writer = .{ .vtable = &.{ .drain = std.Io.Writer.fixedDrain }, .buffer = out[0..], .end = 0 };
@@ -3892,8 +3892,8 @@ test "proxy parked path: a pooled connection completes inline" {
     };
     testResetRoute(&route);
     // Blocking pooled fd: the inline read is deterministic (no WouldBlock race).
-    const seed = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    try compat.connect(seed, &ups[0].sockaddr, 16);
+    const seed = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    try sys.connect(seed, &ups[0].sockaddr, 16);
     setRecvTimeout(seed, default_read_timeout_s);
     releasePooled(0, seed, nowNs(), pool_default_max);
 
@@ -3944,8 +3944,8 @@ test "proxy parked path: a stale pooled fd retries on a fresh connection" {
     testResetRoute(&route);
     // SHUT_WR on the peer: our write succeeds, the read reports EOF — the
     // upstream-closed-idle-connection shape.
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[1]);
     try testing.expect(std.os.linux.errno(std.os.linux.shutdown(pair[1], 1)) == .SUCCESS);
     releasePooled(0, pair[0], nowNs(), pool_default_max);
 
@@ -3975,13 +3975,13 @@ test "proxy parked path: a blocked write parks awaiting_out" {
     testResetRoute(&route);
     // A pre-filled nonblocking socketpair: parkAt's request write EAGAINs
     // before anything was sent, so the transaction parks on the write side.
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
     var snd: c_int = 1024;
     std.posix.setsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&snd)) catch {};
     var junk: [4096]u8 = @splat('x');
     var guard: usize = 0;
     while (guard < 8192) : (guard += 1) {
-        _ = compat.write(pair[0], &junk) catch break;
+        _ = sys.write(pair[0], &junk) catch break;
     }
     releasePooled(0, pair[0], nowNs(), pool_default_max);
 
@@ -3999,7 +3999,7 @@ test "proxy parked path: a blocked write parks awaiting_out" {
     try testing.expect(plan.pooled);
     try testing.expectEqual(@as(usize, 0), plan.sent);
     posix_close(pair[0]);
-    compat.close(pair[1]);
+    sys.close(pair[1]);
     drainPool(0);
 }
 
@@ -4016,8 +4016,8 @@ test "proxy parked path: a write failure on a stale pooled fd retries once" {
         .upstreams = &ups,
     };
     testResetRoute(&route);
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    compat.close(pair[1]); // peer gone: the request write gets EPIPE
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    sys.close(pair[1]); // peer gone: the request write gets EPIPE
     releasePooled(0, pair[0], nowNs(), pool_default_max);
 
     var req = registry.Request.init(testing.allocator);
@@ -4047,9 +4047,9 @@ test "proxy parked path: a malformed pooled response retries and parks" {
     };
     testResetRoute(&route);
     // The malformed response is already buffered when parkAt parses it.
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[1]);
-    _ = try compat.write(pair[1], "HTTP/1.1 xx\r\n\r\n");
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[1]);
+    _ = try sys.write(pair[1], "HTTP/1.1 xx\r\n\r\n");
     releasePooled(0, pair[0], nowNs(), pool_default_max);
 
     var req = registry.Request.init(testing.allocator);
@@ -4102,15 +4102,15 @@ test "reapPooledFd drops a pooled fd and ignores unknown ones" {
     drainPool(idx);
     var pairs: [3][2]posix_fd = undefined;
     for (&pairs) |*p| {
-        p.* = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+        p.* = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
         releasePooled(idx, p[0], nowNs(), pool_default_max);
     }
     defer {
-        for (&pairs) |*p| compat.close(p[1]);
+        for (&pairs) |*p| sys.close(p[1]);
     }
     reapPooledFd(pairs[1][0]); // middle entry: swap-remove + close
     try testing.expectEqual(@as(u32, 2), pool_lens[idx]);
-    try testing.expectError(error.NotOpenForWriting, compat.write(pairs[1][0], "x"));
+    try testing.expectError(error.NotOpenForWriting, sys.write(pairs[1][0], "x"));
     reapPooledFd(-4242); // not pooled: full scan, no change
     try testing.expectEqual(@as(u32, 2), pool_lens[idx]);
     drainPool(idx);
@@ -4207,8 +4207,8 @@ test "upstream bookkeeping helpers and reconnectUpstream" {
     posix_close(fd);
     upstreamFail(0, &route, nowNs());
     upstreamAbandoned(0);
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[1]);
     upstreamSuccess(0, pair[0], nowNs(), &route);
     drainPool(0);
 }
@@ -4221,12 +4221,12 @@ test "releasePooled re-tags fds through a live epoll" {
     setPoolEpoll(&ep);
     defer setPoolEpoll(null);
     // Unregistered fd: MOD fails and the ADD fallback runs.
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[1]);
     releasePooled(idx, pair[0], nowNs(), 1);
     // Pool full: the oldest entry is closed and the shift path re-tags again.
-    const pair2 = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair2[1]);
+    const pair2 = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair2[1]);
     releasePooled(idx, pair2[0], nowNs(), 1);
     try testing.expectEqual(@as(u32, 1), pool_lens[idx]);
     drainPool(idx);
@@ -4327,8 +4327,8 @@ test "attemptForward: send failure answers 502" {
     var ups = [_]router.Upstream{mkUp("127.0.0.1", 1)};
     const route = registry.Route{ .path = "/send-fail", .balance = .round_robin, .max_fails = 10, .upstreams = &ups };
     testResetRoute(&route);
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    compat.close(pair[1]); // the request write gets EPIPE
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    sys.close(pair[1]); // the request write gets EPIPE
     releasePooled(0, pair[0], nowNs(), pool_default_max);
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
@@ -4346,8 +4346,8 @@ test "attemptForward: read failure answers 502" {
     const route = registry.Route{ .path = "/read-fail", .balance = .round_robin, .max_fails = 10, .upstreams = &ups };
     testResetRoute(&route);
     // SHUT_WR: the send succeeds, the response read reports EOF.
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[1]);
     try testing.expect(std.os.linux.errno(std.os.linux.shutdown(pair[1], 1)) == .SUCCESS);
     releasePooled(0, pair[0], nowNs(), pool_default_max);
     var req = registry.Request.init(testing.allocator);
@@ -4371,8 +4371,8 @@ test "attemptForward: first-byte timeout answers 502" {
         .upstreams = &ups,
     };
     testResetRoute(&route);
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[1]); // silent peer: waitReadable times out
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[1]); // silent peer: waitReadable times out
     releasePooled(0, pair[0], nowNs(), pool_default_max);
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();
@@ -4397,14 +4397,14 @@ test "sendUpstreamRequest: a full socket waits out the send timeout" {
     testResetRoute(&route);
     // A pre-filled nonblocking socketpair: the request write EAGAINs, the
     // OUT poll never fires (peer never reads) and the send timeout trips.
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    defer sys.close(pair[1]);
     var snd: c_int = 1024;
     std.posix.setsockopt(pair[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&snd)) catch {};
     var junk: [4096]u8 = @splat('x');
     var guard: usize = 0;
     while (guard < 8192) : (guard += 1) {
-        _ = compat.write(pair[0], &junk) catch break;
+        _ = sys.write(pair[0], &junk) catch break;
     }
     releasePooled(0, pair[0], nowNs(), pool_default_max);
     var req = registry.Request.init(testing.allocator);
@@ -4553,8 +4553,8 @@ test "proxy TLS: sticky sessions offer the backend tag" {
 // ---- TLS pool / record-layer internals ----
 
 fn fakeTlsPooled() !*TlsPooled {
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    sys.close(pair[1]);
     const ps = try std.heap.page_allocator.create(TlsPooled);
     ps.* = .{ .sock = undefined, .handshaked = false, .last_used_ns = 0 };
     ps.sock.fd = pair[0];
@@ -4580,7 +4580,7 @@ test "TLS pool release fills free slots and reaps stale sessions" {
 }
 
 test "tls sock iface: timeouts, EOF and write failures map to transport errors" {
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0);
     var rbuf: [4096]u8 = undefined;
     var wbuf: [4096]u8 = undefined;
     var sock = TlsUpstream{
@@ -4596,19 +4596,19 @@ test "tls sock iface: timeouts, EOF and write failures map to transport errors" 
     // Silent peer: the poll timeout maps to ReadFailed.
     try testing.expectError(error.ReadFailed, sock.reader_iface.vtable.stream(&sock.reader_iface, &w, .limited(out.len)));
     // Peer closes: clean EOF maps to EndOfStream, not ReadFailed.
-    compat.close(pair[1]);
+    sys.close(pair[1]);
     try testing.expectError(error.EndOfStream, sock.reader_iface.vtable.stream(&sock.reader_iface, &w, .limited(out.len)));
     // Closed fd: the record write fails.
-    compat.close(pair[0]);
+    sys.close(pair[0]);
     try testing.expectError(error.WriteFailed, tlsRawWrite(&sock, "x"));
 }
 
 test "trustedBundle caches bundles and resolves relative paths" {
     const testdata = @import("../../tls/testdata.zig");
     const path = "/tmp/zocket-bundle-cache-test.pem";
-    compat.deleteFile(path) catch {};
-    try compat.writeFile(path, testdata.cert_pem);
-    defer compat.deleteFile(path) catch {};
+    sys.deleteFile(path) catch {};
+    try sys.writeFile(path, testdata.cert_pem);
+    defer sys.deleteFile(path) catch {};
     const first = trustedBundle(path);
     try testing.expect(first != null);
     try testing.expect(trustedBundle(path) == first); // cached by path
@@ -4635,7 +4635,7 @@ test "health prober thread sweeps and exits when idle" {
         const running = hc_thread_started;
         hc_mutex.unlock();
         if (!running) break;
-        compat.nanosleep(0, 10 * std.time.ns_per_ms);
+        sys.nanosleep(0, 10 * std.time.ns_per_ms);
     }
     ensureHealthChecker(&route);
     defer unregisterHealthRoute(&route);
@@ -4655,7 +4655,7 @@ test "health prober thread sweeps and exits when idle" {
             exited = true;
             break;
         }
-        compat.nanosleep(0, 10 * std.time.ns_per_ms);
+        sys.nanosleep(0, 10 * std.time.ns_per_ms);
     }
     try testing.expect(exited);
     testResetRoute(&route);

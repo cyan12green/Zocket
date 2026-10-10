@@ -5,7 +5,7 @@
 //! handshake and application traffic both use the same code.
 
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const tls = std.crypto.tls;
 
 pub const header_len = 5;
@@ -104,8 +104,8 @@ const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 test "record: encrypt then decrypt round-trips the fragment and content type" {
     var key: [Aes128Gcm.key_length]u8 = undefined;
     var iv: [Aes128Gcm.nonce_length]u8 = undefined;
-    compat.randomBytes(&key);
-    compat.randomBytes(&iv);
+    sys.randomBytes(&key);
+    sys.randomBytes(&iv);
     const fragment = "GET / HTTP/1.1\r\nHost: x\r\n\r\n" ++ "0123456789abcdef";
     var out: [256]u8 = undefined;
     const n = try encrypt(Aes128Gcm, key, iv, 0, @intFromEnum(tls.ContentType.handshake), fragment, &out);
@@ -126,9 +126,9 @@ test "record: wrong key fails the MAC" {
     var key: [Aes128Gcm.key_length]u8 = undefined;
     var other: [Aes128Gcm.key_length]u8 = undefined;
     var iv: [Aes128Gcm.nonce_length]u8 = undefined;
-    compat.randomBytes(&key);
-    compat.randomBytes(&other);
-    compat.randomBytes(&iv);
+    sys.randomBytes(&key);
+    sys.randomBytes(&other);
+    sys.randomBytes(&iv);
     var out: [128]u8 = undefined;
     const n = try encrypt(Aes128Gcm, key, iv, 7, 0, "hello", &out);
     try testing.expectError(error.TlsBadRecordMac, decryptInPlace(Aes128Gcm, other, iv, 7, out[0..n]));
@@ -139,8 +139,8 @@ test "record: wrong key fails the MAC" {
 test "record: truncated and oversized records fail cleanly" {
     var key: [Aes128Gcm.key_length]u8 = undefined;
     var iv: [Aes128Gcm.nonce_length]u8 = undefined;
-    compat.randomBytes(&key);
-    compat.randomBytes(&iv);
+    sys.randomBytes(&key);
+    sys.randomBytes(&iv);
     var out: [128]u8 = undefined;
     const n = try encrypt(Aes128Gcm, key, iv, 0, 0, "hello", &out);
     try testing.expectError(error.TlsConnectionTruncated, decryptInPlace(Aes128Gcm, key, iv, 0, out[0 .. n - 2]));
@@ -170,8 +170,8 @@ test "record: nonce XORs the sequence big-endian into the IV" {
 test "record: tiny output buffers fail with TlsRecordOverflow" {
     var key: [Aes128Gcm.key_length]u8 = undefined;
     var iv: [Aes128Gcm.nonce_length]u8 = undefined;
-    compat.randomBytes(&key);
-    compat.randomBytes(&iv);
+    sys.randomBytes(&key);
+    sys.randomBytes(&iv);
     var out: [8]u8 = undefined;
     try testing.expectError(error.TlsRecordOverflow, encrypt(Aes128Gcm, key, iv, 0, 0, "hello world, too long", &out));
     // Empty input is not a record at all.
@@ -182,8 +182,8 @@ test "record: tiny output buffers fail with TlsRecordOverflow" {
 test "record: oversized length fields fail cleanly" {
     var key: [Aes128Gcm.key_length]u8 = undefined;
     var iv: [Aes128Gcm.nonce_length]u8 = undefined;
-    compat.randomBytes(&key);
-    compat.randomBytes(&iv);
+    sys.randomBytes(&key);
+    sys.randomBytes(&iv);
     // A record whose length exceeds the TLS ceiling is rejected even when
     // the bytes are all present.
     const big: usize = tls.max_ciphertext_len + 1;
@@ -199,8 +199,8 @@ test "record: oversized length fields fail cleanly" {
 test "record: huge fragments are refused at encrypt time" {
     var key: [Aes128Gcm.key_length]u8 = undefined;
     var iv: [Aes128Gcm.nonce_length]u8 = undefined;
-    compat.randomBytes(&key);
-    compat.randomBytes(&iv);
+    sys.randomBytes(&key);
+    sys.randomBytes(&iv);
     const frag = try testing.allocator.alloc(u8, max_plaintext_len + 1);
     defer testing.allocator.free(frag);
     @memset(frag, 0x61);

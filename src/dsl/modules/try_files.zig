@@ -13,7 +13,7 @@
 //! directory itself when no index is configured). A `=code` last candidate
 //! sets the status directly instead of redirecting (nginx semantics).
 const std = @import("std");
-const compat = @import("../../compat.zig");
+const sys = @import("../../sys.zig");
 const registry = @import("../registry.zig");
 const router_mod = @import("../router.zig");
 
@@ -104,8 +104,8 @@ fn fileExists(root: []const u8, rel: []const u8) bool {
     }
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ root, rel }) catch return false;
-    const fd = compat.open(path, .{ .ACCMODE = .RDONLY, .PATH = true, .CLOEXEC = true }, 0) catch return false;
-    compat.close(fd);
+    const fd = sys.open(path, .{ .ACCMODE = .RDONLY, .PATH = true, .CLOEXEC = true }, 0) catch return false;
+    sys.close(fd);
     return true;
 }
 

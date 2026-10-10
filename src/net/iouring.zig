@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
@@ -93,9 +93,9 @@ test "io_uring read/write on a socketpair" {
     var ring = IoRing.init() catch return error.SkipZigTest;
     defer ring.deinit();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
     try posix.setsockopt(pair[0], posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(posix.timeval{ .sec = 1, .usec = 0 }));
 
     var buf: [64]u8 = undefined;
@@ -106,7 +106,7 @@ test "io_uring read/write on a socketpair" {
     var comps: [4]IoRing.Completion = undefined;
     try testing.expectEqual(@as(usize, 0), try ring.drain(&comps, false));
 
-    _ = try compat.write(pair[0], "hello");
+    _ = try sys.write(pair[0], "hello");
     const n = try ring.drain(&comps, true);
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqual(@as(i32, 5), comps[0].result);
@@ -119,9 +119,9 @@ test "io_uring writev, poll and cancel completions" {
     defer ring.deinit();
     try testing.expect(ring.ringFd() > 0);
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
     // writev completion carries fd | write_tag.
     const iov = [_]posix.iovec_const{

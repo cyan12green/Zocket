@@ -11,7 +11,7 @@
 //! The connection layer wires these to the connection buffers.
 
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const tls = std.crypto.tls;
 const cert_mod = @import("cert.zig");
 const handshake_mod = @import("handshake.zig");
@@ -108,9 +108,9 @@ pub fn Session(
                 .allocator = allocator,
                 .creds = creds,
             };
-            compat.randomBytes(&self.our_random);
+            sys.randomBytes(&self.our_random);
             var seed: [X25519.seed_length]u8 = undefined;
-            compat.randomBytes(&seed);
+            sys.randomBytes(&seed);
             const kp = X25519.KeyPair.generateDeterministic(seed);
             self.x25519_secret = kp.secret_key;
             self.x25519_public = kp.public_key;
@@ -643,7 +643,7 @@ pub fn Session(
             var certs: [8][]const u8 = undefined;
             const n = mtls_mod.parseClientCertificate(message[4..], &certs) catch
                 return self.fail(error.TlsDecodeError, .decode_error);
-            const now = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch
+            const now = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch
                 return self.fail(error.TlsIllegalParameter, .internal_error);
             mtls_mod.verifyChain(bundle, certs[0], certs[1..n], now.sec) catch
                 return self.fail(error.TlsDecodeError, .unknown_ca);
@@ -744,8 +744,8 @@ test "TLS 1.3 handshake and round trip against the std client" {
     var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
     defer allocator.free(creds.cert_der);
 
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[1]);
 
     var server_err: ?Error = null;
     var stop = std.atomic.Value(bool).init(false);
@@ -759,7 +759,7 @@ test "TLS 1.3 handshake and round trip against the std client" {
             while (!stop_flag.load(.acquire)) {
                 const n = std.posix.read(fd, &buf) catch |e| switch (e) {
                     error.WouldBlock => {
-                        compat.nanosleep(0, 1 * std.time.ns_per_ms);
+                        sys.nanosleep(0, 1 * std.time.ns_per_ms);
                         continue;
                     },
                     else => break,
@@ -796,9 +796,9 @@ test "TLS 1.3 handshake and round trip against the std client" {
         fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
             var remaining = bytes;
             while (remaining.len > 0) {
-                const n = compat.write(fd, remaining) catch |e| switch (e) {
+                const n = sys.write(fd, remaining) catch |e| switch (e) {
                     error.WouldBlock => {
-                        compat.nanosleep(0, 1 * std.time.ns_per_ms);
+                        sys.nanosleep(0, 1 * std.time.ns_per_ms);
                         continue;
                     },
                     else => return e,
@@ -823,7 +823,7 @@ test "TLS 1.3 handshake and round trip against the std client" {
     var reader = stream.reader(io, &client_read_buf);
     var writer = stream.writer(io, &client_write_buf);
     var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
-    compat.randomBytes(&entropy);
+    sys.randomBytes(&entropy);
     var client = std.crypto.tls.Client.init(&reader.interface, &writer.interface, .{
         .host = .no_verification,
         .ca = .no_verification,
@@ -853,9 +853,9 @@ test "TLS 1.3 handshake and round trip against the std client" {
     // the socket writer's buffer — flush it.)
     try client.end();
     try writer.interface.flush();
-    compat.nanosleep(0, 20 * std.time.ns_per_ms);
+    sys.nanosleep(0, 20 * std.time.ns_per_ms);
     stop.store(true, .release);
-    compat.close(pair[0]);
+    sys.close(pair[0]);
     server_thread.join();
     try testing.expect(server_err == null);
 }

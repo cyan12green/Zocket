@@ -10,7 +10,7 @@
 //! directive (Config) or `/etc/resolv.conf` at first use. IPv4 only in v1
 //! (the proxy dial path is IPv4-only); AAAA answers are never requested.
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 const dns = @import("dns.zig");
@@ -56,7 +56,7 @@ pub const Servers = struct {
 
 var servers: Servers = .{};
 var servers_set = false;
-var servers_mutex = compat.Mutex{};
+var servers_mutex = sys.Mutex{};
 
 /// Parse `/etc/resolv.conf` content: `nameserver <ipv4>` lines (first 3
 /// win; v6 and garbage skipped in v1). Pure (unit-tested).
@@ -103,7 +103,7 @@ fn getServers() Servers {
     defer servers_mutex.unlock();
     if (servers_set) return servers;
     // Lazy default: /etc/resolv.conf, once.
-    const data = compat.readFileAlloc(std.heap.page_allocator, "/etc/resolv.conf", 64 * 1024) catch return servers;
+    const data = sys.readFileAlloc(std.heap.page_allocator, "/etc/resolv.conf", 64 * 1024) catch return servers;
     defer std.heap.page_allocator.free(data);
     servers = parseResolvConf(data);
     servers_set = true;
@@ -111,15 +111,15 @@ fn getServers() Servers {
 }
 
 /// Monotonic ns on the resolver epoch (expiry comparisons only).
-var epoch: compat.Instant = undefined;
+var epoch: sys.Instant = undefined;
 var epoch_set = false;
 
 fn nowNs() u64 {
     if (!epoch_set) {
-        epoch = compat.Instant.now() catch return 0;
+        epoch = sys.Instant.now() catch return 0;
         epoch_set = true;
     }
-    return (compat.Instant.now() catch return 0).since(epoch);
+    return (sys.Instant.now() catch return 0).since(epoch);
 }
 
 fn serverSockaddr(ip: [16]u8, port: u16, out: *[16]u8) void {
@@ -135,14 +135,14 @@ fn serverSockaddr(ip: [16]u8, port: u16, out: *[16]u8) void {
 /// Exchange one query/response with one server. Returns the raw response
 /// length in `resp_buf`.
 fn exchange(server: [16]u8, port: u16, query: []const u8, resp_buf: []u8) ResolveError!usize {
-    const fd = compat.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0) catch return error.Timeout;
-    defer compat.close(fd);
+    const fd = sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0) catch return error.Timeout;
+    defer sys.close(fd);
     var sa: [16]u8 align(@alignOf(u16)) = undefined;
     serverSockaddr(server, port, &sa);
-    compat.connect(fd, @ptrCast(&sa), 16) catch return error.Timeout;
+    sys.connect(fd, @ptrCast(&sa), 16) catch return error.Timeout;
     var attempt: usize = 0;
     while (attempt < attempts_per_server) : (attempt += 1) {
-        _ = compat.write(fd, query) catch return error.Timeout;
+        _ = sys.write(fd, query) catch return error.Timeout;
         var pfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
         const ready = posix.poll(&pfds, query_timeout_ms) catch return error.Timeout;
         if (ready == 0) continue;
@@ -186,7 +186,7 @@ pub fn resolveBlocking(name: []const u8, srv: Servers, port: u16) ResolveError!s
         var si: usize = 0;
         while (si < srv.len) : (si += 1) {
             var id_bytes: [2]u8 = undefined;
-            compat.randomBytes(&id_bytes);
+            sys.randomBytes(&id_bytes);
             const id = std.mem.readInt(u16, &id_bytes, .big);
             var qbuf: [512]u8 = undefined;
             const qlen = dns.buildQuery(id, current, dns.qtype_a, &qbuf);
@@ -222,7 +222,7 @@ pub fn resolveBlocking(name: []const u8, srv: Servers, port: u16) ResolveError!s
 
 // ---- cache + refresh thread ----
 
-var cache_mutex = compat.Mutex{};
+var cache_mutex = sys.Mutex{};
 var cache_keys: [cache_cap][]const u8 = @as([cache_cap][]const u8, @splat(@as([]const u8, "")));
 var cache_vals: [cache_cap]Entry = undefined;
 var cache_filled: usize = 0;
@@ -270,7 +270,7 @@ const Registration = struct {
     recs_len: usize = 0,
 };
 
-var reg_mutex = compat.Mutex{};
+var reg_mutex = sys.Mutex{};
 var registrations: [64]Registration = undefined;
 var registrations_len: usize = 0;
 var refresh_started = false;
@@ -372,7 +372,7 @@ pub fn refreshOnceWith(srv: Servers, port: u16, now_ns: u64) void {
 
 fn refreshThread() void {
     while (true) {
-        compat.nanosleep(5, 0);
+        sys.nanosleep(5, 0);
         refreshOnce(nowNs());
     }
 }
@@ -405,15 +405,15 @@ pub const Stub = struct {
 
     pub fn start() !*Stub {
         const self = try testing.allocator.create(Stub);
-        const fd = try compat.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+        const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
         var sa: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
         sa[0] = 2;
         sa[4] = 127;
         sa[7] = 1;
-        try compat.bind(fd, @ptrCast(&sa), 16);
+        try sys.bind(fd, @ptrCast(&sa), 16);
         var slen: posix.socklen_t = 16;
         var bound: [16]u8 align(@alignOf(u16)) = undefined;
-        try compat.getsockname(fd, @ptrCast(&bound), &slen);
+        try sys.getsockname(fd, @ptrCast(&bound), &slen);
         self.* = .{ .fd = fd, .port = (@as(u16, bound[2]) << 8) | bound[3] };
         const t = try std.Thread.spawn(.{}, runFn, .{self});
         t.detach();
@@ -427,7 +427,7 @@ pub const Stub = struct {
             var slen: linux.socklen_t = @sizeOf(linux.sockaddr);
             const rc = linux.recvfrom(self.fd, qbuf[0..].ptr, qbuf.len, 0, &src, &slen);
             if (linux.errno(rc) != .SUCCESS) {
-                compat.nanosleep(0, 5 * std.time.ns_per_ms);
+                sys.nanosleep(0, 5 * std.time.ns_per_ms);
                 continue;
             }
             const qlen: usize = @intCast(rc);
@@ -439,7 +439,7 @@ pub const Stub = struct {
 
     pub fn stopStub(self: *Stub) void {
         self.stop.store(true, .release);
-        compat.close(self.fd);
+        sys.close(self.fd);
         testing.allocator.destroy(self);
     }
 };
@@ -557,17 +557,17 @@ test "resolver resolveAndRegister fills sockaddr, caches and registers" {
 
 test "resolver times out against a dead port and rejects empty server lists" {
     // Reserve-then-close a UDP port so nothing answers on it.
-    const fd = try compat.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
+    const fd = try sys.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
     var sa: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     sa[0] = 2;
     sa[4] = 127;
     sa[7] = 1;
-    try compat.bind(fd, @ptrCast(&sa), 16);
+    try sys.bind(fd, @ptrCast(&sa), 16);
     var slen: posix.socklen_t = 16;
     var bound: [16]u8 align(@alignOf(u16)) = undefined;
-    try compat.getsockname(fd, @ptrCast(&bound), &slen);
+    try sys.getsockname(fd, @ptrCast(&bound), &slen);
     const dead = (@as(u16, bound[2]) << 8) | bound[3];
-    compat.close(fd);
+    sys.close(fd);
 
     var srv = Servers{};
     srv.addrs[0] = sockets.parseIpv4("127.0.0.1").?;

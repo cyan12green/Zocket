@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../../compat.zig");
+const sys = @import("../../sys.zig");
 const posix = std.posix;
 const registry = @import("../registry.zig");
 const cache_mod = @import("cache.zig");
@@ -29,7 +29,7 @@ pub const static = registry.Module{
 };
 
 const max_path = std.fs.max_path_bytes;
-const Stat = compat.FileStat;
+const Stat = sys.FileStat;
 
 fn run(ctx: *Context) anyerror!Action {
     const route = ctx.route orelse return .pass;
@@ -123,7 +123,7 @@ fn serveDiskLegacy(ctx: *Context, route: *const registry.Route, target: []const 
     const root_real = if (route.root_real) |rr|
         rr
     else
-        compat.realpath(root, &root_real_buf) catch return notFound(ctx);
+        sys.realpath(root, &root_real_buf) catch return notFound(ctx);
 
     const meta = statPath(full) catch {
         return notFound(ctx);
@@ -205,7 +205,7 @@ fn openat2Beneath(dirfd: posix.fd_t, path: []const u8) error{ Unsupported, NotFo
 }
 
 fn statFd(fd: posix.fd_t) error{ NotFound, AccessDenied, Unexpected }!Meta {
-    const st = compat.fstat(fd) catch |e| switch (e) {
+    const st = sys.fstat(fd) catch |e| switch (e) {
         error.AccessDenied => return error.AccessDenied,
         else => return error.Unexpected,
     };
@@ -248,7 +248,7 @@ fn serveDiskBeneath(ctx: *Context, route: *const registry.Route, target: []const
         error.NotFound => return notFound(ctx),
     };
     const meta = statFd(fd) catch {
-        compat.close(fd);
+        sys.close(fd);
         return notFound(ctx);
     };
 
@@ -257,27 +257,27 @@ fn serveDiskBeneath(ctx: *Context, route: *const registry.Route, target: []const
         if (route.index) |index_file| {
             var idx_buf: [max_path]u8 = undefined;
             const idx_rel = buildRelPath(&idx_buf, rel, index_file) orelse {
-                compat.close(fd);
+                sys.close(fd);
                 return notFound(ctx);
             };
             const idx_fd = openat2Beneath(route.root_fd, idx_buf[0..idx_rel]) catch {
-                compat.close(fd);
+                sys.close(fd);
                 return if (route.autoindex) autoindex(ctx, fd, rel) else notFound(ctx);
             };
             const idx_meta = statFd(idx_fd) catch {
-                compat.close(fd);
-                compat.close(idx_fd);
+                sys.close(fd);
+                sys.close(idx_fd);
                 return notFound(ctx);
             };
             if (idx_meta.is_dir) {
-                compat.close(idx_fd);
+                sys.close(idx_fd);
                 return if (route.autoindex) autoindex(ctx, fd, rel) else notFound(ctx);
             }
-            compat.close(fd);
+            sys.close(fd);
             return serveFd(ctx, .{ .fd = idx_fd, .meta = idx_meta, .mime_path = idx_buf[0..idx_rel] });
         }
         if (route.autoindex) return autoindex(ctx, fd, rel);
-        compat.close(fd);
+        sys.close(fd);
         return notFound(ctx);
     }
 
@@ -332,7 +332,7 @@ fn pathIsSafe(target: []const u8) bool {
 
 fn statPath(path: []const u8) error{ NotFound, AccessDenied, Unexpected }!Meta {
     var meta: Stat = undefined;
-    if (compat.statFile(path)) |st| {
+    if (sys.statFile(path)) |st| {
         meta = st;
     } else |e| switch (e) {
         error.FileNotFound, error.NotDir => return error.NotFound,
@@ -350,7 +350,7 @@ fn statPath(path: []const u8) error{ NotFound, AccessDenied, Unexpected }!Meta {
 /// root (compared as realpaths).
 fn realpathWithinRoot(path: []const u8, root_real: []const u8) bool {
     var file_buf: [max_path]u8 = undefined;
-    const file_real = compat.realpath(path, &file_buf) catch return false;
+    const file_real = sys.realpath(path, &file_buf) catch return false;
     if (file_real.len < root_real.len) return false;
     if (!std.mem.eql(u8, file_real[0..root_real.len], root_real)) return false;
     // Boundary: the file must be the root itself or directly under it.
@@ -359,7 +359,7 @@ fn realpathWithinRoot(path: []const u8, root_real: []const u8) bool {
 
 fn serveFile(ctx: *Context, path: []const u8, meta: Meta, root_real: []const u8) !Action {
     if (!realpathWithinRoot(path, root_real)) return notFound(ctx);
-    const file = compat.openFile(path) catch return notFound(ctx);
+    const file = sys.openFile(path) catch return notFound(ctx);
     return serveFd(ctx, .{ .fd = file, .meta = meta, .mime_path = path });
 }
 
@@ -385,7 +385,7 @@ fn serveFd(ctx: *Context, opts: ServeFdOptions) !Action {
     var resp = ctx.resp;
     const meta = opts.meta;
     var transferred = false;
-    defer if (!transferred and !opts.cached) compat.close(opts.fd);
+    defer if (!transferred and !opts.cached) sys.close(opts.fd);
 
     // Entity metadata for the conditional-GET / cache machinery.
     var scratch: [160]u8 = undefined;
@@ -472,7 +472,7 @@ fn notModified(ctx: *Context) Action {
 /// Minimal HTML directory listing (autoindex). Takes the open directory fd
 /// (path-based callers open it first); the caller keeps ownership.
 fn autoindex(ctx: *Context, dir_fd: posix.fd_t, display_target: []const u8) !Action {
-    var dir = compat.Dir{ .fd = dir_fd };
+    var dir = sys.Dir{ .fd = dir_fd };
 
     var out = std.ArrayList(u8).empty;
     const allocator = ctx.allocator orelse return .pass;
@@ -506,8 +506,8 @@ fn autoindex(ctx: *Context, dir_fd: posix.fd_t, display_target: []const u8) !Act
 /// Path-based autoindex (comptime-route fallback): open the dir, delegate,
 /// close.
 fn autoindexPath(ctx: *Context, dir_path: []const u8) !Action {
-    const dir = compat.openDir(dir_path) catch return notFound(ctx);
-    defer compat.close(dir.fd);
+    const dir = sys.openDir(dir_path) catch return notFound(ctx);
+    defer sys.close(dir.fd);
     return autoindex(ctx, dir.fd, ctx.req.decoded_target);
 }
 
@@ -692,7 +692,7 @@ test "serves the index file for a directory" {
     try testing.expectEqual(@as(usize, 14), served.resp.file_len);
     try testing.expect(served.resp.body_from_file);
     try testing.expectEqualStrings("text/html", headerValue(&served.resp, "Content-Type").?);
-    compat.close(served.resp.file_fd);
+    sys.close(served.resp.file_fd);
 }
 
 test "single range yields 206 with the right slice and Content-Range" {
@@ -704,14 +704,14 @@ test "single range yields 206 with the right slice and Content-Range" {
     try testing.expectEqual(@as(usize, 0), served.resp.file_offset);
     try testing.expectEqual(@as(usize, 5), served.resp.file_len);
     try testing.expectEqualStrings("bytes 0-4/19", headerValue(&served.resp, "Content-Range").?);
-    compat.close(served.resp.file_fd);
+    sys.close(served.resp.file_fd);
 
     var suffix = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=-5\r\n\r\n", &route);
     defer suffix.deinit();
     try testing.expectEqual(registry.Status.partial_content, suffix.resp.status);
     try testing.expectEqual(@as(usize, 14), suffix.resp.file_offset);
     try testing.expectEqual(@as(usize, 5), suffix.resp.file_len);
-    compat.close(suffix.resp.file_fd);
+    sys.close(suffix.resp.file_fd);
 }
 
 test "unsatisfiable range yields 416 with Content-Range" {
@@ -730,7 +730,7 @@ test "conditional GET yields 304 on a matching If-None-Match" {
     var first = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\n\r\n", &route);
     const etag = headerValue(&first.resp, "ETag").?;
     try testing.expect(first.resp.body_from_file);
-    compat.close(first.resp.file_fd);
+    sys.close(first.resp.file_fd);
 
     var wire_buf: [256]u8 = undefined;
     const wire = std.fmt.bufPrint(&wire_buf, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nIf-None-Match: {s}\r\n\r\n", .{etag}) catch unreachable;
@@ -768,8 +768,8 @@ test "embedded asset serves byte-identical content with infinite cache" {
 
 test "openat2 fast path serves beneath the root fd and blocks symlink escapes" {
     const allocator = testing.allocator;
-    const dir = compat.openDir("testdata") catch return error.SkipZigTest;
-    defer compat.close(dir.fd);
+    const dir = sys.openDir("testdata") catch return error.SkipZigTest;
+    defer sys.close(dir.fd);
     const route = registry.Route{
         .path = "/",
         .root = "testdata",
@@ -783,7 +783,7 @@ test "openat2 fast path serves beneath the root fd and blocks symlink escapes" {
         error.Unsupported => return error.SkipZigTest,
         error.NotFound => return error.SkipZigTest,
     };
-    compat.close(probe);
+    sys.close(probe);
 
     var served = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\n\r\n", &route);
     defer served.deinit();
@@ -791,13 +791,13 @@ test "openat2 fast path serves beneath the root fd and blocks symlink escapes" {
     try testing.expectEqual(@as(usize, 19), served.resp.file_len);
     try testing.expect(served.resp.body_from_file);
     try testing.expectEqualStrings("text/plain", headerValue(&served.resp, "Content-Type").?);
-    compat.close(served.resp.file_fd);
+    sys.close(served.resp.file_fd);
 
     // A symlink inside the root pointing outside must be refused by the
     // kernel (RESOLVE_BENEATH), same as the legacy realpath check.
     const link_path = "testdata/link-escape-tmp";
-    compat.symLink("/etc/hostname", link_path) catch return error.SkipZigTest;
-    defer compat.deleteFile(link_path) catch {};
+    sys.symLink("/etc/hostname", link_path) catch return error.SkipZigTest;
+    defer sys.deleteFile(link_path) catch {};
     var escaped = try serveWith(allocator, "GET /link-escape-tmp HTTP/1.1\r\nHost: x\r\n\r\n", &route);
     defer escaped.deinit();
     try testing.expectEqual(registry.Status.not_found, escaped.resp.status);
@@ -808,17 +808,17 @@ test "openat2 fast path serves beneath the root fd and blocks symlink escapes" {
     try testing.expectEqual(registry.Status.partial_content, ranged.resp.status);
     try testing.expectEqual(@as(usize, 0), ranged.resp.file_offset);
     try testing.expectEqual(@as(usize, 5), ranged.resp.file_len);
-    compat.close(ranged.resp.file_fd);
+    sys.close(ranged.resp.file_fd);
 }
 
 test "cached small-file content serves as the response body (no sendfile)" {
     const allocator = testing.allocator;
     var cache = @import("../static_cache.zig").StaticCache.init(allocator);
     defer cache.deinit();
-    const file = compat.openFile("testdata/hello.txt") catch return error.SkipZigTest;
-    const st = compat.fstat(file) catch return error.SkipZigTest;
+    const file = sys.openFile("testdata/hello.txt") catch return error.SkipZigTest;
+    const st = sys.fstat(file) catch return error.SkipZigTest;
     const mtime: u64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-    const dup = compat.dup(file) catch return error.SkipZigTest;
+    const dup = sys.dup(file) catch return error.SkipZigTest;
     const entry = cache.insert("testdata/hello.txt", dup, st.size, mtime) orelse return error.SkipZigTest;
     try testing.expect(entry.content_cached);
     try testing.expectEqualStrings("hello static world\n", entry.content);
@@ -861,10 +861,10 @@ test "cached small-file content serves as the response body (no sendfile)" {
 
 test "openat2 fast path consults the static cache and inserts on a miss" {
     const allocator = testing.allocator;
-    const dir = compat.openDir("testdata") catch return error.SkipZigTest;
-    defer compat.close(dir.fd);
+    const dir = sys.openDir("testdata") catch return error.SkipZigTest;
+    defer sys.close(dir.fd);
     const probe = openat2Beneath(dir.fd, "hello.txt") catch return error.SkipZigTest;
-    compat.close(probe);
+    sys.close(probe);
 
     var cache = @import("../static_cache.zig").StaticCache.init(allocator);
     defer cache.deinit();
@@ -894,10 +894,10 @@ test "openat2 fast path consults the static cache and inserts on a miss" {
 
 test "openat2 fast path serves index files, autoindexes and 404s directories" {
     const allocator = testing.allocator;
-    const dir = compat.openDir("testdata") catch return error.SkipZigTest;
-    defer compat.close(dir.fd);
+    const dir = sys.openDir("testdata") catch return error.SkipZigTest;
+    defer sys.close(dir.fd);
     const probe = openat2Beneath(dir.fd, "dir") catch return error.SkipZigTest;
-    compat.close(probe);
+    sys.close(probe);
 
     // Index file exists: served by fd.
     const idx_route = registry.Route{ .path = "/", .root = "testdata", .root_real = "testdata", .root_fd = dir.fd, .index = "index.html" };
@@ -906,7 +906,7 @@ test "openat2 fast path serves index files, autoindexes and 404s directories" {
     try testing.expectEqual(registry.Status.ok, idx.resp.status);
     try testing.expect(idx.resp.body_from_file);
     try testing.expectEqual(@as(usize, 14), idx.resp.file_len);
-    compat.close(idx.resp.file_fd);
+    sys.close(idx.resp.file_fd);
 
     // Missing index: autoindex when enabled. BUG (documented, not fixed
     // here): the beneath path closes the directory fd before calling
@@ -1003,7 +1003,7 @@ test "route prefix is stripped before resolving" {
     defer served.deinit();
     try testing.expectEqual(registry.Status.ok, served.resp.status);
     try testing.expect(served.resp.body_from_file);
-    compat.close(served.resp.file_fd);
+    sys.close(served.resp.file_fd);
 }
 
 test "missing index falls back to autoindex when enabled" {
@@ -1017,8 +1017,8 @@ test "missing index falls back to autoindex when enabled" {
 
 test "legacy path refuses symlink escapes via the realpath check" {
     const allocator = testing.allocator;
-    compat.symLink("/etc/hostname", "testdata/link-out-tmp") catch return error.SkipZigTest;
-    defer compat.deleteFile("testdata/link-out-tmp") catch {};
+    sys.symLink("/etc/hostname", "testdata/link-out-tmp") catch return error.SkipZigTest;
+    defer sys.deleteFile("testdata/link-out-tmp") catch {};
     const route = registry.Route{ .path = "/", .root = "testdata" };
     var served = try serveWith(allocator, "GET /link-out-tmp HTTP/1.1\r\nHost: x\r\n\r\n", &route);
     defer served.deinit();
@@ -1031,7 +1031,7 @@ test "if-modified-since against file mtime answers 304 or 200" {
     var first = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\n\r\n", &route);
     const lm = headerValue(&first.resp, "Last-Modified").?;
     try testing.expect(first.resp.body_from_file);
-    compat.close(first.resp.file_fd);
+    sys.close(first.resp.file_fd);
     defer first.deinit();
 
     var wire_buf: [320]u8 = undefined;
@@ -1044,13 +1044,13 @@ test "if-modified-since against file mtime answers 304 or 200" {
     var third = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n", &route);
     defer third.deinit();
     try testing.expectEqual(registry.Status.ok, third.resp.status);
-    compat.close(third.resp.file_fd);
+    sys.close(third.resp.file_fd);
 
     // Garbage dates never match: the request passes through to content.
     var fourth = try serveWith(allocator, "GET /hello.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: garbage\r\n\r\n", &route);
     defer fourth.deinit();
     try testing.expectEqual(registry.Status.ok, fourth.resp.status);
-    compat.close(fourth.resp.file_fd);
+    sys.close(fourth.resp.file_fd);
 }
 
 test "multi-range requests fall back to the full 200" {
@@ -1060,7 +1060,7 @@ test "multi-range requests fall back to the full 200" {
     defer served.deinit();
     try testing.expectEqual(registry.Status.ok, served.resp.status);
     try testing.expectEqual(@as(usize, 19), served.resp.file_len);
-    compat.close(served.resp.file_fd);
+    sys.close(served.resp.file_fd);
 }
 
 test "path builders reject oversized inputs" {

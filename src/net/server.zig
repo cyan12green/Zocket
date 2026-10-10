@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 const epoll = @import("epoll.zig");
@@ -11,8 +11,8 @@ const F_SETFL = 4;
 const O_NONBLOCK = 2048;
 
 fn setNonBlock(fd: posix.fd_t) !void {
-    const flags = try compat.fcntl(fd, F_GETFL, 0);
-    _ = try compat.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    const flags = try sys.fcntl(fd, F_GETFL, 0);
+    _ = try sys.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 pub const Server = struct {
@@ -45,7 +45,7 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         self.running = false;
         self.epoll.close();
-        compat.close(self.listener);
+        sys.close(self.listener);
         var iter = self.connections.valueIterator();
         while (iter.next()) |conn| {
             conn.*.destroy();
@@ -167,16 +167,16 @@ test "single-threaded server echoes bytes on an ephemeral port" {
     };
     const thr = try std.Thread.spawn(.{}, Runner.run, .{&srv});
 
-    const cfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-    defer compat.close(cfd);
+    const cfd = try sys.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer sys.close(cfd);
     var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     addr[0] = 2; // AF_INET
     addr[2] = @intCast(port >> 8);
     addr[3] = @intCast(port & 0xff);
     addr[4] = 127;
     addr[7] = 1;
-    try compat.connect(cfd, @ptrCast(&addr), 16);
-    try compat.writeAll(cfd, "ping-echo");
+    try sys.connect(cfd, @ptrCast(&addr), 16);
+    try sys.writeAll(cfd, "ping-echo");
 
     var buf: [9]u8 = undefined;
     var got: usize = 0;

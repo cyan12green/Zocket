@@ -8,7 +8,7 @@
 //! reactor-integrated L4 rides the Stage-2 upstream seam).
 
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const sni_mod = @import("sni.zig");
 
 /// One SNI route inside a stream server block.
@@ -69,7 +69,7 @@ pub fn relayPair(a: std.posix.fd_t, b: std.posix.fd_t, idle_ms: i32) void {
         if (ready == 0) return; // idle timeout
         // Flush staged bytes first.
         if (pa > oa and (pfds[1].revents & std.posix.POLL.OUT) != 0) {
-            const n = compat.write(b, buf_a[oa..pa]) catch return;
+            const n = sys.write(b, buf_a[oa..pa]) catch return;
             oa += n;
             if (oa == pa) {
                 oa = 0;
@@ -77,7 +77,7 @@ pub fn relayPair(a: std.posix.fd_t, b: std.posix.fd_t, idle_ms: i32) void {
             }
         }
         if (pb > ob and (pfds[0].revents & std.posix.POLL.OUT) != 0) {
-            const n = compat.write(a, buf_b[ob..pb]) catch return;
+            const n = sys.write(a, buf_b[ob..pb]) catch return;
             ob += n;
             if (ob == pb) {
                 ob = 0;
@@ -89,7 +89,7 @@ pub fn relayPair(a: std.posix.fd_t, b: std.posix.fd_t, idle_ms: i32) void {
             if (n == 0) return; // client EOF
             pa += n;
             // Opportunistic immediate forward.
-            const m = compat.write(b, buf_a[oa..pa]) catch return;
+            const m = sys.write(b, buf_a[oa..pa]) catch return;
             oa += m;
             if (oa == pa) {
                 oa = 0;
@@ -100,7 +100,7 @@ pub fn relayPair(a: std.posix.fd_t, b: std.posix.fd_t, idle_ms: i32) void {
             const n = std.posix.read(b, buf_b[pb..]) catch return;
             if (n == 0) return; // upstream EOF
             pb += n;
-            const m = compat.write(a, buf_b[ob..pb]) catch return;
+            const m = sys.write(a, buf_b[ob..pb]) catch return;
             ob += m;
             if (ob == pb) {
                 ob = 0;
@@ -151,21 +151,21 @@ test "sni routing prefers exact over wildcard over default" {
 }
 
 test "peekRoute falls back on plain HTTP" {
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
-    _ = try compat.write(pair[1], "GET / HTTP/1.1\r\n\r\n");
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    _ = try sys.write(pair[1], "GET / HTTP/1.1\r\n\r\n");
     const routes = [_]SniRoute{mkRoute("a.example")};
     try testing.expectEqual(@as(usize, 7), peekRoute(pair[0], &routes, 7));
 }
 
 test "peekRoute selects on a ClientHello SNI" {
-    const pair = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
     const hello = try sni_mod.buildClientHello(testing.allocator, "api.example.com");
     defer testing.allocator.free(hello);
-    _ = try compat.write(pair[1], hello);
+    _ = try sys.write(pair[1], hello);
     const routes = [_]SniRoute{ mkRoute("other.example"), mkRoute("api.example.com") };
     try testing.expectEqual(@as(usize, 1), peekRoute(pair[0], &routes, 0));
     // Bytes are still queued (PEEK): a plain read sees the full hello.
@@ -185,12 +185,12 @@ fn shutdownBoth(fd: std.posix.fd_t) void {
 test "relayPair echoes through a socketpair splice" {
     // Client <-> relay <-> echo: relayPair splices two fds; emulate with
     // two socketpairs and a relay thread, then round-trip a payload.
-    const c2r = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(c2r[0]);
-    defer compat.close(c2r[1]);
-    const r2e = try compat.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer compat.close(r2e[0]);
-    defer compat.close(r2e[1]);
+    const c2r = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(c2r[0]);
+    defer sys.close(c2r[1]);
+    const r2e = try sys.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer sys.close(r2e[0]);
+    defer sys.close(r2e[1]);
     const Args = struct { a: std.posix.fd_t, b: std.posix.fd_t };
     const T = struct {
         fn relay(args: Args) void {
@@ -205,7 +205,7 @@ test "relayPair echoes through a socketpair splice" {
                 if (n == 0) {
                     break;
                 }
-                _ = compat.write(fd, buf[0..n]) catch {
+                _ = sys.write(fd, buf[0..n]) catch {
                     break;
                 };
             }
@@ -215,7 +215,7 @@ test "relayPair echoes through a socketpair splice" {
     const rt = try std.Thread.spawn(.{}, T.relay, .{rargs});
     const et = try std.Thread.spawn(.{}, T.echo, .{r2e[1]});
     const msg = "stream-relay round-trip";
-    _ = try compat.write(c2r[0], msg);
+    _ = try sys.write(c2r[0], msg);
     var out: [64]u8 = undefined;
     var got: usize = 0;
     while (got < msg.len) {
@@ -256,14 +256,14 @@ pub const Server = struct {
 
     pub fn start(listen_port: u16, default_addr: std.posix.sockaddr, routes: []const RouteEntry) !*Server {
         const self = try std.heap.page_allocator.create(Server);
-        const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-        errdefer compat.close(lfd);
+        const lfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+        errdefer sys.close(lfd);
         var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
         addr[0] = 2; // AF_INET
         addr[2] = @intCast((listen_port >> 8) & 0xFF);
         addr[3] = @intCast(listen_port & 0xFF);
-        try compat.bind(lfd, @ptrCast(&addr), 16);
-        try compat.listen(lfd, 64);
+        try sys.bind(lfd, @ptrCast(&addr), 16);
+        try sys.listen(lfd, 64);
         self.* = .{ .listen_port = listen_port, .default_addr = default_addr, .routes = routes, .listener = lfd };
         self.thread = try std.Thread.spawn(.{}, acceptFn, .{self});
         return self;
@@ -271,7 +271,7 @@ pub const Server = struct {
 
     pub fn stop(self: *Server) void {
         self.stop_flag.store(true, .release);
-        compat.close(self.listener);
+        sys.close(self.listener);
         self.thread.join();
         std.heap.page_allocator.destroy(self);
     }
@@ -294,7 +294,7 @@ pub const Server = struct {
                 }
             };
             const t = std.Thread.spawn(.{}, Conn.run, .{Conn{ .cfd = @intCast(cfd), .srv = self }}) catch {
-                compat.close(@intCast(cfd));
+                sys.close(@intCast(cfd));
                 continue;
             };
             t.detach();
@@ -302,7 +302,7 @@ pub const Server = struct {
     }
 
     fn serveConn(self: *Server, cfd: std.posix.fd_t) void {
-        defer compat.close(cfd);
+        defer sys.close(cfd);
         // SNI select over a PEEK (bytes stay queued for the relay).
         var snis: [16]SniRoute = undefined;
         const n = @min(self.routes.len, snis.len);
@@ -310,14 +310,14 @@ pub const Server = struct {
         const idx = peekRoute(cfd, snis[0..n], n); // n = default sentinel
         const addr = if (idx < n) self.routes[idx].addr else self.default_addr;
         const ufd = dialAddr(addr, 5000) orelse return;
-        defer compat.close(ufd);
+        defer sys.close(ufd);
         relayPair(cfd, ufd, 60_000);
     }
 
     fn dialAddr(addr: std.posix.sockaddr, timeout_ms: i32) ?std.posix.fd_t {
-        const fd = compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0) catch return null;
-        errdefer compat.close(fd);
-        compat.connect(fd, &addr, 16) catch |e| switch (e) {
+        const fd = sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0) catch return null;
+        errdefer sys.close(fd);
+        sys.connect(fd, &addr, 16) catch |e| switch (e) {
             error.WouldBlock => {},
             else => return null,
         };
@@ -325,8 +325,8 @@ pub const Server = struct {
         const ready = std.posix.poll(&pfds, timeout_ms) catch return null;
         if (ready == 0) return null;
         // Back to blocking: the relay loop uses plain read/write.
-        const flags = compat.fcntl(fd, 3, 0) catch return null; // F_GETFL
-        _ = compat.fcntl(fd, 4, flags & ~@as(usize, 2048)) catch {}; // clear O_NONBLOCK
+        const flags = sys.fcntl(fd, 3, 0) catch return null; // F_GETFL
+        _ = sys.fcntl(fd, 4, flags & ~@as(usize, 2048)) catch {}; // clear O_NONBLOCK
         return fd;
     }
 };
@@ -348,17 +348,17 @@ test "stream server relays TCP to the default backend" {
         stop_flag: std.atomic.Value(bool) = .init(false),
         thread: std.Thread = undefined,
         fn start(self: *@This()) !void {
-            const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-            errdefer compat.close(lfd);
+            const lfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+            errdefer sys.close(lfd);
             var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
             addr[0] = 2;
             addr[4] = 127;
             addr[7] = 1;
-            try compat.bind(lfd, @ptrCast(&addr), 16);
-            try compat.listen(lfd, 8);
+            try sys.bind(lfd, @ptrCast(&addr), 16);
+            try sys.listen(lfd, 8);
             var slen: std.posix.socklen_t = 16;
             var bound: [16]u8 align(@alignOf(u16)) = undefined;
-            try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+            try sys.getsockname(lfd, @ptrCast(&bound), &slen);
             self.lfd = lfd;
             self.port = (@as(u16, bound[2]) << 8) | bound[3];
             self.thread = try std.Thread.spawn(.{}, acceptFn, .{self});
@@ -373,16 +373,16 @@ test "stream server relays TCP to the default backend" {
                 const fd: std.posix.fd_t = @intCast(cfd);
                 var buf: [1024]u8 = undefined;
                 const n = std.posix.read(fd, &buf) catch {
-                    compat.close(fd);
+                    sys.close(fd);
                     continue;
                 };
-                _ = compat.write(fd, buf[0..n]) catch {};
-                compat.close(fd);
+                _ = sys.write(fd, buf[0..n]) catch {};
+                sys.close(fd);
             }
         }
         fn stop(self: *@This()) void {
             self.stop_flag.store(true, .release);
-            compat.close(self.lfd);
+            sys.close(self.lfd);
             self.thread.join();
         }
         fn sockaddr(self: *const @This()) std.posix.sockaddr {
@@ -402,21 +402,21 @@ test "stream server relays TCP to the default backend" {
     // Discover the ephemeral listen port.
     var slen: std.posix.socklen_t = 16;
     var bound: [16]u8 align(@alignOf(u16)) = undefined;
-    try compat.getsockname(srv.listener, @ptrCast(&bound), &slen);
+    try sys.getsockname(srv.listener, @ptrCast(&bound), &slen);
     const sport: u16 = (@as(u16, bound[2]) << 8) | bound[3];
     try testing.expect(sport != 0);
     // Client round-trip through the relay.
-    const cfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    defer compat.close(cfd);
+    const cfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    defer sys.close(cfd);
     var sa: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     sa[0] = 2;
     sa[2] = @intCast((sport >> 8) & 0xFF);
     sa[3] = @intCast(sport & 0xFF);
     sa[4] = 127;
     sa[7] = 1;
-    try compat.connect(cfd, @ptrCast(&sa), 16);
+    try sys.connect(cfd, @ptrCast(&sa), 16);
     const msg = "stream-e2e-payload";
-    _ = try compat.write(cfd, msg);
+    _ = try sys.write(cfd, msg);
     var out: [64]u8 = undefined;
     var got: usize = 0;
     while (got < msg.len) {

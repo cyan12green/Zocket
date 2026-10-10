@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 const epoll = @import("epoll.zig");
@@ -183,8 +183,8 @@ const HttpSession = struct {
     upgraded: bool = false,
     /// Request-timeout bookkeeping (slowloris defense): when the first byte
     /// of this request arrived and when the last successful recv happened.
-    first_byte_at: ?compat.Instant = null,
-    last_rx_at: ?compat.Instant = null,
+    first_byte_at: ?sys.Instant = null,
+    last_rx_at: ?sys.Instant = null,
     /// Scratch for the 101 handshake head (upgradeConnection); 160 covers
     /// the websocket head with digest plus slack.
     upgrade_head_scratch: [160]u8 = undefined,
@@ -242,7 +242,7 @@ pub const Reactor = struct {
     /// Accepted connection fds handed over by the server's acceptor thread
     /// (raw fds: the reactor adopts them in its own pool).
     pending_fds: std.ArrayList(posix.fd_t),
-    pending_lock: compat.Mutex,
+    pending_lock: sys.Mutex,
     /// Total connections this reactor has registered, ever. Bumped on the
     /// reactor thread when a pending connection is added to the registry;
     /// monotonic, so tests can assert dispatch happened without racing
@@ -251,7 +251,7 @@ pub const Reactor = struct {
     /// Idle timeout in wheel ticks (1 s each); zero disables idle reaping.
     idle_timeout_ticks: u64,
     /// Wall-clock epoch the timer ticks are measured from.
-    epoch: compat.Instant,
+    epoch: sys.Instant,
     /// Timer wheel advancing on every loop iteration; idle connections expire
     /// and close.
     wheel: timer_wheel.default_wheel,
@@ -324,7 +324,7 @@ pub const Reactor = struct {
     /// and exit the loop once the connection map empties (or a timeout).
     draining: std.atomic.Value(bool) = .init(false),
     drained: std.atomic.Value(bool) = .init(false),
-    drain_started: compat.Instant = undefined,
+    drain_started: sys.Instant = undefined,
     /// Set by `drain`: the listener should be closed as soon as the current
     /// epoll batch finishes (see `closeListenerIfRequested`).
     listener_close_requested: std.atomic.Value(bool) = .init(false),
@@ -421,7 +421,7 @@ pub const Reactor = struct {
             .pending_lock = .{},
             .registered = std.atomic.Value(usize).init(0),
             .idle_timeout_ticks = timer_wheel.default_wheel.tickForNs(@as(u64, idle_timeout_seconds) * std.time.ns_per_s),
-            .epoch = compat.Instant.now() catch compat.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
+            .epoch = sys.Instant.now() catch sys.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
             .wheel = .{},
             .expired_fds = .empty,
             .throttle_fds = .empty,
@@ -431,7 +431,7 @@ pub const Reactor = struct {
                 null,
             .static_cache = undefined,
             .conn_pool = undefined,
-            .drain_started = compat.Instant.now() catch compat.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
+            .drain_started = sys.Instant.now() catch sys.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
         };
         // NOTE: the pool's epoll hook is set on the reactor THREAD (see
         // reactorLoop): the Reactor value is returned/copied by the init
@@ -503,7 +503,7 @@ pub const Reactor = struct {
         // Tear down connections while the epoll fd is still open: they deregister
         // via epoll_ctl DEL, which would EBADF-panic on a closed epoll fd.
         self.closeAllConnections();
-        if (self.listener >= 0 and !self.shared_listener) compat.close(self.listener);
+        if (self.listener >= 0 and !self.shared_listener) sys.close(self.listener);
         self.static_cache.deinit();
         self.conn_pool.deinit();
         self.ring.deinit();
@@ -542,7 +542,7 @@ pub const Reactor = struct {
     /// `drain_timeout_ns`). The reactor thread must be joined afterwards.
     pub fn drain(self: *Reactor) void {
         self.draining.store(true, .release);
-        self.drain_started = compat.Instant.now() catch compat.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } };
+        self.drain_started = sys.Instant.now() catch sys.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } };
         // Graceful handoff (daemon swap, reload): stop routing new
         // connections to this reactor by closing its SO_REUSEPORT listener,
         // so the kernel delivers them to sibling listeners (the new
@@ -564,7 +564,7 @@ pub const Reactor = struct {
                 // Server closes it once every reactor has detached.
                 self.ep.remove(self.listener) catch {};
             } else {
-                compat.close(self.listener);
+                sys.close(self.listener);
             }
             self.listener = -1;
         }
@@ -592,13 +592,13 @@ pub const Reactor = struct {
     /// kernel's wakeup choices). The fd is adopted on the reactor thread.
     pub fn pushAcceptedFd(self: *Reactor, fd: posix.fd_t) void {
         if (self.draining.load(.acquire)) {
-            compat.close(fd);
+            sys.close(fd);
             return;
         }
         self.pending_lock.lock();
         defer self.pending_lock.unlock();
         self.pending_fds.append(self.allocator, fd) catch {
-            compat.close(fd);
+            sys.close(fd);
             return;
         };
         self.wakeup.write();
@@ -640,7 +640,7 @@ pub const Reactor = struct {
             self.closeListenerIfRequested();
             if (self.draining.load(.acquire)) {
                 if (self.connections.count() == 0) break;
-                const now = compat.Instant.now() catch break;
+                const now = sys.Instant.now() catch break;
                 if (now.since(self.drain_started) > drain_timeout_ns) break;
             }
             self.advanceTimers();
@@ -690,7 +690,7 @@ pub const Reactor = struct {
 
     /// Refresh the cached Date string when the wall-clock second changes.
     fn refreshDate(self: *Reactor) void {
-        const ts = compat.clock_gettime(posix.CLOCK.REALTIME) catch return;
+        const ts = sys.clock_gettime(posix.CLOCK.REALTIME) catch return;
         const now: u64 = @intCast(ts.sec);
         if (now == self.date_sec) return;
         self.date_sec = now;
@@ -711,13 +711,13 @@ pub const Reactor = struct {
 
     /// Wall-clock time in wheel ticks (1 s granularity), relative to `epoch`.
     fn nowTick(self: *const Reactor) u64 {
-        const now = compat.Instant.now() catch return 0;
+        const now = sys.Instant.now() catch return 0;
         return timer_wheel.default_wheel.tickForNs(now.since(self.epoch));
     }
 
     /// Nanoseconds since the reactor epoch (limit_rate bucket clock).
     fn nowNs(self: *const Reactor) u64 {
-        const now = compat.Instant.now() catch return 0;
+        const now = sys.Instant.now() catch return 0;
         return now.since(self.epoch);
     }
 
@@ -766,7 +766,7 @@ pub const Reactor = struct {
             const err = linux.errno(rc);
             if (err != .SUCCESS) {
                 if (err == .AGAIN or err == .INTR) return .wait_io;
-                if (!session.file_fd_cached) compat.close(session.file_fd);
+                if (!session.file_fd_cached) sys.close(session.file_fd);
                 session.file_fd = -1;
                 self.removeConnection(fd);
                 return .gone;
@@ -788,7 +788,7 @@ pub const Reactor = struct {
             self.parkThrottled(fd, session);
             return .wait_budget;
         }
-        if (!session.file_fd_cached) compat.close(session.file_fd);
+        if (!session.file_fd_cached) sys.close(session.file_fd);
         session.file_fd_cached = false;
         session.file_fd = -1;
         return .done;
@@ -899,7 +899,7 @@ pub const Reactor = struct {
         const hdr_s = self.limits.client_header_timeout_s;
         const body_s = self.limits.client_body_timeout_s;
         if (hdr_s == 0 and body_s == 0) return;
-        const now = compat.Instant.now() catch return;
+        const now = sys.Instant.now() catch return;
 
         // At-most-once-per-second gate (wheel ticks are 1s apart).
         const tick = self.nowTick();
@@ -1072,7 +1072,7 @@ pub const Reactor = struct {
                     got_data = true;
                 }
             }
-            const now_inst = compat.Instant.now() catch null;
+            const now_inst = sys.Instant.now() catch null;
             if (got_data) {
                 self.rearmTimer(conn);
                 if (self.stats) |s| {
@@ -1253,7 +1253,7 @@ pub const Reactor = struct {
                             .upgrade => upgrade_proto = slot.value,
                             .sec_websocket_key => ws_key = slot.value,
                             .connection => {
-                                if (compat.indexOfIgnoreCase(slot.value, "upgrade") != null) {
+                                if (http_parser.valueHasToken(slot.value, "upgrade")) {
                                     wants_upgrade = true;
                                 }
                             },
@@ -1336,7 +1336,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         const tx = &session.up_tx;
         session.up_active = false;
         if (self.io_mode == .epoll) self.ep.remove(tx.fd) catch {};
-        compat.close(tx.fd);
+        sys.close(tx.fd);
         // The client went away, not the backend: release the in-flight
         // slot without touching the passive health counters.
         proxy_mod.upstreamAbandoned(tx.backend_idx);
@@ -1355,7 +1355,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         switch (tx.state) {
             .sending => {
                 while (tx.sent < tx.request.len) {
-                    const n = compat.write(up_fd, tx.request[tx.sent..]) catch |e| switch (e) {
+                    const n = sys.write(up_fd, tx.request[tx.sent..]) catch |e| switch (e) {
                         // Yield: arm OUT alongside IN and resume from this
                         // exact byte on the writability event.
                         error.WouldBlock => {
@@ -1396,15 +1396,15 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         tx.retried = true;
         const old_fd = tx.fd;
         if (self.io_mode == .epoll) self.ep.remove(old_fd) catch {};
-        compat.close(old_fd);
+        sys.close(old_fd);
         const fd = proxy_mod.reconnectUpstream(tx.route, tx.backend_idx) catch return false;
         tx.fd = fd;
         // Resend the request inline (non-blocking fd; the request is small
         // and the fresh kernel buffer accepts it).
         var sent: usize = 0;
         while (sent < tx.request.len) {
-            const n = compat.write(fd, tx.request[sent..]) catch {
-                compat.close(fd);
+            const n = sys.write(fd, tx.request[sent..]) catch {
+                sys.close(fd);
                 return false;
             };
             sent += n;
@@ -1412,7 +1412,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         tx.sent = sent;
         tx.state = .reading;
         self.ep.add(fd, epoll.Events.In, @intCast(@as(u64, @intCast(client_fd)) | up_tag)) catch {
-            compat.close(fd);
+            sys.close(fd);
             return false;
         };
         _ = session;
@@ -1493,7 +1493,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         latchRate(session, tx.route);
         proxy_mod.upstreamFail(tx.backend_idx, tx.route, upstreamNowNs());
         if (self.io_mode == .epoll) self.ep.remove(tx.fd) catch {};
-        compat.close(tx.fd); // failed fds are not pooled
+        sys.close(tx.fd); // failed fds are not pooled
         session.up_active = false;
 
         session.resp = http_response.Response.init(.bad_gateway);
@@ -1569,9 +1569,9 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             .static_cache = &self.static_cache,
             .limits = &self.limits,
             .formats = self.handler.formats(),
-            .started = compat.Instant.now() catch compat.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
+            .started = sys.Instant.now() catch sys.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
             .now_ns = blk: {
-                const t = compat.Instant.now() catch break :blk 0;
+                const t = sys.Instant.now() catch break :blk 0;
                 break :blk @intCast(t.since(self.epoch));
             },
         };
@@ -1924,7 +1924,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 sess.req_counted = false;
                 self.in_flight -|= 1;
             }
-            if (sess.file_fd >= 0 and !sess.file_fd_cached) compat.close(sess.file_fd);
+            if (sess.file_fd >= 0 and !sess.file_fd_cached) sys.close(sess.file_fd);
             if (sess.resp.body_owned) self.allocator.free(sess.resp.body);
             if (self.stats) |s| {
                 switch (sess.stat_state) {
@@ -1943,7 +1943,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                     var out: [4096]u8 = undefined;
                     const m = tc.takeOut(&out);
                     if (m > 0) {
-                        _ = compat.write(conn.fd, out[0..m]) catch {};
+                        _ = sys.write(conn.fd, out[0..m]) catch {};
                     }
                 }
                 tc.deinit();
@@ -2048,7 +2048,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             }
             return self.finalizeFlush(fd);
         }
-        const n = compat.writev(fd, iov[0..count]) catch |e| {
+        const n = sys.writev(fd, iov[0..count]) catch |e| {
             if (e == error.WouldBlock) {
                 // Budget-exhausted stops park on the kick list (EPOLLOUT
                 // alone would stall: no writable transition is coming).
@@ -2205,9 +2205,9 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             // keep the synchronous upstream driver.
             .async_supported = self.io_mode == .epoll,
             .body_storage = if (session.req.body_storage) |*bs| bs else null,
-            .started = compat.Instant.now() catch compat.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
+            .started = sys.Instant.now() catch sys.Instant{ .timestamp = .{ .sec = 0, .nsec = 0 } },
             .now_ns = blk: {
-                const t = compat.Instant.now() catch break :blk 0;
+                const t = sys.Instant.now() catch break :blk 0;
                 break :blk @intCast(t.since(self.epoch));
             },
         };
@@ -2399,7 +2399,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 if (n == 0) break;
                 got += n;
             }
-            if (!session.resp.file_fd_cached) compat.close(session.resp.file_fd);
+            if (!session.resp.file_fd_cached) sys.close(session.resp.file_fd);
             session.resp.setBody(fbuf[0..got]);
             session.resp.body_owned = true;
             session.resp.body_from_file = false;
@@ -2986,7 +2986,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         if (self.limits.max_connections > 0) {
             if (self.stats) |s| {
                 if (s.active.load(.monotonic) >= self.limits.max_connections) {
-                    compat.close(conn_fd);
+                    sys.close(conn_fd);
                     return;
                 }
             }
@@ -2998,7 +2998,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         sockets.setTcpNoDelay(conn_fd);
         if (self.accepted_counter) |c| _ = c.fetchAdd(1, .monotonic);
         const conn = self.conn_pool.acquire(conn_fd) catch {
-            compat.close(conn_fd);
+            sys.close(conn_fd);
             return;
         };
         conn.peer_ip = sockets.peerIp(conn_fd);
@@ -3049,7 +3049,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 sess.req_counted = false;
                 self.in_flight -|= 1;
             }
-            if (sess.file_fd >= 0 and !sess.file_fd_cached) compat.close(sess.file_fd);
+            if (sess.file_fd >= 0 and !sess.file_fd_cached) sys.close(sess.file_fd);
             if (sess.resp.body_owned) self.allocator.free(sess.resp.body);
             if (self.stats) |s| {
                 switch (sess.stat_state) {
@@ -3070,7 +3070,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                     var out: [4096]u8 = undefined;
                     const m = tc.takeOut(&out);
                     if (m > 0) {
-                        _ = compat.write(fd, out[0..m]) catch {};
+                        _ = sys.write(fd, out[0..m]) catch {};
                     }
                 }
                 tc.deinit();
@@ -3091,7 +3091,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         self.connections.clearRetainingCapacity();
         var sit = self.http_sessions.valueIterator();
         while (sit.next()) |s| {
-            if (s.file_fd >= 0 and !s.file_fd_cached) compat.close(s.file_fd);
+            if (s.file_fd >= 0 and !s.file_fd_cached) sys.close(s.file_fd);
             if (s.resp.body_owned) self.allocator.free(s.resp.body);
             if (s.h2) |*h2s| h2s.deinit();
             s.h2_out.deinit(self.allocator);
@@ -3106,15 +3106,15 @@ const testing = std.testing;
 
 fn readUntil(sock: posix.fd_t, buf: []u8, expected_len: usize, timeout_ms: u64) !usize {
     var total: usize = 0;
-    const start = compat.Instant.now() catch return error.Timeout;
+    const start = sys.Instant.now() catch return error.Timeout;
     while (total < expected_len) {
-        if ((compat.Instant.now() catch return error.Timeout).since(start) > timeout_ms * std.time.ns_per_ms) {
+        if ((sys.Instant.now() catch return error.Timeout).since(start) > timeout_ms * std.time.ns_per_ms) {
             return error.Timeout;
         }
         // Read at most the remaining need; the socket may deliver more (e.g.
         // the next pipelined response) and the leftover stays buffered.
         const n = posix.read(sock, buf[total..expected_len]) catch {
-            compat.nanosleep(0, 1 * std.time.ns_per_ms);
+            sys.nanosleep(0, 1 * std.time.ns_per_ms);
             continue;
         };
         if (n == 0) return error.Eof;
@@ -3126,10 +3126,10 @@ fn readUntil(sock: posix.fd_t, buf: []u8, expected_len: usize, timeout_ms: u64) 
 fn writeAll(sock: posix.fd_t, bytes: []const u8) !void {
     var remaining = bytes;
     while (remaining.len > 0) {
-        const n = compat.write(sock, remaining) catch |e| {
+        const n = sys.write(sock, remaining) catch |e| {
             // A closed peer (EPIPE/ECONNRESET) must surface, not retry forever.
             if (e == error.WouldBlock) {
-                compat.nanosleep(0, 1 * std.time.ns_per_ms);
+                sys.nanosleep(0, 1 * std.time.ns_per_ms);
                 continue;
             }
             return e;
@@ -3164,8 +3164,8 @@ test "reactor echoes a connection attached from another thread" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3181,8 +3181,8 @@ test "reactor echoes a connection attached from another thread" {
 
     // Attach a second connection through the queue to make sure each pending
     // item is registered independently.
-    const pair2 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair2[0]);
+    const pair2 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair2[0]);
     try sockets.setNonBlock(pair2[0]);
     try sockets.setNonBlock(pair2[1]);
     const conn2 = try connection.Connection.create(allocator, pair2[1]);
@@ -3220,26 +3220,26 @@ test "reactor handles concurrent dispatch from many threads" {
         fn run(p: *@This()) void {
             var i: usize = 0;
             while (i < per_producer) : (i += 1) {
-                const pair = compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
+                const pair = sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch {
                     _ = p.failures.fetchAdd(1, .monotonic);
                     return;
                 };
                 sockets.setNonBlock(pair[0]) catch {
                     _ = p.failures.fetchAdd(1, .monotonic);
-                    compat.close(pair[0]);
-                    compat.close(pair[1]);
+                    sys.close(pair[0]);
+                    sys.close(pair[1]);
                     return;
                 };
                 sockets.setNonBlock(pair[1]) catch {
                     _ = p.failures.fetchAdd(1, .monotonic);
-                    compat.close(pair[0]);
-                    compat.close(pair[1]);
+                    sys.close(pair[0]);
+                    sys.close(pair[1]);
                     return;
                 };
                 const conn = connection.Connection.create(p.alloc, pair[1]) catch {
                     _ = p.failures.fetchAdd(1, .monotonic);
-                    compat.close(pair[0]);
-                    compat.close(pair[1]);
+                    sys.close(pair[0]);
+                    sys.close(pair[1]);
                     return;
                 };
                 p.rid.attach(conn);
@@ -3251,16 +3251,16 @@ test "reactor handles concurrent dispatch from many threads" {
                 };
                 writeAll(pair[0], payload) catch {
                     _ = p.failures.fetchAdd(1, .monotonic);
-                    compat.close(pair[0]);
+                    sys.close(pair[0]);
                     return;
                 };
                 var echo_buf: [96]u8 = undefined;
                 _ = readUntil(pair[0], &echo_buf, payload.len, 5000) catch {
                     _ = p.failures.fetchAdd(1, .monotonic);
-                    compat.close(pair[0]);
+                    sys.close(pair[0]);
                     return;
                 };
-                compat.close(pair[0]);
+                sys.close(pair[0]);
             }
         }
     };
@@ -3294,7 +3294,7 @@ fn httpOkEmpty(_: []u8) []const u8 {
 /// Expected "Date: ...\r\nServer: Zocket\r\n" for the current wall
 /// second (the reactor caches the date and refreshes it once per second).
 fn testDateLine(buf: []u8) []const u8 {
-    const ts = compat.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
+    const ts = sys.clock_gettime(posix.CLOCK.REALTIME) catch unreachable;
     const date = cache_mod.formatHttpDate(@intCast(ts.sec), buf) orelse unreachable;
     return std.fmt.bufPrint(buf[date.len..], "Date: {s}\r\nServer: Zocket/" ++ version_mod.version ++ "\r\n", .{date}) catch unreachable;
 }
@@ -3345,8 +3345,8 @@ test "slowloris: dribbling headers still dies at the header deadline" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3358,7 +3358,7 @@ test "slowloris: dribbling headers still dies at the header deadline" {
     var i: usize = 0;
     while (i < 6) : (i += 1) {
         try writeAll(pair[0], "G");
-        compat.nanosleep(0, 200 * std.time.ns_per_ms);
+        sys.nanosleep(0, 200 * std.time.ns_per_ms);
         if (i >= 4) {
             // By now the deadline has passed; expect the server to hang up.
             var buf: [64]u8 = undefined;
@@ -3384,8 +3384,8 @@ test "body inactivity gap closes the connection (client_body_timeout)" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3408,8 +3408,8 @@ test "reactor upgrades to websocket and echoes frames after the 101" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3465,8 +3465,8 @@ test "reactor websocket drops pongs and rejects continuation and bad frames" {
     // Connection 1: an incomplete frame waits for the rest; pongs are
     // dropped; a continuation frame is rejected with a close.
     {
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
         const conn = try connection.Connection.create(allocator, pair[1]);
@@ -3496,8 +3496,8 @@ test "reactor websocket drops pongs and rejects continuation and bad frames" {
     }
     // Connection 2: a reserved opcode is a protocol error -> close.
     {
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
         const conn = try connection.Connection.create(allocator, pair[1]);
@@ -3512,8 +3512,8 @@ test "reactor websocket drops pongs and rejects continuation and bad frames" {
     }
     // Connection 3: RSV bits set (no extension negotiated) -> malformed.
     {
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
         const conn = try connection.Connection.create(allocator, pair[1]);
@@ -3547,8 +3547,8 @@ test "reactor leaves non-RFC upgrade requests as plain HTTP" {
         defer r.join();
         defer r.stop();
 
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
 
@@ -3572,8 +3572,8 @@ test "reactor serves HTTP with keep-alive and body echo" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3615,8 +3615,8 @@ test "reactor HTTP handles pipelined requests in one write" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3671,8 +3671,8 @@ test "reactor max_requests sheds with 503 at the cap and releases the slot" {
     // At the cap: the next request is shed immediately with 503 + close and
     // is never counted.
     {
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
         const conn = try connection.Connection.create(allocator, pair[1]);
@@ -3688,8 +3688,8 @@ test "reactor max_requests sheds with 503 at the cap and releases the slot" {
     }
     // Below the cap: a normal request completes and releases its slot.
     {
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
         const conn = try connection.Connection.create(allocator, pair[1]);
@@ -3705,7 +3705,7 @@ test "reactor max_requests sheds with 503 at the cap and releases the slot" {
         // loop turn; allow it a moment to land.
         var spins: usize = 0;
         while (r.in_flight != 0 and spins < 200) : (spins += 1) {
-            compat.nanosleep(0, std.time.ns_per_ms);
+            sys.nanosleep(0, std.time.ns_per_ms);
         }
         try testing.expectEqual(@as(usize, 0), r.in_flight);
     }
@@ -3735,8 +3735,8 @@ test "reactor HTTP error paths respond and close" {
         defer r.join();
         defer r.stop();
 
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
 
@@ -3767,8 +3767,8 @@ test "reactor HTTP 413 for a chunked body over the cap" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3796,8 +3796,8 @@ test "reactor HTTP 431 for an oversized header line" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3821,8 +3821,8 @@ test "reactor treats a TLS-looking prefix without credentials as plain HTTP" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3850,8 +3850,8 @@ test "reactor HTTP oversized body hits the buffer cap, yields 431 and closes" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3873,7 +3873,7 @@ test "reactor HTTP oversized body hits the buffer cap, yields 431 and closes" {
         // Body arrives in chunks to exercise the partial-body path. The
         // server 431s and closes as soon as the buffer cap is hit, so a
         // BrokenPipe mid-stream is expected.
-        compat.nanosleep(0, 5 * std.time.ns_per_ms);
+        sys.nanosleep(0, 5 * std.time.ns_per_ms);
         writeAll(pair[0], body[sent..@min(sent + 65536, body.len)]) catch |e| {
             if (e == error.BrokenPipe) break;
             return e;
@@ -3899,8 +3899,8 @@ test "reactor HTTP 64 KiB POST is echoed with 200 (regression: was 431) and keep
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -3919,7 +3919,7 @@ test "reactor HTTP 64 KiB POST is echoed with 200 (regression: was 431) and keep
     var sent: usize = 0;
     while (sent < wire.len) : (sent += 4096) {
         try writeAll(pair[0], wire[sent..@min(sent + 4096, wire.len)]);
-        compat.nanosleep(0, 1 * std.time.ns_per_ms);
+        sys.nanosleep(0, 1 * std.time.ns_per_ms);
     }
 
     var date_buf_head: [96]u8 = undefined;
@@ -3962,8 +3962,8 @@ test "reactor runs a conf-config pipeline with default 404 fallback" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4011,8 +4011,8 @@ test "reactor selects the vhost from the Host header through a server group" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4045,8 +4045,8 @@ test "reactor HEAD responds with head only and correct Content-Length" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4103,8 +4103,8 @@ test "reactor serves a comptime template route from pre-serialised bytes" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4151,8 +4151,8 @@ test "reactor serves a chunked request end to end" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4188,8 +4188,8 @@ test "reactor serves a chunked response when the route opts in" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4243,8 +4243,8 @@ test "reactor detects the h2c preface and speaks HTTP/2" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4301,8 +4301,8 @@ test "reactor sends GOAWAY and closes on an h2 connection error" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4355,8 +4355,8 @@ test "reactor closes a connection that goes idle" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4366,7 +4366,7 @@ test "reactor closes a connection that goes idle" {
     // No traffic at all: the reactor expires the connection ~1 s after it was
     // registered. EOF (error.Eof) proves the close; Timeout would mean the
     // timer never fired.
-    compat.nanosleep(2, 0);
+    sys.nanosleep(2, 0);
     var buf: [64]u8 = undefined;
     try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 1000));
 
@@ -4384,8 +4384,8 @@ test "reactor resets the idle timer on active traffic" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4401,7 +4401,7 @@ test "reactor resets the idle timer on active traffic" {
     try testing.expectEqualStrings(http_ok_empty_1, buf[0..n1]);
 
     // Request 2 just before the deadline: pushes the deadline to ~1.5 s.
-    compat.nanosleep(0, 500 * std.time.ns_per_ms);
+    sys.nanosleep(0, 500 * std.time.ns_per_ms);
     try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var ok_buf_2: [160]u8 = undefined;
     const http_ok_empty_2 = httpOkEmpty(&ok_buf_2);
@@ -4411,7 +4411,7 @@ test "reactor resets the idle timer on active traffic" {
     // Request 3 *after* the original ~1 s deadline: answered, which proves the
     // timer was re-armed (without rearming the connection would already be
     // closed and this write would fail).
-    compat.nanosleep(0, 600 * std.time.ns_per_ms);
+    sys.nanosleep(0, 600 * std.time.ns_per_ms);
     try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var ok_buf_3: [160]u8 = undefined;
     const http_ok_empty_3 = httpOkEmpty(&ok_buf_3);
@@ -4419,7 +4419,7 @@ test "reactor resets the idle timer on active traffic" {
     try testing.expectEqualStrings(http_ok_empty_3, buf[0..n3]);
 
     // Idle again past the re-armed deadline (~2.5 s): now it does expire.
-    compat.nanosleep(2, 0);
+    sys.nanosleep(2, 0);
     try testing.expectError(error.Eof, readUntil(pair[0], &buf, 1, 1000));
 
     r.stop();
@@ -4436,8 +4436,8 @@ test "idle timeout of zero disables reaping" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -4445,7 +4445,7 @@ test "idle timeout of zero disables reaping" {
     r.attach(conn);
 
     // Well past any plausible 1 s window: the connection must still be alive.
-    compat.nanosleep(2, 0);
+    sys.nanosleep(2, 0);
     try writeAll(pair[0], "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     var buf: [512]u8 = undefined;
     var ok_buf_4: [160]u8 = undefined;
@@ -4466,13 +4466,13 @@ test "upstream driver sends parked request and adopts response" {
     var r = try Reactor.init(allocator, 0, .http);
     defer r.deinit();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
-    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(cpair[0]);
+    const cpair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(cpair[0]);
 
     const sess_local = HttpSession{
         .parser = http_parser.Parser.init(allocator),
@@ -4499,7 +4499,7 @@ test "upstream driver sends parked request and adopts response" {
 
     // Pre-stage the origin response so the single drive completes
     // send->read->adopt without hitting the bounded wait.
-    _ = try compat.write(pair[1], "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nX-Mid: mid\r\n\r\nhi");
+    _ = try sys.write(pair[1], "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nX-Mid: mid\r\n\r\nhi");
 
     var rt_buf: [16 * 1024]u8 = undefined;
     sess.up_tx = .{
@@ -4571,13 +4571,13 @@ test "upstream driver fails a transaction past its deadline with 502" {
     // test must not be closed after this test's fds reuse it.
     proxy_mod.testResetRoute(&route);
 
-    const up = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(up[0]);
+    const up = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(up[0]);
     try sockets.setNonBlock(up[0]);
     try sockets.setNonBlock(up[1]);
 
-    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(cpair[0]);
+    const cpair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(cpair[0]);
     try sockets.setNonBlock(cpair[0]);
 
     const sess = try parkTestSession(&r, cpair, &route);
@@ -4619,13 +4619,13 @@ test "upstream driver stamps the sticky cookie on the adopted response" {
     // Runs last (after the fds close): drains the fd upstreamSuccess pools.
     defer proxy_mod.testResetRoute(&route);
 
-    const up = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(up[0]);
+    const up = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(up[0]);
     try sockets.setNonBlock(up[0]);
     try sockets.setNonBlock(up[1]);
 
-    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(cpair[0]);
+    const cpair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(cpair[0]);
     try sockets.setNonBlock(cpair[0]);
 
     const sess = try parkTestSession(&r, cpair, &route);
@@ -4644,7 +4644,7 @@ test "upstream driver stamps the sticky cookie on the adopted response" {
         .started_ns = upstreamNowNs(),
     };
     sess.up_active = true;
-    _ = try compat.write(up[1], "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+    _ = try sys.write(up[1], "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
     r.handleUpstreamEvent(cpair[1]);
 
     var buf: [512]u8 = undefined;
@@ -4663,13 +4663,13 @@ test "upstream driver resumes a partially sent request after EAGAIN" {
     var route = dsl_registry.Route{ .path = "/", .match = .prefix };
     proxy_mod.testResetRoute(&route);
 
-    const up = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(up[0]);
+    const up = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(up[0]);
     try sockets.setNonBlock(up[0]);
     try sockets.setNonBlock(up[1]);
 
-    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(cpair[0]);
+    const cpair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(cpair[0]);
     try sockets.setNonBlock(cpair[0]);
 
     const sess = try parkTestSession(&r, cpair, &route);
@@ -4748,12 +4748,12 @@ test "upstream driver retries a pooled transaction on a fresh connection" {
 
     // A pooled fd whose peer is already gone: the first write fails with
     // EPIPE and triggers the one-shot fresh-connection retry.
-    const dead = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    compat.close(dead[1]);
+    const dead = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    sys.close(dead[1]);
     try sockets.setNonBlock(dead[0]);
 
-    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(cpair[0]);
+    const cpair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(cpair[0]);
     try sockets.setNonBlock(cpair[0]);
 
     const sess = try parkTestSession(&r, cpair, &route);
@@ -4806,13 +4806,13 @@ test "reactor dropUpstream closes the upstream fd on client teardown" {
     var route = dsl_registry.Route{ .path = "/", .match = .prefix };
     proxy_mod.testResetRoute(&route);
 
-    const up = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(up[1]);
+    const up = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(up[1]);
     try sockets.setNonBlock(up[0]);
     try sockets.setNonBlock(up[1]);
 
-    const cpair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(cpair[0]);
+    const cpair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(cpair[0]);
 
     const sess = try parkTestSession(&r, cpair, &route);
     defer parkTestTeardown(&r, cpair);
@@ -4852,21 +4852,21 @@ test "max_connections: active counter tracks registered connections" {
 
     // Attach two connections — both go through registerConnection which
     // bumps stats.active.
-    const pair1 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair1[0]);
+    const pair1 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair1[0]);
     try sockets.setNonBlock(pair1[0]);
     try sockets.setNonBlock(pair1[1]);
     const conn1 = try connection.Connection.create(allocator, pair1[1]);
     r.attach(conn1);
-    compat.nanosleep(0, 50 * std.time.ns_per_ms);
+    sys.nanosleep(0, 50 * std.time.ns_per_ms);
 
-    const pair2 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair2[0]);
+    const pair2 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair2[0]);
     try sockets.setNonBlock(pair2[0]);
     try sockets.setNonBlock(pair2[1]);
     const conn2 = try connection.Connection.create(allocator, pair2[1]);
     r.attach(conn2);
-    compat.nanosleep(0, 50 * std.time.ns_per_ms);
+    sys.nanosleep(0, 50 * std.time.ns_per_ms);
 
     // Both registered: countConnections reflects the map size.
     try testing.expectEqual(@as(usize, 2), r.countConnections());
@@ -4897,8 +4897,8 @@ test "max_connections: adoptAcceptedFd closes the fd at the ceiling" {
     r.stats = &stats;
     stats.active.store(1, .monotonic);
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[1]);
     r.adoptAcceptedFd(pair[1]);
     // At the ceiling the accepted fd is closed without registering.
@@ -4916,7 +4916,7 @@ test "reactor accepts on its own listener and drains gracefully" {
     const lfd = try sockets.createListeningSocket(0, 8);
     var slen: posix.socklen_t = 16;
     var bound: [16]u8 align(@alignOf(u16)) = undefined;
-    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+    try sys.getsockname(lfd, @ptrCast(&bound), &slen);
     const port = (@as(u16, bound[2]) << 8) | bound[3];
 
     var r = try Reactor.initWithHandlerListener(allocator, 0, .http, null, 60, lfd);
@@ -4925,9 +4925,9 @@ test "reactor accepts on its own listener and drains gracefully" {
     defer r.join();
     defer r.stop();
 
-    const cfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const cfd = try sys.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     var cfd_open = true;
-    defer if (cfd_open) compat.close(cfd);
+    defer if (cfd_open) sys.close(cfd);
     try sockets.setNonBlock(cfd);
     var caddr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     caddr[0] = 2;
@@ -4935,7 +4935,7 @@ test "reactor accepts on its own listener and drains gracefully" {
     caddr[3] = @intCast(port & 0xff);
     caddr[4] = 127;
     caddr[7] = 1;
-    compat.connect(cfd, @ptrCast(&caddr), 16) catch |e| switch (e) {
+    sys.connect(cfd, @ptrCast(&caddr), 16) catch |e| switch (e) {
         error.WouldBlock => {}, // EINPROGRESS: wait for the handshake below
         else => return e,
     };
@@ -4953,11 +4953,11 @@ test "reactor accepts on its own listener and drains gracefully" {
     // Graceful drain: the private listener is closed (listener = -1) and the
     // loop exits once the connection is gone.
     r.drain();
-    compat.close(cfd);
+    sys.close(cfd);
     cfd_open = false;
     var spins: usize = 0;
     while (!r.isDrained() and spins < 5000) : (spins += 1) {
-        compat.nanosleep(0, 1 * std.time.ns_per_ms);
+        sys.nanosleep(0, 1 * std.time.ns_per_ms);
     }
     try testing.expect(r.isDrained());
     try testing.expectEqual(@as(posix.fd_t, -1), r.listener);
@@ -4974,8 +4974,8 @@ test "reactor adopts a pushed accepted fd and refuses pushes while draining" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     r.pushAcceptedFd(pair[1]);
@@ -4989,8 +4989,8 @@ test "reactor adopts a pushed accepted fd and refuses pushes while draining" {
 
     // While draining, a pushed fd is closed immediately.
     r.drain();
-    const pair2 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair2[0]);
+    const pair2 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair2[0]);
     try sockets.setNonBlock(pair2[1]);
     r.pushAcceptedFd(pair2[1]);
     try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(pair2[1], linux.F.GETFD, 0)));
@@ -5009,8 +5009,8 @@ test "reactor rejects attach while draining" {
     defer r.stop();
 
     r.drain();
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
     r.attach(conn); // draining: closed and destroyed immediately
@@ -5031,35 +5031,35 @@ test "server_limit_conn: per-IP concurrent cap enforced via attach" {
     defer r.stop();
 
     // Attach two connections — both should be admitted.
-    const pair1 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair1[0]);
+    const pair1 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair1[0]);
     try sockets.setNonBlock(pair1[0]);
     try sockets.setNonBlock(pair1[1]);
     var conn1 = try connection.Connection.create(allocator, pair1[1]);
     conn1.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
     r.attach(conn1);
-    compat.nanosleep(0, 30 * std.time.ns_per_ms);
+    sys.nanosleep(0, 30 * std.time.ns_per_ms);
 
-    const pair2 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair2[0]);
+    const pair2 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair2[0]);
     try sockets.setNonBlock(pair2[0]);
     try sockets.setNonBlock(pair2[1]);
     var conn2 = try connection.Connection.create(allocator, pair2[1]);
     conn2.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
     r.attach(conn2);
-    compat.nanosleep(0, 30 * std.time.ns_per_ms);
+    sys.nanosleep(0, 30 * std.time.ns_per_ms);
 
     try testing.expectEqual(@as(usize, 2), r.countConnections());
 
     // Third connection from the same IP should be rejected.
-    const pair3 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair3[0]);
+    const pair3 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair3[0]);
     try sockets.setNonBlock(pair3[0]);
     try sockets.setNonBlock(pair3[1]);
     var conn3 = try connection.Connection.create(allocator, pair3[1]);
     conn3.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
     r.attach(conn3);
-    compat.nanosleep(0, 30 * std.time.ns_per_ms);
+    sys.nanosleep(0, 30 * std.time.ns_per_ms);
 
     // Exactly 2 connections: third was rejected.
     try testing.expectEqual(@as(usize, 2), r.countConnections());
@@ -5076,36 +5076,36 @@ test "server_limit_conn: different IPs tracked independently" {
     defer r.stop();
 
     // IP A: first connection admitted.
-    const p1 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(p1[0]);
+    const p1 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(p1[0]);
     try sockets.setNonBlock(p1[0]);
     try sockets.setNonBlock(p1[1]);
     var c1 = try connection.Connection.create(allocator, p1[1]);
     c1.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
     r.attach(c1);
-    compat.nanosleep(0, 30 * std.time.ns_per_ms);
+    sys.nanosleep(0, 30 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 1), r.countConnections());
 
     // IP A: second connection rejected (limit = 1).
-    const p2 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(p2[0]);
+    const p2 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(p2[0]);
     try sockets.setNonBlock(p2[0]);
     try sockets.setNonBlock(p2[1]);
     var c2 = try connection.Connection.create(allocator, p2[1]);
     c2.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1 };
     r.attach(c2);
-    compat.nanosleep(0, 30 * std.time.ns_per_ms);
+    sys.nanosleep(0, 30 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 1), r.countConnections());
 
     // IP B: admitted (different IP, independent counter).
-    const p3 = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(p3[0]);
+    const p3 = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(p3[0]);
     try sockets.setNonBlock(p3[0]);
     try sockets.setNonBlock(p3[1]);
     var c3 = try connection.Connection.create(allocator, p3[1]);
     c3.peer_ip = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 2 };
     r.attach(c3);
-    compat.nanosleep(0, 30 * std.time.ns_per_ms);
+    sys.nanosleep(0, 30 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 2), r.countConnections());
 }
 
@@ -5121,16 +5121,16 @@ const TestUpstream = struct {
 
     fn start(response: []const u8) !*TestUpstream {
         const self = try testing.allocator.create(TestUpstream);
-        const lfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+        const lfd = try sys.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
         var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
         addr[0] = 2;
         addr[4] = 127;
         addr[7] = 1;
-        try compat.bind(lfd, @ptrCast(&addr), 16);
-        try compat.listen(lfd, 8);
+        try sys.bind(lfd, @ptrCast(&addr), 16);
+        try sys.listen(lfd, 8);
         var slen: posix.socklen_t = 16;
         var bound: [16]u8 align(@alignOf(u16)) = undefined;
-        try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+        try sys.getsockname(lfd, @ptrCast(&bound), &slen);
         self.* = .{
             .listener = lfd,
             .port = (@as(u16, bound[2]) << 8) | bound[3],
@@ -5165,15 +5165,15 @@ const TestUpstream = struct {
                     }
                 }
                 if (!complete) break;
-                _ = compat.write(fd, self.response) catch break;
+                _ = sys.write(fd, self.response) catch break;
             }
-            compat.close(fd);
+            sys.close(fd);
         }
     }
 
     fn stop(self: *TestUpstream) void {
         self.stop_flag.store(true, .release);
-        compat.close(self.listener);
+        sys.close(self.listener);
         self.thread.join();
         testing.allocator.destroy(self);
     }
@@ -5183,14 +5183,14 @@ const TestUpstream = struct {
 /// body. Returns head_len and body_len.
 fn readHeadBody(sock: posix.fd_t, buf: []u8) !struct { head_len: usize, body_len: usize } {
     var total: usize = 0;
-    const start = compat.Instant.now() catch return error.Timeout;
+    const start = sys.Instant.now() catch return error.Timeout;
     while (true) {
-        if ((compat.Instant.now() catch return error.Timeout).since(start) > 8000 * std.time.ns_per_ms) {
+        if ((sys.Instant.now() catch return error.Timeout).since(start) > 8000 * std.time.ns_per_ms) {
             return error.Timeout;
         }
         if (total >= buf.len) return error.TooLong;
         const n = posix.read(sock, buf[total .. total + 1]) catch {
-            compat.nanosleep(0, 1 * std.time.ns_per_ms);
+            sys.nanosleep(0, 1 * std.time.ns_per_ms);
             continue;
         };
         if (n == 0) return error.Eof;
@@ -5248,8 +5248,8 @@ test "reactor parked proxy completes through epoll events" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5266,17 +5266,17 @@ test "reactor parked proxy to a dead upstream yields 502" {
     std.testing.log_level = .err;
     const allocator = testing.allocator;
     // Reserve-then-close a port so nothing listens on it.
-    const lfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const lfd = try sys.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     addr[0] = 2;
     addr[4] = 127;
     addr[7] = 1;
-    try compat.bind(lfd, @ptrCast(&addr), 16);
+    try sys.bind(lfd, @ptrCast(&addr), 16);
     var slen: posix.socklen_t = 16;
     var bound: [16]u8 align(@alignOf(u16)) = undefined;
-    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+    try sys.getsockname(lfd, @ptrCast(&bound), &slen);
     const dead_port = (@as(u16, bound[2]) << 8) | bound[3];
-    compat.close(lfd);
+    sys.close(lfd);
 
     const router_mod = @import("../dsl/router.zig");
     var ups = [_]router_mod.Upstream{.{
@@ -5301,8 +5301,8 @@ test "reactor parked proxy to a dead upstream yields 502" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5336,8 +5336,8 @@ test "reactor PROXY protocol sets the client IP before access checks" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5380,8 +5380,8 @@ test "reactor PROXY protocol denies unlisted sources and drops garbage" {
 
     // Unlisted source IP: header parses, access denies -> 403.
     {
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
         const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5393,8 +5393,8 @@ test "reactor PROXY protocol denies unlisted sources and drops garbage" {
     }
     // Garbage where the header belongs: connection dropped, EOF, no reply.
     {
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
         const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5472,18 +5472,18 @@ test "reactor limit_rate paces file and echo bodies byte-exact" {
     // Sendfile path: 20 KiB at 10 KiB/s takes ~1 s (10 KiB burst, then
     // paced). Must arrive byte-exact, not just eventually.
     {
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
         const conn = try connection.Connection.create(allocator, pair[1]);
         r.attach(conn);
 
-        const t0 = compat.Instant.now() catch return error.NoClock;
+        const t0 = sys.Instant.now() catch return error.NoClock;
         try writeAll(pair[0], "GET /file/slow.bin HTTP/1.1\r\nHost: test\r\n\r\n");
         var buf: [32 * 1024]u8 = undefined;
         const res = try readHeadBody(pair[0], &buf);
-        const t1 = compat.Instant.now() catch return error.NoClock;
+        const t1 = sys.Instant.now() catch return error.NoClock;
         try testing.expect(std.mem.startsWith(u8, buf[0..res.head_len], "HTTP/1.1 200 OK"));
         try testing.expectEqual(@as(usize, 20 * 1024), res.body_len);
         // Byte-exact against the 0..255 cycling fixture pattern.
@@ -5498,8 +5498,8 @@ test "reactor limit_rate paces file and echo bodies byte-exact" {
     }
     // Memory path: 8 KiB echo at 10 KiB/s, byte-exact round trip.
     {
-        const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        defer compat.close(pair[0]);
+        const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer sys.close(pair[0]);
         try sockets.setNonBlock(pair[0]);
         try sockets.setNonBlock(pair[1]);
         const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5527,8 +5527,8 @@ test "reactor answers Expect: 100-continue before the body arrives" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -5568,8 +5568,8 @@ test "reactor closes the connection for return 444 without a byte" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
 
@@ -5627,8 +5627,8 @@ test "reactor parked proxy honors X-Accel-Redirect to a template route" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5684,8 +5684,8 @@ test "reactor parked accel redirect serves a static file via sendfile" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5740,8 +5740,8 @@ test "reactor parked accel redirect to an unknown target yields 404" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5788,8 +5788,8 @@ test "reactor parked proxy applies proxy_hide_header and proxy_redirect" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5808,17 +5808,17 @@ test "reactor parked 502 runs error_page to a named location" {
     std.testing.log_level = .err;
     const allocator = testing.allocator;
     // Reserve-then-close a port so nothing listens.
-    const lfd = try compat.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const lfd = try sys.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     addr[0] = 2;
     addr[4] = 127;
     addr[7] = 1;
-    try compat.bind(lfd, @ptrCast(&addr), 16);
+    try sys.bind(lfd, @ptrCast(&addr), 16);
     var slen: posix.socklen_t = 16;
     var bound: [16]u8 align(@alignOf(u16)) = undefined;
-    try compat.getsockname(lfd, @ptrCast(&bound), &slen);
+    try sys.getsockname(lfd, @ptrCast(&bound), &slen);
     const dead_port = (@as(u16, bound[2]) << 8) | bound[3];
-    compat.close(lfd);
+    sys.close(lfd);
 
     const router_mod = @import("../dsl/router.zig");
     var ups = [_]router_mod.Upstream{.{
@@ -5854,8 +5854,8 @@ test "reactor parked 502 runs error_page to a named location" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5887,8 +5887,8 @@ test "reactor ring backend echoes a connection" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);
@@ -5912,8 +5912,8 @@ test "reactor ring backend serves an HTTP transaction" {
     defer r.join();
     defer r.stop();
 
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
     try sockets.setNonBlock(pair[0]);
     try sockets.setNonBlock(pair[1]);
     const conn = try connection.Connection.create(allocator, pair[1]);

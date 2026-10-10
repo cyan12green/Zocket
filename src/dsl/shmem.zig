@@ -13,7 +13,7 @@
 //! access (the same trade-off nginx makes with its zone locks).
 
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const linux = std.os.linux;
 
 /// A fixed-capacity open-addressing map: u64 key -> V. `cap` must be a
@@ -30,7 +30,7 @@ pub fn KeyedTable(comptime V: type, comptime cap: usize) type {
 
         const zero_val: V = std.mem.zeroes(V);
 
-        mutex: compat.Mutex = .{},
+        mutex: sys.Mutex = .{},
         keys: [cap]u64 = @as([cap]u64, @splat(@as(u64, 0))),
         vals: [cap]V = @as([cap]V, @splat(zero_val)),
         filled: usize = 0,
@@ -122,7 +122,7 @@ pub const LruStore = struct {
         bytes: []u8,
     };
 
-    mutex: compat.Mutex = .{},
+    mutex: sys.Mutex = .{},
     allocator: std.mem.Allocator,
     max_bytes: usize,
     entries: []Entry,
@@ -525,7 +525,7 @@ pub fn MmapKeyedTable(comptime V: type, comptime cap: usize) type {
 
         const zero_val: V = std.mem.zeroes(V);
 
-        mutex: compat.Mutex = .{},
+        mutex: sys.Mutex = .{},
         keys: [*]u64,
         vals: [*]V,
         filled_ptr: *u64,
@@ -718,7 +718,7 @@ pub const ZoneRegistry = struct {
     pub fn deinit(self: *ZoneRegistry) void {
         for (self.zones.values()) |z| {
             posix.munmap(z.region);
-            compat.close(z.fd);
+            sys.close(z.fd);
             self.allocator.free(z.name);
         }
         self.zones.deinit(self.allocator);
@@ -730,7 +730,7 @@ pub const ZoneRegistry = struct {
     pub fn acquire(self: *ZoneRegistry, name: []const u8, size: usize) ![]align(std.heap.page_size_min) u8 {
         if (self.zones.getPtr(name)) |z| return z.region;
         const fd = try posix.memfd_create(name, 0);
-        try compat.ftruncate(fd, @intCast(size));
+        try sys.ftruncate(fd, @intCast(size));
         const region = try posix.mmap(
             null,
             size,
@@ -757,7 +757,7 @@ pub const ZoneRegistry = struct {
     /// back to a fresh zone.
     pub fn adopt(self: *ZoneRegistry, name: []const u8, fd: posix.fd_t, size: usize) ![]align(std.heap.page_size_min) u8 {
         if (self.zones.getPtr(name)) |z| return z.region;
-        _ = compat.fcntl(fd, linux.F.GETFD, 0) catch return error.BadFd;
+        _ = sys.fcntl(fd, linux.F.GETFD, 0) catch return error.BadFd;
         const region = try posix.mmap(
             null,
             size,

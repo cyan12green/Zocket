@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const config_mod = @import("config.zig");
 const pipeline = @import("../dsl/pipeline.zig");
 const registry = @import("../dsl/registry.zig");
@@ -53,15 +53,15 @@ pub const Server = struct {
     /// files once at startup — nginx reads `ssl_certificate` at startup too).
     pub fn loadTls(self: *Server, allocator: std.mem.Allocator) !void {
         if (self.cfg.tls.enabled()) {
-            const cert_pem = try compat.readFileAlloc(allocator, self.cfg.tls.cert, 1 << 20);
+            const cert_pem = try sys.readFileAlloc(allocator, self.cfg.tls.cert, 1 << 20);
             defer allocator.free(cert_pem);
-            const key_pem = try compat.readFileAlloc(allocator, self.cfg.tls.key, 1 << 20);
+            const key_pem = try sys.readFileAlloc(allocator, self.cfg.tls.key, 1 << 20);
             defer allocator.free(key_pem);
             self.tls_creds = try tls_cert.loadCredentials(allocator, cert_pem, key_pem);
             // OCSP staple: DER file, parsed at startup (fail closed — a bad
             // response disables the server rather than stapling garbage).
             if (self.cfg.tls.ocsp_file.len > 0) {
-                const der = try compat.readFileAlloc(allocator, self.cfg.tls.ocsp_file, 1 << 20);
+                const der = try sys.readFileAlloc(allocator, self.cfg.tls.ocsp_file, 1 << 20);
                 errdefer allocator.free(der);
                 const parsed = tls_ocsp.parseResponse(der) catch {
                     allocator.free(@constCast(self.tls_creds.?.cert_der));
@@ -87,7 +87,7 @@ pub const Server = struct {
                 var bundle = Certificate.Bundle.empty;
                 errdefer bundle.deinit(std.heap.page_allocator);
                 const io = std.Io.Threaded.global_single_threaded.io();
-                const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch
+                const ts = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch
                     return error.MtlsNeedsClientCa;
                 const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
                 const abs = self.cfg.tls.client_ca;
@@ -201,7 +201,7 @@ pub const Server = struct {
         var prepared_len: usize = 0;
         errdefer for (routes[0..prepared_len]) |r| {
             if (r.root_real) |rr| allocator.free(rr);
-            if (r.root_fd >= 0) compat.close(r.root_fd);
+            if (r.root_fd >= 0) sys.close(r.root_fd);
             if (hasHostnameUpstream(r)) allocator.free(r.upstreams);
         };
         // Explicit nameservers apply process-wide, once (first server wins;
@@ -213,11 +213,11 @@ pub const Server = struct {
             copy.upstreams = try prepareUpstreams(allocator, r, dns_servers);
             if (r.root) |root| {
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
-                const resolved = compat.realpath(root, &buf) catch null;
+                const resolved = sys.realpath(root, &buf) catch null;
                 if (resolved) |rp| {
                     copy.root_real = try allocator.dupe(u8, rp);
                 }
-                copy.root_fd = compat.open(root, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true, .CLOEXEC = true }, 0) catch -1;
+                copy.root_fd = sys.open(root, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .PATH = true, .CLOEXEC = true }, 0) catch -1;
             }
             routes[i] = copy;
             prepared_len += 1;
@@ -246,7 +246,7 @@ pub const Server = struct {
     pub fn deinitPrepared(self: *Server, allocator: std.mem.Allocator) void {
         for (self.cfg.routes) |r| {
             if (r.root_real) |rr| allocator.free(rr);
-            if (r.root_fd >= 0) compat.close(r.root_fd);
+            if (r.root_fd >= 0) sys.close(r.root_fd);
             if (hasHostnameUpstream(r)) allocator.free(r.upstreams);
         }
         allocator.free(self.cfg.routes);
@@ -1151,8 +1151,8 @@ test "loadTls loads credentials from disk files" {
     var key_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cert_path = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
     const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
-    try compat.writeFile(cert_path, testdata.cert_pem);
-    try compat.writeFile(key_path, testdata.key_pem);
+    try sys.writeFile(cert_path, testdata.cert_pem);
+    try sys.writeFile(key_path, testdata.key_pem);
 
     var srv = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path } });
     try srv.loadTls(testing.allocator);
@@ -1617,11 +1617,11 @@ test "loadTls staples a good OCSP response and rejects a revoked one" {
     const cert_path = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
     const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
     const ocsp_path = try std.fmt.bufPrint(&ocsp_buf, ".zig-cache/tmp/{s}/ocsp.der", .{tmp.sub_path});
-    try compat.writeFile(cert_path, testdata.cert_pem);
-    try compat.writeFile(key_path, testdata.key_pem);
+    try sys.writeFile(cert_path, testdata.cert_pem);
+    try sys.writeFile(key_path, testdata.key_pem);
     const good = try ocsp_mod.buildResponse(testing.allocator, .good);
     defer testing.allocator.free(good);
-    try compat.writeFile(ocsp_path, good);
+    try sys.writeFile(ocsp_path, good);
 
     var srv = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .ocsp_file = ocsp_path } });
     try srv.loadTls(testing.allocator);
@@ -1634,7 +1634,7 @@ test "loadTls staples a good OCSP response and rejects a revoked one" {
     // Revoked: fail closed.
     const bad = try ocsp_mod.buildResponse(testing.allocator, .revoked);
     defer testing.allocator.free(bad);
-    try compat.writeFile(ocsp_path, bad);
+    try sys.writeFile(ocsp_path, bad);
     var srv2 = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .ocsp_file = ocsp_path } });
     try testing.expectError(error.OcspNotGood, srv2.loadTls(testing.allocator));
     try testing.expect(srv2.tls_creds == null);
@@ -1650,9 +1650,9 @@ test "loadTls refuses verify_client without a bundle, loads a good one" {
     const cert_path = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
     const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
     const ca_path = try std.fmt.bufPrint(&ca_buf, ".zig-cache/tmp/{s}/ca.pem", .{tmp.sub_path});
-    try compat.writeFile(cert_path, testdata.cert_pem);
-    try compat.writeFile(key_path, testdata.key_pem);
-    try compat.writeFile(ca_path, testdata.client_ca_pem);
+    try sys.writeFile(cert_path, testdata.cert_pem);
+    try sys.writeFile(key_path, testdata.key_pem);
+    try sys.writeFile(ca_path, testdata.client_ca_pem);
 
     // verify on, no CA: fail closed.
     var bare = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .verify_client = true } });
@@ -1684,11 +1684,11 @@ test "loadTls rejects malformed OCSP and client-CA files without leaking" {
     const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
     const ocsp_path = try std.fmt.bufPrint(&ocsp_buf, ".zig-cache/tmp/{s}/ocsp.der", .{tmp.sub_path});
     const ca_path = try std.fmt.bufPrint(&ca_buf, ".zig-cache/tmp/{s}/ca.pem", .{tmp.sub_path});
-    try compat.writeFile(cert_path, testdata.cert_pem);
-    try compat.writeFile(key_path, testdata.key_pem);
-    try compat.writeFile(ocsp_path, "not a DER OCSP response");
+    try sys.writeFile(cert_path, testdata.cert_pem);
+    try sys.writeFile(key_path, testdata.key_pem);
+    try sys.writeFile(ocsp_path, "not a DER OCSP response");
     // An unterminated PEM block: the bundle loader must reject it.
-    try compat.writeFile(ca_path, "-----BEGIN CERTIFICATE-----\nZm9v\n");
+    try sys.writeFile(ca_path, "-----BEGIN CERTIFICATE-----\nZm9v\n");
 
     // Malformed OCSP DER: fail closed, credentials cleared.
     var bad_ocsp = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .ocsp_file = ocsp_path } });
@@ -1702,7 +1702,7 @@ test "loadTls rejects malformed OCSP and client-CA files without leaking" {
 
     // Absolute path variant takes the addCertsFromFilePathAbsolute branch.
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const ca_abs = compat.realpath(ca_path, &abs_buf) catch return error.SkipZigTest;
+    const ca_abs = sys.realpath(ca_path, &abs_buf) catch return error.SkipZigTest;
     var bad_ca_abs = Server.init(.{ .tls = .{ .cert = cert_path, .key = key_path, .client_ca = ca_abs } });
     try testing.expectError(error.MtlsBadBundle, bad_ca_abs.loadTls(testing.allocator));
     try testing.expect(bad_ca_abs.tls_creds == null);

@@ -1,7 +1,7 @@
 const std = @import("std");
 const registry = @import("../registry.zig");
 const router = @import("../router.zig");
-const compat = @import("../../compat.zig");
+const sys = @import("../../sys.zig");
 
 pub const Context = registry.Context;
 pub const Action = registry.Action;
@@ -25,9 +25,9 @@ fn run(ctx: *Context) anyerror!Action {
 }
 
 fn sendMirror(ctx: *Context, up: *const router.Upstream) !void {
-    const fd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
-    defer compat.close(fd);
-    compat.connect(fd, &up.sockaddr, 16) catch |e| switch (e) {
+    const fd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
+    defer sys.close(fd);
+    sys.connect(fd, &up.sockaddr, 16) catch |e| switch (e) {
         error.WouldBlock => {
             // In-progress connect: wait briefly; a slow shadow is skipped.
             var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
@@ -74,7 +74,7 @@ fn sendMirror(ctx: *Context, up: *const router.Upstream) !void {
 
     var sent: usize = 0;
     while (sent < buf.items.len) {
-        const n = compat.write(fd, buf.items[sent..]) catch return error.WriteFailed;
+        const n = sys.write(fd, buf.items[sent..]) catch return error.WriteFailed;
         sent += n;
     }
 }
@@ -99,7 +99,7 @@ test "mirror forwards the request line, filtered headers and body" {
     // Shadow backend: a bound listener the module connects to.
     const sockets = @import("../../net/sockets.zig");
     const listener = try sockets.createListeningSocketReusePort(0, 4);
-    defer compat.close(listener);
+    defer sys.close(listener);
     const port = try sockets.boundPort(listener);
 
     var req = registry.Request.init(allocator);
@@ -125,7 +125,7 @@ test "mirror forwards the request line, filtered headers and body" {
     const linux = std.os.linux;
     const conn = linux.accept4(listener, null, null, 0);
     if (linux.errno(conn) != .SUCCESS) return error.NoShadowConnection;
-    defer compat.close(@intCast(conn));
+    defer sys.close(@intCast(conn));
     var got: [512]u8 = undefined;
     const n = try std.posix.read(@intCast(conn), &got);
     const seen = got[0..n];

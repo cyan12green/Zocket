@@ -8,7 +8,7 @@ this tree works around. User-facing documentation lives in
 ## Project
 
 Zocket is a high-performance HTTP/TCP server in Zig 0.18.0-dev (pinned in
-`build.zig.zon`; ported from 0.16 — see `src/compat.zig`). It implements a
+`build.zig.zon`; ported from 0.16 — see `src/sys.zig`). It implements a
 multi-reactor epoll transport, HTTP/1.1, HTTP/2 (h2spec-verified), native TLS
 1.3 (`src/tls/`, no OpenSSL; ECDSA, X25519, ALPN h2/http1.1, session tickets),
 WebSocket upgrade, and an nginx-style configuration language compiled entirely
@@ -398,16 +398,18 @@ Keep the recipe mechanical; framework flexibility is a priority.
 
 ## Known stdlib quirks (pinned 0.18.0-dev snapshot; ported from 0.16)
 
-`src/compat.zig` shims what 0.18 removed: the `std.posix` socket layer
+`src/sys.zig` is the Linux system layer. It provides what this snapshot's
+std lacks (or moved behind `std.Io`): the `std.posix` socket layer
 (socket/bind/listen/connect/close/write/writev/fcntl/open/dup/pipe/fork/
-eventfd/epoll_*/clock_gettime/nanosleep/ftruncate/pread — all re-implemented
-over `std.os.linux` with the old error names), `std.time.Instant` (BOOTTIME
-`now()` + `since()`), `std.Thread.Mutex` (futex-backed, no-Io call shape),
+eventfd/epoll_*/clock_gettime/nanosleep/ftruncate/pread — re-implemented
+over `std.os.linux` with the error names the call sites handle),
+`std.time.Instant` (BOOTTIME `now()` + `since()`), `std.Thread.Mutex`
+(futex-backed, no-Io call shape),
 `std.process.args()` (now `main(init: Init.Minimal)` + `init.args.iterate()`),
 `std.StringArrayHashMap` (now unmanaged: `std.array_hash_map.String` +
 per-call allocator), `std.fs.Dir/File` (fd-based helpers over
 `openat`/`statx`/`getdents64`), `std.crypto.random.bytes` (getrandom),
-`std.ascii.indexOfIgnoreCase`, `Mem.trimRight` (now `trimEnd`),
+`Mem.trimRight` (now `trimEnd`),
 `X25519.KeyPair.generate()` (now needs `io:` — use `generateDeterministic` +
 a getrandom seed), `Child.init`/`spawnAndWait` (now `process.spawn(io, …)` +
 `child.wait(io)`), `builtin.mode == .Debug` (now lowercase `.debug`), `b.args`

@@ -49,7 +49,7 @@ def addrs_to_files(binary, addrs):
 
 
 def is_test_fn(fn):
-    # Zig test symbols look like `compat.test.compat: file helpers...`.
+    # Zig test symbols look like `sys.test.sys: file helpers...`.
     return ".test." in fn
 
 

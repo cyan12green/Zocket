@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const registry = @import("../registry.zig");
-const compat = @import("../../compat.zig");
+const sys = @import("../../sys.zig");
 
 pub const Context = registry.Context;
 pub const Action = registry.Action;
@@ -107,7 +107,7 @@ fn queryArg(query: []const u8, name: []const u8) ?[]const u8 {
 
 fn nowSeconds(ctx: *const Context) i64 {
     if (ctx.now_ns > 0) return @intCast(ctx.now_ns / 1_000_000_000);
-    const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return 0;
+    const ts = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch return 0;
     return ts.sec;
 }
 
@@ -188,7 +188,7 @@ const JwksFile = struct {
     key_count: usize = 0,
     keys: [max_jwks_keys]JwksKey = undefined,
 };
-var jwks_mutex = compat.Mutex{};
+var jwks_mutex = sys.Mutex{};
 var jwks_files: [max_jwks_files]JwksFile = @splat(.{});
 
 /// Extract a JSON string field value (no escapes: JWKS fields are
@@ -224,14 +224,14 @@ fn jwksSlot(path: []const u8) *JwksFile {
 /// Reload the JWKS file into its slot when needed. Caller holds the lock.
 fn jwksRefresh(path: []const u8) *JwksFile {
     const f = jwksSlot(path);
-    const st = compat.statFile(path) catch {
+    const st = sys.statFile(path) catch {
         f.key_count = 0;
         return f;
     };
     if (f.mtime_ns == st.mtime.nanoseconds and f.key_count > 0) return f;
     f.mtime_ns = st.mtime.nanoseconds;
     f.key_count = 0;
-    const bytes = compat.readFileAlloc(std.heap.page_allocator, path, 1 << 20) catch return f;
+    const bytes = sys.readFileAlloc(std.heap.page_allocator, path, 1 << 20) catch return f;
     defer std.heap.page_allocator.free(bytes);
     var rest = bytes;
     while (std.mem.indexOfScalar(u8, rest, '{')) |brace| {
@@ -300,7 +300,7 @@ pub fn verifyJwtJwks(path: []const u8, token: []const u8, now_s: i64, leeway_s: 
 /// until replaced — same convention as the proxy CA bundle cache).
 /// Null when the file is missing or holds no P-256 certificate.
 const max_jwt_keys = 4;
-var jwt_key_mutex = compat.Mutex{};
+var jwt_key_mutex = sys.Mutex{};
 var jwt_key_paths: [max_jwt_keys][]const u8 = @as([max_jwt_keys][]const u8, @splat(@as([]const u8, "")));
 var jwt_key_pubs: [max_jwt_keys][65]u8 = undefined;
 var jwt_key_filled: usize = 0;
@@ -314,7 +314,7 @@ fn jwtPubkey(path: []const u8) ?[65]u8 {
     if (jwt_key_filled >= max_jwt_keys) return null;
     const pem_mod = @import("../../tls/pem.zig");
     const Certificate = std.crypto.Certificate;
-    const pem_bytes = compat.readFileAlloc(std.heap.page_allocator, path, 1 << 20) catch return null;
+    const pem_bytes = sys.readFileAlloc(std.heap.page_allocator, path, 1 << 20) catch return null;
     defer std.heap.page_allocator.free(pem_bytes);
     var der_buf: [4096]u8 = undefined;
     const der_len = (pem_mod.decodeFirst(pem_bytes, "CERTIFICATE", &der_buf) catch return null) orelse return null;
@@ -627,9 +627,9 @@ test "jwks verifies by kid and rotates when the file changes" {
     var jwks_buf: [1024]u8 = undefined;
     const jwks = std.fmt.bufPrint(&jwks_buf, "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"k1\",\"x\":\"{s}\",\"y\":\"{s}\"}}]}}", .{ xs, ys }) catch unreachable;
     const path = "/tmp/zocket-jwks-rotate-test.json";
-    compat.deleteFile(path) catch {};
-    try compat.writeFile(path, jwks);
-    defer compat.deleteFile(path) catch {};
+    sys.deleteFile(path) catch {};
+    try sys.writeFile(path, jwks);
+    defer sys.deleteFile(path) catch {};
 
     // Token with kid k1, signed by the fixture key.
     const h = "eyJhbGciOiJFUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0"; // {"alg":"ES256","kid":"k1","typ":"JWT"}
@@ -647,24 +647,24 @@ test "jwks verifies by kid and rotates when the file changes" {
 
     try testing.expect(verifyJwtJwks(path, token, 1_000, 60));
     // Garbage JWKS fails closed.
-    try compat.writeFile(path, "not json");
+    try sys.writeFile(path, "not json");
     try testing.expect(!verifyJwtJwks(path, token, 1_000, 60));
     // Restore, then rotate: same file, new kid -> the old token no longer
     // matches (mtime moves to a new nanosecond).
-    try compat.writeFile(path, jwks);
+    try sys.writeFile(path, jwks);
     try testing.expect(verifyJwtJwks(path, token, 1_000, 60));
     var jwks2_buf: [1024]u8 = undefined;
     const jwks2 = std.fmt.bufPrint(&jwks2_buf, "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"k2\",\"x\":\"{s}\",\"y\":\"{s}\"}}]}}", .{ xs, ys }) catch unreachable;
-    try compat.writeFile(path, jwks2);
+    try sys.writeFile(path, jwks2);
     try testing.expect(!verifyJwtJwks(path, token, 1_000, 60));
 }
 
 test "jwt es256 handler gates on the key file" {
     const testdata = @import("../../tls/testdata.zig");
     const path = "/tmp/zocket-jwt-key-test.pem";
-    compat.deleteFile(path) catch {};
-    try compat.writeFile(path, testdata.client_cert_pem);
-    defer compat.deleteFile(path) catch {};
+    sys.deleteFile(path) catch {};
+    try sys.writeFile(path, testdata.client_cert_pem);
+    defer sys.deleteFile(path) catch {};
     // Missing Authorization with key configured: 401 (fail closed).
     var req = registry.Request.init(testing.allocator);
     defer req.deinit();

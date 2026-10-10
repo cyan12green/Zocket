@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../../compat.zig");
+const sys = @import("../../sys.zig");
 const registry = @import("../registry.zig");
 
 pub const Context = registry.Context;
@@ -75,7 +75,7 @@ pub const expires_max_age: u32 = 315360000;
 
 /// Wall-clock seconds (REALTIME). Falls back to 0 under a hostile clock.
 fn wallNowSecs() u64 {
-    const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return 0;
+    const ts = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch return 0;
     return @intCast(@max(0, ts.sec));
 }
 

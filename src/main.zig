@@ -1,7 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const zocket = @import("zocket");
-const compat = zocket.compat;
+const sys = zocket.sys;
 const build_options = @import("build_options");
 const shmem_mod = zocket.dsl.shmem;
 
@@ -87,14 +87,14 @@ pub const ValidateError = error{
 };
 
 fn validateTlsBlock(tls: zocket.runtime.config.TlsConfig, allocator: std.mem.Allocator) ValidateError!void {
-    const cert_pem = compat.readFileAlloc(allocator, tls.cert, 1 << 20) catch return error.TlsFilesUnreadable;
+    const cert_pem = sys.readFileAlloc(allocator, tls.cert, 1 << 20) catch return error.TlsFilesUnreadable;
     defer allocator.free(cert_pem);
-    const key_pem = compat.readFileAlloc(allocator, tls.key, 1 << 20) catch return error.TlsFilesUnreadable;
+    const key_pem = sys.readFileAlloc(allocator, tls.key, 1 << 20) catch return error.TlsFilesUnreadable;
     defer allocator.free(key_pem);
     const creds = zocket.tls.cert.loadCredentials(allocator, cert_pem, key_pem) catch return error.TlsCredentialsInvalid;
     defer allocator.free(creds.cert_der);
     if (tls.ocsp_file.len > 0) {
-        const der = compat.readFileAlloc(allocator, tls.ocsp_file, 1 << 20) catch return error.TlsFilesUnreadable;
+        const der = sys.readFileAlloc(allocator, tls.ocsp_file, 1 << 20) catch return error.TlsFilesUnreadable;
         defer allocator.free(der);
         const parsed = zocket.tls.ocsp.parseResponse(der) catch return error.TlsCredentialsInvalid;
         if (parsed.cert != .good) return error.TlsCredentialsInvalid;
@@ -104,7 +104,7 @@ fn validateTlsBlock(tls: zocket.runtime.config.TlsConfig, allocator: std.mem.All
         var bundle = std.crypto.Certificate.Bundle.empty;
         defer bundle.deinit(allocator);
         const io = std.Io.Threaded.global_single_threaded.io();
-        const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return error.TlsCredentialsInvalid;
+        const ts = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch return error.TlsCredentialsInvalid;
         const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
         if (std.fs.path.isAbsolute(tls.client_ca)) {
             bundle.addCertsFromFilePathAbsolute(allocator, io, now, tls.client_ca) catch
@@ -123,14 +123,14 @@ fn validateConfig(cfg: zocket.runtime.config.Config, opts: ServerOpts, allocator
         if (spec.tls.cert.len > 0) try validateTlsBlock(spec.tls, allocator);
     }
     if (cfg.tls.enabled()) {
-        const cert_pem = compat.readFileAlloc(allocator, cfg.tls.cert, 1 << 20) catch return error.TlsFilesUnreadable;
+        const cert_pem = sys.readFileAlloc(allocator, cfg.tls.cert, 1 << 20) catch return error.TlsFilesUnreadable;
         defer allocator.free(cert_pem);
-        const key_pem = compat.readFileAlloc(allocator, cfg.tls.key, 1 << 20) catch return error.TlsFilesUnreadable;
+        const key_pem = sys.readFileAlloc(allocator, cfg.tls.key, 1 << 20) catch return error.TlsFilesUnreadable;
         defer allocator.free(key_pem);
         const creds = zocket.tls.cert.loadCredentials(allocator, cert_pem, key_pem) catch return error.TlsCredentialsInvalid;
         defer allocator.free(creds.cert_der);
         if (cfg.tls.ocsp_file.len > 0) {
-            const der = compat.readFileAlloc(allocator, cfg.tls.ocsp_file, 1 << 20) catch return error.TlsFilesUnreadable;
+            const der = sys.readFileAlloc(allocator, cfg.tls.ocsp_file, 1 << 20) catch return error.TlsFilesUnreadable;
             defer allocator.free(der);
             const parsed = zocket.tls.ocsp.parseResponse(der) catch return error.TlsCredentialsInvalid;
             if (parsed.cert != .good) return error.TlsCredentialsInvalid;
@@ -140,7 +140,7 @@ fn validateConfig(cfg: zocket.runtime.config.Config, opts: ServerOpts, allocator
             var bundle = std.crypto.Certificate.Bundle.empty;
             defer bundle.deinit(allocator);
             const io = std.Io.Threaded.global_single_threaded.io();
-            const ts = compat.clock_gettime(std.posix.CLOCK.REALTIME) catch return error.TlsCredentialsInvalid;
+            const ts = sys.clock_gettime(std.posix.CLOCK.REALTIME) catch return error.TlsCredentialsInvalid;
             const now: std.Io.Timestamp = .{ .nanoseconds = @as(i96, ts.sec) * 1_000_000_000 + ts.nsec };
             if (std.fs.path.isAbsolute(cfg.tls.client_ca)) {
                 bundle.addCertsFromFilePathAbsolute(allocator, io, now, cfg.tls.client_ca) catch
@@ -154,16 +154,16 @@ fn validateConfig(cfg: zocket.runtime.config.Config, opts: ServerOpts, allocator
     // Effective listen port (CLI wins, else conf, else default), resolved
     // the same way runServer resolves it.
     const port = if (opts.port_set) opts.port else (cfg.listen_port orelse opts.port);
-    const fd = compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch return error.PortBindFailed;
-    defer compat.close(fd);
+    const fd = sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch return error.PortBindFailed;
+    defer sys.close(fd);
     var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     addr[0] = 2; // AF_INET
     addr[2] = @intCast(port >> 8);
     addr[3] = @intCast(port & 0xff);
     addr[4] = 127;
     addr[7] = 1;
-    compat.bind(fd, @ptrCast(&addr), 16) catch return error.PortBindFailed;
-    compat.listen(fd, 8) catch return error.PortBindFailed;
+    sys.bind(fd, @ptrCast(&addr), 16) catch return error.PortBindFailed;
+    sys.listen(fd, 8) catch return error.PortBindFailed;
 }
 
 fn printConfigSummary(cfg: zocket.runtime.config.Config) void {
@@ -488,11 +488,11 @@ fn runServer(
 }
 
 fn writePidfile(path: []const u8, pid: posix_pid_t) !void {
-    const f = try compat.createFile(path);
-    defer compat.close(f);
+    const f = try sys.createFile(path);
+    defer sys.close(f);
     var buf: [32]u8 = undefined;
     const s = try std.fmt.bufPrint(&buf, "{d}\n", .{pid});
-    try compat.writeAll(f, s);
+    try sys.writeAll(f, s);
 }
 
 const posix_pid_t = std.posix.pid_t;
@@ -506,10 +506,10 @@ fn handleHup(_: std.posix.SIG) callconv(.c) void {
     // inline (not deferred to the event loop) like traditional daemons;
     // only open/dup2 run here, and failures keep the old fds.
     const path = sighup_logfile orelse return;
-    const fd = compat.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644) catch return;
-    defer compat.close(fd);
-    compat.dup2(fd, 1) catch {};
-    compat.dup2(fd, 2) catch {};
+    const fd = sys.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644) catch return;
+    defer sys.close(fd);
+    sys.dup2(fd, 1) catch {};
+    sys.dup2(fd, 2) catch {};
 }
 
 fn installHupHandler() void {
@@ -524,16 +524,16 @@ fn installHupHandler() void {
 /// Redirect stdout/stderr to `path` (append, created if missing). Used for
 /// --logfile in the daemon child and in the foreground server alike.
 fn redirectLogs(path: []const u8) !void {
-    const fd = try compat.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644);
-    defer compat.close(fd);
-    try compat.dup2(fd, 1);
-    try compat.dup2(fd, 2);
+    const fd = try sys.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644);
+    defer sys.close(fd);
+    try sys.dup2(fd, 1);
+    try sys.dup2(fd, 2);
 }
 
 fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u8) !void {
     // Readiness handshake: the child writes 'R' once the listeners are
     // bound; the parent exits 0 on 'R', non-zero on EOF (child died).
-    const fds = try compat.pipe();
+    const fds = try sys.pipe();
     // State for --reload-hard, built before the fork (the child inherits it
     // and writes it out at ready time). The config path is normalized to
     // project-root-relative: the comptime embed (`@embedFile`) resolves
@@ -543,7 +543,7 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
     if (project_root) |root| {
         if (recorded_config) |p| {
             if (std.fs.path.isAbsolute(p)) {
-                recorded_config = compat.relativePath(allocator, root, p) catch p;
+                recorded_config = std.fs.path.relativeAlloc(allocator, ".", null, root, p) catch p;
             }
         }
     }
@@ -564,25 +564,25 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
         .embedded = embedded_cfg != null,
         .project_root = project_root,
     };
-    const pid = try compat.fork();
+    const pid = try sys.fork();
     if (pid == 0) {
         // ---- child: detach, then run the server ----
-        compat.close(fds[0]);
-        _ = compat.setsid() catch 0;
+        sys.close(fds[0]);
+        _ = sys.setsid() catch 0;
         // stdin to /dev/null always; stdout/stderr to --logfile when set
         // (SIGHUP reopens it for rotation), else /dev/null.
-        const devnull = compat.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch -1;
-        if (devnull >= 0) compat.dup2(devnull, 0) catch {};
+        const devnull = sys.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch -1;
+        if (devnull >= 0) sys.dup2(devnull, 0) catch {};
         if (opts.logfile) |lf| redirectLogs(lf) catch {
             if (devnull >= 0) {
-                compat.dup2(devnull, 1) catch {};
-                compat.dup2(devnull, 2) catch {};
+                sys.dup2(devnull, 1) catch {};
+                sys.dup2(devnull, 2) catch {};
             }
         } else if (devnull >= 0) {
-            compat.dup2(devnull, 1) catch {};
-            compat.dup2(devnull, 2) catch {};
+            sys.dup2(devnull, 1) catch {};
+            sys.dup2(devnull, 2) catch {};
         }
-        if (devnull > 2) compat.close(devnull);
+        if (devnull > 2) sys.close(devnull);
         const Daemon = struct {
             pipe_fd: std.posix.fd_t,
             pidfile: []const u8,
@@ -601,14 +601,14 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
                 writeStateFile(std.heap.page_allocator, d.pidfile, state_with_zones) catch {};
                 if (state_with_zones.zone_fds.len > 0)
                     std.heap.page_allocator.free(state_with_zones.zone_fds);
-                _ = compat.write(d.pipe_fd, "R") catch {};
+                _ = sys.write(d.pipe_fd, "R") catch {};
             }
         };
         var daemon = Daemon{
             .pipe_fd = fds[1],
             .pidfile = pidfile,
             .state = state,
-            .pid = compat.getpid(),
+            .pid = sys.getpid(),
         };
         // On --reload-hard the new daemon inherits memfd fds from the old
         // one (memfd_create has no CLOEXEC). Adopt them before module
@@ -630,10 +630,10 @@ fn startDaemon(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const 
     }
 
     // ---- parent: wait for readiness ----
-    compat.close(fds[1]);
+    sys.close(fds[1]);
     var b: [1]u8 = undefined;
     const n = std.posix.read(fds[0], &b) catch 0;
-    compat.close(fds[0]);
+    sys.close(fds[0]);
     if (n == 1 and b[0] == 'R') {
         std.debug.print("zocket started (pid {d}, pidfile {s})\n", .{ pid, pidfile });
         return;
@@ -652,7 +652,7 @@ fn processAlive(pid: posix_pid_t) bool {
 }
 
 fn readPidfile(allocator: std.mem.Allocator, pidfile: []const u8) !posix_pid_t {
-    const data = try compat.readFileAlloc(allocator, pidfile, 64);
+    const data = try sys.readFileAlloc(allocator, pidfile, 64);
     defer allocator.free(data);
     return std.fmt.parseInt(posix_pid_t, std.mem.trim(u8, data, " \t\r\n"), 10);
 }
@@ -663,10 +663,10 @@ fn readPidfile(allocator: std.mem.Allocator, pidfile: []const u8) !posix_pid_t {
 /// wrote the same pidfile path, and must not delete the new daemon's files.
 fn cleanupOwnedFiles(allocator: std.mem.Allocator, pidfile: []const u8) bool {
     if (readPidfile(allocator, pidfile)) |pf| {
-        if (pf == compat.getpid()) {
-            compat.deleteFile(pidfile) catch {};
+        if (pf == sys.getpid()) {
+            sys.deleteFile(pidfile) catch {};
             if (stateFilePath(allocator, pidfile)) |sp| {
-                compat.deleteFile(sp) catch {};
+                sys.deleteFile(sp) catch {};
                 allocator.free(sp);
             } else |_| {}
             return true;
@@ -682,7 +682,7 @@ test "daemon cleanup only removes pid/state files it still owns (reload-hard rac
     var rel_buf: [256]u8 = undefined;
     const rel = try std.fmt.bufPrint(&rel_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_abs = try compat.realpath(rel, &abs_buf);
+    const tmp_abs = try sys.realpath(rel, &abs_buf);
     const pidfile = try std.fmt.allocPrint(allocator, "{s}/pid", .{tmp_abs});
     defer allocator.free(pidfile);
     // State file next to the pidfile.
@@ -690,25 +690,25 @@ test "daemon cleanup only removes pid/state files it still owns (reload-hard rac
     defer allocator.free(state_path);
 
     // Case 1: the pidfile names us -> cleanup removes pid + state files.
-    try writePidfile(pidfile, compat.getpid());
+    try writePidfile(pidfile, sys.getpid());
     try writeStateFile(allocator, pidfile, .{});
     try testing.expect(cleanupOwnedFiles(allocator, pidfile));
-    try testing.expectError(error.FileNotFound, compat.statFile(pidfile));
-    try testing.expectError(error.FileNotFound, compat.statFile(state_path));
+    try testing.expectError(error.FileNotFound, sys.statFile(pidfile));
+    try testing.expectError(error.FileNotFound, sys.statFile(state_path));
 
     // Case 2: a reload-hard swap already overwrote the pidfile with the NEW
     // daemon's pid -> the exiting old daemon must leave both files alone.
-    try writePidfile(pidfile, compat.getpid() + 1);
+    try writePidfile(pidfile, sys.getpid() + 1);
     try writeStateFile(allocator, pidfile, .{});
     try testing.expect(!cleanupOwnedFiles(allocator, pidfile));
-    _ = try compat.statFile(pidfile);
-    _ = try compat.statFile(state_path);
+    _ = try sys.statFile(pidfile);
+    _ = try sys.statFile(state_path);
     // The new daemon's files survive the old daemon's exit.
-    const data = try compat.readFileAlloc(allocator, pidfile, 64);
+    const data = try sys.readFileAlloc(allocator, pidfile, 64);
     defer allocator.free(data);
     // The pid file still names the NEW daemon (our pid + 1).
     const new_pid = try std.fmt.parseInt(posix_pid_t, std.mem.trim(u8, data, " \t\r\n"), 10);
-    try testing.expectEqual(compat.getpid() + 1, new_pid);
+    try testing.expectEqual(sys.getpid() + 1, new_pid);
 }
 
 fn stopDaemon(allocator: std.mem.Allocator, pidfile: []const u8) !void {
@@ -718,9 +718,9 @@ fn stopDaemon(allocator: std.mem.Allocator, pidfile: []const u8) !void {
     };
     if (!processAlive(pid)) {
         // Stale pid file: the daemon is gone.
-        compat.deleteFile(pidfile) catch {};
+        sys.deleteFile(pidfile) catch {};
         if (stateFilePath(allocator, pidfile)) |sp| {
-            compat.deleteFile(sp) catch {};
+            sys.deleteFile(sp) catch {};
             allocator.free(sp);
         } else |_| {}
         std.debug.print("not running (stale pid file {s} removed)\n", .{pidfile});
@@ -731,15 +731,15 @@ fn stopDaemon(allocator: std.mem.Allocator, pidfile: []const u8) !void {
     // drain cap is 30 s, so allow up to 35 s).
     var exited = false;
     for (0..700) |_| {
-        compat.nanosleep(0, 50 * std.time.ns_per_ms);
+        sys.nanosleep(0, 50 * std.time.ns_per_ms);
         if (!processAlive(pid)) {
             exited = true;
             break;
         }
     }
-    compat.deleteFile(pidfile) catch {};
+    sys.deleteFile(pidfile) catch {};
     if (stateFilePath(allocator, pidfile)) |sp| {
-        compat.deleteFile(sp) catch {};
+        sys.deleteFile(sp) catch {};
         allocator.free(sp);
     } else |_| {}
     if (exited) {
@@ -802,9 +802,9 @@ fn writeStateFile(allocator: std.mem.Allocator, pidfile: []const u8, state: Stat
     defer allocator.free(path);
     const json = try std.json.Stringify.valueAlloc(allocator, state, .{});
     defer allocator.free(json);
-    const f = try compat.createFile(path);
-    defer compat.close(f);
-    try compat.writeAll(f, json);
+    const f = try sys.createFile(path);
+    defer sys.close(f);
+    try sys.writeAll(f, json);
 }
 
 /// Read the state file; strings are duped into `allocator` (free with
@@ -812,7 +812,7 @@ fn writeStateFile(allocator: std.mem.Allocator, pidfile: []const u8, state: Stat
 fn readStateFile(allocator: std.mem.Allocator, pidfile: []const u8) !StateFile {
     const path = try stateFilePath(allocator, pidfile);
     defer allocator.free(path);
-    const json = try compat.readFileAlloc(allocator, path, 8192);
+    const json = try sys.readFileAlloc(allocator, path, 8192);
     defer allocator.free(json);
     var parsed = try std.json.parseFromSlice(StateFile, allocator, json, .{});
     defer parsed.deinit();
@@ -851,12 +851,12 @@ fn freeStateFile(allocator: std.mem.Allocator, state: *StateFile) void {
 /// is impossible.
 fn resolveProjectRoot(allocator: std.mem.Allocator) ?[]const u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = compat.readlink("/proc/self/exe", &buf) catch return null;
+    const exe = sys.readlink("/proc/self/exe", &buf) catch return null;
     var dir = std.fs.path.dirname(exe) orelse return null;
     while (true) {
         const marker = std.fs.path.join(allocator, &.{ dir, "build.zig.zon" }) catch return null;
         defer allocator.free(marker);
-        if (compat.statFile(marker)) |_| {
+        if (sys.statFile(marker)) |_| {
             return allocator.dupe(u8, dir) catch null;
         } else |_| {}
         dir = std.fs.path.dirname(dir) orelse return null;
@@ -924,7 +924,7 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
         return;
     };
     if (std.fs.path.isAbsolute(config_path)) {
-        const rel = compat.relativePath(allocator, project_root, config_path) catch config_path;
+        const rel = std.fs.path.relativeAlloc(allocator, ".", null, project_root, config_path) catch config_path;
         if (std.fs.path.isAbsolute(rel) or std.mem.startsWith(u8, rel, "../")) {
             std.debug.print("zocket: config {s} lies outside the project tree ({s}) — a comptime embed cannot reach it\n", .{ config_path, project_root });
             return;
@@ -1001,7 +1001,7 @@ fn hardReload(allocator: std.mem.Allocator, opts: ServerOpts, pidfile: []const u
     };
     var exited = false;
     for (0..800) |_| {
-        compat.nanosleep(0, 50 * std.time.ns_per_ms);
+        sys.nanosleep(0, 50 * std.time.ns_per_ms);
         if (!processAlive(old_pid)) {
             exited = true;
             break;
@@ -1130,10 +1130,10 @@ test "validate accepts a bindable port and rejects missing TLS files" {
     try testing.expectError(error.TlsFilesUnreadable, validateConfig(bad_tls, ServerOpts{}, testing.allocator));
     // Present-but-garbage PEM fails credential parsing, not file IO.
     const dir = "/tmp";
-    try compat.writeFile(dir ++ "/zocket-bad-cert.pem", "not a certificate\n");
-    defer compat.deleteFile(dir ++ "/zocket-bad-cert.pem") catch {};
-    try compat.writeFile(dir ++ "/zocket-bad-key.pem", "not a key\n");
-    defer compat.deleteFile(dir ++ "/zocket-bad-key.pem") catch {};
+    try sys.writeFile(dir ++ "/zocket-bad-cert.pem", "not a certificate\n");
+    defer sys.deleteFile(dir ++ "/zocket-bad-cert.pem") catch {};
+    try sys.writeFile(dir ++ "/zocket-bad-key.pem", "not a key\n");
+    defer sys.deleteFile(dir ++ "/zocket-bad-key.pem") catch {};
     const garbage_tls = zocket.runtime.config.Config{
         .tls = .{ .cert = dir ++ "/zocket-bad-cert.pem", .key = dir ++ "/zocket-bad-key.pem" },
     };
@@ -1142,21 +1142,21 @@ test "validate accepts a bindable port and rejects missing TLS files" {
 
 test "redirectLogs appends stdout/stderr to the file" {
     const path = "/tmp/zocket-logfile-test.log";
-    compat.deleteFile(path) catch {};
-    defer compat.deleteFile(path) catch {};
+    sys.deleteFile(path) catch {};
+    defer sys.deleteFile(path) catch {};
     // Save the console fds: redirectLogs steals 1/2, and the runner's own
     // progress output must keep flowing after this test.
-    const save1 = try compat.dup(1);
-    defer compat.close(save1);
-    const save2 = try compat.dup(2);
-    defer compat.close(save2);
+    const save1 = try sys.dup(1);
+    defer sys.close(save1);
+    const save2 = try sys.dup(2);
+    defer sys.close(save2);
     try redirectLogs(path);
     // Something lands in the file while redirected...
     std.debug.print("logfile-probe-line\n", .{});
     // ...then console output is restored before any assertion output.
-    try compat.dup2(save1, 1);
-    try compat.dup2(save2, 2);
-    const data = try compat.readFileAlloc(testing.allocator, path, 1 << 20);
+    try sys.dup2(save1, 1);
+    try sys.dup2(save2, 2);
+    const data = try sys.readFileAlloc(testing.allocator, path, 1 << 20);
     defer testing.allocator.free(data);
     try testing.expect(std.mem.indexOf(u8, data, "logfile-probe-line\n") != null);
 }

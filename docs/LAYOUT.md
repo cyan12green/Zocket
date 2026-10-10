@@ -16,7 +16,9 @@ src/
                       --idle-timeout, --uring (flags only; logic below)
   root.zig            library root; re-exports + comptime test imports
   version.zig         version constant (comptime)
-  compat.zig          shims for the std API surface removed in 0.18
+  sys.zig             Linux system layer: fd/socket/process syscalls, file
+                      helpers, monotonic clock, futex mutex, getrandom (raw
+                      `std.os.linux` calls; std moved these behind `std.Io`)
   ct_pool.zig         typed comptime pool for comptime builders
   fuzz.zig            fuzz corpus and test drivers (zig build fuzz)
   fuzz_main.zig       fuzz harness setup

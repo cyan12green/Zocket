@@ -16,7 +16,7 @@ pub const epoll = @import("net/epoll.zig");
 pub const ct_pool = @import("ct_pool.zig");
 pub const iouring = @import("net/iouring.zig");
 pub const version = @import("version.zig");
-pub const compat = @import("compat.zig");
+pub const sys = @import("sys.zig");
 
 pub const http = struct {
     pub const mime = @import("http/mime.zig");
@@ -133,7 +133,7 @@ comptime {
     _ = @import("dsl/static_cache.zig");
     _ = @import("dsl/limits.zig");
     _ = @import("ct_pool.zig");
-    _ = @import("compat.zig");
+    _ = @import("sys.zig");
     _ = @import("net/iouring.zig");
     _ = @import("net/body_storage.zig");
     _ = @import("net/proxy_proto.zig");

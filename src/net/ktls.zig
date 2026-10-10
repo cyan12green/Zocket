@@ -10,7 +10,7 @@
 //! iv[] = IV[4..12] XORed with rec_seq by the kernel).
 
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 
 pub const SOL_TLS: u32 = 282;
 pub const TLS_TX: u32 = 1;
@@ -79,8 +79,8 @@ pub fn probe() bool {
 }
 
 fn probeOnce() bool {
-    const fd = compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch return false;
-    defer compat.close(fd);
+    const fd = sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch return false;
+    defer sys.close(fd);
     const ulp = "tls\x00";
     const rc = std.os.linux.setsockopt(fd, 6, TCP_ULP, ulp, @intCast(ulp.len));
     return std.os.linux.errno(rc) == .SUCCESS;
@@ -141,14 +141,14 @@ test "ktls probe is stable and configure fails closed without kTLS" {
     const a = probe();
     try testing.expectEqual(a, probe());
     // Loopback TCP pair: configure must not crash; without kTLS it is false.
-    const lfd = try compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    defer compat.close(lfd);
+    const lfd = try sys.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    defer sys.close(lfd);
     var addr: [16]u8 align(@alignOf(u16)) = std.mem.zeroes([16]u8);
     addr[0] = 2;
     addr[4] = 127;
     addr[7] = 1;
-    try compat.bind(lfd, @ptrCast(&addr), 16);
-    try compat.listen(lfd, 1);
+    try sys.bind(lfd, @ptrCast(&addr), 16);
+    try sys.listen(lfd, 1);
     if (!a) {
         // No kTLS here: configure fails closed (userspace keeps working).
         const key = @as([16]u8, @splat(@as(u8, 0x11)));

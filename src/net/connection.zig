@@ -1,5 +1,5 @@
 const std = @import("std");
-const compat = @import("../compat.zig");
+const sys = @import("../sys.zig");
 const posix = std.posix;
 const buffer = @import("buffer.zig");
 const timer_wheel = @import("timer_wheel.zig");
@@ -119,7 +119,7 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
-        compat.close(self.fd);
+        sys.close(self.fd);
     }
 
     pub fn recv(self: *Connection) !usize {
@@ -155,7 +155,7 @@ pub const Connection = struct {
         }
 
         const slice = self.send_buf.peek();
-        const n = compat.write(self.fd, slice) catch |e| return e;
+        const n = sys.write(self.fd, slice) catch |e| return e;
         if (n > 0) {
             self.send_buf.read_pos += @intCast(n);
             self.send_buf.compact();
@@ -330,14 +330,14 @@ test "connection reset clears timer, peer and ring state" {
 
 test "connection recv and send round-trip over a socketpair" {
     const allocator = testing.allocator;
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[1]);
 
     const conn = try Connection.create(allocator, pair[0]);
     defer conn.destroy();
 
     // Nothing to read yet on a closed... write from the peer first.
-    _ = try compat.write(pair[1], "ping");
+    _ = try sys.write(pair[1], "ping");
     const n = try conn.recv();
     try testing.expectEqual(@as(usize, 4), n);
     try testing.expectEqualStrings("ping", conn.recv_buf.peek());
@@ -362,30 +362,30 @@ test "connection recv and send round-trip over a socketpair" {
 
 test "connection recv returns BufferFull at the growth cap" {
     const allocator = testing.allocator;
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
     // 8-byte buffer pinned at 8 bytes: once full, recv must refuse.
     const conn = try Connection.createWithLimits(allocator, pair[0], 8, 8, 8);
     defer conn.destroy();
-    _ = try compat.write(pair[1], "12345678");
+    _ = try sys.write(pair[1], "12345678");
     try testing.expectEqual(@as(usize, 8), try conn.recv());
     try testing.expectError(error.BufferFull, conn.recv());
 }
 
 test "connection recv grows the buffer below the cap" {
     const allocator = testing.allocator;
-    const pair = try compat.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    defer compat.close(pair[0]);
-    defer compat.close(pair[1]);
+    const pair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
 
     const conn = try Connection.createWithLimits(allocator, pair[0], 8, 8, 64);
     defer conn.destroy();
-    _ = try compat.write(pair[1], "12345678");
+    _ = try sys.write(pair[1], "12345678");
     try testing.expectEqual(@as(usize, 8), try conn.recv());
     // Buffer is full; next recv grows (8 -> 16, within the 64 cap).
-    _ = try compat.write(pair[1], "AB");
+    _ = try sys.write(pair[1], "AB");
     try testing.expectEqual(@as(usize, 2), try conn.recv());
     try testing.expect(conn.recv_buf.data.len >= 10);
     try testing.expectEqualStrings("12345678AB", conn.recv_buf.peek());
