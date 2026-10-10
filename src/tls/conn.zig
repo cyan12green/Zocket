@@ -430,3 +430,23 @@ test "conn: wrapper drives negotiation state and post-hello errors" {
     try testing.expectError(error.TlsUnexpectedMessage, conn.write("data"));
     try conn.shutdown();
 }
+
+test "conn: P-384 credentials map every suite and drive the wrapper" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert384_pem, testdata.key384_pem);
+    defer allocator.free(creds.cert_der);
+    for ([_]u16{ 0x1301, 0x1302, 0x1303 }) |suite| {
+        var s = sessionFor(&creds, suite);
+        defer switch (s) {
+            inline else => |*x| x.deinit(),
+        };
+    }
+    // The wrapper's placeholder follows the certificate curve too; the
+    // synthetic hello picks the suite, then its truncated body fails.
+    var conn = TlsConn.init(&creds);
+    defer conn.deinit();
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.TlsDecodeError, conn.feed(helloRecord(&buf, 0x1301)));
+    try testing.expect(conn.chosen);
+    try testing.expectEqual(Stage.waiting_hello, conn.stage());
+}

@@ -1346,3 +1346,387 @@ test "all six cipher suites complete the server flight" {
         try testing.expect(sess.takeOut(&out) > 0);
     }
 }
+
+test "session: application writes chunk into framed records" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    var sess = TestSession.init(allocator, &creds);
+    defer sess.deinit();
+    sess.stage = .application;
+    @memset(sess.secrets.server_application_key[0..], 0x5A);
+    @memset(sess.secrets.server_application_iv[0..], 0xA5);
+
+    const payload = try allocator.alloc(u8, 2 * max_plaintext + 7);
+    defer allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i);
+    try sess.write(payload);
+    // Two full records and a tail record; the sequence advanced with them.
+    try testing.expectEqual(@as(u64, 3), sess.write_seq);
+
+    const wire = try allocator.alloc(u8, payload.len + 3 * (5 + 1 + 16));
+    defer allocator.free(wire);
+    const n = sess.takeOut(wire);
+    try testing.expectEqual(wire.len, n);
+    var off: usize = 0;
+    var seq: u64 = 0;
+    var got: usize = 0;
+    while (off < n) : (seq += 1) {
+        const rec_len: usize = std.mem.readInt(u16, wire[off + 3 ..][0..2], .big);
+        try testing.expectEqual(@as(u8, @intFromEnum(tls.ContentType.application_data)), wire[off]);
+        const dec = try record_mod.decryptInPlace(Aes128Gcm, sess.secrets.server_application_key, sess.secrets.server_application_iv, seq, wire[off..][0 .. 5 + rec_len]);
+        try testing.expectEqual(@as(u8, @intFromEnum(tls.ContentType.application_data)), dec.content_type);
+        try testing.expectEqualSlices(u8, payload[got..][0..dec.plaintext.len], dec.plaintext);
+        got += dec.plaintext.len;
+        off += 5 + rec_len;
+    }
+    try testing.expectEqual(@as(usize, 3), seq);
+    try testing.expectEqual(payload.len, got);
+    // An empty write produces no record and does not advance the sequence.
+    try sess.write("");
+    try testing.expectEqual(@as(u64, 3), sess.write_seq);
+    try testing.expectEqual(@as(usize, 0), sess.takeOutSlice().len);
+}
+
+/// Encrypt one record straight into `sess.in_buf` and dispatch it through
+/// `processEncryptedRecord` (the stage/content-type matrix without framing).
+fn feedEncryptedRecord(sess: *TestSession, key: [16]u8, iv: [12]u8, seq: u64, inner: u8, payload: []const u8) !void {
+    var rec: [max_plaintext + 1 + 5 + 16]u8 = undefined;
+    const n = try record_mod.encrypt(Aes128Gcm, key, iv, seq, inner, payload, &rec);
+    sess.in_buf.clearRetainingCapacity();
+    try sess.in_buf.appendSlice(testing.allocator, rec[0..n]);
+    try sess.processEncryptedRecord(0);
+}
+
+test "session: encrypted records dispatch by stage and inner content type" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    const hs_key = @as([16]u8, @splat(0x11));
+    const hs_iv = @as([12]u8, @splat(0x22));
+    const ap_key = @as([16]u8, @splat(0x33));
+    const ap_iv = @as([12]u8, @splat(0x44));
+    const app_data = @intFromEnum(tls.ContentType.application_data);
+    const hs = @intFromEnum(tls.ContentType.handshake);
+    const alert = @intFromEnum(tls.ContentType.alert);
+
+    // No keys exist before the ServerHello: any encrypted record is refused.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        try testing.expectError(error.TlsUnexpectedMessage, feedEncryptedRecord(&sess, hs_key, hs_iv, 0, app_data, "x"));
+    }
+    // waiting_finished: handshake fragments assemble, app data is refused.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        sess.stage = .waiting_finished;
+        sess.secrets.client_handshake_key = hs_key;
+        sess.secrets.client_handshake_iv = hs_iv;
+        try testing.expectError(error.TlsUnexpectedMessage, feedEncryptedRecord(&sess, hs_key, hs_iv, 0, app_data, "early"));
+        // The decrypt consumed seq 0 even though the inner type was wrong.
+        try feedEncryptedRecord(&sess, hs_key, hs_iv, 1, hs, "ab");
+        try testing.expectEqual(@as(usize, 2), sess.handshake_buf.items.len);
+        try testing.expectEqual(@as(u64, 2), sess.read_seq);
+        // A bad MAC (wrong key) fails without consuming the sequence.
+        try testing.expectError(error.TlsBadRecordMac, feedEncryptedRecord(&sess, ap_key, hs_iv, 2, hs, "ab"));
+        try testing.expectEqual(@as(u64, 2), sess.read_seq);
+        // A body too short to carry a tag is a record overflow.
+        sess.in_buf.clearRetainingCapacity();
+        try sess.in_buf.appendSlice(allocator, &.{ app_data, 0x03, 0x03, 0x00, 0x00 });
+        try testing.expectError(error.TlsRecordOverflow, sess.processEncryptedRecord(0));
+    }
+    // application: data, close_notify, fatal alerts, stray handshake.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        sess.stage = .application;
+        sess.secrets.client_application_key = ap_key;
+        sess.secrets.client_application_iv = ap_iv;
+        try feedEncryptedRecord(&sess, ap_key, ap_iv, 0, app_data, "ping");
+        try testing.expectEqualStrings("ping", sess.plaintext_out.items);
+        try feedEncryptedRecord(&sess, ap_key, ap_iv, 1, alert, &.{ 0x01, 0x00 });
+        try testing.expectEqual(Stage.closed, sess.currentStage());
+        // A fatal alert in the application phase surfaces as TlsAlert.
+        sess.stage = .application;
+        try testing.expectError(error.TlsAlert, feedEncryptedRecord(&sess, ap_key, ap_iv, 2, alert, &.{ 0x02, 0x28 }));
+        // Post-handshake messages other than a NewSessionTicket are refused.
+        sess.stage = .application;
+        try testing.expectError(error.TlsUnexpectedMessage, feedEncryptedRecord(&sess, ap_key, ap_iv, 3, hs, "x"));
+    }
+    // An oversized length field maps the record layer's overflow.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        sess.stage = .application;
+        const big: usize = tls.max_ciphertext_len + 1;
+        const buf = try allocator.alloc(u8, 5 + big);
+        defer allocator.free(buf);
+        @memset(buf, 0);
+        var hdr: [5]u8 = undefined;
+        record_mod.writeHeader(&hdr, app_data, @intCast(big));
+        @memcpy(buf[0..5], &hdr);
+        sess.in_buf.clearRetainingCapacity();
+        try sess.in_buf.appendSlice(allocator, buf);
+        try testing.expectError(error.TlsRecordOverflow, sess.processEncryptedRecord(0));
+    }
+}
+
+test "session: late and malformed ClientHellos fail closed" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    var sess = TestSession.init(allocator, &creds);
+    defer sess.deinit();
+    // A ClientHello after the handshake left the hello stages.
+    sess.stage = .waiting_finished;
+    var hello_buf: [1024]u8 = undefined;
+    const rec = mtlsHelloRecord(&hello_buf);
+    try testing.expectError(error.TlsUnexpectedMessage, sess.onClientHello(rec[5..]));
+    // A truncated body maps the parser's decode error onto a fatal alert.
+    var sess2 = TestSession.init(allocator, &creds);
+    defer sess2.deinit();
+    var msg_buf: [8]u8 = undefined;
+    const msg = testHsMsg(0x01, "ab", &msg_buf);
+    try testing.expectError(error.TlsDecodeError, sess2.onClientHello(msg));
+    try testing.expect(sess2.alert() != null);
+}
+
+/// The PSK ClientHello built by `testPskHello`.
+const TestPskHello = struct {
+    msg: []u8,
+    /// Offset of the psk_key_exchange_modes list length byte.
+    modes_at: usize,
+    /// Offset of the first PskBinderEntry byte.
+    binder_at: usize,
+};
+
+/// Build a ClientHello with an x25519 share, psk_dhe_ke and `ticket` as the
+/// PSK identity; the binder is derived exactly like the server does
+/// (RFC 8446 §4.2.11.2) from the sealed resumption master secret `rms`.
+fn testPskHello(out: []u8, ticket: []const u8, rms: [32]u8) TestPskHello {
+    var pos: usize = 0;
+    out[pos] = 0x01; // client_hello
+    pos += 1;
+    const len_at = pos;
+    pos += 3;
+    const body_at = pos;
+    out[pos] = 0x03;
+    out[pos + 1] = 0x03;
+    pos += 2;
+    @memset(out[pos..][0..32], 0xCD);
+    pos += 32;
+    out[pos] = 0; // session id
+    pos += 1;
+    out[pos] = 0;
+    out[pos + 1] = 2; // cipher suites
+    pos += 2;
+    out[pos] = 0x13;
+    out[pos + 1] = 0x01;
+    pos += 2;
+    out[pos] = 1; // compression
+    pos += 1;
+    out[pos] = 0;
+    pos += 1;
+    const ext_len_at = pos;
+    pos += 2;
+    const ext_at = pos;
+    // supported_versions
+    std.mem.writeInt(u16, out[pos..][0..2], 0x002b, .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 3, .big);
+    pos += 2;
+    out[pos] = 2;
+    pos += 1;
+    std.mem.writeInt(u16, out[pos..][0..2], 0x0304, .big);
+    pos += 2;
+    // supported_groups
+    std.mem.writeInt(u16, out[pos..][0..2], 0x000a, .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 4, .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 2, .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], handshake_mod.x25519_group, .big);
+    pos += 2;
+    // key_share: one x25519 share
+    std.mem.writeInt(u16, out[pos..][0..2], 0x0033, .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 38, .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 36, .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], handshake_mod.x25519_group, .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 32, .big);
+    pos += 2;
+    @memset(out[pos..][0..32], 0x42);
+    pos += 32;
+    // psk_key_exchange_modes: psk_dhe_ke
+    std.mem.writeInt(u16, out[pos..][0..2], 0x002d, .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], 2, .big);
+    pos += 2;
+    const modes_at = pos;
+    out[pos] = 1;
+    pos += 1;
+    out[pos] = 0x01;
+    pos += 1;
+    // pre_shared_key: one identity + one binder
+    std.mem.writeInt(u16, out[pos..][0..2], 0x0029, .big);
+    pos += 2;
+    const psk_len_at = pos;
+    pos += 2;
+    const psk_body_at = pos;
+    std.mem.writeInt(u16, out[pos..][0..2], @intCast(2 + ticket.len + 4), .big);
+    pos += 2;
+    std.mem.writeInt(u16, out[pos..][0..2], @intCast(ticket.len), .big);
+    pos += 2;
+    @memcpy(out[pos..][0..ticket.len], ticket);
+    pos += ticket.len;
+    std.mem.writeInt(u32, out[pos..][0..4], 0, .big);
+    pos += 4;
+    const binders_len_at = pos;
+    std.mem.writeInt(u16, out[pos..][0..2], 33, .big);
+    pos += 2;
+    out[pos] = 32;
+    pos += 1;
+    const binder_at = pos;
+    @memset(out[pos..][0..32], 0);
+    pos += 32;
+    std.mem.writeInt(u16, out[psk_len_at..][0..2], @intCast(pos - psk_body_at), .big);
+    std.mem.writeInt(u16, out[ext_len_at..][0..2], @intCast(pos - ext_at), .big);
+    std.mem.writeInt(u24, out[len_at..][0..3], @intCast(pos - body_at), .big);
+
+    // Binder: expand the sealed secret with the (zero) ticket nonce, then
+    // sign the truncated ClientHello up to the binders list.
+    const Suite = keyschedule_mod.Suite(Aes128Gcm, Sha256);
+    const empty_hash = tls.emptyHash(Sha256);
+    const nonce_byte = [1]u8{0};
+    const psk_full = tls.hkdfExpandLabel(Suite.Hkdf, rms, "resumption", &nonce_byte, 32);
+    const psk_bytes: [32]u8 = psk_full;
+    const early = Suite.Hkdf.extract(&[1]u8{0}, &psk_bytes);
+    const binder_key = tls.hkdfExpandLabel(Suite.Hkdf, early, "res binder", &empty_hash, Suite.finished_key_length);
+    const finished_key = tls.hkdfExpandLabel(Suite.Hkdf, binder_key, "finished", "", Suite.finished_key_length);
+    var trunc_hash: [32]u8 = undefined;
+    Sha256.hash(out[0..binders_len_at], &trunc_hash, .{});
+    const binder = keyschedule_mod.Secrets(Suite).verifyData(finished_key, trunc_hash);
+    @memcpy(out[binder_at..][0..32], &binder);
+
+    return .{ .msg = out[0..pos], .modes_at = modes_at, .binder_at = binder_at };
+}
+
+test "session: PSK resumption resumes without a certificate" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    var sess = TestSession.init(allocator, &creds);
+    defer sess.deinit();
+
+    var rms: [32]u8 = undefined;
+    @memset(&rms, 0x7C);
+    var ticket: [tickets_mod.max_ticket_len]u8 = undefined;
+    const ticket_len = try tickets_mod.seal(&rms, .{ 1, 2, 3, 4, 5, 6, 7, 8 }, &ticket);
+
+    var msg_buf: [1024]u8 = undefined;
+    const hello = testPskHello(&msg_buf, ticket[0..ticket_len], rms);
+    try sess.onClientHello(hello.msg);
+    try testing.expectEqual(Stage.waiting_finished, sess.currentStage());
+    try testing.expectEqual(@as(usize, 32), sess.psk_len);
+
+    // ServerHello is cleartext and selects the PSK identity (the last
+    // extension, RFC 8446 §4.2.8.1).
+    var out: [32 * 1024]u8 = undefined;
+    const n = sess.takeOut(&out);
+    try testing.expect(n > 0);
+    try testing.expectEqual(@as(u8, @intFromEnum(tls.ContentType.handshake)), out[0]);
+    const sh_len: usize = std.mem.readInt(u16, out[3..5], .big);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x29, 0x00, 0x02, 0x00, 0x00 }, out[5 + sh_len - 6 ..][0..6]);
+    var off = 5 + sh_len;
+    try testing.expectEqual(@as(u8, @intFromEnum(tls.ContentType.change_cipher_spec)), out[off]);
+    const ccs_len: usize = std.mem.readInt(u16, out[off + 3 ..][0..2], .big);
+    off += 5 + ccs_len;
+
+    // The resumed flight decrypts to EncryptedExtensions + Finished only:
+    // no Certificate / CertificateVerify.
+    var msgs: [512]u8 = undefined;
+    var mn: usize = 0;
+    var seq: u64 = 0;
+    while (off < n) : (seq += 1) {
+        const rec_len: usize = std.mem.readInt(u16, out[off + 3 ..][0..2], .big);
+        const dec = try record_mod.decryptInPlace(Aes128Gcm, sess.secrets.server_handshake_key, sess.secrets.server_handshake_iv, seq, out[off..][0 .. 5 + rec_len]);
+        @memcpy(msgs[mn..][0..dec.plaintext.len], dec.plaintext);
+        mn += dec.plaintext.len;
+        off += 5 + rec_len;
+    }
+    var p: usize = 0;
+    var types: [4]u8 = undefined;
+    var tn: usize = 0;
+    while (p + 4 <= mn) {
+        const ml: usize = std.mem.readInt(u24, msgs[p + 1 ..][0..3], .big);
+        types[tn] = msgs[p];
+        tn += 1;
+        p += 4 + ml;
+    }
+    try testing.expectEqualSlices(u8, &.{ 0x08, 0x14 }, types[0..tn]);
+
+    // The client Finished completes the resumed handshake and a
+    // NewSessionTicket goes out under the application keys.
+    const Suite = keyschedule_mod.Suite(Aes128Gcm, Sha256);
+    const verify = keyschedule_mod.Secrets(Suite).verifyData(sess.secrets.client_finished_key, sess.full_transcript.peek());
+    var fin_msg: [64]u8 = undefined;
+    const fin = testHsMsg(0x14, &verify, &fin_msg);
+    var fin_rec: [128]u8 = undefined;
+    const enc = try record_mod.encrypt(Aes128Gcm, sess.secrets.client_handshake_key, sess.secrets.client_handshake_iv, 0, @intFromEnum(tls.ContentType.handshake), fin, &fin_rec);
+    try sess.feed(fin_rec[0..enc]);
+    try testing.expectEqual(Stage.application, sess.currentStage());
+    try testing.expectEqual(@as(u64, 1), sess.write_seq); // the ticket record
+    try testing.expect(sess.takeOutSlice().len > 0);
+}
+
+test "session: PSK resumption rejects bad binders, modes and tickets" {
+    const allocator = testing.allocator;
+    var creds = try cert_mod.loadCredentials(allocator, testdata.cert_pem, testdata.key_pem);
+    defer allocator.free(creds.cert_der);
+    var rms: [32]u8 = undefined;
+    @memset(&rms, 0x7C);
+    var ticket: [tickets_mod.max_ticket_len]u8 = undefined;
+    const ticket_len = try tickets_mod.seal(&rms, .{ 9, 9, 9, 9, 9, 9, 9, 9 }, &ticket);
+
+    // A tampered binder fails the HMAC over the truncated ClientHello.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        var buf: [1024]u8 = undefined;
+        const hello = testPskHello(&buf, ticket[0..ticket_len], rms);
+        buf[hello.binder_at] ^= 0xFF;
+        try testing.expectError(error.TlsIllegalParameter, sess.onClientHello(hello.msg));
+    }
+    // psk_ke (no forward secrecy) is not accepted.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        var buf: [1024]u8 = undefined;
+        const hello = testPskHello(&buf, ticket[0..ticket_len], rms);
+        buf[hello.modes_at + 1] = 0x02;
+        try testing.expectError(error.TlsIllegalParameter, sess.onClientHello(hello.msg));
+    }
+    // A ticket we never sealed cannot be opened.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        var buf: [1024]u8 = undefined;
+        const junk = @as([40]u8, @splat(@as(u8, 0xAA)));
+        const hello = testPskHello(&buf, &junk, rms);
+        try testing.expectError(error.TlsIllegalParameter, sess.onClientHello(hello.msg));
+    }
+    // A PSK offered on the second hello after an HRR is illegal.
+    {
+        var sess = TestSession.init(allocator, &creds);
+        defer sess.deinit();
+        sess.stage = .sent_hrr;
+        var buf: [1024]u8 = undefined;
+        const hello = testPskHello(&buf, ticket[0..ticket_len], rms);
+        try testing.expectError(error.TlsIllegalParameter, sess.onClientHello(hello.msg));
+    }
+}

@@ -724,3 +724,114 @@ test "handshake: CertificateRequest advertises ECDSA schemes" {
     try testing.expectEqual(@as(u8, 0x05), buf[15]); // second scheme hi
     try testing.expectEqual(@as(u8, 0x03), buf[16]); // second scheme lo
 }
+
+test "handshake: pre_shared_key identity, binder and offsets parse" {
+    var body: [256]u8 = undefined;
+    var pos: usize = 0;
+    body[pos] = 0x03;
+    body[pos + 1] = 0x03;
+    pos += 2;
+    @memset(body[pos..][0..32], 0xAB);
+    pos += 32;
+    body[pos] = 0;
+    pos += 1;
+    body[pos] = 0;
+    body[pos + 1] = 2;
+    pos += 2;
+    body[pos] = 0x13;
+    body[pos + 1] = 0x01;
+    pos += 2;
+    body[pos] = 1;
+    body[pos + 1] = 0;
+    pos += 2;
+    const ext_len_at = pos;
+    pos += 2;
+    // psk_key_exchange_modes
+    std.mem.writeInt(u16, body[pos..][0..2], 0x002d, .big);
+    pos += 2;
+    std.mem.writeInt(u16, body[pos..][0..2], 2, .big);
+    pos += 2;
+    body[pos] = 1;
+    body[pos + 1] = 0x01;
+    pos += 2;
+    // pre_shared_key: one identity + one binder
+    const ticket = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02 };
+    std.mem.writeInt(u16, body[pos..][0..2], 0x0029, .big);
+    pos += 2;
+    const psk_len_at = pos;
+    pos += 2;
+    const psk_body_at = pos;
+    std.mem.writeInt(u16, body[pos..][0..2], @intCast(2 + ticket.len + 4), .big);
+    pos += 2;
+    std.mem.writeInt(u16, body[pos..][0..2], @intCast(ticket.len), .big);
+    pos += 2;
+    @memcpy(body[pos..][0..ticket.len], &ticket);
+    pos += ticket.len;
+    std.mem.writeInt(u32, body[pos..][0..4], 42, .big);
+    pos += 4;
+    const binders_len_at = pos;
+    std.mem.writeInt(u16, body[pos..][0..2], 33, .big);
+    pos += 2;
+    body[pos] = 32;
+    pos += 1;
+    @memset(body[pos..][0..32], 0x5C);
+    pos += 32;
+    std.mem.writeInt(u16, body[psk_len_at..][0..2], @intCast(pos - psk_body_at), .big);
+    std.mem.writeInt(u16, body[ext_len_at..][0..2], @intCast(pos - ext_len_at - 2), .big);
+
+    const hello = try parseClientHello(body[0..pos]);
+    try testing.expectEqualSlices(u8, &ticket, hello.psk_identity);
+    try testing.expectEqual(@as(usize, 32), hello.psk_binder.len);
+    try testing.expectEqual(@as(u8, 0x5C), hello.psk_binder[0]);
+    try testing.expectEqualSlices(u8, &.{0x01}, hello.psk_modes);
+    // Offsets are absolute into the full handshake message (header included).
+    try testing.expectEqual(@as(usize, 4 + binders_len_at), hello.psk_binders_pos);
+    try testing.expectEqual(@as(usize, 4 + psk_len_at), hello.psk_ext_len_pos);
+}
+
+/// Minimal ClientHello body carrying one raw pre_shared_key extension
+/// (type + length included) after the fixed prefix.
+fn testPskExtHello(out: []u8, psk_ext: []const u8) []u8 {
+    var pos: usize = 0;
+    out[pos] = 0x03;
+    out[pos + 1] = 0x03;
+    pos += 2;
+    @memset(out[pos..][0..32], 0x11);
+    pos += 32;
+    out[pos] = 0;
+    pos += 1;
+    out[pos] = 0;
+    out[pos + 1] = 2;
+    pos += 2;
+    out[pos] = 0x13;
+    out[pos + 1] = 0x01;
+    pos += 2;
+    out[pos] = 1;
+    out[pos + 1] = 0;
+    pos += 2;
+    const ext_len_at = pos;
+    pos += 2;
+    @memcpy(out[pos..][0..psk_ext.len], psk_ext);
+    pos += psk_ext.len;
+    std.mem.writeInt(u16, out[ext_len_at..][0..2], @intCast(pos - ext_len_at - 2), .big);
+    return out[0..pos];
+}
+
+test "handshake: pre_shared_key parse errors stay contained" {
+    var body: [256]u8 = undefined;
+    // identities length points past the extension body.
+    const trunc_ids = [_]u8{ 0x00, 0x29, 0x00, 0x03, 0x00, 0x06, 0xAA };
+    try testing.expectError(error.TlsDecodeError, parseClientHello(testPskExtHello(&body, &trunc_ids)));
+    // A 1-byte identity list: no identity, no binders, offsets stay zero.
+    const short_ids = [_]u8{ 0x00, 0x29, 0x00, 0x03, 0x00, 0x01, 0xAA };
+    const h1 = try parseClientHello(testPskExtHello(&body, &short_ids));
+    try testing.expectEqual(@as(usize, 0), h1.psk_identity.len);
+    try testing.expectEqual(@as(usize, 0), h1.psk_binders_pos);
+    // Binder list length overruns the extension.
+    const trunc_binders = [_]u8{ 0x00, 0x29, 0x00, 0x0A, 0x00, 0x06, 0x00, 0x02, 0xAA, 0xBB, 0x00, 0x21, 0x00, 0x21 };
+    try testing.expectError(error.TlsDecodeError, parseClientHello(testPskExtHello(&body, &trunc_binders)));
+    // Binder entry length overruns the list: no binder captured.
+    const short_binder = [_]u8{ 0x00, 0x29, 0x00, 0x0C, 0x00, 0x06, 0x00, 0x02, 0xAA, 0xBB, 0x00, 0x21, 0x00, 0x02, 0x20, 0xCC };
+    const h2 = try parseClientHello(testPskExtHello(&body, &short_binder));
+    try testing.expectEqual(@as(usize, 0), h2.psk_binder.len);
+}
