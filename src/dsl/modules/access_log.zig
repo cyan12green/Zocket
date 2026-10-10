@@ -44,11 +44,18 @@ fn run(ctx: *Context) anyerror!Action {
         break :blk combined_frags;
     };
 
-    var sink = vars.ArrayListSink{ .list = &line, .allocator = allocator };
-    try vars.renderComplex(ctx, frags, &sink);
-    try line.append(allocator, '\n');
-
-    std.log.info("{s}", .{std.mem.trimEnd(u8, line.items, &.{'\n'})});
+    // Common case: render straight into a stack buffer (no per-line arena
+    // traffic); fall back to the arena-backed list for very long lines
+    // (huge request lines / user agents).
+    var stack_buf: [1024]u8 = undefined;
+    var stack_sink = vars.StackSink{ .buf = &stack_buf };
+    if (vars.renderComplex(ctx, frags, &stack_sink)) |_| {
+        std.log.info("{s}", .{stack_buf[0..stack_sink.len]});
+    } else |_| {
+        var sink = vars.ArrayListSink{ .list = &line, .allocator = allocator };
+        try vars.renderComplex(ctx, frags, &sink);
+        std.log.info("{s}", .{line.items});
+    }
     return .pass;
 }
 

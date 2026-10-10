@@ -19,6 +19,10 @@ pub const Entry = struct {
     in_use: bool = false,
     /// Resolved path key (owned by the cache).
     path: []u8 = &.{},
+    /// FNV-1a of `path`: the lookup compares integers first and only then
+    /// verifies bytes (collision-hardening on a hot path), so the common
+    /// miss over 15 non-matching entries is 15 integer compares.
+    path_hash: u64 = 0,
     fd: posix.fd_t = -1,
     size: u64 = 0,
     mtime_secs: u64 = 0,
@@ -35,6 +39,16 @@ pub const Entry = struct {
     /// When the entry was last revalidated.
     refreshed: compat.Instant = undefined,
 };
+
+/// FNV-1a 64 over the path bytes (cache key prefilter).
+fn pathHash(path: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (path) |b| {
+        h ^= b;
+        h *%= 0x100000001b3;
+    }
+    return h;
+}
 
 pub const StaticCache = struct {
     allocator: std.mem.Allocator,
@@ -74,8 +88,9 @@ pub const StaticCache = struct {
     /// miss or when the file changed on disk.
     pub fn lookup(self: *StaticCache, path: []const u8) ?*Entry {
         const now = compat.Instant.now() catch return null;
+        const want = pathHash(path);
         for (self.entries) |*e| {
-            if (!e.in_use) continue;
+            if (!e.in_use or e.path_hash != want) continue;
             if (!std.mem.eql(u8, e.path, path)) continue;
             if (now.since(e.refreshed) > self.valid_ns) {
                 if (!self.revalidate(e, now)) return null;
@@ -110,6 +125,7 @@ pub const StaticCache = struct {
 
         e.path = self.allocator.dupe(u8, path) catch return null;
         errdefer self.allocator.free(e.path);
+        e.path_hash = pathHash(path);
         e.fd = fd;
         e.size = size;
         e.mtime_secs = mtime_secs;

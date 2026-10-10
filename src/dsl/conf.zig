@@ -2643,9 +2643,13 @@ fn build(b: *const Builder) Config {
             const sr = set_table.ranges[ri];
             const route_sets = set_table.items[sr.start..][0..sr.len];
             for (proxy_specs[spec.proxy_headers_start..][0..spec.proxy_headers_len]) |ph| {
+                const resolved_name = resolve(ph.name, strings);
                 items[pos] = .{
-                    .name = resolve(ph.name, strings),
+                    .name = resolved_name,
                     .value = vars.parseComplexValue(resolve(ph.value, strings), route_sets),
+                    // Precomputed at conf build: the proxy request builder
+                    // no longer hashes override names per request.
+                    .name_hash = @import("../http/parser.zig").header_hasher.hash(resolved_name),
                 };
                 pos += 1;
             }

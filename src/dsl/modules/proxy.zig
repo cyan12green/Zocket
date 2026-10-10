@@ -1402,7 +1402,12 @@ fn buildUpstreamRequest(ctx: *Context, up: *const router.Upstream) ![]const u8 {
     var override_count: usize = 0;
     for (overrides) |ph| {
         if (override_count < 8) {
-            override_hashes[override_count] = http_parser.header_hasher.hash(ph.name);
+            // Conf-built routes carry the hash (computed at compile time);
+            // hand-built test routes fall back to hashing here.
+            override_hashes[override_count] = if (ph.name_hash != 0)
+                ph.name_hash
+            else
+                http_parser.header_hasher.hash(ph.name);
             override_count += 1;
         }
     }

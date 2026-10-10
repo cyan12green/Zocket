@@ -48,6 +48,10 @@ pub const Frag = union(enum) {
     builtin: VarId,
     /// `$http_<name>`: header_hasher.hash of the dashed name.
     http_header: u32,
+    /// `$http_<name>` where the name is one of the parser's known headers:
+    /// resolved against the request's parse-time DFA tags (integer compare)
+    /// instead of re-hashing every header name per render.
+    http_header_tag: http_parser.HeaderTag,
     /// `$arg_<name>`: FNV-1a (verbatim, case-sensitive) of the param name.
     arg: u32,
     /// `$cookie_<name>`: FNV-1a (lowercased) of the cookie name.
@@ -95,7 +99,14 @@ pub const LogFormat = struct {
 };
 
 /// A proxy_set_header override (M-E).
-pub const ProxyHeader = struct { name: []const u8, value: []const Frag };
+pub const ProxyHeader = struct {
+    name: []const u8,
+    value: []const Frag,
+    /// FNV-1a of `name`, precomputed at conf build (the proxy request
+    /// builder compares override names per forwarded header; hand-built
+    /// test routes leave it 0 and the builder falls back to hashing).
+    name_hash: u32 = 0,
+};
 
 /// A dynamic response template header (M-B).
 pub const CVHeader = struct { name: []const u8, value: []const Frag };
@@ -305,6 +316,8 @@ fn resolveName(comptime name: []const u8, comptime set_vars: []const SetVar, com
         for (name[5..], 0..) |c, j| {
             dashed[j] = if (c == '_') '-' else c;
         }
+        const tag = comptime http_parser.HeaderTag.of(&dashed);
+        if (tag != .unknown) return .{ .http_header_tag = tag };
         return .{ .http_header = http_parser.header_hasher.hash(&dashed) };
     }
     // 3. $arg_<name> (verbatim, case-sensitive)
@@ -497,6 +510,16 @@ pub const monthNames = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", 
 
 // ---- generic variable lookups ($http_*, $arg_*, $cookie_*) ----
 
+/// `$http_<name>` for a DFA-known header: compare the parse-time tag
+/// stored in each slot (no hashing).
+fn getHttpHeaderTag(ctx: *Context, tag: http_parser.HeaderTag) []const u8 {
+    const req = ctx.req;
+    for (0..req.headerCount()) |i| {
+        if (req.headerTagAt(i) == tag) return req.headerAt(i).value;
+    }
+    return "";
+}
+
 /// `$http_<name>`: scan request header slots comparing the lowercased hash.
 fn getHttpHeader(ctx: *Context, h: u32) []const u8 {
     const req = ctx.req;
@@ -579,6 +602,20 @@ pub fn evalMap(ctx: *Context, idx: u8) ?[]const u8 {
 // ---- sinks ----
 
 /// A sink is anything exposing `appendAll([]const u8) !void`.
+/// Stack-buffer sink for response/log rendering: the common log line fits
+/// in a few hundred bytes, so the per-line arena allocation disappears;
+/// overflow aborts the render and the caller falls back to the ArrayList
+/// sink.
+pub const StackSink = struct {
+    buf: []u8,
+    len: usize = 0,
+    pub fn appendAll(self: *StackSink, bytes: []const u8) !void {
+        if (self.len + bytes.len > self.buf.len) return error.NoSpaceLeft;
+        @memcpy(self.buf[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+};
+
 pub const ArrayListSink = struct {
     list: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -608,6 +645,7 @@ pub fn renderComplex(ctx: *Context, value: []const Frag, sink: anytype) !void {
             .literal => |lit| try sink.appendAll(lit),
             .builtin => |id| try sink.appendAll(getBuiltin(ctx, id, &scratch)),
             .http_header => |h| try sink.appendAll(getHttpHeader(ctx, h)),
+            .http_header_tag => |tag| try sink.appendAll(getHttpHeaderTag(ctx, tag)),
             .arg => |h| try sink.appendAll(getArg(ctx, h)),
             .cookie => |h| try sink.appendAll(getCookie(ctx, h)),
             .capture => |idx| try sink.appendAll(getCapture(ctx, idx)),
@@ -660,6 +698,7 @@ fn fragLen(ctx: *Context, frag: Frag, scratch: *GetterScratch) ?usize {
         .literal => |lit| lit.len,
         .builtin => |id| getBuiltin(ctx, id, scratch).len,
         .http_header => |h| getHttpHeader(ctx, h).len,
+        .http_header_tag => |tag| getHttpHeaderTag(ctx, tag).len,
         .arg => |h| getArg(ctx, h).len,
         .cookie => |h| getCookie(ctx, h).len,
         .capture => |idx| getCapture(ctx, idx).len,
@@ -682,6 +721,7 @@ fn fragSlice(ctx: *Context, frag: Frag, scratch: *GetterScratch) ?[]const u8 {
         .literal => |lit| lit,
         .builtin => |id| getBuiltin(ctx, id, scratch),
         .http_header => |h| getHttpHeader(ctx, h),
+        .http_header_tag => |tag| getHttpHeaderTag(ctx, tag),
         .arg => |h| getArg(ctx, h),
         .cookie => |h| getCookie(ctx, h),
         .capture => |idx| getCapture(ctx, idx),
@@ -709,12 +749,23 @@ test "parseComplexValue: braced names and http_/arg_/cookie_ hashing" {
     const frags = parseComplexValue("${request_uri} $http_user_agent $arg_q $cookie_session", &.{});
     try testing.expectEqual(@as(usize, 7), frags.len);
     try testing.expectEqual(VarId.request_uri, frags[0].builtin);
+    // Known header names resolve to the parser's DFA tag (integer compare at
+    // render time instead of re-hashing every request header).
     try testing.expectEqual(
-        comptime http_parser.header_hasher.hash("user-agent"),
-        frags[2].http_header,
+        http_parser.HeaderTag.user_agent,
+        frags[2].http_header_tag,
     );
     try testing.expectEqual(comptime hashFn("q"), frags[4].arg);
     try testing.expectEqual(comptime hashLower("session"), frags[6].cookie);
+}
+
+test "parseComplexValue: unknown $http_ names keep the hash fallback" {
+    const frags = parseComplexValue("$http_x_custom", &.{});
+    try testing.expectEqual(@as(usize, 1), frags.len);
+    try testing.expectEqual(
+        comptime http_parser.header_hasher.hash("x-custom"),
+        frags[0].http_header,
+    );
 }
 
 test "parseComplexValue: captures $1..$9" {

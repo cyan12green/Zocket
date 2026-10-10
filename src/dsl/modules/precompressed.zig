@@ -58,30 +58,31 @@ fn run(ctx: *Context) anyerror!Action {
 
     // Best-first among the enabled codecs the client accepts (nginx serves
     // each static twin independently; here one module covers all three).
-    for (codecs) |c| {
-        if (!codecEnabled(route, c.token)) continue;
-        if (!accepted.has(c.token)) continue;
+    // Both sets are comptime/app-config data reduced to bit compares: the
+    // old token-string compares ran per codec per request.
+    for (codecs, 0..) |c, i| {
+        if (!codecEnabledAt(route, i)) continue;
+        if (!accepted.hasAt(i)) continue;
         if (tryTwin(ctx, root, target, c)) return .handled;
     }
     return .pass;
 }
 
-fn codecEnabled(route: *const registry.Route, token: []const u8) bool {
-    if (std.mem.eql(u8, token, "gzip")) return route.precompressed;
-    if (std.mem.eql(u8, token, "br")) return route.precompressed_br;
-    if (std.mem.eql(u8, token, "zstd")) return route.precompressed_zstd;
-    return false;
+/// Codec enabled for this route, by `codecs` index (br, zstd, gzip).
+fn codecEnabledAt(route: *const registry.Route, i: usize) bool {
+    return switch (i) {
+        0 => route.precompressed_br,
+        1 => route.precompressed_zstd,
+        2 => route.precompressed,
+        else => false,
+    };
 }
 
 const Accepted = struct {
-    gzip: bool = false,
-    br: bool = false,
-    zstd: bool = false,
-    fn has(self: Accepted, token: []const u8) bool {
-        if (std.mem.eql(u8, token, "gzip")) return self.gzip;
-        if (std.mem.eql(u8, token, "br")) return self.br;
-        if (std.mem.eql(u8, token, "zstd")) return self.zstd;
-        return false;
+    /// Bit i set = `codecs[i]` accepted by the client.
+    bits: u3 = 0,
+    fn hasAt(self: Accepted, i: usize) bool {
+        return (self.bits & (@as(u3, 1) << @intCast(i))) != 0;
     }
 };
 
@@ -92,11 +93,11 @@ fn acceptedEncodings(ctx: *Context) Accepted {
     while (it.next()) |tok_raw| {
         const tok = std.mem.trim(u8, tok_raw, " \t");
         if (std.ascii.startsWithIgnoreCase(tok, "gzip")) {
-            out.gzip = true;
+            out.bits |= 1 << 2;
         } else if (std.ascii.startsWithIgnoreCase(tok, "br")) {
-            out.br = true;
+            out.bits |= 1 << 0;
         } else if (std.ascii.startsWithIgnoreCase(tok, "zstd")) {
-            out.zstd = true;
+            out.bits |= 1 << 1;
         }
     }
     return out;

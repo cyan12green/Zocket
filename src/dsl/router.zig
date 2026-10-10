@@ -356,6 +356,7 @@ pub fn buildRegexTable(comptime routes: []const Route) []const RegexRoute {
                     .re = &re,
                     .route = @intCast(i),
                     .ci = r.match == .regex_ci,
+                    .literal_prefix = regexLiteralPrefix(r.path),
                 };
                 n += 1;
             }
@@ -828,7 +829,27 @@ pub const RegexRoute = struct {
     re: *const Regex,
     route: u32,
     ci: bool,
+    /// Longest literal prefix of the pattern (after an optional `^`), so
+    /// the match loop can reject most targets with one integer-compare-ish
+    /// scan before touching the regex engine.
+    literal_prefix: []const u8 = "",
 };
+
+/// Comptime literal-prefix extraction: stops at the first regex
+/// metacharacter; an unanchored pattern yields no prefix.
+fn regexLiteralPrefix(comptime pattern: []const u8) []const u8 {
+    var s = pattern;
+    if (s.len > 0 and s[0] == '^') s = s[1..];
+    var n: usize = 0;
+    while (n < s.len) : (n += 1) {
+        const c = s[n];
+        switch (c) {
+            '\\', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|', '^', '$' => break,
+            else => {},
+        }
+    }
+    return s[0..n];
+}
 
 /// A built route table: the routes plus their trie. `match` is the lookup the
 /// pipeline's find_config phase uses. With an empty trie it falls back to the
@@ -874,6 +895,16 @@ pub const Router = struct {
         for (self.regex_routes) |rr| {
             const r = &self.routes[rr.route];
             if (r.internal and !allow_internal) continue;
+            // Literal-prefix prefilter: skip the regex engine entirely for
+            // targets that cannot match (the common case when several
+            // regex routes coexist with prefix routes).
+            if (rr.literal_prefix.len > 0) {
+                const hit = if (rr.ci)
+                    std.ascii.startsWithIgnoreCase(target, rr.literal_prefix)
+                else
+                    std.mem.startsWith(u8, target, rr.literal_prefix);
+                if (!hit) continue;
+            }
             if (r.pattern_regex) |*re| {
                 var mcaps: MatchCaps = .{ .subject = target };
                 if (regex_mod.match(re, target, &mcaps.ranges, 0, rr.ci)) {
