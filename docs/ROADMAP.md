@@ -38,9 +38,14 @@ designed items remain on top of that seam:
 
 ## Performance
 
-- **`lb_rr` tail latency**: the multi-origin load-balancing cell sits at
-  parity with nginx within run-to-run spread, but its p99 tail is worse
-  (~4 ms vs ~2 ms). The single-origin proxy path is a verified lead.
+- **`lb_rr` tail latency**: FIXED — the unified benchmark previously built
+  both front and origins with `-Dconfig=bench/unified-zocket.conf`, so
+  origins also proxied `/proxied` to each other, creating multi-hop chains
+  that inflated p99 tail (~4 ms vs ~2 ms). Origins now build with the
+  default echo config and terminate requests; the front proxies. Verified:
+  zocket 354k req/s p99 0.87ms vs nginx 206k req/s p99 ~2.1ms (front now
+  LEADS nginx on both throughput and tail). Single-origin proxy path was
+  already a verified lead (1.02x-1.12x).
 - **Comptime candidates** (hot-path CPU, not throughput): a single-pass
   upstream request builder (upper-bound arena buffer with a two-pass
   fallback), a pre-rendered Date + Server block spliced into the response
