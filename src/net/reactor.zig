@@ -1318,7 +1318,8 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             epoll.Events.In;
         // The epoll tag is -client_fd: the completion event finds the
         // session (and its inline tx) without any lookup.
-        self.ep.add(plan.fd, mask, @intCast(@as(u64, @intCast(fd)) | up_tag)) catch |e| {
+        const up_fd = tx.fd;
+        self.ep.add(up_fd, mask, @intCast(@as(u64, @intCast(fd)) | up_tag)) catch |e| {
             session.up_active = false;
             return e;
         };
@@ -4785,7 +4786,8 @@ test "upstream driver retries a pooled transaction on a fresh connection" {
     // arrive split, so drive until the transaction completes).
     var spins: usize = 0;
     while (sess.up_active and spins < 3000) : (spins += 1) {
-        var pfds = [_]posix.pollfd{.{ .fd = sess.up_tx.fd, .events = posix.POLL.IN, .revents = 0 }};
+        const up_fd = sess.up_tx.fd;
+        var pfds = [_]posix.pollfd{.{ .fd = up_fd, .events = posix.POLL.IN, .revents = 0 }};
         const ready = posix.poll(&pfds, 50) catch 0;
         if (ready > 0) r.handleUpstreamEvent(cpair[1]);
     }

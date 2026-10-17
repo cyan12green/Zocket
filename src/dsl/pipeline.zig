@@ -74,19 +74,22 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
     // Comptime-specialised dispatch (struct-literal configs).
     // Zero loops, zero moduleFor scans, zero Registry.resolve at runtime.
     if (r.dispatch) |f| {
-        var out = try f(ctx);
-        // Template fallback when no module claimed the request.
-        if (out == .not_handled) {
+        const act = try f(ctx);
+        if (act == .handled) {
+            try applyFilters(Registry, r, ctx);
+            return .handled;
+        }
+        if (act == .not_handled) {
             if (r.response) |t| {
                 applyTemplate(ctx, t);
-                out = .handled;
+                return .handled;
             } else if (r.response_cv) |t| {
                 applyTemplateCV(ctx, t);
-                out = .handled;
+                return .handled;
             }
         }
         try applyFilters(Registry, r, ctx);
-        return out;
+        return .not_handled;
     }
 
     var outcome = blk: {
@@ -159,6 +162,7 @@ pub fn runWithRouter(comptime Registry: type, routes: []const router.Route, rtr:
 fn applyFilters(comptime Registry: type, route: *const router.Route, ctx: *Context) !void {
     // Streaming escape hatch: routes claimed by a streaming handler bypass
     // response filters entirely (v1 constraint: all of them).
+    if (route.streams_response) return;
     for (route.modules) |b| {
         if (Registry.streamsResponse(b.module)) return;
     }

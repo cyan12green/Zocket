@@ -4061,7 +4061,8 @@ test "proxy parked path: a malformed pooled response retries and parks" {
     ctx.route = &route;
     ctx.async_supported = true;
     try testing.expectEqual(Action.async, try park(&ctx));
-    posix_close(takeParked(&ctx).?.fd);
+    const p = takeParked(&ctx).?;
+    posix_close(p.fd);
     drainPool(0);
 }
 

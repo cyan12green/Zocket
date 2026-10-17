@@ -121,9 +121,11 @@ pub const Module = struct {
 };
 
 /// What a module run decided for the current request. `.async` parks the
-/// request: the reactor registers `ctx.async_fd` with the connection's
+/// request: the reactor registers `ctx.async_handle` with the connection's
 /// event set and dispatches completions back into the module's stored
-/// state machine (upstream modules only).
+/// state machine (upstream modules only). `.internal_redirect` restarts
+/// the pipeline walk against a new target (nginx `error_page` /
+/// `try_files ... @name` semantics).
 pub const Action = union(enum) {
     /// Do nothing; keep walking the phase chain.
     pass,
@@ -132,7 +134,7 @@ pub const Action = union(enum) {
     /// Stop the chain without producing a response (the caller sends the
     /// default response). Any phase may short-circuit this way.
     short_circuit,
-    /// Park until `ctx.async_fd` is ready (direction carried by the
+    /// Park until `ctx.async_handle` is ready (direction carried by the
     /// module's own state machine).
     async,
 };
@@ -332,10 +334,14 @@ pub const ModuleInfo = struct {
 /// comptime-unrolled switch, which is how config-declared names (from JSON or
 /// a struct literal) reach the concrete modules. There is no dynamic loading:
 /// every module a config can name must be in the list.
-/// Opaque upstream I/O handle: an fd today; QUIC streams etc. slot in
+/// Opaque upstream I/O handle: an fd today; QUIC/h2 streams etc. slot in
 /// here without touching modules again (drivers dispatch on the tag).
 pub const IoHandle = union(enum) {
     fd: std.posix.fd_t,
+    /// Opaque handle for non-fd transports (QUIC streams, h2 streams, etc.).
+    /// The owner module is responsible for the lifetime of the pointed-to
+    /// object; the reactor only passes it through.
+    stream: *const anyopaque,
 };
 
 /// One-per-process lifecycle gate shared by every registry instantiation

@@ -311,6 +311,12 @@ pub const Route = struct {
     /// reverse after the handler walk and any template fallback). Distinct
     /// from `modules` so kind semantics stay explicit.
     filters: []const ModuleBinding = &.{},
+    /// Streaming escape hatch: when true, response body filters are bypassed
+    /// for this route (header filters still run). Modules declare
+    /// `streams_response: true` when they produce an incremental body that
+    /// cannot be buffered into a single filter pass. The reactor consults
+    /// this before applying body filters in the send path.
+    streams_response: bool = false,
 
     pub fn moduleFor(self: *const Route, phase: Phase) ?[]const u8 {
         for (self.modules) |b| {
