@@ -39,12 +39,15 @@ AUTH_HEADER="Authorization: Basic YmVuY2g6cGFzc3dvcmQ="
 ZP=18701 NP=18702 HP=18703 EP=18704 ORIGIN_BASE=18910
 
 echo "== ensuring builds =="
+# Front: comptime-embedded proxy config (proxies /proxied to the origin pool).
 (cd "$ROOT" && zig build -Doptimize=ReleaseFast -Dconfig=bench/unified-zocket.conf)
+cp "$TCP_BIN" "$ROOT/bench/.cache/zocket-front"
+# Origin: default config (echo on /) so origins terminate requests rather than
+# proxying /proxied further, which would create multi-hop chains and tail latency.
+(cd "$ROOT" && zig build -Doptimize=ReleaseFast)
+cp "$TCP_BIN" "$ROOT/bench/.cache/zocket-origin"
 mkdir -p "$ROOT/bench/.cache"
-if [ ! -x "$ROOT/bench/.cache/zocket-origin" ]; then
-    (cd "$ROOT" && zig build -Doptimize=ReleaseFast)
-    cp "$TCP_BIN" "$ROOT/bench/.cache/zocket-origin"
-fi
+FRONT_BIN="$ROOT/bench/.cache/zocket-front"
 ORIGIN_BIN="$ROOT/bench/.cache/zocket-origin"
 [ -x "$NGINX_BIN" ] || bash "$ROOT/bench/build-nginx.sh" >/dev/null
 HAVE_HAPROXY=0; [ -x "$HAPROXY_BIN" ] || { bash "$ROOT/bench/build-haproxy.sh" >/dev/null 2>&1 && HAVE_HAPROXY=1; } || HAVE_HAPROXY=$([ -x "$HAPROXY_BIN" ] && echo 1 || echo 0)
@@ -60,7 +63,7 @@ start_origins() {
     done
 }
 
-start_zocket() { pin "$PIN_SRV" "$TCP_BIN" --port "$ZP" --threads 4 >/dev/null 2>&1 & ZPID=$!; }
+start_zocket() { pin "$PIN_SRV" "$FRONT_BIN" --port "$ZP" --threads 4 >/dev/null 2>&1 & ZPID=$!; }
 
 start_haproxy() {
     [ -x "$HAPROXY_BIN" ] || return 0
