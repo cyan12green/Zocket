@@ -149,9 +149,9 @@ start_servers() {
         -e "s|@@STATICDIR@@|$STATIC_DIR|" "$NGINX_TEMPLATE" > "$ROOT/bench/.cache/nginx-$5.conf"
     "$NGINX_BIN" -p "$NGINX_PREFIX" -c "$ROOT/bench/.cache/nginx-$5.conf" >/dev/null 2>&1 &
     # caddy: GOMAXPROCS=4 for parity with the other 4-worker servers.
-    sed -e "s/@@PORT@@/$6/" \
-        -e "s|@@STATICDIR@@|$STATIC_DIR|" "$CADDY_TEMPLATE" > "$ROOT/bench/.cache/caddy-$6.caddyfile"
-    GOMAXPROCS=4 "$CADDY_BIN" run --config "$ROOT/bench/.cache/caddy-$6.caddyfile" --adapter caddyfile >/dev/null 2>&1 &
+    sed -e "s/@@PORT@@/$5/" \
+        -e "s|@@STATICDIR@@|$STATIC_DIR|" "$CADDY_TEMPLATE" > "$ROOT/bench/.cache/caddy-$5.caddyfile"
+    GOMAXPROCS=4 "$CADDY_BIN" run --config "$ROOT/bench/.cache/caddy-$5.caddyfile" --adapter caddyfile >/dev/null 2>&1 &
     sleep 2
 }
 
@@ -178,7 +178,7 @@ run_cell() {
     run_layout() {
         # $1 = label prefix, $2..$6 = ports
         local pref="$1" tcp_port=$2 actix_port=$3 bun_port=$4 nginx_port=$5 caddy_port=$6
-        start_servers "$tcp_port" "$actix_port" "$bun_port" "$hx_port" "$nginx_port" "$caddy_port"
+        start_servers "$tcp_port" "$actix_port" "$bun_port" "$nginx_port" "$caddy_port"
 
         local all_ports=("$tcp_port" "$actix_port" "$bun_port" "$nginx_port" "$caddy_port")
         for srv in "${all_ports[@]}"; do
