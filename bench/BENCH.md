@@ -68,7 +68,7 @@ interleaved reps in both port layouts, 6 s per rep, 4 threads / 4 workers.
 | 64 KB | 100 | 44.9 | 32.9 | 11.8 | 1.37x | 3.81x |
 | 64 KB | 1000 | 43.6 | 42.1 | 13.3 | 1.04x | 3.28x |
 
-Numbers are req/s × 1000. actix-web, Bun.serve and httpx.zig cells require
+Numbers are req/s × 1000. actix-web, Bun.serve cells require
 toolchains that are not installed on this machine; `SERVERS=` selects the
 subset. Raw JSON under `bench/results/`.
 

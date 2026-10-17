@@ -142,7 +142,7 @@ for methodology and current results.
 - `bash bench/bench2.sh <binary> <tag> [--extra server args]` — true-capacity
   echo-client sweeps; summarize with `bench/summarize.py` /
   `bench/summarize2.py`; e2e HTTP checks: `bench/http-check.py <port>`.
-- Cross-language comparison (actix-web, Bun.serve, httpx.zig, nginx, Caddy as
+- Cross-language comparison (actix-web, Bun.serve, nginx, Caddy as
   pinned submodules): `bash bench/compare-servers.sh` (single cell), `--matrix`
   (payload × connections), `--static "1024 1048576"` (file serving),
   `--bodies`, `--conns-list`.

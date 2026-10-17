@@ -142,5 +142,5 @@ bench/
   results/            raw per-rep values (JSON)
   graphs/             rendered graphs (embedded in README.md)
 third_party/          pinned submodules: nginx (+ echo-nginx-module),
-                      actix-web, bun, caddy, httpx.zig, nghttp2
+                      actix-web, bun, caddy, nghttp2
 ```

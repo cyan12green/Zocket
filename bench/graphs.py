@@ -34,9 +34,7 @@ SERVERS = [
     ("tcp", "Zocket", "#111111", 2.5),
     ("actix", "actix-web", "#e63946", 1.6),
     ("nginx", "nginx", "#457b9d", 1.6),
-    ("bun", "Bun.serve", "#f4a261", 1.6),
     ("caddy", "Caddy", "#2a9d8f", 1.6),
-    ("hx", "httpx.zig", "#8d99ae", 1.6),
 ]
 
 

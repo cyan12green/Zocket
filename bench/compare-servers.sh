@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Server-level comparison: Zocket vs actix-web (Rust) vs Bun.serve
-# (JavaScript) vs httpx.zig, all built from third-party submodules.
+# (JavaScript) vs nginx vs Caddy, all built from third-party submodules.
 #
 # Single cell:
 #   bench/compare-servers.sh [--workload get|post] [--conns N] [--reps N] [--duration s]
@@ -44,7 +44,6 @@ TCP_BIN="$ROOT/zig-out/bin/zocket"
 ACTIX_BIN="$ROOT/bench/foreign/actix/target/release/actix_bench"
 BUN_BIN="$ROOT/bench/.cache/bun/bun"
 BUN_SRV="$ROOT/bench/foreign/bun/server.ts"
-HX_BIN="$ROOT/third_party/httpx.zig/zig-out/bin/bench_server"
 NGINX_BIN="$ROOT/bench/.cache/nginx-build/sbin/nginx"
 NGINX_TEMPLATE="$ROOT/bench/foreign/nginx/nginx.conf.template"
 CADDY_BIN="$ROOT/bench/.cache/caddy/caddy"
@@ -56,11 +55,10 @@ echo "== ensuring builds =="
 # benchmark on that binary is meaningless.
 (cd "$ROOT" && zig build -Doptimize=ReleaseFast)
 # Optional competitors: built only when their toolchains/binaries are
-# present (cargo/bun/httpx are not on every machine). SERVERS overrides
+# present (cargo/bun are not on every machine). SERVERS overrides
 # the default subset.
 HAS_ACTIX=0; [ -x "$ACTIX_BIN" ] && HAS_ACTIX=1
 HAS_BUN=0; [ -x "$BUN_BIN" ] && HAS_BUN=1
-HAS_HX=0; [ -x "$HX_BIN" ] && HAS_HX=1
 HAS_NGINX=0; [ -x "$NGINX_BIN" ] || bash "$ROOT/bench/build-nginx.sh" >/dev/null
 [ -x "$NGINX_BIN" ] && HAS_NGINX=1
 HAS_CADDY=0; [ -x "$CADDY_BIN" ] || bash "$ROOT/bench/build-caddy.sh" >/dev/null
@@ -70,7 +68,6 @@ sel() { case " $SERVERS " in *" $1 "*) return 0 ;; esac; return 1; }
 sel tcp || { echo "SERVERS must include tcp (Zocket)"; exit 1; }
 sel actix && [ "$HAS_ACTIX" = 0 ] && { echo "actix not built -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^actix$' | tr '\n' ' ')"; }
 sel bun && [ "$HAS_BUN" = 0 ] && { echo "bun not fetched -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^bun$' | tr '\n' ' ')"; }
-sel hx && [ "$HAS_HX" = 0 ] && { echo "httpx.zig not built -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^hx$' | tr '\n' ' ')"; }
 sel nginx && [ "$HAS_NGINX" = 0 ] && { echo "nginx unavailable -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^nginx$' | tr '\n' ' ')"; }
 sel caddy && [ "$HAS_CADDY" = 0 ] && { echo "caddy unavailable -- dropping"; SERVERS="$(echo "$SERVERS" | tr ' ' '\n' | grep -v '^caddy$' | tr '\n' ' ')"; }
 echo "== servers: $SERVERS =="
@@ -89,7 +86,7 @@ pkill_servers
 
 # Static-file mode: every server serves the same generated file at
 # GET /static (real disk path for tcp/nginx/caddy/actix/bun; preloaded
-# into memory for httpx, which has no sendfile path).
+# into memory for Bun.serve, which has no sendfile path).
 STATIC_MODE=${STATIC_MODE:-0}
 STATIC_SIZES=${STATIC_SIZES:-""}
 STATIC_DIR="$ROOT/bench/.cache/static-1024"
@@ -132,18 +129,16 @@ CONF
 }
 
 start_servers() {
-    # $1 = tcp port, $2 = actix port, $3 = bun port, $4 = httpx port,
-    # $5 = nginx port, $6 = caddy port
+    # $1 = tcp port, $2 = actix port, $3 = bun port, $4 = nginx port,
+    # $5 = caddy port
     if [ "$STATIC_MODE" = "1" ]; then
         "$TCP_BIN" --http --port "$1" --threads 4 >/dev/null 2>&1 &
         sel actix && { ACTIX_STATIC="$STATIC_FILE" "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 & }
         sel bun && { BUN_STATIC="$STATIC_FILE" "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 & }
-        sel hx && { "$HX_BIN" --port "$4" --static "$STATIC_FILE" >/dev/null 2>&1 & }
     else
         "$TCP_BIN" --port "$1" --threads 4 >/dev/null 2>&1 &
         sel actix && { "$ACTIX_BIN" "$2" 4 >/dev/null 2>&1 & }
         sel bun && { "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 & }
-        sel hx && { "$HX_BIN" --port "$4" >/dev/null 2>&1 & }
     fi
     # nginx: per-port runtime prefix (pid file) and config.
     NGINX_PREFIX="$ROOT/bench/.cache/nginx-p$5"
@@ -181,11 +176,11 @@ run_cell() {
     fi
 
     run_layout() {
-        # $1 = label prefix, $2..$7 = ports
-        local pref="$1" tcp_port=$2 actix_port=$3 bun_port=$4 hx_port=$5 nginx_port=$6 caddy_port=$7
+        # $1 = label prefix, $2..$6 = ports
+        local pref="$1" tcp_port=$2 actix_port=$3 bun_port=$4 nginx_port=$5 caddy_port=$6
         start_servers "$tcp_port" "$actix_port" "$bun_port" "$hx_port" "$nginx_port" "$caddy_port"
 
-        local all_ports=("$tcp_port" "$actix_port" "$bun_port" "$hx_port" "$nginx_port" "$caddy_port")
+        local all_ports=("$tcp_port" "$actix_port" "$bun_port" "$nginx_port" "$caddy_port")
         for srv in "${all_ports[@]}"; do
             path="/"
             if [ "$STATIC_MODE" = "1" ]; then
@@ -203,7 +198,6 @@ run_cell() {
                     tcp) port="$tcp_port" ;;
                     actix) port="$actix_port" ;;
                     bun) port="$bun_port" ;;
-                    hx) port="$hx_port" ;;
                     nginx) port="$nginx_port" ;;
                     caddy) port="$caddy_port" ;;
                 esac
@@ -219,8 +213,8 @@ run_cell() {
         stop_servers
     }
 
-    run_layout A "$BASE" "$((BASE+1))" "$((BASE+2))" "$((BASE+3))" "$((BASE+4))" "$((BASE+5))"
-    run_layout B "$((BASE+5))" "$((BASE+4))" "$((BASE+3))" "$((BASE+2))" "$((BASE+1))" "$BASE"
+    run_layout A "$BASE" "$((BASE+1))" "$((BASE+2))" "$((BASE+3))" "$((BASE+4))"
+    run_layout B "$((BASE+4))" "$((BASE+3))" "$((BASE+2))" "$((BASE+1))" "$BASE"
 }
 
 trap 'stop_servers' EXIT
@@ -265,7 +259,7 @@ root = sys.argv[1]
 matrix = sys.argv[2] == "1"
 cells = sys.argv[3].split()
 
-servers = [("tcp", "Zocket"), ("actix", "actix-web"), ("bun", "Bun.serve"), ("hx", "httpx.zig"), ("nginx", "nginx"), ("caddy", "Caddy")]
+servers = [("tcp", "Zocket"), ("actix", "actix-web"), ("bun", "Bun.serve"), ("nginx", "nginx"), ("caddy", "Caddy")]
 
 def stats(d, name):
     vals = {"rps": [], "p50": [], "p95": [], "p99": [], "tput": []}

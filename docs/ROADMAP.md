@@ -71,9 +71,9 @@ target those error branches.
   (zstd is decompress-only). Serving precompressed `.br`/`.zstd` twins works
   today; runtime compression needs a vendored codec (C dependency vs a
   pure-Zig port).
-- **Cross-server comparison cells**: the actix-web and httpx.zig cells need
-  toolchains/submodule pins that are not currently available; the Envoy
-  unified cell has a fetched binary but no authored cell configuration.
+- **Cross-server comparison cells**: the actix-web cell needs a Rust
+  toolchain (`cargo`/`rustc`) to build; the Envoy unified cell has a fetched
+  binary but no authored cell configuration.
 
 ## Explicitly deferred
 
