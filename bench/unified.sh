@@ -51,6 +51,7 @@ FRONT_BIN="$ROOT/bench/.cache/zocket-front"
 ORIGIN_BIN="$ROOT/bench/.cache/zocket-origin"
 [ -x "$NGINX_BIN" ] || bash "$ROOT/bench/build-nginx.sh" >/dev/null
 HAVE_HAPROXY=0; [ -x "$HAPROXY_BIN" ] || { bash "$ROOT/bench/build-haproxy.sh" >/dev/null 2>&1 && HAVE_HAPROXY=1; } || HAVE_HAPROXY=$([ -x "$HAPROXY_BIN" ] && echo 1 || echo 0)
+HAVE_ENVOY=0; [ -x "$ENVOY_BIN" ] && HAVE_ENVOY=1
 mkdir -p "$RES"
 
 CELLS=(h1_echo static_small static_large precompressed cache_hit headers_ops auth_basic lb_rr)
@@ -76,6 +77,18 @@ start_haproxy() {
         "$ROOT/bench/haproxy-lb.cfg.template" > "$ROOT/bench/.cache/haproxy-uni.cfg"
     "$HAPROXY_BIN" -f "$ROOT/bench/.cache/haproxy-uni.cfg" >/dev/null 2>&1 &
     HPIDS+=($!)
+}
+
+start_envoy() {
+    [ -x "$ENVOY_BIN" ] || return 0
+    sed -e "s/@@PORT@@/$EP/" \
+        -e "s/@@ORIGIN0@@/$ORIGIN_BASE/" \
+        -e "s/@@ORIGIN1@@/$((ORIGIN_BASE+1))/" \
+        -e "s/@@ORIGIN2@@/$((ORIGIN_BASE+2))/" \
+        -e "s/@@ORIGIN3@@/$((ORIGIN_BASE+3))/" \
+        "$ROOT/bench/foreign/envoy/unified.yaml.template" > "$ROOT/bench/.cache/envoy-uni.yaml"
+    pin "$PIN_SRV" "$ENVOY_BIN" -c "$ROOT/bench/.cache/envoy-uni.yaml" >/dev/null 2>&1 &
+    EPIDS+=($!)
 }
 
 start_nginx() {
@@ -111,6 +124,7 @@ stop_all() {
     for p in ${NPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
     for p in ${OPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
     for p in ${HPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
+    for p in ${EPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
     wait 2>/dev/null || true
 }
 trap stop_all EXIT
@@ -119,8 +133,8 @@ REP_LIST=$(seq 1 "$REPS"); [ -n "$REP_LABEL" ] && REP_LIST="$REP_LABEL"
 for rep in $REP_LIST; do
     echo "== rep $rep/$REPS =="
     OPIDS=(); NPIDS=()
-    HPIDS=()
-    start_origins; start_zocket; start_nginx; start_haproxy
+    HPIDS=(); EPIDS=()
+    start_origins; start_zocket; start_nginx; start_haproxy; start_envoy
     sleep 1.5
     curl -s -o /dev/null "http://127.0.0.1:$ZP/cached" || true
     curl -s -o /dev/null "http://127.0.0.1:$NP/cached" || true
@@ -131,6 +145,7 @@ for rep in $REP_LIST; do
         case "$path" in /echo) m=(-m POST -b "$(python3 -c "print('x'*1024)")");; *) m=();; esac
         run_cell "$cell" "$ZP" zocket "$rep" "$path" ${m[@]+"${m[@]}"} ${extra[@]+"${extra[@]}"}
         run_cell "$cell" "$NP" nginx "$rep" "$path" ${m[@]+"${m[@]}"} ${extra[@]+"${extra[@]}"}
+        run_cell "$cell" "$EP" envoy "$rep" "$path" ${m[@]+"${m[@]}"} ${extra[@]+"${extra[@]}"}
         if [ "$cell" = lb_rr ]; then
             run_cell "$cell" "$HP" haproxy "$rep" "$path"
         fi
