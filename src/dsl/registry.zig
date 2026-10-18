@@ -239,11 +239,12 @@ pub const Context = struct {
     /// slice valid only for Content-Length bodies).
     body_storage: ?*body_storage_mod.BodyStorage = null,
 
-    /// Internal-subrequest hook (auth_request): installed by the reactor,
-    /// implemented by the runtime Server so modules can run a request
-    /// through the full pipeline without touching transport internals.
-    /// The subrequest inherits only the Authorization header.
-    subrequest: ?SubrequestHook = null,
+    /// Internal-subrequest hook (installed by the reactor, implemented by
+    /// the runtime Server): runs `target` through the server's full pipeline
+    /// as a fresh GET carrying the original Authorization header, and copies
+    /// the nested verdict (status, response headers, body) into the source
+    /// request's shared arena so the caller owns stable storage.
+    subrequest_hook: ?SubrequestHook = null,
 
     /// Shared request memory (the framework's module allocation facility):
     /// every byte a module allocates here is reclaimed wholesale by the
@@ -268,14 +269,28 @@ pub const Context = struct {
         return std.fmt.allocPrint(ctx.req.arena.asAllocator(), fmt, args) catch null;
     }
 
-    /// Run the configured subrequest hook against `target`. Depth-guarded
-    /// centrally so every caller shares the recursion budget.
-    pub fn runSubrequest(ctx: *Context, target: []const u8, out_status: *u16) !void {
-        if (ctx.subrequest_depth >= 8) return error.SubrequestDepthExceeded;
-        const hook = ctx.subrequest orelse return error.NoSubrequestHook;
+    /// Run the configured subrequest hook against `target` and copy the
+    /// nested verdict out. Depth-guarded centrally so every caller shares
+    /// the recursion budget.
+    ///
+    /// The returned `Subresponse.headers`/`body` point into the CURRENT
+    /// request's shared arena: valid until the request completes, never
+    /// beyond (module memory rules).
+    pub fn subrequest(ctx: *Context, target: []const u8) !Subresponse {
+        if (ctx.subrequest_depth >= max_subrequest_depth) return error.SubrequestDepthExceeded;
+        const hook = ctx.subrequest_hook orelse return error.NoSubrequestHook;
         ctx.subrequest_depth += 1;
         defer ctx.subrequest_depth -= 1;
-        return hook.call(hook.impl, ctx.req, target, out_status);
+        var out = Subresponse{};
+        try hook.call(hook.impl, ctx, target, &out);
+        return out;
+    }
+
+    /// Status-only convenience sharing the `subrequest` path and depth
+    /// budget (auth_request's admit rule).
+    pub fn runSubrequest(ctx: *Context, target: []const u8, out_status: *u16) !void {
+        const sr = try ctx.subrequest(target);
+        out_status.* = sr.status;
     }
 
     /// This module's private slot for the current request. Typical use:
@@ -305,11 +320,45 @@ pub const SubrequestHook = struct {
     impl: *const anyopaque,
     call: *const fn (
         impl: *const anyopaque,
-        src_req: *const Request,
+        src_ctx: *Context,
         target: []const u8,
-        out_status: *u16,
+        out: *Subresponse,
     ) anyerror!void,
 };
+
+/// Verdict of a full-pipeline subrequest (fresh GET with the source's
+/// Authorization header inherited): status, response headers, and body, all
+/// copied into the source request's shared arena — valid until the request
+/// completes, never beyond.
+pub const Subresponse = struct {
+    status: u16 = 200,
+    headers: []const Header = &.{},
+    body: []const u8 = "",
+
+    pub const Header = struct { name: []const u8, value: []const u8 };
+
+    /// First header with this name (case-insensitive), else null.
+    pub fn get(self: *const Subresponse, name: []const u8) ?[]const u8 {
+        for (self.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+        }
+        return null;
+    }
+
+    /// 2xx admit rule (nginx auth_request semantics).
+    pub fn isSuccess(self: *const Subresponse) bool {
+        return self.status >= 200 and self.status < 300;
+    }
+};
+
+/// Recursion budget for `ctx.subrequest` (the reactor caps internal-redirect
+/// chains at 8; nested subrequests share the headroom).
+pub const max_subrequest_depth = 8;
+
+/// Subresponse body cap: a subrequest exists for control flow (verdicts,
+/// metadata), not bulk transfer; blow past this and hold the whole body in
+/// a walk with arena copies.
+pub const max_subresponse_body = 1 << 20;
 
 pub const ServerStats = struct {
     accepted: std.atomic.Value(u64) = .init(0),
@@ -649,24 +698,32 @@ test "Context runSubrequest guards depth and needs a hook" {
     var code: u16 = 0;
     // No hook installed.
     try testing.expectError(error.NoSubrequestHook, ctx.runSubrequest("/x", &code));
+    try testing.expectError(error.NoSubrequestHook, ctx.subrequest("/x"));
     // Depth guard fires before the hook is consulted.
-    ctx.subrequest_depth = 8;
+    ctx.subrequest_depth = max_subrequest_depth;
     try testing.expectError(error.SubrequestDepthExceeded, ctx.runSubrequest("/x", &code));
+    try testing.expectError(error.SubrequestDepthExceeded, ctx.subrequest("/x"));
     ctx.subrequest_depth = 0;
 
     const Hook = struct {
-        fn call(impl: *const anyopaque, src: *const Request, target: []const u8, out: *u16) anyerror!void {
+        fn call(impl: *const anyopaque, src: *Context, target: []const u8, out: *Subresponse) anyerror!void {
             _ = impl;
             _ = src;
             try testing.expectEqualStrings("/auth", target);
-            out.* = 200;
+            out.* = .{ .status = 200, .body = "ok" };
         }
     };
     var token: u8 = 0;
-    ctx.subrequest = .{ .impl = @ptrCast(&token), .call = Hook.call };
+    ctx.subrequest_hook = .{ .impl = @ptrCast(&token), .call = Hook.call };
     try ctx.runSubrequest("/auth", &code);
     try testing.expectEqual(@as(u16, 200), code);
     try testing.expectEqual(@as(u8, 0), ctx.subrequest_depth); // restored
+
+    // Full subrequest returns the copied verdict.
+    const sr = try ctx.subrequest("/auth");
+    try testing.expect(sr.isSuccess());
+    try testing.expectEqualStrings("ok", sr.body);
+    try testing.expect(sr.get("Content-Type") == null);
 }
 
 test "ServerStats starts zeroed" {

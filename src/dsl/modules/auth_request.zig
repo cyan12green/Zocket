@@ -71,15 +71,15 @@ threadlocal var fake_calls: usize = 0;
 
 fn fakeHook(
     impl: *const anyopaque,
-    src_req: *const Request,
+    src_req: *Context,
     target: []const u8,
-    out_status: *u16,
+    out: *registry.Subresponse,
 ) anyerror!void {
     _ = impl;
     _ = src_req;
     fake_calls += 1;
     try testing.expectEqualStrings("/_auth", target);
-    out_status.* = fake_status;
+    out.* = .{ .status = fake_status };
 }
 
 const fake_state: u8 = 0;
@@ -91,7 +91,7 @@ test "2xx verdicts pass; failures copy the status and claim" {
         defer req.deinit();
         var resp = Response.init(.ok);
         var ctx = Context{ .req = &req, .resp = &resp };
-        ctx.subrequest = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
+        ctx.subrequest_hook = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
         ctx.route = &.{ .path = "/", .auth_request_uri = "/_auth" };
         try testing.expectEqual(Action.pass, try run(&ctx));
     }
@@ -102,7 +102,7 @@ test "2xx verdicts pass; failures copy the status and claim" {
         defer req.deinit();
         var resp = Response.init(.ok);
         var ctx = Context{ .req = &req, .resp = &resp };
-        ctx.subrequest = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
+        ctx.subrequest_hook = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
         ctx.route = &.{ .path = "/", .auth_request_uri = "/_auth" };
         try testing.expectEqual(Action.handled, try run(&ctx));
         try testing.expectEqual(registry.Status.forbidden, resp.status);
@@ -115,7 +115,7 @@ test "2xx verdicts pass; failures copy the status and claim" {
         defer req.deinit();
         var resp = Response.init(.ok);
         var ctx = Context{ .req = &req, .resp = &resp };
-        ctx.subrequest = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
+        ctx.subrequest_hook = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
         ctx.route = &.{ .path = "/", .auth_request_uri = "/_auth" };
         try testing.expectEqual(Action.handled, try run(&ctx));
         try testing.expectEqual(registry.Status.forbidden, resp.status);
@@ -161,7 +161,7 @@ test "subrequest verdicts map to client-facing statuses" {
         defer req.deinit();
         var resp = Response.init(.ok);
         var ctx = Context{ .req = &req, .resp = &resp };
-        ctx.subrequest = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
+        ctx.subrequest_hook = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
         ctx.route = &.{ .path = "/", .auth_request_uri = "/_auth" };
         if (c.code >= 200 and c.code <= 299) {
             try testing.expectEqual(Action.pass, try run(&ctx));
@@ -185,14 +185,14 @@ test "subrequest verdicts map to client-facing statuses" {
 
 fn failHook(
     impl: *const anyopaque,
-    src_req: *const Request,
+    src_req: *Context,
     target: []const u8,
-    out_status: *u16,
+    out: *registry.Subresponse,
 ) anyerror!void {
     _ = impl;
     _ = src_req;
     _ = target;
-    _ = out_status;
+    _ = out;
     return error.HookBlewUp;
 }
 
@@ -203,7 +203,7 @@ test "a failing hook and recursion both fail safe to 500" {
         defer req.deinit();
         var resp = Response.init(.ok);
         var ctx = Context{ .req = &req, .resp = &resp };
-        ctx.subrequest = .{ .impl = @ptrCast(&fake_state), .call = failHook };
+        ctx.subrequest_hook = .{ .impl = @ptrCast(&fake_state), .call = failHook };
         ctx.route = &.{ .path = "/", .auth_request_uri = "/_auth" };
         try testing.expectEqual(Action.handled, try run(&ctx));
         try testing.expectEqual(registry.Status.internal_error, resp.status);
@@ -215,7 +215,7 @@ test "a failing hook and recursion both fail safe to 500" {
         defer req.deinit();
         var resp = Response.init(.ok);
         var ctx = Context{ .req = &req, .resp = &resp };
-        ctx.subrequest = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
+        ctx.subrequest_hook = .{ .impl = @ptrCast(&fake_state), .call = fakeHook };
         ctx.route = &.{ .path = "/", .auth_request_uri = "/_auth" };
         var marker: u8 = 0;
         ctx.setState("auth_request", @ptrCast(&marker));

@@ -319,12 +319,15 @@ pub const Server = struct {
     /// module could still act on the request.
     /// Subrequest hook installed into every request Context by the
     /// reactors: runs `target` through THIS server's full pipeline as a
-    /// fresh GET carrying the original Authorization header.
+    /// fresh GET carrying the original Authorization header, and copies the
+    /// nested verdict (status, headers, body) into the source request's
+    /// shared arena so the returned `Subresponse` stays stable after this
+    /// call returns.
     pub fn subrequestImpl(
         impl: *const anyopaque,
-        src_req: *const pipeline.Request,
+        src_ctx: *pipeline.Context,
         target: []const u8,
-        out_status: *u16,
+        out: *registry.Subresponse,
     ) anyerror!void {
         const srv: *const Server = @ptrCast(@alignCast(impl));
         var req = pipeline.Request.init(std.heap.page_allocator);
@@ -332,7 +335,7 @@ pub const Server = struct {
         req.method = .get;
         req.target = target;
         req.decoded_target = target;
-        if (src_req.header("authorization")) |a| {
+        if (src_ctx.req.header("authorization")) |a| {
             req.addHeaderParsed("Authorization", a) catch {};
         }
         var resp = pipeline.Response.init(.ok);
@@ -340,7 +343,22 @@ pub const Server = struct {
         const outcome = try srv.handleRequest(&sctx);
         // Mirror the reactor's default-404 semantics for unmatched targets.
         if (outcome == .not_handled) resp.status = .not_found;
-        out_status.* = @intFromEnum(resp.status);
+        out.status = @intFromEnum(resp.status);
+
+        // Copy the nested verdict into the source request's arena: the
+        // nested request/response die with this call, but module-visible
+        // subresponse storage lives until the outer request completes.
+        const arena = src_ctx.req.arena.asAllocator();
+        const hdrs = arena.alloc(registry.Subresponse.Header, resp.header_count) catch return error.SubrequestArenaExhausted;
+        for (hdrs, resp.headers[0..resp.header_count]) |*o, h| {
+            o.name = arena.dupe(u8, h.name) catch return error.SubrequestArenaExhausted;
+            o.value = arena.dupe(u8, h.value) catch return error.SubrequestArenaExhausted;
+        }
+        out.headers = hdrs;
+        if (resp.body.len > registry.max_subresponse_body) {
+            return error.SubresponseBodyTooLarge;
+        }
+        out.body = arena.dupe(u8, resp.body) catch return error.SubrequestArenaExhausted;
     }
 
     pub fn matchFast(self: *const Server, ctx: *pipeline.Context) ?router_mod.FastResponse {
@@ -1105,13 +1123,38 @@ test "subrequestImpl runs a target through the server pipeline" {
     var src = registry.Request.init(testing.allocator);
     defer src.deinit();
     src.addHeaderParsed("authorization", "Bearer s3cret") catch unreachable;
+    var sresp = pipeline.Response.init(.ok);
+    var sctx = pipeline.Context{ .req = &src, .resp = &sresp };
 
-    var code: u16 = 0;
-    try Server.subrequestImpl(&srv, &src, "/only", &code);
-    try testing.expectEqual(@as(u16, 200), code);
+    var sr = registry.Subresponse{};
+    try Server.subrequestImpl(&srv, &sctx, "/only", &sr);
+    try testing.expectEqual(@as(u16, 200), sr.status);
     // Unmatched targets mirror the reactor's default 404.
-    try Server.subrequestImpl(&srv, &src, "/nope-missing", &code);
-    try testing.expectEqual(@as(u16, 404), code);
+    try Server.subrequestImpl(&srv, &sctx, "/nope-missing", &sr);
+    try testing.expectEqual(@as(u16, 404), sr.status);
+}
+
+test "subrequestImpl copies the verdict into the source request's arena" {
+    const cfg = comptime Config.fromConfComptime(
+        \\server {
+        \\    location = /meta {
+        \\        add_header X-Sub Verdict;
+        \\        return 200 "accepted";
+        \\    }
+        \\}
+    );
+    const srv = Server.init(cfg);
+
+    var src = registry.Request.init(testing.allocator);
+    defer src.deinit();
+    var sresp = pipeline.Response.init(.ok);
+    var ctx = pipeline.Context{ .req = &src, .resp = &sresp };
+    var sr = registry.Subresponse{};
+    try Server.subrequestImpl(&srv, &ctx, "/meta", &sr);
+    try testing.expect(sr.isSuccess());
+    try testing.expectEqualStrings("accepted", sr.body);
+    try testing.expectEqualStrings("Verdict", sr.get("X-Sub").?);
+    try testing.expectEqual(@as(u16, 200), sr.status);
 }
 
 test "subrequestImpl forwards only the Authorization header" {
@@ -1128,9 +1171,11 @@ test "subrequestImpl forwards only the Authorization header" {
     defer src.deinit();
     src.addHeaderParsed("x-other", "1") catch unreachable;
     src.addHeaderParsed("cookie", "a=b") catch unreachable;
-    var code: u16 = 0;
-    try Server.subrequestImpl(&srv, &src, "/", &code);
-    try testing.expectEqual(@as(u16, 200), code);
+    var sresp = pipeline.Response.init(.ok);
+    var sctx = pipeline.Context{ .req = &src, .resp = &sresp };
+    var sr = registry.Subresponse{};
+    try Server.subrequestImpl(&srv, &sctx, "/", &sr);
+    try testing.expectEqual(@as(u16, 200), sr.status);
 }
 
 test "loadTls is a no-op without TLS and errors on missing files" {
