@@ -142,9 +142,27 @@ pub const Connection = struct {
         }
 
         const slice = self.recv_buf.data[self.recv_buf.write_pos..];
-        const n = posix.read(self.fd, slice) catch |e| return e;
+        // Raw syscall (bypasses std.posix.read's errno switch and retry
+        // loop): the reactor's read path already handles WouldBlock/BufferFull
+        // and tears down on other errors, so the wrapper's bookkeeping is
+        // pure overhead on this hot path.
+        const rc = std.os.linux.read(self.fd, slice.ptr, slice.len);
+        // Linux returns a small negative errno on failure.
+        if (rc > ~@as(usize, 4095)) {
+            const e: std.os.linux.E = @enumFromInt(@as(u32, @truncate(0 -% rc)));
+            return switch (e) {
+                .AGAIN => error.WouldBlock,
+                .INTR => error.WouldBlock, // retry not needed: LT re-fires
+                .BADF => error.Unexpected,
+                .IO => error.InputOutput,
+                .ISDIR => error.IsDir,
+                .NOBUFS => error.SystemResources,
+                else => error.Unexpected,
+            };
+        }
+        const n = rc;
         if (n > 0) {
-            self.recv_buf.write_pos += @intCast(n);
+            self.recv_buf.write_pos += n;
         }
         return n;
     }
