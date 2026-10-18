@@ -224,7 +224,15 @@ pub const Reactor = struct {
     ep: epoll.Epoll,
     wakeup: eventfd.EventFd,
     connections: std.AutoHashMap(posix.fd_t, *connection.Connection),
-    http_sessions: std.AutoHashMap(posix.fd_t, HttpSession),
+    /// Sessions are stored **by pointer**, not by value: `HttpSession`
+    /// embeds its own request arena, TLS plaintext/staging buffers and
+    /// response staging, and `Request`'s header/target slices point into
+    /// that embedded storage. A value map rehashes (moves) entries as it
+    /// grows, which would leave every slice into a session's own buffers
+    /// dangling the moment another connection is adopted. Heap-allocating
+    /// the session keeps its address fixed for the connection's lifetime
+    /// (the same reason `connections` holds `*Connection`).
+    http_sessions: std.AutoHashMap(posix.fd_t, *HttpSession),
     /// Config-driven HTTP request processor. Only used in `.http`
     /// mode; when null, `default_http_handler` is used. Shared read-only across
     /// reactors, so it is safe to call from the reactor thread.
@@ -409,7 +417,7 @@ pub const Reactor = struct {
             .ep = try epoll.Epoll.create(),
             .wakeup = try eventfd.EventFd.create(),
             .connections = std.AutoHashMap(posix.fd_t, *connection.Connection).init(allocator),
-            .http_sessions = std.AutoHashMap(posix.fd_t, HttpSession).init(allocator),
+            .http_sessions = std.AutoHashMap(posix.fd_t, *HttpSession).init(allocator),
             .upstream_conns = std.AutoHashMap(posix.fd_t, posix.fd_t).init(allocator),
             .http_handler = http_handler,
             .handler = http_handler orelse &default_http_handler,
@@ -847,6 +855,14 @@ pub const Reactor = struct {
         }
     }
 
+    /// Look up a connection's HTTP session. The map stores `*HttpSession`
+    /// (see the field comment): this hides the extra dereference so call
+    /// sites read as if the session were stored by value.
+    inline fn httpSession(self: *Reactor, fd: posix.fd_t) ?*HttpSession {
+        const p = self.http_sessions.getPtr(fd) orelse return null;
+        return p.*;
+    }
+
     /// Refill throttled sessions (limit_rate): budgeted ones resume via
     /// flushHttp; finished, unflagged or stale entries leave the list.
     /// Runs once per loop iteration (after the timer advance).
@@ -855,12 +871,12 @@ pub const Reactor = struct {
         var i: usize = 0;
         while (i < self.throttle_fds.items.len) {
             const fd = self.throttle_fds.items[i];
-            const gone = self.connections.get(fd) == null or self.http_sessions.getPtr(fd) == null;
+            const gone = self.connections.get(fd) == null or self.httpSession(fd) == null;
             if (gone) {
                 _ = self.throttle_fds.swapRemove(i);
                 continue;
             }
-            const sess = self.http_sessions.getPtr(fd).?;
+            const sess = self.httpSession(fd).?;
             if (!sess.throttle_listed or !sess.throttled or !sess.writing) {
                 sess.throttle_listed = false;
                 sess.throttled = false;
@@ -868,7 +884,7 @@ pub const Reactor = struct {
                 continue;
             }
             self.flushHttp(fd);
-            if (self.http_sessions.getPtr(fd)) |s2| {
+            if (self.httpSession(fd)) |s2| {
                 if (!s2.throttled or !s2.writing) {
                     s2.throttle_listed = false;
                     s2.throttled = false;
@@ -911,7 +927,7 @@ pub const Reactor = struct {
         var it = self.http_sessions.iterator();
         outer: while (it.next()) |kv| {
             const fd = kv.key_ptr.*;
-            const sess = kv.value_ptr; // *HttpSession — no giant copies
+            const sess = kv.value_ptr.*; // *HttpSession — no giant copies
             if (sess.upgraded or sess.h2 != null or sess.tls != null or sess.writing) continue;
             const first = sess.first_byte_at orelse continue;
             const header_phase = switch (sess.parser.state) {
@@ -959,7 +975,7 @@ pub const Reactor = struct {
     /// (a response has been queued).
     fn markWriting(self: *Reactor, fd: posix.fd_t) void {
         const stats = self.stats orelse return;
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
         if (session.stat_state == .reading) {
             session.stat_state = .writing;
             _ = stats.reading.fetchSub(1, .monotonic);
@@ -1076,7 +1092,7 @@ pub const Reactor = struct {
             if (got_data) {
                 self.rearmTimer(conn);
                 if (self.stats) |s| {
-                    const session0 = self.http_sessions.getPtr(fd) orelse return;
+                    const session0 = self.httpSession(fd) orelse return;
                     if (session0.stat_state == .waiting) {
                         session0.stat_state = .reading;
                         _ = s.waiting.fetchSub(1, .monotonic);
@@ -1084,7 +1100,7 @@ pub const Reactor = struct {
                     }
                 }
             }
-            const session = self.http_sessions.getPtr(fd) orelse return;
+            const session = self.httpSession(fd) orelse return;
             if (now_inst) |t| {
                 if (session.first_byte_at == null) session.first_byte_at = t;
                 session.last_rx_at = t;
@@ -1093,14 +1109,14 @@ pub const Reactor = struct {
         }
 
         if (events & epoll.Events.Out != 0) {
-            const session = self.http_sessions.getPtr(fd) orelse return;
+            const session = self.httpSession(fd) orelse return;
             if (session.writing) self.flushHttp(fd);
             // Level-triggered OUT must be removed once the response is fully
             // written: a writable socket is always reported ready, so a
             // stale OUT arm makes epoll return this fd on EVERY wait — a
             // busy event storm (and the latency tail it causes).
             if (self.connections.get(fd) == null) return;
-            const s2 = self.http_sessions.getPtr(fd) orelse return;
+            const s2 = self.httpSession(fd) orelse return;
             // Disarmed when the response is finished or paused on the rate
             // budget (the throttle kick re-drives it): an armed OUT on a
             // writable socket re-fires on every wait otherwise.
@@ -1118,7 +1134,7 @@ pub const Reactor = struct {
     /// the connection.
     fn processHttp(self: *Reactor, fd: posix.fd_t) void {
         while (true) {
-            const session = self.http_sessions.getPtr(fd) orelse return;
+            const session = self.httpSession(fd) orelse return;
             const conn = self.connections.get(fd) orelse return;
             // PROXY protocol: on opted-in listeners the first bytes are the
             // proxy header — consume before any sniffing (TLS/h2/preface all
@@ -1284,7 +1300,7 @@ pub const Reactor = struct {
 fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !void {
         const plan = proxy_mod.takeParked(ctx) orelse return error.NoParkedPlan;
         const conn = self.connections.get(fd) orelse return error.NoConn;
-        const session = self.http_sessions.getPtr(fd) orelse return error.NoSession;
+        const session = self.httpSession(fd) orelse return error.NoSession;
 
         const tx = &session.up_tx;
         // Resume from the parked state, not from scratch: the inline phase
@@ -1345,7 +1361,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
 
     /// Drive a parked upstream transaction from an epoll readiness event.
     fn handleUpstreamEvent(self: *Reactor, client_fd: posix.fd_t) void {
-        const session = self.http_sessions.getPtr(client_fd) orelse return;
+        const session = self.httpSession(client_fd) orelse return;
         if (!session.up_active) return;
         const tx = &session.up_tx;
         const up_fd = tx.fd;
@@ -1485,7 +1501,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
 
     /// 502 with keep-alive semantics identical to the synchronous path.
     fn failUpstream(self: *Reactor, client_fd: posix.fd_t) void {
-        const session = self.http_sessions.getPtr(client_fd) orelse return;
+        const session = self.httpSession(client_fd) orelse return;
         if (!session.up_active) return;
         const tx = &session.up_tx;
         // Route pointer stays valid after the transaction dies (routes are
@@ -1624,7 +1640,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// digest is appended so real ws clients accept the handshake.
     fn upgradeConnection(self: *Reactor, fd: posix.fd_t, proto: []const u8, ws_key: []const u8) void {
         const conn = self.connections.get(fd) orelse return;
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
         const head = websocket_mod.upgradeHead(proto, ws_key, &session.upgrade_head_scratch) orelse {
             self.removeConnection(fd);
             return;
@@ -1650,7 +1666,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             // and tear the connection down (close frames), so nothing may be
             // held across an iteration.
             const conn = self.connections.get(fd) orelse return;
-            const session = self.http_sessions.getPtr(fd) orelse return;
+            const session = self.httpSession(fd) orelse return;
             if (session.writing) return; // flush first; bytes stay buffered
             if (conn.recv_buf.availableRead() == 0) return;
             var frame = websocket_mod.Frame{};
@@ -1792,7 +1808,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         }
         self.rearmTimer(conn);
         if (self.mode == .http) {
-            const session = self.http_sessions.getPtr(fd) orelse return;
+            const session = self.httpSession(fd) orelse return;
             if (self.stats) |s| {
                 if (session.stat_state == .waiting) {
                     session.stat_state = .reading;
@@ -1846,7 +1862,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// resubmit the remainder or finalize the flush.
     fn handleWriteData(self: *Reactor, fd: posix.fd_t, n: usize) void {
         const conn = self.connections.get(fd) orelse return;
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
         if (!session.writing) return;
 
         self.advanceHttpWrite(conn, session, n);
@@ -1918,7 +1934,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         if (self.io_mode == .epoll) self.ep.remove(fd) catch {};
         self.dropConnection(conn);
         if (self.http_sessions.fetchRemove(fd)) |kv| {
-            var sess = kv.value;
+            const sess = kv.value;
             // A torn-down connection may hold a counted request (abort or
             // error close): release the `max_requests` slot exactly once.
             if (sess.req_counted) {
@@ -1950,6 +1966,8 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 tc.deinit();
             }
             if (sess.h2) |*h2| h2.deinit();
+            sess.h2_out.deinit(self.allocator);
+            self.allocator.destroy(sess);
         }
     }
 
@@ -1958,7 +1976,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// immediately process any pipelined data already buffered.
     fn flushHttp(self: *Reactor, fd: posix.fd_t) void {
         const conn = self.connections.get(fd) orelse return;
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
 
         // Iov order mirrors the wire: head (send buffer; chunked routes put
         // the chunk-size line there), then the body, then the chunked
@@ -2082,7 +2100,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// submits a POLLOUT wait instead of relying on an epoll event.
     fn finalizeFlush(self: *Reactor, fd: posix.fd_t) void {
         const conn = self.connections.get(fd) orelse return;
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
 
         // Push any file body straight into the socket (budgeted
         // by limit_rate inside pumpFile).
@@ -2163,7 +2181,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// request (plaintext only; TLS processes one request per pass).
     fn handleHttpRequest(self: *Reactor, fd: posix.fd_t, tls_mode: bool) bool {
         const conn = self.connections.get(fd) orelse return false;
-        const session = self.http_sessions.getPtr(fd) orelse return false;
+        const session = self.httpSession(fd) orelse return false;
         // In-flight request cap (`limits.max_requests`, per reactor/worker):
         // shed new work with 503 once this reactor already holds that many
         // requests. The count runs from parse to the fully-flushed response
@@ -2236,7 +2254,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 session.writing = true;
                 self.flushHttp(fd);
                 if (!self.connections.contains(fd)) return false;
-                const sess = self.http_sessions.getPtr(fd) orelse return false;
+                const sess = self.httpSession(fd) orelse return false;
                 if (!sess.writing) return true; // flushed fully; next pipelined request
                 sess.out_armed = true;
                 self.ep.modify(fd, epoll.Events.In | epoll.Events.Out, fd) catch {};
@@ -2369,7 +2387,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         session.writing = true;
         self.flushHttp(fd);
         if (!self.connections.contains(fd)) return false;
-        const sess = self.http_sessions.getPtr(fd) orelse return false;
+        const sess = self.httpSession(fd) orelse return false;
         if (!sess.writing) return true; // flushed fully; next pipelined request
         // Partially flushed: re-arm EPOLLOUT (epoll_ctl MOD
         // re-evaluates readiness, so this delivers the event).
@@ -2384,7 +2402,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// read into memory (the static content cache covers small files).
     fn handleHttpResponseTls(self: *Reactor, fd: posix.fd_t, close: bool) void {
         const conn = self.connections.get(fd) orelse return;
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
         const tc = &session.tls.?;
 
         // File bodies: read into memory (no sendfile through TLS).
@@ -2457,7 +2475,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         session.writing = true;
         self.flushHttp(fd);
         if (!self.connections.contains(fd)) return;
-        const sess = self.http_sessions.getPtr(fd) orelse return;
+        const sess = self.httpSession(fd) orelse return;
         if (sess.writing) {
             sess.out_armed = true;
             self.ep.modify(fd, epoll.Events.In | epoll.Events.Out, fd) catch {};
@@ -2474,7 +2492,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         self.tls_processing = true;
         defer self.tls_processing = false;
         const conn = self.connections.get(fd) orelse return;
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
 
         // Feed all buffered ciphertext into the TLS session.
         const recv_slice = conn.recv_buf.data[conn.recv_buf.read_pos..conn.recv_buf.write_pos];
@@ -2511,13 +2529,13 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             session.writing = true;
             self.flushHttp(fd);
             if (!self.connections.contains(fd)) return;
-            const sess = self.http_sessions.getPtr(fd) orelse return;
+            const sess = self.httpSession(fd) orelse return;
             if (sess.writing) {
                 sess.out_armed = true;
                 self.ep.modify(fd, epoll.Events.In | epoll.Events.Out, fd) catch {};
                 return;
             }
-            const s2 = self.http_sessions.getPtr(fd) orelse return;
+            const s2 = self.httpSession(fd) orelse return;
             if (s2.tls == null) return;
         }
 
@@ -2526,7 +2544,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         if (self.connections.get(fd) == null) {
             return;
         }
-        const sess = self.http_sessions.getPtr(fd) orelse {
+        const sess = self.httpSession(fd) orelse {
             return;
         };
 
@@ -2566,16 +2584,16 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 }
                 const before = sess.tls_plain.availableRead();
                 self.processHttpFrom(fd, &sess.tls_plain);
-                if (self.http_sessions.getPtr(fd) == null) return; // connection gone
+                if (self.httpSession(fd) == null) return; // connection gone
                 if (sess.tls_plain.availableRead() == before and p == 0) break;
             }
         }
-        if (sess.h2) |*h2s| self.flushH2Output(fd, h2s);
+        if (sess.h2 != null) self.flushH2Output(fd);
     }
 
     /// Process a request from an arbitrary plaintext buffer (TLS path).
     fn processHttpFrom(self: *Reactor, fd: posix.fd_t, plain: *buffer_mod.Buffer) void {
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
         const outcome = session.parser.parse(plain, &session.req);
         switch (outcome) {
             .incomplete => {
@@ -2608,7 +2626,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                     }
                     self.flushHttp(fd);
                     if (!self.connections.contains(fd)) return;
-                    const s = self.http_sessions.getPtr(fd) orelse return;
+                    const s = self.httpSession(fd) orelse return;
                     if (s.writing) {
                         s.out_armed = true;
                         self.ep.modify(fd, epoll.Events.In | epoll.Events.Out, fd) catch {};
@@ -2651,7 +2669,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         // trailing frame stays buffered for the next read. Advance before
         // flushing: flushHttp recurses back here and must not reprocess.
         conn.recv_buf.read_pos += consumed;
-        self.flushH2Output(fd, h2s);
+        self.flushH2Output(fd);
     }
 
     /// Process h2 bytes from an arbitrary slice (the recv buffer for h2c,
@@ -2662,7 +2680,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
 
     fn processHttp2Slice(self: *Reactor, fd: posix.fd_t, h2s: *http2_session.Session, recv_slice: []const u8) usize {
         const conn = self.connections.get(fd) orelse return 0;
-        const session_p = self.http_sessions.getPtr(fd) orelse return 0;
+        const session_p = self.httpSession(fd) orelse return 0;
         const out = &session_p.h2_out;
         out.clearRetainingCapacity();
 
@@ -2696,14 +2714,14 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             http2_frames.writeGoaway(&gbuf, self.allocator, h2s.max_stream_id, code, @errorName(e)) catch {};
             self.appendH2Output(fd, &gbuf);
             self.markWriting(fd);
-            const sess = self.http_sessions.getPtr(fd) orelse return 0;
+            const sess = self.httpSession(fd) orelse return 0;
             sess.writing = true;
             sess.close_after_write = true;
             break :blk 0;
         };
         if (out.items.len > 0) {
             self.appendH2Output(fd, out);
-            const sess = self.http_sessions.getPtr(fd) orelse return consumed;
+            const sess = self.httpSession(fd) orelse return consumed;
             if (sess.tls != null) {
                 // h2 over TLS: drain the encrypted records into send_buf.
                 while (true) {
@@ -2733,21 +2751,27 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// close. Must run after the caller advanced its buffer past the
     /// consumed bytes: flushHttp recurses (finalizeFlush → processHttp →
     /// processHttp2) and must not see the same bytes twice.
-    fn flushH2Output(self: *Reactor, fd: posix.fd_t, h2s: *http2_session.Session) void {
-        const sess = self.http_sessions.getPtr(fd) orelse return;
-        if (sess.writing) self.flushHttp(fd);
-        // If the session asked to close (GOAWAY received), finish draining
-        // and close.
-        if (h2s.closing) {
-            const s2 = self.http_sessions.getPtr(fd) orelse return;
-            if (!s2.writing) self.removeConnection(fd);
+    /// Flush any queued h2 output and, if the session is closing, tear the
+    /// connection down once the send buffer has drained.
+    ///
+    /// Takes only the fd: `flushHttp` below can close the connection, which
+    /// frees the `HttpSession` (and with it the HTTP/2 session), so a
+    /// caller-held `*Session` would dangle. Every use re-looks-up the
+    /// session instead.
+    fn flushH2Output(self: *Reactor, fd: posix.fd_t) void {
+        if (self.httpSession(fd)) |sess| {
+            if (sess.writing) self.flushHttp(fd);
+        }
+        const s2 = self.httpSession(fd) orelse return;
+        if (s2.h2) |*h2s| {
+            if (h2s.closing and !s2.writing) self.removeConnection(fd);
         }
     }
 
     fn appendH2Output(self: *Reactor, fd: posix.fd_t, out: *const std.ArrayList(u8)) void {
         const conn = self.connections.get(fd) orelse return;
         if (out.items.len == 0) return;
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
         if (session.tls != null) {
             // h2 over TLS the frames must be encrypted. The caller
             // (processHttp2Slice) drains + flushes afterwards.
@@ -2780,7 +2804,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     /// Queue an error response and close the connection after it is flushed.
     fn respondAndClose(self: *Reactor, fd: posix.fd_t, status: http_response.Status) void {
         const conn = self.connections.get(fd) orelse return;
-        const session = self.http_sessions.getPtr(fd) orelse return;
+        const session = self.httpSession(fd) orelse return;
         // Error-log line for errors the pipeline never sees
         // (parse failures). Pipeline-visible errors are logged by the
         // error_log module when bound. Severity is .warn for all codes:
@@ -2901,13 +2925,21 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             _ = s.waiting.fetchAdd(1, .monotonic);
         }
         if (self.mode == .http) {
-            var session = HttpSession{
-                .parser = http_parser.Parser.initWithLimits(self.allocator, self.limits.max_line_bytes, self.limits.max_chunked_body),
-                .req = http_parser.Request.initWithLimits(self.allocator, self.limits.max_headers, self.limits.max_body_spool),
-            };
-            if (self.http_sessions.put(conn.fd, session)) |_| {} else |_| {
-                session.parser.deinit();
-                session.req.deinit();
+            if (self.allocator.create(HttpSession)) |session| {
+                session.* = HttpSession{
+                    .parser = http_parser.Parser.initWithLimits(self.allocator, self.limits.max_line_bytes, self.limits.max_chunked_body),
+                    .req = http_parser.Request.initWithLimits(self.allocator, self.limits.max_headers, self.limits.max_body_spool),
+                };
+                self.http_sessions.put(conn.fd, session) catch {
+                    session.parser.deinit();
+                    session.req.deinit();
+                    self.allocator.destroy(session);
+                    self.wheel.remove(&conn.timer);
+                    if (self.io_mode == .epoll) self.ep.remove(conn.fd) catch {};
+                    _ = self.connections.fetchRemove(conn.fd);
+                    self.dropConnection(conn);
+                };
+            } else |_| {
                 self.wheel.remove(&conn.timer);
                 if (self.io_mode == .epoll) self.ep.remove(conn.fd) catch {};
                 _ = self.connections.fetchRemove(conn.fd);
@@ -3024,7 +3056,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 return;
             }
         }
-        if (self.http_sessions.getPtr(fd)) |sess| {
+        if (self.httpSession(fd)) |sess| {
             if (sess.up_active) self.dropUpstream(sess);
         }
         if (self.connections.fetchRemove(fd)) |kv| {
@@ -3043,7 +3075,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             self.dropConnection(conn);
         }
         if (self.http_sessions.fetchRemove(fd)) |kv| {
-            var sess = kv.value;
+            const sess = kv.value;
             // A torn-down connection may hold a counted request (abort or
             // error close): release the `max_requests` slot exactly once.
             if (sess.req_counted) {
@@ -3076,6 +3108,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 }
                 tc.deinit();
             }
+            self.allocator.destroy(sess);
         }
     }
 
@@ -3091,13 +3124,15 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         }
         self.connections.clearRetainingCapacity();
         var sit = self.http_sessions.valueIterator();
-        while (sit.next()) |s| {
+        while (sit.next()) |sp| {
+            const s = sp.*;
             if (s.file_fd >= 0 and !s.file_fd_cached) sys.close(s.file_fd);
             if (s.resp.body_owned) self.allocator.free(s.resp.body);
             if (s.h2) |*h2s| h2s.deinit();
             s.h2_out.deinit(self.allocator);
             s.parser.deinit();
             s.req.deinit();
+            self.allocator.destroy(s);
         }
         self.http_sessions.clearRetainingCapacity();
     }
@@ -4475,24 +4510,26 @@ test "upstream driver sends parked request and adopts response" {
     const cpair = try sys.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer sys.close(cpair[0]);
 
-    const sess_local = HttpSession{
+    const sess_local = try testing.allocator.create(HttpSession);
+    sess_local.* = HttpSession{
         .parser = http_parser.Parser.init(allocator),
         .req = http_parser.Request.init(allocator),
     };
     // Register under the client fd so the driver's session lookup succeeds
     // (same contract as production).
     try r.http_sessions.put(cpair[1], sess_local);
-    // Always refetch: map storage can move.
-    const sess = r.http_sessions.getPtr(cpair[1]).?;
+    // Always refetch: the map itself can move; the session address is fixed.
+    const sess = r.httpSession(cpair[1]).?;
     // The arena-backed body adoption needs a live request arena.
     sess.req.arena = @import("../http/arena.zig").Arena.init(allocator);
     sess.up_active = false;
     var route = dsl_registry.Route{ .path = "/", .match = .prefix };
     sess.route_ptr_for_test = &route;
     defer {
-        if (r.http_sessions.getPtr(cpair[1])) |s2| {
+        if (r.httpSession(cpair[1])) |s2| {
             s2.parser.deinit();
             s2.req.deinit();
+            testing.allocator.destroy(s2);
         }
         _ = r.http_sessions.remove(cpair[1]);
     }
@@ -4541,12 +4578,13 @@ test "upstream driver sends parked request and adopts response" {
 /// route anchored for the driver. Mirrors "upstream driver sends parked
 /// request and adopts response".
 fn parkTestSession(r: *Reactor, cpair: [2]posix.fd_t, route: *const dsl_registry.Route) !*HttpSession {
-    const sess_local = HttpSession{
+    const sess_local = try testing.allocator.create(HttpSession);
+    sess_local.* = HttpSession{
         .parser = http_parser.Parser.init(testing.allocator),
         .req = http_parser.Request.init(testing.allocator),
     };
     try r.http_sessions.put(cpair[1], sess_local);
-    const sess = r.http_sessions.getPtr(cpair[1]).?;
+    const sess = r.httpSession(cpair[1]).?;
     sess.req.arena = @import("../http/arena.zig").Arena.init(testing.allocator);
     sess.route_ptr_for_test = route;
     try r.connections.put(cpair[1], try connection.Connection.create(testing.allocator, cpair[1]));
@@ -4554,9 +4592,10 @@ fn parkTestSession(r: *Reactor, cpair: [2]posix.fd_t, route: *const dsl_registry
 }
 
 fn parkTestTeardown(r: *Reactor, cpair: [2]posix.fd_t) void {
-    if (r.http_sessions.getPtr(cpair[1])) |s2| {
+    if (r.httpSession(cpair[1])) |s2| {
         s2.parser.deinit();
         s2.req.deinit();
+        testing.allocator.destroy(s2);
     }
     _ = r.http_sessions.remove(cpair[1]);
 }
@@ -4839,7 +4878,7 @@ test "reactor dropUpstream closes the upstream fd on client teardown" {
     try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(up[0], linux.F.GETFD, 0)));
     try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(cpair[1], linux.F.GETFD, 0)));
     try testing.expectEqual(@as(usize, 0), r.countConnections());
-    try testing.expect(r.http_sessions.getPtr(cpair[1]) == null);
+    try testing.expect(r.httpSession(cpair[1]) == null);
 }
 
 test "max_connections: active counter tracks registered connections" {
@@ -5930,4 +5969,49 @@ test "reactor ring backend serves an HTTP transaction" {
     const n = try readUntil(pair[0], &buf, ok.len, 5000);
     try testing.expectEqualStrings(ok, buf[0..n]);
     try testing.expectEqual(@as(usize, 1), r.countConnections());
+}
+
+// ---- session storage stability -------------------------------------------
+
+// `HttpSession` embeds the request arena (and TLS/staging buffers) that
+// `Request`'s header, target and query slices point into, so its address
+// must not change for the connection's lifetime. Storing sessions by value
+// in a growing hash map used to move them under a client mid-request: a
+// target parsed into the embedded arena became a dangling pointer the
+// moment any other connection was adopted, and the next access faulted.
+test "http session keeps a stable address as the session map grows" {
+    const allocator = testing.allocator;
+    var r = try Reactor.init(allocator, 0, .http);
+    defer r.deinit();
+
+    const first = try allocator.create(HttpSession);
+    first.* = HttpSession{
+        .parser = http_parser.Parser.init(allocator),
+        .req = http_parser.Request.init(allocator),
+    };
+    try r.http_sessions.put(2000, first);
+
+    // A request target as the parser stores it: a slice of the embedded arena.
+    const target = first.req.arena.alloc(5).?;
+    @memcpy(target, "/echo");
+    first.req.target = target;
+    first.req.decoded_target = target;
+    const target_addr = target.ptr;
+
+    // Grow far past the map's initial capacity; a by-value map rehashes here.
+    var fd: posix.fd_t = 2001;
+    while (fd < 2600) : (fd += 1) {
+        const s = try allocator.create(HttpSession);
+        s.* = HttpSession{
+            .parser = http_parser.Parser.init(allocator),
+            .req = http_parser.Request.init(allocator),
+        };
+        try r.http_sessions.put(fd, s);
+    }
+
+    const again = r.httpSession(2000).?;
+    try testing.expectEqual(first, again);
+    try testing.expectEqual(target_addr, again.req.decoded_target.ptr);
+    try testing.expectEqualStrings("/echo", again.req.decoded_target);
+    // `r.deinit()` frees every session through `closeAllConnections`.
 }
