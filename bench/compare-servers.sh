@@ -141,13 +141,13 @@ start_servers() {
         sel bun && { "$BUN_BIN" run "$BUN_SRV" "$3" >/dev/null 2>&1 & }
     fi
     # nginx: per-port runtime prefix (pid file) and config.
-    NGINX_PREFIX="$ROOT/bench/.cache/nginx-p$5"
+    NGINX_PREFIX="$ROOT/bench/.cache/nginx-p$4"
     mkdir -p "$NGINX_PREFIX"
-    sed -e "s/@@PORT@@/$5/" \
-        -e "s|@@ERRLOG@@|$ROOT/bench/.cache/nginx-err-$5.log|" \
+    sed -e "s/@@PORT@@/$4/" \
+        -e "s|@@ERRLOG@@|$ROOT/bench/.cache/nginx-err-$4.log|" \
         -e "s|@@PREFIX@@|$NGINX_PREFIX|" \
-        -e "s|@@STATICDIR@@|$STATIC_DIR|" "$NGINX_TEMPLATE" > "$ROOT/bench/.cache/nginx-$5.conf"
-    "$NGINX_BIN" -p "$NGINX_PREFIX" -c "$ROOT/bench/.cache/nginx-$5.conf" >/dev/null 2>&1 &
+        -e "s|@@STATICDIR@@|$STATIC_DIR|" "$NGINX_TEMPLATE" > "$ROOT/bench/.cache/nginx-$4.conf"
+    "$NGINX_BIN" -p "$NGINX_PREFIX" -c "$ROOT/bench/.cache/nginx-$4.conf" >/dev/null 2>&1 &
     # caddy: GOMAXPROCS=4 for parity with the other 4-worker servers.
     sed -e "s/@@PORT@@/$5/" \
         -e "s|@@STATICDIR@@|$STATIC_DIR|" "$CADDY_TEMPLATE" > "$ROOT/bench/.cache/caddy-$5.caddyfile"
