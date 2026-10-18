@@ -23,18 +23,19 @@ async upstream work and kTLS have settled; the reactor's transport seam
 
 ## Module framework v2 — remaining items
 
-The handler/filter split and the async upstream driver shipped; three
+The handler/filter split and the async upstream driver shipped; two
 designed items remain on top of that seam:
 
-- **Subrequests and internal redirects**: generalize the `auth_request` hook
-  into `ctx.subrequest(uri) -> Subresponse` (a depth-limited mini-pipeline
-  walk) plus `Action.internal_redirect(target)` for `error_page`-style chains.
-- **Transport abstraction for upstreams**: `on_ready` should receive an
-  opaque I/O handle (an fd today) so QUIC streams can slot in without
-  touching modules again.
-- **Streaming body escape hatch**: modules declare `streams_response`; such
-  routes bypass body filters (header filters still run) until an incremental
-  filter API exists. The constraint is documented rather than silent.
+- **Subrequests**: generalize the `auth_request` hook into
+  `ctx.subrequest(uri) -> Subresponse` (a depth-limited mini-pipeline walk).
+  Internal redirects already exist generically (`ctx.internal_redirect_*`
+  in `error_page`/`rewrite`/`try_files`).
+- **Transport abstraction for upstreams**: the seam exists
+  (`IoHandle` in `dsl/registry.zig`; parked async upstreams register
+  `ctx.async_handle` with the connection's fd) — grow its variants when
+  HTTP/3 arrives rather than re-touching modules. The streaming body
+  escape hatch (`streams_response` route/module flag) shipped.
+
 
 ## Performance
 
@@ -71,9 +72,10 @@ target those error branches.
   (zstd is decompress-only). Serving precompressed `.br`/`.zstd` twins works
   today; runtime compression needs a vendored codec (C dependency vs a
   pure-Zig port).
-- **Cross-server comparison cells**: the actix-web cell needs a Rust
-  toolchain (`cargo`/`rustc`) to build; the Envoy unified cell has a fetched
-  binary but no authored cell configuration.
+- **Cross-server Envoy cell**: the unified cell configuration is authored
+  (`bench/foreign/envoy/unified.yaml.template`); the comparison needs an
+  envoy binary fetched/set via `ENVOY_BIN` on the benchmarking machine. The
+  actix-web and Bun cells build and run from in-tree sources.
 
 ## Explicitly deferred
 
