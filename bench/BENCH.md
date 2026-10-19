@@ -49,24 +49,29 @@ python3 bench/graphs.py
 ## Echo matrix (POST, req/s)
 
 Body sizes 1 KB / 8 KB / 64 KB × connections 10 / 100 / 1000, medians of 3
-interleaved reps in both port layouts, 6 s per rep, 4 threads / 4 workers.
+interleaved reps in both port layouts, 10 s per rep, 4 threads / 4 workers.
 
 ![Matrix 1 KB](graphs/matrix_1024.png)
 ![Matrix 8 KB](graphs/matrix_8192.png)
 ![Matrix 64 KB](graphs/matrix_65536.png)
 
-| Body | Conns | Zocket | nginx | Caddy | vs nginx | vs Caddy |
-|---|---:|---:|---:|---:|---:|---:|
-| GET / | 100 | 440.0 | 385.7 | 96.9 | 1.14x | 4.54x |
-| 1 KB | 10 | 231.8 | 157.1 | 77.5 | 1.48x | 2.99x |
-| 1 KB | 100 | 379.4 | 221.4 | 70.8 | 1.71x | 5.36x |
-| 1 KB | 1000 | 307.5 | 202.6 | 60.1 | 1.52x | 5.11x |
-| 8 KB | 10 | 151.4 | 61.5 | 32.7 | 2.46x | 4.63x |
-| 8 KB | 100 | 204.2 | 80.6 | 34.0 | 2.53x | 6.00x |
-| 8 KB | 1000 | 156.2 | 101.9 | 33.5 | 1.53x | 4.67x |
-| 64 KB | 10 | 59.1 | 21.0 | 10.6 | 2.81x | 5.57x |
-| 64 KB | 100 | 44.9 | 32.9 | 11.8 | 1.37x | 3.81x |
-| 64 KB | 1000 | 43.6 | 42.1 | 13.3 | 1.04x | 3.28x |
+A complete set now runs the actix and Bun cells alongside nginx and Caddy
+(`SERVERS="tcp nginx caddy actix bun" bash bench/compare-servers.sh
+--matrix --reps 3`); every POST cell echoes real bytes on all five servers,
+so the numbers are body-for-body. Zocket leads on every cell.
+
+| Body | Conns | Zocket | actix | nginx | Caddy | Bun | vs actix | vs nginx | vs Caddy | vs Bun |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| GET / | 100 | 444.8 | 415.5 | 380.1 | 96.3 | 156.3 | 1.07x | 1.17x | 4.62x | 2.85x |
+| 1 KB | 10 | 229.2 | 192.9 | 163.0 | 74.2 | 108.7 | 1.19x | 1.41x | 3.09x | 2.11x |
+| 1 KB | 100 | 404.7 | 306.9 | 232.4 | 69.7 | 118.0 | 1.32x | 1.74x | 5.80x | 3.43x |
+| 1 KB | 1000 | 340.3 | 240.4 | 204.0 | 58.3 | 87.4 | 1.42x | 1.67x | 5.84x | 3.89x |
+| 8 KB | 10 | 143.2 | 137.3 | 55.5 | 30.9 | 73.3 | 1.04x | 2.58x | 4.63x | 1.95x |
+| 8 KB | 100 | 218.8 | 162.7 | 81.7 | 33.0 | 64.9 | 1.35x | 2.68x | 6.63x | 3.37x |
+| 8 KB | 1000 | 156.3 | 124.2 | 101.7 | 33.0 | 59.1 | 1.26x | 1.54x | 4.74x | 2.65x |
+| 64 KB | 10 | 58.2 | 41.0 | 19.1 | 9.6 | 32.5 | 1.42x | 3.06x | 6.09x | 1.79x |
+| 64 KB | 100 | 47.1 | 39.6 | 30.3 | 10.6 | 28.0 | 1.19x | 1.55x | 4.43x | 1.68x |
+| 64 KB | 1000 | 42.4 | 35.4 | 38.1 | 11.2 | 24.9 | 1.20x | 1.11x | 3.80x | 1.70x |
 
 Numbers are req/s × 1000. actix-web, Bun.serve cells require
 toolchains that are not installed on this machine; `SERVERS=` selects the
