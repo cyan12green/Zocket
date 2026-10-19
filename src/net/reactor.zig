@@ -296,12 +296,19 @@ pub const Reactor = struct {
     /// IMF-fixdate string is formatted once per wall-clock second and
     /// copied into every response, so per-request date formatting is zero.
     date_cache: [40]u8 = undefined,
+    /// Pre-rendered trailing header block, rebuilt with the Date cache: a
+    /// per-wall-second `Date: ...\r\nServer: Zocket/<ver>\r\n` pair the hot
+    /// response path splices in as one memcpy (net.http.response trailer).
+    /// 38 bytes for Date at the 29-char IMF-fixdate maximum plus the Server
+    /// line; 64 covers both with the current version string.
+    trailer_cache: [64]u8 = undefined,
     /// Runtime-tunable limits from the config `limits` section (buffers,
     /// parser caps, caches, pool). Applied at init; the compiled defaults
     /// apply when no config sets them.
     limits: limits_mod.Limits = .{},
     date_len: usize = 0,
     date_sec: u64 = 0,
+    trailer_len: usize = 0,
     /// Requests parsed-but-unanswered on this reactor right now
     /// (`limits.max_requests` cap; single-threaded access).
     in_flight: usize = 0,
@@ -696,7 +703,8 @@ pub const Reactor = struct {
         self.drained.store(true, .release);
     }
 
-    /// Refresh the cached Date string when the wall-clock second changes.
+    /// Refresh the cached Date string (and its combined Server trailer)
+    /// when the wall-clock second changes.
     fn refreshDate(self: *Reactor) void {
         const ts = sys.clock_gettime(posix.CLOCK.REALTIME) catch return;
         const now: u64 = @intCast(ts.sec);
@@ -704,6 +712,17 @@ pub const Reactor = struct {
         self.date_sec = now;
         const date = cache_mod.formatHttpDate(now, &self.date_cache) orelse return;
         self.date_len = date.len;
+        if (std.fmt.bufPrint(
+            &self.trailer_cache,
+            "Date: {s}\r\nServer: Zocket/" ++ version_mod.version ++ "\r\n",
+            .{date},
+        )) |t| {
+            self.trailer_len = t.len;
+        } else |_| {
+            // Misformatted (impossible for the fixed IMF-fixdate width):
+            // keep the previous second's trailer, same staleness class as
+            // the Date cache above.
+        }
     }
 
     /// Advance the timer wheel to the current wall tick and close every
@@ -1520,8 +1539,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         // response still carries them.
         self.continueParked(client_fd, session, route);
         session.resp.setHeader("Connection", "keep-alive");
-        session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
-        session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
+        session.resp.trailer = self.trailer_cache[0..self.trailer_len];
         const conn = self.connections.get(client_fd) orelse return;
         conn.send_buf.compact();
         session.resp.writeHeadToBuffer(&conn.send_buf) catch {
@@ -1539,8 +1557,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
     fn finishProxied(self: *Reactor, client_fd: posix.fd_t, session: *HttpSession) void {
         const close0 = !session.req.keep_alive;
         session.resp.setHeader("Connection", if (close0) "close" else "keep-alive");
-        session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
-        session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
+        session.resp.trailer = self.trailer_cache[0..self.trailer_len];
         const conn = self.connections.get(client_fd) orelse return;
         conn.send_buf.compact();
         if (session.resp.body_from_file) {
@@ -2219,7 +2236,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             .static_cache = &self.static_cache,
             .limits = &self.limits,
             .formats = handler.formats(),
-            .subrequest = .{ .impl = handler, .call = runtime_server.Server.subrequestImpl },
+            .subrequest_hook = .{ .impl = handler, .call = runtime_server.Server.subrequestImpl },
             // Parking available on the epoll HTTP path; ring/TLS fronts
             // keep the synchronous upstream driver.
             .async_supported = self.io_mode == .epoll,
@@ -2315,8 +2332,7 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         const has_content = session.resp.body.len > 0 or session.resp.body_from_file;
         const is_head_req = session.req.method == .head;
         if (has_content or session.resp.header_count > 0 or close or is_head_req or session.resp.chunked) {
-            session.resp.setHeader("Date", self.date_cache[0..self.date_len]);
-            session.resp.setHeader("Server", "Zocket/" ++ version_mod.version);
+            session.resp.trailer = self.trailer_cache[0..self.trailer_len];
         }
         conn.send_buf.compact();
 
