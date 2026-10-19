@@ -221,8 +221,15 @@ trap 'stop_servers' EXIT
 
 if [ "$MATRIX" = "1" ]; then
     RESROOT="$ROOT/bench/results/servers/matrix"
-    rm -rf "$RESROOT"
     mkdir -p "$RESROOT"
+    # Clear only the cells this sweep covers (a partial --bodies/--conns-list
+    # run must not delete unrelated cells measured in a previous sweep).
+    rm -rf "$RESROOT/get_c0"
+    for _body in $BODIES; do
+        for _conns in $CONNS_LIST; do
+            rm -rf "$RESROOT/b${_body}_c${_conns}"
+        done
+    done
     CELLS="GET_(empty)|get_c0"
     run_cell "get_c0" "100" "0"
     for body in $BODIES; do
