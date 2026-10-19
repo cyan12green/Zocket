@@ -222,13 +222,6 @@ pub const Response = struct {
     /// sendfile body into one TCP segment. Set by the pipeline from the route's
     /// `tcp_nopush` directive; the reactor reads it to decide whether to cork.
     tcp_nopush: bool = false,
-    /// Trailing literal block spliced after the last header and before
-    /// Content-Length / Transfer-Encoding. The reactor hands a pre-rendered
-    /// "Date: ...\r\nServer: Zocket/...\r\n" pair (cached per wall second),
-    /// so the hot path copies one block instead of formatting two headers;
-    /// on the wire this is byte-identical to the previous two `setHeader`
-    /// calls that ended the header list.
-    trailer: []const u8 = "",
 
     pub const Header = struct { name: []const u8, value: []const u8 };
 
@@ -307,7 +300,6 @@ pub const Response = struct {
         for (self.headers[0..self.header_count]) |h| {
             size += h.name.len + 2 + h.value.len + 2;
         }
-        size += self.trailer.len;
         size += 16 + digitCount(content_length) + 4; // "Content-Length: " + digits + "\r\n\r\n"
         return size;
     }
@@ -320,7 +312,6 @@ pub const Response = struct {
         for (self.headers[0..self.header_count]) |h| {
             size += h.name.len + 2 + h.value.len + 2;
         }
-        size += self.trailer.len;
         size += 26 + 4; // "Transfer-Encoding: chunked\r\n" + "\r\n"
         return size;
     }
@@ -341,7 +332,6 @@ pub const Response = struct {
             try sink.writeAll(h.value);
             try sink.writeAll("\r\n");
         }
-        try sink.writeAll(self.trailer);
         try sink.writeAll("Content-Length: ");
         try sink.writeAll(num[0..formatUInt(&num, 0, content_length)]);
         try sink.writeAll("\r\n\r\n");
@@ -364,7 +354,6 @@ pub const Response = struct {
             try sink.writeAll(h.value);
             try sink.writeAll("\r\n");
         }
-        try sink.writeAll(self.trailer);
         try sink.writeAll("Transfer-Encoding: chunked\r\n");
         try sink.writeAll("\r\n");
         if (content_length > 0) {
@@ -447,7 +436,6 @@ pub const Response = struct {
             cp(region, &pos, h.value);
             cp(region, &pos, "\r\n");
         }
-        cp(region, &pos, self.trailer);
         cp(region, &pos, "Content-Length: ");
         cp(region, &pos, num[0..formatUInt(&num, 0, content_length)]);
         cp(region, &pos, "\r\n\r\n");
@@ -540,7 +528,6 @@ pub const Response = struct {
             add.push(parts, &count, h.value);
             add.push(parts, &count, "\r\n");
         }
-        add.push(parts, &count, self.trailer);
         add.push(parts, &count, "Content-Length: ");
         add.push(parts, &count, digits_at[status_end..cl_end]);
         add.push(parts, &count, "\r\n\r\n");
@@ -693,45 +680,6 @@ test "writeHeadToBuffer writes head only with full Content-Length" {
     );
     // Head-only serialization is exactly the full wire size minus the body.
     try testing.expectEqual(resp.wireSize() - resp.body.len, buf.availableRead());
-}
-
-test "trailer splices after declared headers and before Content-Length" {
-    const allocator = testing.allocator;
-    var resp = Response.init(.ok);
-    resp.setHeader("Content-Type", "text/plain");
-    resp.trailer = "Date: Sun, 18 Oct 2026 14:00:00 GMT\r\nServer: Zocket/test\r\n";
-    resp.setBody("hi");
-
-    const buf = try buffer_mod.Buffer.init(allocator);
-    defer buf.deinit(allocator);
-    try resp.writeHeadToBuffer(buf);
-    try testing.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" ++
-            "Date: Sun, 18 Oct 2026 14:00:00 GMT\r\nServer: Zocket/test\r\n" ++
-            "Content-Length: 2\r\n\r\n",
-        buf.peek(),
-    );
-    try testing.expectEqual(resp.wireSize() - resp.body.len, buf.availableRead());
-}
-
-test "chunked head carries the trailer before Transfer-Encoding" {
-    const allocator = testing.allocator;
-    var resp = Response.init(.ok);
-    resp.trailer = "Date: Sun, 18 Oct 2026 14:00:00 GMT\r\n";
-    resp.setBody("hello");
-    resp.chunked = true;
-
-    const buf = try buffer_mod.Buffer.init(allocator);
-    defer buf.deinit(allocator);
-    var tail: [16]u8 = undefined;
-    const framing = try resp.writeChunkedHeadToBuffer(buf, resp.body.len, &tail);
-    // Head carries Transfer-Encoding, no Content-Length, plus the size line.
-    try testing.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nDate: Sun, 18 Oct 2026 14:00:00 GMT\r\n" ++
-            "Transfer-Encoding: chunked\r\n\r\n5\r\n",
-        buf.peek()[0..framing.head_len],
-    );
-    try testing.expectEqualStrings("\r\n0\r\n\r\n", framing.tail);
 }
 
 test "chunked head: body is framed as a single chunk with terminator split" {
@@ -1039,21 +987,6 @@ test "writevHeadParts skips empty segments" {
     var head_buf: [256]u8 = undefined;
     @memcpy(head_buf[0.."HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".len], "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
     try testing.expectEqual(head_buf[0.."HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".len].len, total);
-}
-
-test "writevHeadParts emits the trailer as its own part before Content-Length" {
-    var resp = Response.init(.ok);
-    resp.trailer = "Date: Sun, 18 Oct 2026 14:00:00 GMT\r\nServer: Zocket/test\r\n";
-    resp.setBody("b");
-    var parts: [max_writev_parts]posix.iovec_const = undefined;
-    const n = resp.writevHeadParts(&parts, resp.body.len, resp.body);
-    var joined: [512]u8 = undefined;
-    const out = copyParts(parts[0..n], &joined);
-    try testing.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nDate: Sun, 18 Oct 2026 14:00:00 GMT\r\n" ++
-            "Server: Zocket/test\r\nContent-Length: 1\r\n\r\nb",
-        out,
-    );
 }
 
 test "BufferSink writes and reports BufferFull" {
