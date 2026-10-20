@@ -29,7 +29,8 @@ zig build -Dconfig=config.example.conf run
   flow control, CONTINUATION, trailers
 - Native TLS 1.3 (`src/tls/`, no OpenSSL): ECDSA P-256/P-384, X25519, ALPN,
   stateless session tickets and PSK resumption, SNI certificate selection,
-  OCSP stapling, mTLS client verification
+  OCSP stapling, mTLS client verification, optional kTLS offload of the
+  server's encryption (`tls { ktls on; }`)
 - WebSocket upgrade (RFC 6455) with an in-reactor byte-pipe mode
 - PROXY protocol v1/v2 inbound headers and a TLS SNI-aware L4 stream proxy
   (`stream { server { ... } }`)

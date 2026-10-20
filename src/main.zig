@@ -446,9 +446,10 @@ fn runServer(
     for (stream_buf[0..stream_len]) |s| {
         std.debug.print("Starting TCP stream proxy on port {d}\n", .{s.listen_port});
     }
-    // kTLS: probe once when asked (per-connection TX cutover in
-    // processHttpTls rides exportTxKeys + ktls.configure; until then the
-    // probe result only decides this log line — userspace stays).
+    // kTLS: probe once when asked. The per-connection cutover (the
+    // reactor hands the TX encryption to the kernel after the handshake)
+    // rides exportTxKeys + ktls.configure; the probe only decides this
+    // log line.
     if (embedded) |cfg| {
         if (cfg.tls.ktls) {
             if (zocket.ktls.probe()) {
