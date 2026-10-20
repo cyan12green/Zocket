@@ -131,29 +131,37 @@ Notes:
 
 ## Unified benchmark (web/file/load-balancer)
 
-Zocket, nginx and HAProxy (built from source via `bench/build-haproxy.sh`)
-co-resident; 8 workload cells, pinned, medians of 3 samples (server on CPUs
-0-3, four fixture origins on 4-7, loader on 8-11).
+Zocket, nginx, HAProxy (built from source via `bench/build-haproxy.sh`) and
+Envoy (pinned release, fetched by `bench/build-envoy.sh`) co-resident; 8
+workload cells, pinned, medians of 3 samples (server on CPUs 0-3, four
+fixture origins on 4-7, loader on 8-11).
 
 ![Unified](graphs/unified_web.png)
 
-| Cell | Zocket | nginx | HAProxy | Zocket/nginx |
-|---|---:|---:|---:|---:|
-| h1_echo | 255,532 | 171,608 | — | 1.49x |
-| static_small | 217,817 | 188,108 | — | 1.16x |
-| static_large | 15,821 | 16,425 | — | 0.96x |
-| precompressed | 214,212 | 187,204 | — | 1.14x |
-| headers_ops | 270,544 | 265,236 | — | 1.02x |
-| auth_basic | 268,353 | 246,745 | — | 1.09x |
-| cache_hit | 266,536 | 259,387 | — | 1.03x |
-| lb_rr | 181,392 | 205,939 | 126,870 | 0.88x |
+| Cell | Zocket | nginx | Envoy | HAProxy | Zocket/nginx |
+|---|---:|---:|---:|---:|---:|
+| h1_echo | 291,425 | 180,955 | 58,085 | — | 1.61x |
+| static_small | 231,681 | 192,416 | 72,658 | — | 1.20x |
+| static_large | 16,549 | 17,273 | 72,569 | — | 0.96x |
+| precompressed | 224,365 | 192,003 | 70,813 | — | 1.17x |
+| headers_ops | 283,121 | 273,919 | 71,497 | — | 1.03x |
+| auth_basic | 280,739 | 256,788 | 69,848 | — | 1.09x |
+| cache_hit | 281,413 | 265,657 | 71,517 | — | 1.06x |
+| lb_rr | 213,016 | 217,339 | 70,918 | 131,790 | 0.98x |
 
 `lb_rr` proxies through a four-origin pool. Across four interleaved
-comparisons it sits within the machine's run-to-run spread (0.88x in this
-run; 0.98x, 0.90x and 1.000x in earlier ones); its p50 is consistently lower
+comparisons it sits within the machine's run-to-run spread (0.98x in this
+run; 0.88x, 0.90x and 1.000x in earlier ones); its p50 is consistently lower
 than nginx's while the p99 tail (≈4 ms vs ≈2 ms) is the remaining item
 (tracked in `docs/ROADMAP.md`). Against HAProxy's default proxy path, Zocket
-leads 1.43x (181,392 vs 126,870). Raw JSON under `bench/results/unified/`.
+leads 1.62x (213,016 vs 131,790).
+
+Envoy's cell is a catch-all reverse proxy: every request is proxied to the
+origin pool, so only `lb_rr` compares the same work — there Zocket leads
+Envoy 3.0x (213,016 vs 70,918) and HAProxy 1.62x. The other rows show Envoy
+proxying a trivial origin rather than serving the static/auth/cache/header
+work the other two do, and are not a like-for-like comparison. Raw JSON
+under `bench/results/unified/`.
 
 ## HTTP/2 over TLS (h2load)
 

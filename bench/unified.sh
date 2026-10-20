@@ -17,7 +17,7 @@ REP_LABEL=""
 TCP_BIN="$ROOT/zig-out/bin/zocket"
 NGINX_BIN="$ROOT/bench/.cache/nginx-build/sbin/nginx"
 HAPROXY_BIN="$ROOT/bench/.cache/haproxy-build/sbin/haproxy"
-ENVOY_BIN="${ENVOY_BIN:-}"   # set ENVOY_BIN=/path/to/envoy to enable
+ENVOY_BIN="${ENVOY_BIN:-$ROOT/bench/.cache/envoy/envoy}"   # bench/build-envoy.sh
 BOMB=~/go/bin/bombardier
 # CPU pinning (see bench/modules-bench.sh): the server under test gets the
 # performance-core threads; each origin gets its own CPU; the loader gets a
@@ -87,7 +87,10 @@ start_envoy() {
         -e "s/@@ORIGIN2@@/$((ORIGIN_BASE+2))/" \
         -e "s/@@ORIGIN3@@/$((ORIGIN_BASE+3))/" \
         "$ROOT/bench/foreign/envoy/unified.yaml.template" > "$ROOT/bench/.cache/envoy-uni.yaml"
-    pin "$PIN_SRV" "$ENVOY_BIN" -c "$ROOT/bench/.cache/envoy-uni.yaml" >/dev/null 2>&1 &
+    # --concurrency 4 matches the other servers (nginx 4 workers, Zocket 4
+    # threads, Caddy GOMAXPROCS=4): without it Envoy spawns one worker per
+    # visible CPU (12) and the 4 pinned cores then carry 12 workers.
+    pin "$PIN_SRV" "$ENVOY_BIN" -c "$ROOT/bench/.cache/envoy-uni.yaml" --concurrency 4 --use-dynamic-base-id >/dev/null 2>&1 &
     EPIDS+=($!)
 }
 
@@ -125,6 +128,14 @@ stop_all() {
     for p in ${OPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
     for p in ${HPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
     for p in ${EPIDS[@]:-}; do kill "$p" 2>/dev/null || true; done
+    # The pinned servers are children of taskset: killing the wrapper
+    # leaves the server running, so sweep the bench binaries by name too
+    # (otherwise the next run cannot replace them: "Text file busy").
+    pkill -f "zocket-fron[t]" 2>/dev/null || true
+    pkill -f "zocket-origi[n]" 2>/dev/null || true
+    pkill -f "envoy.*envoy-uni[.]yaml" 2>/dev/null || true
+    pkill -f "haproxy.*haproxy-uni[.]cfg" 2>/dev/null || true
+    pkill -f "nginx.*nginx-uni[.]conf" 2>/dev/null || true
     wait 2>/dev/null || true
 }
 trap stop_all EXIT

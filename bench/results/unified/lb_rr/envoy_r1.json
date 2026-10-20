@@ -1,0 +1,4 @@
+Bombarding http://127.0.0.1:18704/proxied for 6s using 100 connection(s)
+ 00m05s 00m04s 00m04s 00m04s 00m04s 00m04s 00m03s 00m03s 00m03s 00m03s 00m03s 00m02s 00m02s 00m02s 00m02s 00m02s 00m01s 00m01s 00m01s 00m01s 00m01s 6s
+Done!
+{"spec":{"numberOfConnections":100,"testType":"timed","testDurationSeconds":6,"method":"GET","url":"http://127.0.0.1:18704/proxied","body":"","stream":false,"timeoutSeconds":2,"client":"fasthttp"},"result":{"bytesRead":53419944,"bytesWritten":30156420,"timeTakenSeconds":6.000607523,"req1xx":0,"req2xx":430806,"req3xx":0,"req4xx":0,"req5xx":0,"others":0,"latency":{"mean":1389.353351624629,"stddev":154.48877621338193,"max":11199,"percentiles":{"50":1373,"75":1577,"90":1678,"95":1842,"99":2075}},"rps":{"mean":71852.861018712,"stddev":2206.24888459775,"max":78128.4449391264,"percentiles":{"50":72304.456781,"75":72651.284542,"90":72952.016099,"95":73195.659497,"99":73754.495336}}}}
