@@ -151,7 +151,9 @@ for methodology and current results.
   HIT, limit_req shedding); JSON in `bench/results/modules/`, graph via
   `python3 bench/graphs_modules.py` → `bench/graphs/modules_compare.png`.
 - Unified suite (web/file/load-balancer): `bash bench/unified.sh`; JSON in
-  `bench/results/unified/`.
+  `bench/results/unified/`. The Envoy cell needs a binary —
+  `bash bench/build-envoy.sh` fetches the pinned release into
+  `bench/.cache/envoy/envoy` (or point `ENVOY_BIN` at one).
 - HTTP/2-over-TLS benchmark: `bash bench/h2-bench.sh [--reps N] [--conns "100 500"]`
   — Zocket vs a TLS nginx (`bench/build-nginx-tls.sh`) over a P-256 cert pair
   (defaults to `/tmp/opencode/bench-tls.{crt,key}`; the openssl one-liner is
