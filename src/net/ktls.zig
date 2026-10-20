@@ -1,16 +1,19 @@
 //! Kernel TLS offload (C3): crypto_info builders, probe and enable
 //! helpers for TX (and RX) offload of AES-GCM/ChaCha20-Poly1305 suites.
 //!
-//! ABI (verified against the running kernel — `setsockopt(SOL_TLS, ...)`
-//! accepts a crypto_info only at the exact per-cipher length, and the
-//! kernel's TLS 1.3 path wants the 1.3 field order, not the 1.2 one):
+//! ABI (verified against a running kernel — a `setsockopt(SOL_TLS, ...)`
+//! crypto_info is accepted only at the exact per-cipher length, and the
+//! field order is the TLS 1.2 one even for TLS 1.3):
 //!
-//!     version:u16le = 0x0304 | cipher:u16le | iv[12] | key[key_len] | seq:u64le
+//!     info{version:u16le = 0x0304, cipher:u16le} ++ iv[8] ++ key[key_len]
+//!         ++ salt[4] ++ rec_seq[8]
 //!
-//! `iv` is the full 12-byte TLS 1.3 traffic IV (salt in bytes 0..4, the
-//! explicit-nonce base zeroed — the kernel writes the record sequence
-//! number into bytes 4..12 itself). The cipher ids are the kernel's, not
-//! the wire's: 51 (AES-128-GCM), 52 (AES-256-GCM), 54 (ChaCha20-Poly1305).
+//! `iv[8]` is the second half of the 12-byte TLS 1.3 traffic IV (the
+//! static explicit-nonce base) and `salt[4]` the first half (the salt).
+//! The kernel builds the nonce as `salt || (iv XOR rec_seq)`, so the
+//! record sequence number goes in big-endian (RFC 8446 §5.3). The cipher
+//! ids are the kernel's, not the wire's: 51 (AES-128-GCM), 52
+//! (AES-256-GCM), 54 (ChaCha20-Poly1305).
 //!
 //! Activation (per-connection cutover in the reactor) rides on `probe()`:
 //! kernels without kTLS fail closed into the userspace record layer —
