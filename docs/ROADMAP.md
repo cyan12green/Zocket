@@ -76,10 +76,8 @@ target those error branches.
   (zstd is decompress-only). Serving precompressed `.br`/`.zstd` twins works
   today; runtime compression needs a vendored codec (C dependency vs a
   pure-Zig port).
-- **Cross-server Envoy cell**: the unified cell configuration is authored
-  (`bench/foreign/envoy/unified.yaml.template`); the comparison needs an
-  envoy binary fetched/set via `ENVOY_BIN` on the benchmarking machine. The
-  actix-web and Bun cells build and run from in-tree sources.
+- The actix-web and Bun cells build and run from in-tree sources; the Envoy
+  cell fetches its pinned release with `bench/build-envoy.sh`.
 
 ## Explicitly deferred
 
