@@ -65,7 +65,8 @@ src/
     phase.zig         nginx-style phase enum (post_read ... log)
     router.zig        prefix/exact/regex matching + comptime trie
     registry.zig      comptime module registry + Context (a module is a
-                      value: name, phase, kind, run(ctx) -> Action)
+                      value: name, phase, kind, run(ctx) -> Action) and
+                      the subrequest seam (Subresponse, depth budget)
     pipeline.zig      phase dispatch loop (route match -> per-phase modules)
     conf.zig          comptime-only nginx-flavored conf parser: the only
                       config path (-Dconfig=<file>, conf:<line>:<col>
