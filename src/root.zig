@@ -95,6 +95,7 @@ comptime {
     _ = @import("net/server.zig");
     _ = @import("net/dispatcher.zig");
     _ = @import("net/reactor.zig");
+    _ = @import("net/ktls.zig");
     _ = @import("net/multireactor.zig");
     _ = @import("http/parser.zig");
     _ = @import("http/response.zig");

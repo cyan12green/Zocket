@@ -43,6 +43,13 @@ pub const Stage = enum {
     closed,
 };
 
+/// Exported kTLS material: the negotiated wire suite and the record
+/// sequence number the kernel continues from.
+pub const TxKeys = struct {
+    suite: u16,
+    seq: u64,
+};
+
 const max_plaintext = tls.max_ciphertext_inner_record_len;
 
 pub fn Session(
@@ -173,7 +180,7 @@ pub fn Session(
         /// the wire suite + the next TX record sequence (== records sent
         /// so far — the kernel continues numbering from there). Null when
         /// the session has no application keys yet (pre-Finished).
-        pub fn exportTxKeys(self: *const Self, key_out: []u8, iv_out: []u8) ?struct { suite: u16, seq: u64 } {
+        pub fn exportTxKeys(self: *const Self, key_out: []u8, iv_out: []u8) ?TxKeys {
             if (self.stage != .application) return null;
             const klen = self.secrets.server_application_key.len;
             const ivlen = self.secrets.server_application_iv.len;

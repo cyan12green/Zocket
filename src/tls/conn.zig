@@ -223,6 +223,15 @@ pub const TlsConn = struct {
         }
     }
 
+    /// Export the server->client application traffic key/IV (and the next
+    /// TX record sequence) for kTLS offload — see `net/ktls.zig`. Null
+    /// until the handshake reaches the application stage.
+    pub fn exportTxKeys(self: *const TlsConn, key_out: []u8, iv_out: []u8) ?session_mod.TxKeys {
+        return switch (self.inner) {
+            inline else => |*s| s.exportTxKeys(key_out, iv_out),
+        };
+    }
+
     pub fn shutdown(self: *TlsConn) Error!void {
         switch (self.inner) {
             inline else => |*s| return s.shutdown(),

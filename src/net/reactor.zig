@@ -18,6 +18,7 @@ const limit_mod = @import("../dsl/modules/limit.zig");
 const version_mod = @import("../version.zig");
 const http2_session = @import("../http2/session.zig");
 const tls_conn = @import("../tls/conn.zig");
+const ktls_mod = @import("ktls.zig");
 const buffer_mod = @import("buffer.zig");
 const http2_frames = @import("../http2/frames.zig");
 const websocket_mod = @import("../http/websocket.zig");
@@ -111,6 +112,10 @@ const HttpSession = struct {
     /// like a ClientHello. When non-null the recv buffer holds ciphertext;
     /// the plaintext lands in `tls_plain` and the parser reads from there.
     tls: ?tls_conn.TlsConn = null,
+    /// kTLS cutover done: the kernel owns the TX encryption, so writes go
+    /// out as plaintext (the kernel encrypts them) while reads still come
+    /// back as ciphertext for the userspace session to decrypt.
+    tls_offloaded: bool = false,
     /// Decrypted plaintext for the HTTP parser (TLS connections only).
     tls_plain: buffer_mod.Buffer = undefined,
     tls_plain_data: [16 * 1024]u8 = undefined,
@@ -1955,7 +1960,10 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             sess.req.deinit();
             if (sess.tls) |*tc| {
                 // Best-effort close_notify before the FIN, then drain.
-                if (tc.stage() == .application) {
+                // After a kTLS cutover the kernel owns the encryption and
+                // the userspace sequence counter is stale — sending a
+                // close_notify from userspace would be undecryptable.
+                if (tc.stage() == .application and !sess.tls_offloaded) {
                     tc.shutdown() catch {};
                     var out: [4096]u8 = undefined;
                     const m = tc.takeOut(&out);
@@ -2396,6 +2404,48 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         return false;
     }
 
+    /// Write plaintext to the client over a TLS connection. Normally the
+    /// userspace TLS session encrypts; after a kTLS cutover the kernel
+    /// owns the encryption and the bytes go into the send buffer as they
+    /// are. Returns false when the connection is gone.
+    fn writeTlsPlaintext(self: *Reactor, fd: posix.fd_t, session: *HttpSession, bytes: []const u8) bool {
+        if (bytes.len == 0) return true;
+        if (!session.tls_offloaded) {
+            session.tls.?.write(bytes) catch return false;
+            return true;
+        }
+        const conn = self.connections.get(fd) orelse return false;
+        conn.send_buf.compact();
+        if (conn.send_buf.availableWrite() < bytes.len) {
+            const grown = conn.send_buf.data.len + bytes.len;
+            if (conn.send_buf.data.len >= connection.Connection.max_recv_buffer) return false;
+            conn.send_buf.grow(self.allocator, @min(connection.Connection.max_recv_buffer, grown)) catch return false;
+        }
+        _ = conn.send_buf.writeSlice(bytes);
+        return true;
+    }
+
+    /// Try the kTLS cutover for this connection: hand the TX encryption to
+    /// the kernel once the handshake is done and the session holds the
+    /// application traffic keys. Fails closed (userspace keeps
+    /// encrypting) when the config disables it, the kernel has no kTLS, or
+    /// the key install is refused.
+    fn tryKtlsOffload(self: *Reactor, fd: posix.fd_t, session: *HttpSession) bool {
+        if (session.tls_offloaded) return true;
+        if (!self.handler.cfg.tls.ktls) return false;
+        const tc = if (session.tls) |*t| t else return false;
+        if (tc.stage() != .application) return false;
+        var key: [32]u8 = undefined;
+        var iv: [12]u8 = undefined;
+        const exported = tc.exportTxKeys(&key, &iv) orelse return false;
+        if (!ktls_mod.probe()) return false;
+        // Attach the ULP and install the keys; a refused install leaves
+        // the socket in userspace mode (the ULP attach alone is inert).
+        if (!ktls_mod.cutover(fd, ktls_mod.TLS_TX, exported.suite, key[0..], &iv, exported.seq)) return false;
+        session.tls_offloaded = true;
+        return true;
+    }
+
     /// TLS response path the head and body go through the TLS session
     /// (encrypted); the ciphertext lands in the send buffer and flushes like
     /// the plaintext path. Sendfile is disabled over TLS — file bodies are
@@ -2424,6 +2474,10 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             session.resp.body_from_file = false;
         }
 
+        // Hand the encryption to the kernel when it can take it (the
+        // handshake is done, the application keys exist).
+        _ = self.tryKtlsOffload(fd, session);
+
         // Serialize the head into the staging buffer, then push head + body
         // through the TLS session.
         session.tls_stage.compact();
@@ -2432,17 +2486,17 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             self.removeConnection(fd);
             return;
         };
-        tc.write(session.tls_stage.peek()) catch {
+        if (!self.writeTlsPlaintext(fd, session, session.tls_stage.peek())) {
             self.freeResponseBody(session);
             self.removeConnection(fd);
             return;
-        };
+        }
         if (session.req.method != .head and session.resp.body.len > 0) {
-            tc.write(session.resp.body) catch {
+            if (!self.writeTlsPlaintext(fd, session, session.resp.body)) {
                 self.freeResponseBody(session);
                 self.removeConnection(fd);
                 return;
-            };
+            }
         }
         self.freeResponseBody(session);
 
@@ -2602,6 +2656,18 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
                 if (session.parser.takeContinue()) {
                     const tc = &(session.tls orelse return);
                     const conn = self.connections.get(fd) orelse return;
+                    if (session.tls_offloaded) {
+                        // The kernel encrypts: the interim response goes
+                        // out as plaintext.
+                        if (!self.writeTlsPlaintext(fd, session, "HTTP/1.1 100 Continue\r\n\r\n")) {
+                            self.removeConnection(fd);
+                            return;
+                        }
+                        self.markWriting(fd);
+                        session.writing = true;
+                        self.flushHttp(fd);
+                        return;
+                    }
                     tc.write("HTTP/1.1 100 Continue\r\n\r\n") catch {
                         self.removeConnection(fd);
                         return;
@@ -2774,7 +2840,17 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
         const session = self.httpSession(fd) orelse return;
         if (session.tls != null) {
             // h2 over TLS the frames must be encrypted. The caller
-            // (processHttp2Slice) drains + flushes afterwards.
+            // (processHttp2Slice) drains + flushes afterwards. After a
+            // kTLS cutover the kernel encrypts, so the frames go into the
+            // send buffer as plaintext.
+            if (session.tls_offloaded) {
+                conn.send_buf.compact();
+                if (conn.send_buf.availableWrite() < out.items.len) {
+                    conn.send_buf.grow(self.allocator, conn.send_buf.data.len + out.items.len) catch return;
+                }
+                _ = conn.send_buf.writeSlice(out.items);
+                return;
+            }
             session.tls.?.write(out.items) catch {
                 self.removeConnection(fd);
             };
@@ -3098,7 +3174,10 @@ fn parkUpstream(self: *Reactor, fd: posix.fd_t, ctx: *dsl_pipeline.Context) !voi
             sess.req.deinit();
             if (sess.tls) |*tc| {
                 // Best-effort close_notify before the FIN, then drain.
-                if (tc.stage() == .application) {
+                // After a kTLS cutover the kernel owns the encryption, so
+                // a userspace close_notify would carry a stale record
+                // sequence number — skip it and let the FIN speak.
+                if (tc.stage() == .application and !sess.tls_offloaded) {
                     tc.shutdown() catch {};
                     var out: [4096]u8 = undefined;
                     const m = tc.takeOut(&out);

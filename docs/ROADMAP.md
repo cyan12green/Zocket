@@ -50,12 +50,15 @@ designed item remains on top of that seam:
   already a verified lead (1.02x-1.12x).
 - **Comptime candidates** (hot-path CPU, not throughput): a single-pass
   upstream request builder (upper-bound arena buffer with a two-pass
-  fallback), a pre-rendered Date + Server block spliced into the response
-  head, and an O(1) value-indexed HPACK static-table map (the name-indexed
-  path is already a comptime hash-sorted table).
-- **kTLS cutover**: the foundation (crypto-info, probe, TX/RX configuration,
-  key export) is in `net/ktls.zig` but activation needs a kTLS-capable kernel
-  to validate; this machine does not have one.
+  fallback) and an O(1) value-indexed HPACK static-table map (the
+  name-indexed path is already a comptime hash-sorted table).
+- **kTLS**: the TX cutover ships (`tls { ktls on; }`): after the handshake the
+  reactor exports the application traffic key and hands the encryption to the
+  kernel; reads still decrypt in userspace. RX offload (the kernel decrypts
+  too) is the next step — it needs the client->server key export and a
+  handover that keeps the record sequence counters in step.
+- **Pre-rendered Date + Server block**: measured and reverted (a pinned A/B
+  showed 0.99x/1.00x — noise), so it stays out of the tree.
 
 ## Coverage
 
