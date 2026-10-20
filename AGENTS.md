@@ -394,7 +394,13 @@ Keep the recipe mechanical; framework flexibility is a priority.
    and caching fails open. Reload-surviving zones use `ZoneRegistry`
    (`acquire`/`adopt`/`descriptors`) with memfd backing; lifecycle init in
    modules creates or inherits zones from the daemon state file.
-8. `zig build test`. The registry-count test derives its count — never touch
+8. Internal control-flow calls into the server's own routes go through
+   `ctx.subrequest(uri)`: it runs the target through the full pipeline and
+   returns a `Subresponse` (status, response headers, body) copied into the
+   source request's shared arena, under the shared depth budget
+   (`max_subrequest_depth`). `ctx.runSubrequest(uri, &status)` is the
+   status-only form (`auth_request` uses it).
+9. `zig build test`. The registry-count test derives its count — never touch
    it.
 
 ## Known stdlib quirks (pinned 0.18.0-dev snapshot; ported from 0.16)

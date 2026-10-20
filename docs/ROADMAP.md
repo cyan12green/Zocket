@@ -23,18 +23,19 @@ async upstream work and kTLS have settled; the reactor's transport seam
 
 ## Module framework v2 — remaining items
 
-The handler/filter split and the async upstream driver shipped; two
-designed items remain on top of that seam:
+The handler/filter split and the async upstream driver shipped; one
+designed item remains on top of that seam:
 
-- **Subrequests**: generalize the `auth_request` hook into
-  `ctx.subrequest(uri) -> Subresponse` (a depth-limited mini-pipeline walk).
-  Internal redirects already exist generically (`ctx.internal_redirect_*`
-  in `error_page`/`rewrite`/`try_files`).
 - **Transport abstraction for upstreams**: the seam exists
   (`IoHandle` in `dsl/registry.zig`; parked async upstreams register
   `ctx.async_handle` with the connection's fd) — grow its variants when
   HTTP/3 arrives rather than re-touching modules. The streaming body
   escape hatch (`streams_response` route/module flag) shipped.
+- Subrequests shipped: `ctx.subrequest(uri) -> Subresponse` runs a target
+  through the full pipeline and returns the verdict (status, response
+  headers, body) copied into the source request's shared arena, under a
+  shared depth budget with `auth_request`. Internal redirects remain
+  generic (`ctx.internal_redirect_*` in `error_page`/`rewrite`/`try_files`).
 
 
 ## Performance
